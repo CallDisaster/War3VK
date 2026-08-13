@@ -32,7 +32,7 @@ WarVK 是一个面向 **Warcraft III 1.27a** 的 Windows 图形增强项目。�
 
 ## 当前状态
 
-- 当前分支：`codex/stage11-exact-attachment-fallback-20260809`。工作树另有用户未提交的外部子模块、
+- 当前分支：`codex/stable-optimization-integration-20260814`。原工作树另有用户未提交的外部子模块、
   PlayerCrash 与构建日志；
   保留它们，避免 reset、checkout 或覆盖式操作。
 - 最近已提交的阴影基础已将地图/设备 epoch、Arena quarantine、fence retirement 与最终 replay
@@ -44,36 +44,10 @@ WarVK 是一个面向 **Warcraft III 1.27a** 的 Windows 图形增强项目。�
   并以视角无关 CSM 光学证据替代阴影柱俯仰特判；77/77 静态、21/21 Win32 runnable、DLL 构建及
   no-work 通过，但尚未部署、真实 Catalog 回读或玩家前台物理验收，详见
   `docs/agent-history/2026-08-12-local-volumetric-fog-candidate.md`。
-- 2026-08-13 的 Volumetric Lighting 2.0 候选新增可选 Froxel Medium/High；玩家回归已否决逐列
-  `[L-D,L]` surface-tail 和其后 128/256 步过早回退。当前研究修复使用全屏统一 `[20,10000]`
-  对数 Z、64/128 层，scene depth 只在独立 `1/8`/`1/4` effect 网格终止积分；太阳阴影使用整 ray
-  1024/2048 步 shadow-texel 光学区间，并在耗尽后作有界密集回退。旧 RayMarch 仍为默认；450 万
-  grid-cell 与 3.5 亿主 DDA pixel-step admission 失败会安全回退。78/78 静态、21/21 Win32 runnable、
-  DLL 构建及 no-work 通过；已部署但尚未完成玩家前台视觉/4K 性能门，详见
-  `docs/agent-history/2026-08-13-froxel-full-view-research-fix-candidate.md`。
-- 上述部署候选的玩家回归仍显示低俯角/侧视亮缝、分层及阴影柱收缩。当前未部署修复已将错误的
-  `0.0075` 归一化 volume-sun bias 改为 2 世界单位后按实际光空间跨度归一化，并让预算耗尽
-  fallback 使用贯穿全部 Z slice 的共同采样格点；78/78 静态、DLL 构建及 no-work 通过。独立确认
-  的上游离屏 Caster 提交缺失仍未修改，不能宣称本候选已彻底解决该类消失，详见
-  `docs/agent-history/2026-08-13-volumetric-bias-and-fallback-phase-candidate.md`。
-- 后续运行取证确认该玩家回归实际仍在 backend 0：地图只调用 `SetEnabled(true)`，没有调用
-  `SetBackend`，日志也没有任何 Froxel 提交。当前未部署验收候选默认进入 Froxel High，并新增
-  实际 backend 日志，显式 0/1/2 回退仍保留；78/78 静态、DLL 构建及 no-work 已通过，尚待
-  玩家前台低视角 A/B，详见
-  `docs/agent-history/2026-08-13-froxel-backend-admission-candidate.md`。
-- 玩家已确认 Froxel High 不再复现上述几何错误，但阴影柱对比度几乎不可见。当前未部署候选已把
-  旧路径受真实 CSM 光学证据约束、最大 24% 的可读性衰减移植到 Froxel alpha，不提高全局雾密度；
-  78/78 静态、21/21 Win32 runnable、DLL 构建及 no-work 通过，尚待玩家前台视觉 A/B，详见
-  `docs/agent-history/2026-08-13-froxel-shadow-readability-candidate.md`。
-- 玩家回归确认上述可读性显著改善，但 `1/4` effect 自身强边 range weight 把轮廓放大成大块阶梯。
-  当前未部署候选改为由全分辨率 scene depth 单独引导 RGBA 双线性重建，保护真实几何断层而不锁死
-  低分辨率体积边；78/78 静态、21/21 Win32 runnable、DLL 构建及 no-work 通过，尚待视觉 A/B，
-  详见 `docs/agent-history/2026-08-13-froxel-shadow-edge-aa-candidate.md`。
-- 动态回归仍有整格跳变；根因是 integrator 只在 receiver-depth transition 过滤，Caster 横向
-  silhouette 仍为单 shadow texel 二值判断。当前未部署候选改为每个有效区间一次 2×2 depth gather，
-  对四个深度先解析比较再按亚 texel 覆盖率合并；不增加历史拖影或 DDA 上限；78/78 静态、
-  21/21 Win32 runnable、DLL 构建及 no-work 通过，详见
-  `docs/agent-history/2026-08-13-froxel-dynamic-shadow-comparison-pcf-candidate.md`。
+- 2026-08-13 的 Froxel Medium/High 候选使用统一 `[20,10000]` 对数 Z、受限三维网格、时域重建、
+  全分辨率 depth 引导和 compare-first 2×2 Caster 可见度；当前候选默认 Froxel High，并保留显式
+  Legacy 回退。78/78 静态和 21/21 runnable 已在合并前通过，现正与生产者性能线集成；组合 DLL、
+  4K 性能和玩家前台视觉仍未验收，详见 `docs/agent-history/2026-08-13-froxel-dynamic-shadow-comparison-pcf-candidate.md`。
 - 产品、DLL 资源、外部 Shader API 与 JAPI 显示版本已统一为 `1.2.0 Release`；GitHub 源码、
   玩家包、地图作者包及明确排除项见 `docs/RELEASE_1.2.0.md`。
 - 当前候选验证为：474/474 静态测试、15/15 Win32 runnable、真实 YDWE Catalog 35/35 回读与
@@ -107,28 +81,67 @@ WarVK 是一个面向 **Warcraft III 1.27a** 的 Windows 图形增强项目。�
   bounds provenance 授权，Unknown/Generic/Animated/Skinned 一律 fail-visible，并保留 would-cull 统计。
   该候选会增加远级联工作，尚未部署或通过低视角物理 A/B，详见
   `docs/agent-history/2026-08-09-object-bounds-fail-visible.md`。
+- 2026-08-11 的夜间高压门捕获到真实 NVIDIA `READ_INVALID` device fault；当前仅新增一个默认关闭、
+  编译期开发专用的 `VK_EXT_device_address_binding_report` 有界环，用于下一次复现时把 fault 地址关联到
+  Vulkan 对象。它尚未部署或实机取证，不能描述为 TDR 修复；详见
+  `docs/agent-history/2026-08-11-device-address-binding-fault-correlation.md`。
 - 2026-08-09 已修复 Transparent Type0 建造附件在 Stage11 被错误拒绝的问题：Type0 现在拥有常驻的
   exact CurrentDraw 边界，使用子部件身份和同帧 VB/IB/UV/完整矩阵调色板，并正确支持
   `D3DVBF_0WEIGHTS` 索引蒙皮。用户已确认不死族 UBirth 建造阴影不再闪烁；该路径没有重新开启
   全局跨帧 VB/IB cache。详细证据见
   `docs/agent-history/2026-08-09-stage11-type0-correctness-baseline.md`。
-- 2026-08-09 的当前集成候选为 `203932c` / `codex/integrated-correctness-baseline-20260809`，
-  build32 DLL SHA-256 为 `56566E0418E2C51AE22C7978E5934AC45ACDB32191F7E02E15C83EBB3FAF8190`。
-  它把用户分别确认过的 Type0/UBirth 修复与点阴影 receiver-bias 修复合入同一源码线，并包含本轮
-  跨地图 CPU 身份缓存失效；73 个静态脚本、18/18 Win32 runnable、DLL 构建和 no-work 已通过。
-  该组合 DLL 尚未部署或完成前台物理回归，不能把两个旧候选的独立验收冒充组合验收。
-- 2026-08-09 的本地运行时安全候选默认编译期禁用 legacy `warvk:cmd`，并闭合 JASS reset、异步
-  settings 生命周期、active-device 发布、Reset device epoch 与 SceneCollector 早退身份残留风险；
-  76/76 静态、20/20 Win32 runnable、32 位 DLL link 与 no-work 已通过，但尚未部署或完成 Reset/
-  A→B→A 前台物理门。详细证据见
+- 2026-08-09 的本地 `1.2003` Hotfix3 组合候选已合入用户确认过的 Type0/UBirth 建造阴影、点阴影
+  receiver-bias，以及编译期关闭 legacy `warvk:cmd`、JASS CPU-only reset、异步 settings mailbox、
+  active-device 发布、Reset device epoch 和 SceneCollector 早退身份清理。76 个静态脚本/581 个用例、
+  20/20 Win32 runnable、32 位 clean build 与 no-work 通过；DLL SHA-256 为
+  `A36253BC63854B4B9F620DE6303B076C5361B8511A3A732D8768459F42A4147F`。前两项视觉修复已有用户
+  前台确认，新增运行时安全组合仍未部署或完成 Reset/A→B→A 物理门。详细证据见
   `docs/agent-history/2026-08-09-runtime-safety-and-shadow-edge-research.md`。
+- 2026-08-10 的 TDR terminal-drain 候选让 D3D9 CS 在终态设备丢失时仅等待已派发序号，并让
+  submission/finish/presenter 只做 CPU 收尾、停止新增 GPU/WSI wait；仅通过离线合同和构建，尚无
+  实际 device-lost 注入或玩家前台证据，详见
+  `docs/agent-history/2026-08-10-tdr-terminal-drain.md`。
+- 2026-08-10 的 TDR P2 候选在已锁存的设备丢失后拒绝新的 D3D9 shader、PipelineManager 与
+  compiler-worker 工作，并 CPU 排空既有 worker entry；它不把 pipeline 编译失败解释为 device loss，
+  仅完成离线合同/构建，详见 `docs/agent-history/2026-08-10-tdr-p2-pipeline-compiler-drain.md`。
+- 2026-08-10 的 TDR P3 候选将同一不可逆 fail-stop 语义补到 D3D9Ex `ResetEx` 和额外 swapchain
+  创建入口，终态时不再重建原 Vulkan device；仅完成离线合同/构建，详见
+  `docs/agent-history/2026-08-10-tdr-p3-d3d9ex-reset-fail-stop.md`。
+- 2026-08-10 的 TDR P4 候选在支持 `VK_EXT_device_fault` 时只对真实 `VK_ERROR_DEVICE_LOST`
+  采集一次有界、按值拥有的文本/地址诊断；不启用或写入 vendor binary，且不改变终态 fail-stop。
+  它仅有 fake/离线验证，真实 device-loss 注入仍未验收，详见
+  `docs/agent-history/2026-08-10-tdr-p4-device-fault-text-capture.md`。
 - 同一调查确认现有 3794 帧取证全为 4096 DirectInline，阴影边缘持续爬动并非 Temporal 或自适应
   降档所致；首要源码嫌疑是 CSM 先线性过滤原始深度再比较，以及默认周期性世界坐标 Poisson 旋转。
-  这些算法项仍是研究/执行方案，不能描述为已修复；详见上述研究文档。
+  compare-first PCF、固定对称核和关闭周期旋转已在候选中实现；2026-08-10 又统一了 Direct/Prepass
+  的 PCSS、级联失效回退、receiver-plane 数值合同、non-uniform 控制流前的导数和 UBO fail-soft。
+  仍未获得玩家物理复审，不能描述为视觉问题已修复；
+  详见 `docs/agent-history/2026-08-10-issue4-receiver-prepass-numeric-contract.md`。
+- 2026-08-10 的 Issue #4 alpha-cascade parity 候选将 Release 默认远级联 cutout bias 设为零，并让
+  depth/mask 共用有限值 helper；它仅消除确定的跨级联 silhouette 差异，仍等待玩家前台物理复测。
 - Issue #5 的地形级联剔除现为默认关闭的 `Off / Observe / Consume` 合同；只有同帧、同代且来自
   已验证 position span 的精确 bounds 才能授权 C2/C3 剔除，猜测或陈旧 bounds 一律 fail-visible。
   当前仅完成离线验证，未部署且未通过实机 A/B；详见
   `docs/agent-history/2026-08-09-issue5-terrain-bounds-observer.md`。
+- 2026-08-10 的 Issue #5 observer build policy 候选保持正式 DLL 的 terrain/union observer 永远 Off；
+  仅独立 `warvk_shadow_observers_dev=true` 开发构建可用环境值 `1` 收集 Observe，`2` 仍为 Off，不能授权
+  Consume 或部署发布。
+- 2026-08-11 的本地候选补齐 S1 persistent/early-hit 与 Stage10 的 exact terrain bounds 来源：indexed
+  draw 只接受当前 IB 扫描域，persistent local bounds 由不可变 geometry generation 拥有；Release 仍 Off，
+  但实机开发 Observe 的 proof accepted 仍为零，因为 indexed-domain 计算受历史禁用的 exact-trim 门
+  阻断，不能据此宣称剔除可用；详见 `docs/agent-history/2026-08-11-issue5-exact-terrain-bounds-provenance.md`。
+- 2026-08-11 的高压低视角门捕获到真实 `VK_ERROR_DEVICE_LOST`：device fault 报告
+  `READ_INVALID`，点阴影为零且 Arena 无 ownership/overflow 违规；TDR 前同时存在连续
+  `ProducerIncomplete` 与四级联重复重放。本地诊断候选已把独立 producer/cache/unknown-index 原因
+  贯通到 runtime、flight、incident 和 perf，仍不等于 TDR 已修复；详见
+  `docs/agent-history/2026-08-11-night-tdr-invalid-read-evidence.md`。
+- 2026-08-11 最新报告证明高压全体阴影闪烁主要来自必需 Caster 被软优先级预算拒绝，而非 Arena
+  硬容量耗尽；本地候选改为低于 384 MiB 硬上限时全部准入并增加独立原因诊断，尚待前台物理 A/B。
+- 2026-08-12 的开发专用 coherent REAL index-trim 候选只对同一 draw 内可同步冻结的刚体不透明
+  地形收紧 position/index 域；已删除会产生多毫秒回归的中间 scratch copy，303 秒门的 Arena
+  p95 为 63.929 MiB，producer-incomplete/TDR 均为零，但瞬时峰值仍为 369.132 MiB。Release 默认
+  仍不可达，前台视觉验收尚未完成；详见
+  `docs/research/2026-08-12-coherent-real-index-trim.md`。
 - Issue #6 已先闭合两个确定的跨地图 CPU 身份泄漏：caster tombstone 现在按 map epoch 隔离，且
   旧相机、per-draw upload、RT/DS fallback 会在 Present 安全点重置；显式禁用 producer stage 的
   进程级策略仍跨地图保留。该阶段仅通过离线合同和 Win32 runnable，尚未部署或完成 A→B→A
@@ -159,11 +172,11 @@ WarVK 是一个面向 **Warcraft III 1.27a** 的 Windows 图形增强项目。�
 - 当前 RTX 4060 Ti 的主 15.73 GiB device-local heap 不可 host-visible；唯一同时
   `DEVICE_LOCAL | HOST_VISIBLE` 的 heap 只有 214 MiB。因此 ReBAR direct-upload 实验不满足既定
   准入条件，保持未实现/默认关闭，不能占用小 BAR heap 冒充完整 ReBAR 收益。
-- 1.2.0 的发布范围限定为“新启动进程只进入一张地图”。同进程退出地图后再进入其他地图仍会造成
-  性能下降、阴影异常或其他生命周期问题，已由用户决定延期到下一版本；点光开启点阴影后，部分
-  地面/角度仍有摩尔纹或带状伪影。README/CHANGELOG 必须保留这两项已知问题，后续不得描述为已修复。
+- 1.2003 的发布范围仍限定为“新启动进程只进入一张地图”。同进程退出地图后再进入其他地图仍可能
+  造成性能下降、阴影异常或其他生命周期问题，已由用户决定延期到下一版本；README/CHANGELOG
+  必须保留该已知问题。点阴影 receiver-bias 修复已由用户前台确认，不再把旧摩尔纹列为当前已知问题。
 - 当前 JAPI/体积效果仍需用户地图物理验收；可见桌面 AutoTest 的低视角稳定门不能代替玩家前台
-  视觉判断，也不能外推为跨地图或点阴影摩尔纹已经修复。
+  视觉判断，也不能外推为跨地图生命周期已经修复。
 
 ## 不可破坏的工程约束
 
@@ -185,6 +198,12 @@ WarVK 是一个面向 **Warcraft III 1.27a** 的 Windows 图形增强项目。�
   改写进 WarVK/DXVK 开源树或提交历史；WarVK 的实现、测试和注释必须保持独立表达与可追溯的一手依据。
 - 不要将 `AutoTest` 的 isolated desktop 数据宣称为玩家前台性能；涉及性能时按
   `AutoTest/README.md` 的前台基线和特性矩阵规则执行。
+- 修改阴影、过滤、抗锯齿、同步或其他图形学算法时，只要结论不是十足确定，必须先查阅原始或同行评审
+  论文、Microsoft DirectX 指南、Khronos Vulkan 规范或 GPU 厂商研究资料，并在 `docs/research/`
+  记录公式、适用边界、来源与本项目映射。博客只能作为检索线索，不能单独授权 Release 默认值。
+- Unreal Engine 官方源码只允许从已获 EULA 权限的 `EpicGames/UnrealEngine` 检出到项目外部
+  `E:\Mycode\Source\References\UnrealEngine`，作为只读架构参考。不得复制、改写或提交 UE 源码、
+  Shader、资产到 WarVK/DXVK 开源树；实现必须独立完成并优先引用公开论文/规范。
 - 构建或测试不会自动授权部署 DLL、覆盖 YDWE/Warcraft 文件、启动/关闭编辑器或游戏。此类操作需有
   用户明确请求，并先检查目标进程与精确备份/哈希。
 

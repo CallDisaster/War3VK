@@ -10,6 +10,7 @@ layout(location = 3) in vec2 in_uv;            // 纹理坐标 (用于Alpha测�
 
 // ===== 顶点输出 =====
 layout(location = 0) out vec2 v_uv;            // 传递给片段着色器的UV
+layout(location = 1) out vec3 v_surfaceCoord;  // 稳定的模型空间覆盖率坐标
 
 // ===== 统一缓冲区 =====
 layout(set = 1, binding = 0, std140, row_major) readonly buffer WorldMatrices {
@@ -135,6 +136,10 @@ void main() {
   vec4 position = in_pos;
   vec2 uv = in_uv;
   v_uv = uv;
+  // Hash coverage is anchored to the immutable pre-transform surface. Never
+  // salt this coordinate with frame, palette, buffer or sampler identities:
+  // those can change while the logical caster remains the same.
+  v_surfaceCoord = in_pos.xyz;
 
   // VS-B1 aliases binding 0 to bind-pose positions and intentionally skips
   // the native/compute output VB. Reconstruct the current pose from the exact

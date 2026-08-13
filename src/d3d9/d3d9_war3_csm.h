@@ -12,6 +12,10 @@ namespace dxvk {
     enum class War3CsmFitMode : uint8_t {
         StableSphere = 0, // 稳定优先：使用包围球拟合（更稳定但可能浪费分辨率）
         TightAabb    = 1, // 清晰优先：使用光空间 AABB 拟合（更清晰但旋转/缩放更敏感）
+        // Development-only RTS receiver-band candidate. Release never selects
+        // this mode; an unproven or uncovered footprint falls back to the
+        // existing StableSphere path instead of clipping receivers.
+        RtsReceiverBand = 2,
     };
 
     struct War3CsmConfig {
@@ -34,6 +38,10 @@ namespace dxvk {
         // the smallest possible normalized-depth precision cost.
         float farCasterDepthExtension = 0.0f;
         War3CsmFitMode fitMode = War3CsmFitMode::StableSphere;
+        float rtsReceiverPlaneHeight = 0.0f;
+        float rtsReceiverBandHalfHeight = 512.0f;
+        float rtsReceiverPadding = 64.0f;
+        float rtsBaseWorldTexelSize = 0.25f;
     };
 
     struct War3CsmCascade {

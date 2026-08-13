@@ -50,6 +50,15 @@ public static class War3DesktopKey {
   [DllImport("kernel32.dll")]
   public static extern uint GetCurrentThreadId();
   [DllImport("user32.dll")]
+  public static extern IntPtr GetThreadDesktop(uint threadId);
+  [DllImport("user32.dll", SetLastError=true)]
+  public static extern IntPtr OpenInputDesktop(uint flags, bool inherit, uint desiredAccess);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+  public static extern bool GetUserObjectInformation(
+    IntPtr handle, int index, System.Text.StringBuilder info, uint length, out uint needed);
+  [DllImport("user32.dll")]
+  public static extern bool CloseDesktop(IntPtr desktop);
+  [DllImport("user32.dll")]
   public static extern bool AttachThreadInput(uint from, uint to, bool attach);
   [DllImport("user32.dll")]
   public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extraInfo);
@@ -57,6 +66,17 @@ public static class War3DesktopKey {
   public static extern uint MapVirtualKey(uint code, uint mapType);
   [DllImport("user32.dll")]
   public static extern bool PostMessage(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam);
+
+  public static string DesktopName(IntPtr desktop) {
+    if (desktop == IntPtr.Zero) return "";
+    uint needed;
+    GetUserObjectInformation(desktop, 2, null, 0, out needed);
+    if (needed == 0) return "";
+    var value = new System.Text.StringBuilder((int)(needed / 2 + 2));
+    if (!GetUserObjectInformation(desktop, 2, value,
+        (uint)(value.Capacity * 2), out needed)) return "";
+    return value.ToString();
+  }
 
   public static IntPtr FindLargestWindow(uint targetPid) {
     IntPtr best = IntPtr.Zero;
@@ -84,6 +104,19 @@ public static class War3DesktopKey {
     GetWindowThreadProcessId(hwnd, out targetPid);
     targetThread = GetWindowThreadProcessId(hwnd, out targetPid);
     uint currentThread = GetCurrentThreadId();
+    IntPtr helperDesktop = GetThreadDesktop(currentThread);
+    IntPtr inputDesktop = OpenInputDesktop(0, false, 0x0001);
+    if (helperDesktop == IntPtr.Zero || inputDesktop == IntPtr.Zero)
+      throw new InvalidOperationException("unable to resolve input desktops");
+    string helperDesktopName = DesktopName(helperDesktop);
+    string inputDesktopName = DesktopName(inputDesktop);
+    bool desktopMatches = !String.IsNullOrEmpty(helperDesktopName) &&
+      !String.IsNullOrEmpty(inputDesktopName) &&
+      String.Equals(helperDesktopName, inputDesktopName,
+        StringComparison.OrdinalIgnoreCase);
+    CloseDesktop(inputDesktop);
+    if (!desktopMatches)
+      throw new InvalidOperationException("non-input desktop injection is forbidden");
     bool attached = AttachThreadInput(currentThread, targetThread, true);
     bool top = BringWindowToTop(hwnd);
     bool foreground = SetForegroundWindow(hwnd);

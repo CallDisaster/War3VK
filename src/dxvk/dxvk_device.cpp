@@ -24,7 +24,12 @@ namespace dxvk {
     m_properties        (adapter->deviceProperties()),
     m_perfHints         (getPerfHints()),
     m_objects           (this),
+    m_deviceFault       (features.extDeviceFault.deviceFault == VK_TRUE,
+                         vkd->device(), vkd->vkGetDeviceFaultInfoEXT),
     m_submissionQueue   (this, queueCallback) {
+
+    GetDxvkDeviceAddressBindingTracker().setDeviceFeatureEnabled(
+      features.extDeviceAddressBindingReport.reportAddressBinding == VK_TRUE);
 
     if (adapter->kmtLocal()) {
       D3DKMT_CREATEDEVICE create = { };
@@ -43,6 +48,8 @@ namespace dxvk {
   
   
   DxvkDevice::~DxvkDevice() {
+    GetDxvkDeviceAddressBindingTracker().setDeviceFeatureEnabled(false);
+
     if (m_kmtLocal) {
       D3DKMT_DESTROYDEVICE destroy = { };
       destroy.hDevice = m_kmtLocal;
@@ -320,8 +327,10 @@ namespace dxvk {
     VkResult vr = m_vkd->vkCreateComputePipelines(m_vkd->device(),
       VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline);
 
-    if (vr)
+    if (vr) {
+      notifyDeviceErrorFromDriverResult(vr);
       throw DxvkError(str::format("Failed to create built-in compute pipeline: ", vr));
+    }
 
     return pipeline;
   }
@@ -477,8 +486,10 @@ namespace dxvk {
     VkResult vr = m_vkd->vkCreateGraphicsPipelines(m_vkd->device(),
       VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline);
 
-    if (vr)
+    if (vr) {
+      notifyDeviceErrorFromDriverResult(vr);
       throw DxvkError(str::format("Failed to create built-in graphics pipeline: ", vr));
+    }
 
     return pipeline;
   }
@@ -557,12 +568,18 @@ namespace dxvk {
   
   
   void DxvkDevice::registerShader(const Rc<DxvkShader>& shader) {
+    if (getDeviceStatus() == VK_ERROR_DEVICE_LOST)
+      return;
+
     m_objects.pipelineManager().registerShader(shader);
   }
   
   
   void DxvkDevice::requestCompileShader(
     const Rc<DxvkShader>&           shader) {
+    if (getDeviceStatus() == VK_ERROR_DEVICE_LOST)
+      return;
+
     m_objects.pipelineManager().requestCompileShader(shader);
   }
 
@@ -673,8 +690,12 @@ namespace dxvk {
     m_submissionQueue.waitForIdle();
     m_submissionQueue.lockDeviceQueue();
 
-    if (m_vkd->vkDeviceWaitIdle(m_vkd->device()) != VK_SUCCESS)
+    VkResult vr = m_vkd->vkDeviceWaitIdle(m_vkd->device());
+
+    if (vr != VK_SUCCESS) {
+      notifyDeviceErrorFromDriverResult(vr);
       Logger::err("DxvkDevice: waitForIdle: Operation failed");
+    }
 
     m_submissionQueue.unlockDeviceQueue();
   }

@@ -251,8 +251,10 @@ namespace dxvk {
     VkResult vr = vk->vkCreateGraphicsPipelines(vk->device(),
       VK_NULL_HANDLE, 1, &info, nullptr, &m_pipeline);
 
-    if (vr)
+    if (vr) {
+      m_device->notifyDeviceErrorFromDriverResult(vr);
       throw DxvkError("Failed to create vertex input pipeline library");
+    }
   }
 
 
@@ -532,8 +534,10 @@ namespace dxvk {
     VkResult vr = vk->vkCreateGraphicsPipelines(vk->device(),
       VK_NULL_HANDLE, 1, &info, nullptr, &m_pipeline);
 
-    if (vr)
+    if (vr) {
+      m_device->notifyDeviceErrorFromDriverResult(vr);
       throw DxvkError("Failed to create vertex input pipeline library");
+    }
   }
 
 
@@ -1366,6 +1370,9 @@ namespace dxvk {
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkResult vr = vk->vkCreateGraphicsPipelines(vk->device(), VK_NULL_HANDLE, 1, &info, nullptr, &pipeline);
 
+    if (vr != VK_SUCCESS && vr != VK_PIPELINE_COMPILE_REQUIRED_EXT)
+      m_device->notifyDeviceErrorFromDriverResult(vr);
+
     if (vr && vr != VK_PIPELINE_COMPILE_REQUIRED_EXT)
       Logger::err(str::format("DxvkGraphicsPipeline: Failed to create base pipeline: ", vr));
 
@@ -1448,6 +1455,7 @@ namespace dxvk {
     VkResult vr = vk->vkCreateGraphicsPipelines(vk->device(), VK_NULL_HANDLE, 1, &info, nullptr, &pipeline);
 
     if (vr != VK_SUCCESS) {
+      m_device->notifyDeviceErrorFromDriverResult(vr);
       Logger::err(str::format("DxvkGraphicsPipeline: Failed to compile pipeline: ", vr));
       return VK_NULL_HANDLE;
     }

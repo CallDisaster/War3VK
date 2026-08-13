@@ -18,6 +18,7 @@ RES_H = ROOT / "src/d3d9/war3/gpu_skin/war3_gpu_skin_resources.h"
 RES_CPP = ROOT / "src/d3d9/war3/gpu_skin/war3_gpu_skin_resources.cpp"
 STORE_H = ROOT / "src/d3d9/war3/gpu_skin/war3_persistent_gpu_package_store.h"
 STORE_CPP = ROOT / "src/d3d9/war3/gpu_skin/war3_persistent_gpu_package_store.cpp"
+OWNER_H = ROOT / "src/d3d9/war3/gpu_skin/war3_persistent_gpu_package_owner.h"
 DEVICE_CPP = ROOT / "src/d3d9/d3d9_device.cpp"
 
 
@@ -152,6 +153,7 @@ class SourceContractTests(unittest.TestCase):
         cls.resources_source = RES_CPP.read_text(encoding="utf-8")
         cls.store_header = STORE_H.read_text(encoding="utf-8")
         cls.source = STORE_CPP.read_text(encoding="utf-8")
+        cls.owner_header = OWNER_H.read_text(encoding="utf-8")
         cls.device = DEVICE_CPP.read_text(encoding="utf-8")
 
     def test_proof_carries_epoch_generation_content_and_index_identity(self) -> None:
@@ -302,7 +304,11 @@ class SourceContractTests(unittest.TestCase):
 
     def test_no_renderer_consumer_is_enabled_by_this_foundation(self) -> None:
         self.assertNotIn("ValidateGpuSkinStaticPackage", self.device)
-        self.assertNotIn("indexSource", self.device)
+        self.assertIn(
+            "static_assert(!War3PersistentGpuPackageOwner::kSharedConsumerEnabled)",
+            self.owner_header,
+        )
+        self.assertIn("Consume denied; Observe uploader", self.device)
 
 
 if __name__ == "__main__":

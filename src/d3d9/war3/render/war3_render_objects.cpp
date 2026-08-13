@@ -623,6 +623,31 @@ RenderObjectRegistry::findByHandle(uint32_t jHandle) const {
   return itHandle->second;
 }
 
+const RenderObjectInfo* RenderObjectRegistry::findFirstForDirectPacket(
+    void* worldObjectEntry, void* sceneNode, uint32_t jHandle) const {
+  const Snapshot& snap = snapshotForThread();
+
+  if (worldObjectEntry != nullptr) {
+    const auto entryIt = snap.byEntry.find(worldObjectEntry);
+    if (entryIt != snap.byEntry.end())
+      return &entryIt->second;
+  }
+
+  if (sceneNode != nullptr) {
+    const auto sceneIt = snap.sceneToInfo.find(sceneNode);
+    if (sceneIt != snap.sceneToInfo.end() && sceneIt->second != nullptr)
+      return sceneIt->second;
+  }
+
+  if (jHandle != 0u) {
+    const auto handleIt = snap.handleToInfo.find(jHandle);
+    if (handleIt != snap.handleToInfo.end() && handleIt->second != nullptr)
+      return handleIt->second;
+  }
+
+  return nullptr;
+}
+
 std::vector<RenderObjectInfo> RenderObjectRegistry::getAllObjects() const {
   const Snapshot &snap = snapshotForThread();
 

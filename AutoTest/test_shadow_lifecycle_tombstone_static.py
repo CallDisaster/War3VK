@@ -1,4 +1,5 @@
 import pathlib
+import re
 import unittest
 
 
@@ -75,15 +76,21 @@ class ShadowLifecycleTombstoneStaticTest(unittest.TestCase):
         )
 
     def test_grace_never_refreshes_manifest_or_lease_epochs(self):
-        self.assertIn("if (record.fromGrace)\n      continue;", VISIBLE_CPP)
+        self.assertRegex(
+            VISIBLE_CPP,
+            re.compile(r"if\s*\(record\.fromGrace\)\s*(?:continue|return);"),
+        )
         self.assertIn(
             "record.producerFreshThisFrame && !snapshot.fromGrace",
             CURRENT_DRAW_CPP,
         )
-        self.assertIn(
-            "if (!eligible.sample.contract.fromGrace)\n"
-            "      shadowEligibleManifestRecords.push_back(manifestRecord);",
+        self.assertRegex(
             DEVICE_CPP,
+            re.compile(
+                r"if\s*\(!eligible\.sample\.contract\.fromGrace\)\s*"
+                r"shadowEligibleManifestRecords\.push_back\("
+                r"(?:std::move\()?manifestRecord\)?\);"
+            ),
         )
         self.assertIn(
             "!eligible.sample.contract.fromGrace &&\n"

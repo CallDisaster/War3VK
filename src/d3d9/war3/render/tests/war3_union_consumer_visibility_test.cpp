@@ -259,6 +259,13 @@ void TestBoundsProvenanceRequiresExactCurrentEvidence() {
 } // namespace
 
 int main() {
+  CHECK(kWar3ShadowBoundsCullRejectReasonCount == 12u);
+  CHECK(War3ShadowBoundsCullRejectReasonIndex(
+            War3ShadowBoundsCullRejectReason::SourceGenerationUnknown) == 4u);
+  CHECK(War3ShadowBoundsCullRejectReasonIndex(
+            War3ShadowBoundsCullRejectReason::Count) ==
+        static_cast<uint32_t>(
+            War3ShadowBoundsCullRejectReason::UnknownProvenance));
   TestObserveDoesNotCullEffectiveMask();
   TestConsumeRequiresSeparateAdmission();
   TestInsideAndGuardBandStayVisible();

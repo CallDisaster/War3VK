@@ -45,13 +45,25 @@ class BridgeRampShadowSafetyTests(unittest.TestCase):
         name = "DXVK_WAR3_DRAWTIME_SOURCE_FINGERPRINT_REUSE"
         self.assertIn(f'"{name}", 0u', self.device)
         self.assertIn(f'"{name}"', self.monitor)
-        reuse = self.device.index(
-            "War3DrawTimeSourceFingerprintReuseRuntime() &&"
+        begin = self.device.index(
+            "War3ShadowDrawTimeCapturePhase::FingerprintAndDedup"
         )
-        break_call = self.device.index("break;", reuse)
-        block = self.device[reuse:break_call]
+        end = self.device.index(
+            "War3ShadowDrawTimeCapturePhase::CacheRecordSetup", begin
+        )
+        block = self.device[begin:end]
+        compile_gate = "if constexpr (!dxvk::war3::internal::"
+        self.assertGreaterEqual(block.count(compile_gate), 2)
+        self.assertIn("War3DrawTimeSourceFingerprintReuseRuntime() &&", block)
         self.assertIn("sameFrame && fingerprintMatch", block)
         self.assertIn("staticCrossFrameReuse", block)
+        self.assertLess(block.index(compile_gate), block.index("const auto fold"))
+        self.assertLess(
+            block.index(compile_gate, block.index("auto drawTimeCacheIt")),
+            block.index("War3DrawTimeSourceFingerprintReuseRuntime() &&"),
+        )
+        self.assertIn("if (sameFrame) {", block)
+        self.assertIn("drawTimeVBCacheSameFrameDedupMiss++", block)
 
     def test_drawtime_snapshot_cache_uses_current_draw_slice_identity(self) -> None:
         self.assertIn("struct War3DrawTimeVBCacheKey", self.header)
@@ -138,7 +150,7 @@ class BridgeRampShadowSafetyTests(unittest.TestCase):
         self.assertIn("vbIt->second.MatchesKey(cacheKey)", consume_block)
 
         producer = self.device.index(
-            "uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer()"
+            "uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer("
         )
         producer_end = self.device.index(
             "War3ShadowCasterDraw draw = {};", producer
@@ -178,9 +190,12 @@ class BridgeRampShadowSafetyTests(unittest.TestCase):
             capture_gate_block,
         )
         producer = self.device.index(
-            "uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer()"
+            "uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer("
         )
-        producer_block = self.device[producer:producer + 500]
+        producer_end = self.device.index(
+            "War3ShadowCasterDraw draw = {};", producer
+        )
+        producer_block = self.device[producer:producer_end]
         self.assertIn("War3DrawTimeCurrentFrameGeometryRuntime()", producer_block)
         self.assertIn("!War3DrawTimeVBCacheRuntime()", producer_block)
 
@@ -524,7 +539,30 @@ class BridgeRampShadowSafetyTests(unittest.TestCase):
             "sourceFingerprint != s1SourceFingerprint", hit_guard
         )
         self.assertIn("s1EarlySourceMismatchEvictCount", hit_guard)
-        # 指纹必须在查找之前从当前 draw 状态计算，两个 store 站点都必须记录。
+        # Empty and key-miss probes must not scan every active stream. The
+        # fingerprint is computed only inside the hit branch, before the
+        # fail-closed source comparison. Both store sites still record it.
+        early_block_start = self.device.rindex(
+            "if (isTerrainS1Draw &&", 0, hit_start
+        )
+        early_block = self.device[early_block_start:hit_publish]
+        self.assertIn("!m_war3S1TerrainEarlyCache.empty()", early_block)
+        fingerprint = early_block.index(
+            "War3ComputeS1TerrainSourceFingerprint(indexed, BaseVertexIndex,"
+        )
+        lookup = early_block.index(
+            "auto earlyIt = m_war3S1TerrainEarlyCache.find"
+        )
+        hit_if = early_block.index(
+            "if (earlyIt != m_war3S1TerrainEarlyCache.end())", lookup
+        )
+        compare = early_block.index(
+            "sourceFingerprint != s1SourceFingerprint", hit_if
+        )
+        self.assertLess(lookup, hit_if)
+        self.assertLess(hit_if, fingerprint)
+        self.assertLess(fingerprint, compare)
+        self.assertNotIn("return;", early_block[:lookup])
         self.assertIn(
             "War3ComputeS1TerrainSourceFingerprint(indexed, BaseVertexIndex,",
             self.device,

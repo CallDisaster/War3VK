@@ -1006,6 +1006,11 @@ struct ShadowPoseFullTraceConfigSnapshot {
 };
 
 std::mutex g_shadowPoseFullTraceMutex;
+// Start enabled so the first caller performs the one-time environment probe.
+// Once that probe proves tracing is disabled, render hot paths can return
+// without contending on the trace mutex. Start/stop and terminal trace states
+// republish this gate while holding g_shadowPoseFullTraceMutex.
+std::atomic<bool> g_shadowPoseFullTraceFastEnabled{true};
 std::ofstream g_shadowPoseFullTraceStream;
 bool g_shadowPoseFullTraceEnvLoaded = false;
 bool g_shadowPoseFullTraceEnvEnabled = false;
@@ -1153,7 +1158,13 @@ ShadowPoseFullTraceConfigSnapshot ShadowPoseFullTraceConfigLocked() {
   config.finalCasterSampleBytes =
       g_shadowPoseFullTraceFinalCasterSampleBytes;
   config.epoch = g_shadowPoseFullTraceEpoch;
+  g_shadowPoseFullTraceFastEnabled.store(config.enabled,
+                                         std::memory_order_release);
   return config;
+}
+
+bool ShadowPoseFullTraceFastEnabled() noexcept {
+  return g_shadowPoseFullTraceFastEnabled.load(std::memory_order_acquire);
 }
 
 bool ShadowPoseFullTraceDeadlineReachedLocked() {
@@ -2045,6 +2056,66 @@ void WriteTraceFrameEvent(
      << stats.drawTimeVBCacheConsumeHitCount
      << ",\"drawTimeVBCacheConsumeMissCount\":"
      << stats.drawTimeVBCacheConsumeMissCount
+     << ",\"producerCompletenessSealed\":"
+     << stats.producerCompletenessSealed
+     << ",\"producerSealFrameSerial\":"
+     << stats.producerSealFrameSerial
+     << ",\"producerSealMapEpoch\":"
+     << stats.producerSealMapEpoch
+     << ",\"producerSealDeviceEpoch\":"
+     << stats.producerSealDeviceEpoch
+     << ",\"producerRequiredCasterOmissionCount\":"
+     << stats.producerRequiredCasterOmissionCount
+     << ",\"producerExactBudgetDeferredUniqueCasterCount\":"
+     << stats.producerExactBudgetDeferredUniqueCasterCount
+     << ",\"producerPositionAllocBudgetCount\":"
+     << stats.producerPositionAllocBudgetCount
+     << ",\"producerUvAllocBudgetCount\":"
+     << stats.producerUvAllocBudgetCount
+     << ",\"producerIndexAllocBudgetCount\":"
+     << stats.producerIndexAllocBudgetCount
+     << ",\"producerAllocationFailureCount\":"
+     << stats.producerAllocationFailureCount
+     << ",\"producerFallbackByteBudgetCount\":"
+     << stats.producerFallbackByteBudgetCount
+     << ",\"producerArenaAdmissionCount\":"
+     << stats.producerArenaAdmissionCount
+     << ",\"producerFreezeFailureCount\":"
+     << stats.producerFreezeFailureCount
+     << ",\"producerSoftPriorityBudgetCount\":"
+     << stats.producerSoftPriorityBudgetCount
+     << ",\"producerCompletenessReasonMask\":"
+     << stats.producerCompletenessReasonMask
+     << ",\"producerCompletenessCounterOverflow\":"
+     << stats.producerCompletenessCounterOverflow
+     << ",\"drawTimeVBCacheStaticLiveBytes\":"
+     << stats.drawTimeVBCacheStaticLiveBytes
+     << ",\"drawTimeVBCacheStaticProtectedBytes\":"
+     << stats.drawTimeVBCacheStaticProtectedBytes
+     << ",\"drawTimeVBCacheStaticOverCapBytes\":"
+     << stats.drawTimeVBCacheStaticOverCapBytes
+     << ",\"drawTimeVBCacheStaticOverCapFrameCount\":"
+     << stats.drawTimeVBCacheStaticOverCapFrameCount
+     << ",\"drawTimeVBCacheStaticEvictedBytes\":"
+     << stats.drawTimeVBCacheStaticEvictedBytes
+     << ",\"drawTimeVBCacheStaticEvictedEntryCount\":"
+     << stats.drawTimeVBCacheStaticEvictedEntryCount
+     << ",\"drawTimeSnapshotPageResidentBytes\":"
+     << stats.drawTimeSnapshotPageResidentBytes
+     << ",\"drawTimeSnapshotPageUsedBytes\":"
+     << stats.drawTimeSnapshotPageUsedBytes
+     << ",\"drawTimeSnapshotPageCreateCount\":"
+     << stats.drawTimeSnapshotPageCreateCount
+     << ",\"drawTimeSnapshotSuballocationCount\":"
+     << stats.drawTimeSnapshotSuballocationCount
+     << ",\"drawTimeSnapshotSuballocationBytes\":"
+     << stats.drawTimeSnapshotSuballocationBytes
+     << ",\"drawTimeSnapshotPageReclaimedCount\":"
+     << stats.drawTimeSnapshotPageReclaimedCount
+     << ",\"drawTimeSnapshotPageCapacityRejectCount\":"
+     << stats.drawTimeSnapshotPageCapacityRejectCount
+     << ",\"drawTimeSnapshotPageAllocationFailureCount\":"
+     << stats.drawTimeSnapshotPageAllocationFailureCount
      << ",\"drawTimeSemanticProducerVisibleCandidateCount\":"
      << stats.drawTimeSemanticProducerVisibleCandidateCount
      << ",\"drawTimeSemanticProducerFreshEntryCount\":"
@@ -2129,6 +2200,72 @@ void WriteTraceFrameEvent(
      << stats.drawTimeVBCachePositionCopyBytes
      << ",\"drawTimeVBCachePositionAllocCount\":"
      << stats.drawTimeVBCachePositionAllocCount
+     << ",\"drawTimeAllocObserverEnabled\":"
+     << stats.drawTimeAllocObserverEnabled
+     << ",\"drawTimePositionAllocRequestCount\":"
+     << stats.drawTimePositionAllocRequestCount
+     << ",\"drawTimePositionAllocNewEntryCount\":"
+     << stats.drawTimePositionAllocNewEntryCount
+     << ",\"drawTimePositionAllocMissingBackingCount\":"
+     << stats.drawTimePositionAllocMissingBackingCount
+     << ",\"drawTimePositionAllocCapacityGrowthCount\":"
+     << stats.drawTimePositionAllocCapacityGrowthCount
+     << ",\"drawTimePositionAllocLeaseDetachCount\":"
+     << stats.drawTimePositionAllocLeaseDetachCount
+     << ",\"drawTimePositionAllocStaticRequestCount\":"
+     << stats.drawTimePositionAllocStaticRequestCount
+     << ",\"drawTimePositionAllocDynamicRequestCount\":"
+     << stats.drawTimePositionAllocDynamicRequestCount
+     << ",\"drawTimePositionDeferredNewEntryCount\":"
+     << stats.drawTimePositionDeferredNewEntryCount
+     << ",\"drawTimePositionDeferredMissingBackingCount\":"
+     << stats.drawTimePositionDeferredMissingBackingCount
+     << ",\"drawTimePositionDeferredCapacityGrowthCount\":"
+     << stats.drawTimePositionDeferredCapacityGrowthCount
+     << ",\"drawTimePositionDeferredLeaseDetachCount\":"
+     << stats.drawTimePositionDeferredLeaseDetachCount
+     << ",\"drawTimePositionProofUniqueCount\":"
+     << stats.drawTimePositionProofUniqueCount
+     << ",\"drawTimePositionProofDuplicateCount\":"
+     << stats.drawTimePositionProofDuplicateCount
+     << ",\"drawTimePositionProofInvalidCount\":"
+     << stats.drawTimePositionProofInvalidCount
+     << ",\"drawTimePositionProofSetOverflowCount\":"
+     << stats.drawTimePositionProofSetOverflowCount
+     << ",\"drawTimePositionProofUniqueBytes\":"
+     << stats.drawTimePositionProofUniqueBytes
+     << ",\"drawTimePositionProofDuplicateBytes\":"
+     << stats.drawTimePositionProofDuplicateBytes
+     << ",\"drawTimeDirectStaticPositionBindCount\":"
+     << stats.drawTimeDirectStaticPositionBindCount
+     << ",\"drawTimeDirectStaticPositionBytes\":"
+     << stats.drawTimeDirectStaticPositionBytes
+     << ",\"drawTimeDirectStaticIndexBindCount\":"
+     << stats.drawTimeDirectStaticIndexBindCount
+     << ",\"drawTimeDirectStaticIndexBytes\":"
+     << stats.drawTimeDirectStaticIndexBytes
+     << ",\"drawTimeDirectUploadPositionBindCount\":"
+     << stats.drawTimeDirectUploadPositionBindCount
+     << ",\"drawTimeDirectUploadPositionBytes\":"
+     << stats.drawTimeDirectUploadPositionBytes
+     << ",\"drawTimeDirectUploadUvBindCount\":"
+     << stats.drawTimeDirectUploadUvBindCount
+     << ",\"drawTimeDirectUploadUvBytes\":"
+     << stats.drawTimeDirectUploadUvBytes
+     << ",\"drawTimeDirectUploadIndexBindCount\":"
+     << stats.drawTimeDirectUploadIndexBindCount
+     << ",\"drawTimeDirectUploadIndexBytes\":"
+     << stats.drawTimeDirectUploadIndexBytes
+     << ",\"drawTimeDirectUploadCandidateCount\":"
+     << stats.drawTimeDirectUploadCandidateCount
+     << ",\"drawTimeDirectUploadRejectNoProofCount\":"
+     << stats.drawTimeDirectUploadRejectNoProofCount
+     << ",\"drawTimeDirectUploadRejectNoStorageCount\":"
+     << stats.drawTimeDirectUploadRejectNoStorageCount
+     << ",\"drawTimeDirectUploadRejectRangeCount\":"
+     << stats.drawTimeDirectUploadRejectRangeCount
+     << ",\"drawTimePositionAllocDirectMutableRequestCount\":"
+     << stats.drawTimePositionAllocDirectMutableRequestCount
      << ",\"drawTimeVBCacheUvCopyCount\":"
      << stats.drawTimeVBCacheUvCopyCount
      << ",\"drawTimeVBCacheUvCopyBytes\":"
@@ -2165,6 +2302,14 @@ void WriteTraceFrameEvent(
      << stats.drawTimeVBCacheSameFrameDedupHit
      << ",\"drawTimeVBCacheSameFrameDedupMiss\":"
      << stats.drawTimeVBCacheSameFrameDedupMiss
+     << ",\"drawTimeGenerationBackedPositionReuseCount\":"
+     << stats.drawTimeGenerationBackedPositionReuseCount
+     << ",\"drawTimeGenerationBackedUvReuseCount\":"
+     << stats.drawTimeGenerationBackedUvReuseCount
+     << ",\"drawTimeGenerationBackedIndexReuseCount\":"
+     << stats.drawTimeGenerationBackedIndexReuseCount
+     << ",\"drawTimeGenerationBackedCopyBytesSaved\":"
+     << stats.drawTimeGenerationBackedCopyBytesSaved
      << ",\"drawTimeVBCacheSameFrameStateRefresh\":"
      << stats.drawTimeVBCacheSameFrameStateRefresh
      << ",\"drawTimeD3DPoseAttemptCount\":"
@@ -2419,6 +2564,7 @@ bool EnsureShadowPoseFullTraceOpenLocked(
   if (!g_shadowPoseFullTraceStream.is_open()) {
     Logger::err("DXVK War3Shadow: failed to open shadow pose full trace log");
     g_shadowPoseFullTraceStoppedByLimit = true;
+    g_shadowPoseFullTraceFastEnabled.store(false, std::memory_order_release);
     return false;
   }
 
@@ -2460,6 +2606,9 @@ void MaybeWriteShadowPoseFullTrace(
     const ShadowRuntimeCadenceSample& sample,
     const War3ShadowCaptureStats& stats,
     const CurrentDrawContractDiagnosticsSummary& currentDraw) {
+  if (!ShadowPoseFullTraceFastEnabled())
+    return;
+
   ShadowPoseFullTraceConfigSnapshot config = {};
   {
     std::lock_guard<std::mutex> lock(g_shadowPoseFullTraceMutex);
@@ -2468,6 +2617,8 @@ void MaybeWriteShadowPoseFullTrace(
       return;
     if (ShadowPoseFullTraceDeadlineReachedLocked()) {
       g_shadowPoseFullTraceStoppedByLimit = true;
+      g_shadowPoseFullTraceFastEnabled.store(false,
+                                             std::memory_order_release);
       CloseShadowPoseFullTraceLocked();
       Logger::info("DXVK War3Shadow: shadow pose full trace stopped by "
                    "duration limit");
@@ -2506,6 +2657,7 @@ void MaybeWriteShadowPoseFullTrace(
     return;
   if (ShadowPoseFullTraceDeadlineReachedLocked()) {
     g_shadowPoseFullTraceStoppedByLimit = true;
+    g_shadowPoseFullTraceFastEnabled.store(false, std::memory_order_release);
     CloseShadowPoseFullTraceLocked();
     Logger::info("DXVK War3Shadow: shadow pose full trace stopped by "
                  "duration limit");
@@ -2745,6 +2897,10 @@ void MergeRenderObject(dxvk::War3ShadowSemanticContext& semantic,
 }
 
 } // namespace
+
+bool ShadowPoseFullTraceFastEnabledForRenderThread() noexcept {
+  return ShadowPoseFullTraceFastEnabled();
+}
 
 SemanticAugmentTlsCacheStats QuerySemanticAugmentTlsCacheStats() noexcept {
   const auto& source = g_semanticAugmentTlsCacheStats;
@@ -4440,6 +4596,8 @@ void NoteFinalShadowCasterFrame(
     uint64_t frameSerial) {
   if (frameSerial == 0u)
     return;
+  if (!ShadowPoseFullTraceFastEnabled())
+    return;
 
   std::lock_guard<std::mutex> lock(g_shadowPoseFullTraceMutex);
   auto config = ShadowPoseFullTraceConfigLocked();
@@ -4447,6 +4605,7 @@ void NoteFinalShadowCasterFrame(
     return;
   if (ShadowPoseFullTraceDeadlineReachedLocked()) {
     g_shadowPoseFullTraceStoppedByLimit = true;
+    g_shadowPoseFullTraceFastEnabled.store(false, std::memory_order_release);
     CloseShadowPoseFullTraceLocked();
     Logger::info("DXVK War3Shadow: shadow pose full trace stopped by "
                  "duration limit");
@@ -4558,6 +4717,8 @@ void NoteCurrentDrawSnapshotFrame(
     uint64_t frameSerial) {
   if (frameSerial == 0u)
     return;
+  if (!ShadowPoseFullTraceFastEnabled())
+    return;
 
   std::lock_guard<std::mutex> lock(g_shadowPoseFullTraceMutex);
   auto config = ShadowPoseFullTraceConfigLocked();
@@ -4565,6 +4726,7 @@ void NoteCurrentDrawSnapshotFrame(
     return;
   if (ShadowPoseFullTraceDeadlineReachedLocked()) {
     g_shadowPoseFullTraceStoppedByLimit = true;
+    g_shadowPoseFullTraceFastEnabled.store(false, std::memory_order_release);
     CloseShadowPoseFullTraceLocked();
     Logger::info("DXVK War3Shadow: shadow pose full trace stopped by "
                  "duration limit");
@@ -4810,6 +4972,7 @@ void StartShadowPoseFullTrace(uint32_t maxSeconds, bool includeMatrixBytes,
   g_shadowPoseFullTraceStart = {};
   g_shadowPoseFullTracePath.clear();
   ++g_shadowPoseFullTraceEpoch;
+  g_shadowPoseFullTraceFastEnabled.store(true, std::memory_order_release);
 }
 
 void StopShadowPoseFullTrace() {
@@ -4820,6 +4983,7 @@ void StopShadowPoseFullTrace() {
   g_shadowPoseFullTraceLastFinalCasterFrameSerial = 0u;
   g_shadowPoseFullTraceLastFinalCasterScene = nullptr;
   CloseShadowPoseFullTraceLocked();
+  g_shadowPoseFullTraceFastEnabled.store(false, std::memory_order_release);
 }
 
 ShadowPoseFullTraceStatus QueryShadowPoseFullTraceStatus() {
@@ -4978,6 +5142,79 @@ void NoteShadowRuntimeSpriteFramePose(void* runtimeModelPtr, void* spritePtr,
       runtimeModelPtr, spritePtr, sceneNode, unitPtr, dt, sequenceId,
       sequenceTime, scale, yaw, pitch, roll, height, hasWorldTransform,
       worldTransform, matrixCount, matrixHash);
+}
+
+ShadowProducerRuntimeDiagnostics QueryShadowProducerRuntimeDiagnostics() {
+  ShadowProducerRuntimeDiagnostics summary = {};
+  std::shared_lock<std::shared_mutex> lock(g_shadowSceneStatsMutex);
+  summary.producerSealFrameSerial = g_shadowSceneStats.producerSealFrameSerial;
+  summary.producerSealMapEpoch = g_shadowSceneStats.producerSealMapEpoch;
+  summary.producerSealDeviceEpoch = g_shadowSceneStats.producerSealDeviceEpoch;
+  summary.producerRequiredCasterOmissionCount =
+      g_shadowSceneStats.producerRequiredCasterOmissionCount;
+  summary.producerExactBudgetDeferredUniqueCasterCount =
+      g_shadowSceneStats.producerExactBudgetDeferredUniqueCasterCount;
+  summary.producerPositionAllocBudgetCount =
+      g_shadowSceneStats.producerPositionAllocBudgetCount;
+  summary.producerUvAllocBudgetCount =
+      g_shadowSceneStats.producerUvAllocBudgetCount;
+  summary.producerIndexAllocBudgetCount =
+      g_shadowSceneStats.producerIndexAllocBudgetCount;
+  summary.producerAllocationFailureCount =
+      g_shadowSceneStats.producerAllocationFailureCount;
+  summary.producerFallbackByteBudgetCount =
+      g_shadowSceneStats.producerFallbackByteBudgetCount;
+  summary.producerArenaAdmissionCount =
+      g_shadowSceneStats.producerArenaAdmissionCount;
+  summary.producerFreezeFailureCount =
+      g_shadowSceneStats.producerFreezeFailureCount;
+  summary.producerSoftPriorityBudgetCount =
+      g_shadowSceneStats.producerSoftPriorityBudgetCount;
+  summary.producerCompletenessReasonMask =
+      g_shadowSceneStats.producerCompletenessReasonMask;
+  summary.producerCompletenessSealed =
+      g_shadowSceneStats.producerCompletenessSealed;
+  summary.producerCompletenessCounterOverflow =
+      g_shadowSceneStats.producerCompletenessCounterOverflow;
+  summary.drawTimeVBCacheStaticLiveBytes =
+      g_shadowSceneStats.drawTimeVBCacheStaticLiveBytes;
+  summary.drawTimeVBCacheStaticProtectedBytes =
+      g_shadowSceneStats.drawTimeVBCacheStaticProtectedBytes;
+  summary.drawTimeVBCacheStaticOverCapBytes =
+      g_shadowSceneStats.drawTimeVBCacheStaticOverCapBytes;
+  summary.drawTimeVBCacheStaticOverCapFrameCount =
+      g_shadowSceneStats.drawTimeVBCacheStaticOverCapFrameCount;
+  summary.drawTimeVBCacheStaticEvictedBytes =
+      g_shadowSceneStats.drawTimeVBCacheStaticEvictedBytes;
+  summary.drawTimeVBCacheStaticEvictedEntryCount =
+      g_shadowSceneStats.drawTimeVBCacheStaticEvictedEntryCount;
+  summary.drawTimeSnapshotPageResidentBytes =
+      g_shadowSceneStats.drawTimeSnapshotPageResidentBytes;
+  summary.drawTimeSnapshotPageUsedBytes =
+      g_shadowSceneStats.drawTimeSnapshotPageUsedBytes;
+  summary.drawTimeSnapshotPageCreateCount =
+      g_shadowSceneStats.drawTimeSnapshotPageCreateCount;
+  summary.drawTimeSnapshotSuballocationCount =
+      g_shadowSceneStats.drawTimeSnapshotSuballocationCount;
+  summary.drawTimeSnapshotSuballocationBytes =
+      g_shadowSceneStats.drawTimeSnapshotSuballocationBytes;
+  summary.drawTimeSnapshotPageReclaimedCount =
+      g_shadowSceneStats.drawTimeSnapshotPageReclaimedCount;
+  summary.drawTimeSnapshotPageCapacityRejectCount =
+      g_shadowSceneStats.drawTimeSnapshotPageCapacityRejectCount;
+  summary.drawTimeSnapshotPageAllocationFailureCount =
+      g_shadowSceneStats.drawTimeSnapshotPageAllocationFailureCount;
+  summary.drawTimeVBCacheIndexedUnknownRangeFallbackCount =
+      g_shadowSceneStats.drawTimeVBCacheIndexedUnknownRangeFallbackCount;
+  summary.drawTimeGenerationBackedPositionReuseCount =
+      g_shadowSceneStats.drawTimeGenerationBackedPositionReuseCount;
+  summary.drawTimeGenerationBackedUvReuseCount =
+      g_shadowSceneStats.drawTimeGenerationBackedUvReuseCount;
+  summary.drawTimeGenerationBackedIndexReuseCount =
+      g_shadowSceneStats.drawTimeGenerationBackedIndexReuseCount;
+  summary.drawTimeGenerationBackedCopyBytesSaved =
+      g_shadowSceneStats.drawTimeGenerationBackedCopyBytesSaved;
+  return summary;
 }
 
 ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
@@ -6851,6 +7088,75 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
         g_shadowSceneStats.semanticSceneShadowMapDrawnCasters;
     summary.semanticSceneShadowMapCascadeCulledCount =
         g_shadowSceneStats.semanticSceneShadowMapCascadeCulledCount;
+    summary.producerSealFrameSerial =
+        g_shadowSceneStats.producerSealFrameSerial;
+    summary.producerSealMapEpoch = g_shadowSceneStats.producerSealMapEpoch;
+    summary.producerSealDeviceEpoch =
+        g_shadowSceneStats.producerSealDeviceEpoch;
+    summary.producerRequiredCasterOmissionCount =
+        g_shadowSceneStats.producerRequiredCasterOmissionCount;
+    summary.producerExactBudgetDeferredUniqueCasterCount =
+        g_shadowSceneStats.producerExactBudgetDeferredUniqueCasterCount;
+    summary.producerPositionAllocBudgetCount =
+        g_shadowSceneStats.producerPositionAllocBudgetCount;
+    summary.producerUvAllocBudgetCount =
+        g_shadowSceneStats.producerUvAllocBudgetCount;
+    summary.producerIndexAllocBudgetCount =
+        g_shadowSceneStats.producerIndexAllocBudgetCount;
+    summary.producerAllocationFailureCount =
+        g_shadowSceneStats.producerAllocationFailureCount;
+    summary.producerFallbackByteBudgetCount =
+        g_shadowSceneStats.producerFallbackByteBudgetCount;
+    summary.producerArenaAdmissionCount =
+        g_shadowSceneStats.producerArenaAdmissionCount;
+    summary.producerFreezeFailureCount =
+        g_shadowSceneStats.producerFreezeFailureCount;
+    summary.producerSoftPriorityBudgetCount =
+        g_shadowSceneStats.producerSoftPriorityBudgetCount;
+    summary.producerCompletenessReasonMask =
+        g_shadowSceneStats.producerCompletenessReasonMask;
+    summary.producerCompletenessSealed =
+        g_shadowSceneStats.producerCompletenessSealed;
+    summary.producerCompletenessCounterOverflow =
+        g_shadowSceneStats.producerCompletenessCounterOverflow;
+    summary.drawTimeVBCacheStaticLiveBytes =
+        g_shadowSceneStats.drawTimeVBCacheStaticLiveBytes;
+    summary.drawTimeVBCacheStaticProtectedBytes =
+        g_shadowSceneStats.drawTimeVBCacheStaticProtectedBytes;
+    summary.drawTimeVBCacheStaticOverCapBytes =
+        g_shadowSceneStats.drawTimeVBCacheStaticOverCapBytes;
+    summary.drawTimeVBCacheStaticOverCapFrameCount =
+        g_shadowSceneStats.drawTimeVBCacheStaticOverCapFrameCount;
+    summary.drawTimeVBCacheStaticEvictedBytes =
+        g_shadowSceneStats.drawTimeVBCacheStaticEvictedBytes;
+    summary.drawTimeVBCacheStaticEvictedEntryCount =
+        g_shadowSceneStats.drawTimeVBCacheStaticEvictedEntryCount;
+    summary.drawTimeSnapshotPageResidentBytes =
+        g_shadowSceneStats.drawTimeSnapshotPageResidentBytes;
+    summary.drawTimeSnapshotPageUsedBytes =
+        g_shadowSceneStats.drawTimeSnapshotPageUsedBytes;
+    summary.drawTimeSnapshotPageCreateCount =
+        g_shadowSceneStats.drawTimeSnapshotPageCreateCount;
+    summary.drawTimeSnapshotSuballocationCount =
+        g_shadowSceneStats.drawTimeSnapshotSuballocationCount;
+    summary.drawTimeSnapshotSuballocationBytes =
+        g_shadowSceneStats.drawTimeSnapshotSuballocationBytes;
+    summary.drawTimeSnapshotPageReclaimedCount =
+        g_shadowSceneStats.drawTimeSnapshotPageReclaimedCount;
+    summary.drawTimeSnapshotPageCapacityRejectCount =
+        g_shadowSceneStats.drawTimeSnapshotPageCapacityRejectCount;
+    summary.drawTimeSnapshotPageAllocationFailureCount =
+        g_shadowSceneStats.drawTimeSnapshotPageAllocationFailureCount;
+    summary.drawTimeVBCacheIndexedUnknownRangeFallbackCount =
+        g_shadowSceneStats.drawTimeVBCacheIndexedUnknownRangeFallbackCount;
+    summary.drawTimeGenerationBackedPositionReuseCount =
+        g_shadowSceneStats.drawTimeGenerationBackedPositionReuseCount;
+    summary.drawTimeGenerationBackedUvReuseCount =
+        g_shadowSceneStats.drawTimeGenerationBackedUvReuseCount;
+    summary.drawTimeGenerationBackedIndexReuseCount =
+        g_shadowSceneStats.drawTimeGenerationBackedIndexReuseCount;
+    summary.drawTimeGenerationBackedCopyBytesSaved =
+        g_shadowSceneStats.drawTimeGenerationBackedCopyBytesSaved;
     summary.semanticSceneTerrainBoundsCullMode =
         g_shadowSceneStats.semanticSceneTerrainBoundsCullMode;
     summary.semanticSceneTerrainBoundsCandidateCount =
@@ -9355,6 +9661,10 @@ void ResetShadowRuntimeBridgeState() {
     g_shadowPoseFullTraceStart = {};
     g_shadowPoseFullTracePath.clear();
     ++g_shadowPoseFullTraceEpoch;
+    g_shadowPoseFullTraceFastEnabled.store(
+        g_shadowPoseFullTraceEnvEnabled ||
+            g_shadowPoseFullTraceManualEnabled,
+        std::memory_order_release);
   }
   shadow::NativeD3D9BackendRuntime::instance().reset();
 }

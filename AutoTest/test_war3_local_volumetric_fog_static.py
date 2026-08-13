@@ -84,7 +84,11 @@ class War3LocalVolumetricFogStaticTests(unittest.TestCase):
         self.assertIn("requestedSamples", run)
         self.assertIn("rayBudgetFits && fogBudgetFits", run)
         self.assertIn("HalfResRegionRect(localRegion)", run)
-        self.assertIn("uint64_t(effectScissor.extent.width)", PASS_CPP)
+        self.assertIn(
+            "effectScissor.extent.width, effectScissor.extent.height",
+            PASS_CPP,
+        )
+        self.assertIn("War3VolumetricCheckedMultiply", PASS_CPP)
 
     def test_shapes_use_analytic_ray_support_before_fixed_step_integration(self):
         intersection = SHADER[
@@ -107,9 +111,12 @@ class War3LocalVolumetricFogStaticTests(unittest.TestCase):
         self.assertIn(
             "kVolumetricFogSegmentTestBudget = 96'000'000ull", PASS_CPP
         )
-        self.assertIn("uint64_t(fogVolumes.count)", PASS_CPP)
-        self.assertIn("(1u + uint64_t(pointSelection.count))", PASS_CPP)
-        self.assertIn("minimumFogSegmentTests(effectExtent)", PASS_CPP)
+        self.assertIn("segments, fogVolumes.count, fogSegments", PASS_CPP)
+        self.assertIn("fogSegments, 1u + pointSelection.count", PASS_CPP)
+        self.assertIn(
+            "minimumFogSegmentTests(effectExtent, minimumFogTests)",
+            PASS_CPP,
+        )
 
     def test_map_reset_and_public_managed_lifetime_are_closed(self):
         reset_start = DEVICE.index("D3D9DeviceEx::War3ResetCpuSemanticMapSession")

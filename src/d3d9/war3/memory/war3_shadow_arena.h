@@ -75,7 +75,18 @@ struct ShadowArenaDiagnostics {
   uint64_t usedBytes = 0u;
   uint64_t residentBytes = 0u;
   uint64_t perGenerationCapacityBytes = 0u;
+  // Effective cap from the latest Present-safe memory-budget snapshot.
   uint64_t residentLimitBytes = 0u;
+  uint64_t fixedResidentLimitBytes = 0u;
+  uint64_t memoryHeapSizeBytes = 0u;
+  uint64_t memoryBudgetBytes = 0u;
+  uint64_t memoryAllocatedBytes = 0u;
+  uint64_t memoryAvailableBytes = 0u;
+  uint64_t proportionalLimitBytes = 0u;
+  uint64_t reserveLimitBytes = 0u;
+  uint64_t budgetRefreshCount = 0u;
+  uint64_t budgetGrowthRejectCount = 0u;
+  uint64_t budgetSnapshotFrameSerial = 0u;
   uint64_t generation = 0u;
   uint64_t submittedSerial = 0u;
   uint64_t completedSerial = 0u;
@@ -100,9 +111,27 @@ struct ShadowArenaDiagnostics {
   uint64_t exactIndexTrimAcceptedCount = 0u;
   uint64_t exactIndexTrimRejectedCount = 0u;
   uint64_t exactIndexTrimBytesSaved = 0u;
+  uint64_t coherentUpTrimObservedCount = 0u;
+  uint64_t coherentUpTrimEligibleCount = 0u;
+  uint64_t coherentUpTrimWouldSaveBytes = 0u;
+  uint64_t coherentUpTrimConsumedCount = 0u;
+  uint64_t coherentUpTrimConsumedBytesSaved = 0u;
+  uint64_t coherentRealTrimObservedCount = 0u;
+  uint64_t coherentRealTrimEligibleCount = 0u;
+  uint64_t coherentRealTrimWouldSaveBytes = 0u;
+  uint64_t coherentRealTrimConsumedCount = 0u;
+  uint64_t coherentRealTrimConsumedBytesSaved = 0u;
+  uint64_t currentUpPositionReplayObservedCount = 0u;
+  uint64_t currentUpPositionReplayEligibleCount = 0u;
+  uint64_t currentUpPositionReplayWouldAvoidBytes = 0u;
+  uint64_t currentUpPositionReplayConsumedCount = 0u;
+  uint64_t currentUpPositionReplayAvoidedBytes = 0u;
   uint64_t quarantineCount = 0u;
   uint64_t lastQuarantinedGeneration = 0u;
   uint64_t lastQuarantinedRetireSerial = 0u;
+  uint32_t primaryHeapIndex = 0xFFFFFFFFu;
+  uint32_t memoryBudgetSupported = 0u;
+  uint32_t memoryBudgetTrusted = 0u;
   uint32_t activeGenerationCount = 0u;
   uint32_t frameIncomplete = 0u;
 };
@@ -110,14 +139,18 @@ struct ShadowArenaDiagnostics {
 /**
  * @brief 初始化 Shadow Arena 分配器。
  *
- * 创建三个 64 MiB DEVICE_LOCAL 预热页；每个 GPU 代际最多 384 MiB，
- * 总驻留上限 1.125 GiB。无 CPU 映射；写入通过 EmitCs(ctx->copyBuffer) 完成。
+ * 创建三个 64 MiB DEVICE_LOCAL 预热页；每个 GPU 代际最多 384 MiB。
+ * 总驻留量不超过 1.125 GiB，并在 VK_EXT_memory_budget 数据可信时进一步
+ * 受主显存可用预算比例和固定保留量约束。无 CPU 映射；写入通过
+ * EmitCs(ctx->copyBuffer) 完成。
  * 在 D3D9 设备创建后调用，不依赖 TLSF 池。
  *
  * @return 成功返回 true。
  */
-bool ShadowArena_Init();
+bool ShadowArena_Init(DxvkDevice* device);
 bool ShadowArena_IsInitialized();
+bool ShadowArena_IsOwnedBy(const DxvkDevice* device);
+void ShadowArena_Shutdown(DxvkDevice* device);
 
 /**
  * @brief 切换到当前渲染帧对应的 Arena 分区。
@@ -155,6 +188,14 @@ void ShadowArena_NoteFreezeCatalogBytes(
     uint64_t uniqueBytes, uint64_t duplicateBytesSaved);
 void ShadowArena_NoteExactIndexTrim(
     bool accepted, uint64_t bytesBefore, uint64_t bytesAfter);
+void ShadowArena_NoteCoherentUpIndexTrim(
+    bool eligible, bool consumed, uint64_t bytesBefore,
+    uint64_t bytesAfter);
+void ShadowArena_NoteCoherentRealIndexTrim(
+    bool observed, bool eligible, bool consumed, uint64_t bytesBefore,
+    uint64_t bytesAfter);
+void ShadowArena_NoteCurrentUpPositionReplay(
+    bool observed, bool eligible, bool consumed, uint64_t avoidedBytes);
 
 /**
  * @brief 重置分配器游标。

@@ -4,6 +4,7 @@
 #include "war3_render_state.h"
 
 #include <cstdint>
+#include <limits>
 
 namespace dxvk::war3::render {
 
@@ -43,7 +44,25 @@ struct ShadowCaptureBudgetPolicy {
   uint64_t indexBytes = 0;
   bool freezeDynamicEnabled = true;
   bool aggressiveExperimental = false;
+  // A required directional caster may only be rejected by the real hard
+  // capacity. Soft priority thresholds are useful for optional work, but
+  // omitting one required caster invalidates the entire atomic CSM candidate.
+  bool requiredDirectionalCaster = false;
 };
+
+inline bool RequiredShadowCasterFitsHardBudget(
+    const ShadowCaptureBudgetPolicy& policy) noexcept {
+  uint64_t totalBytes = 0u;
+  const uint64_t parts[] = {
+      policy.posBytes, policy.blendBytes, policy.uvBytes, policy.indexBytes};
+  for (const uint64_t bytes : parts) {
+    if (bytes > std::numeric_limits<uint64_t>::max() - totalBytes)
+      return false;
+    totalBytes += bytes;
+  }
+  return policy.usedBudgetBytes <= policy.hardBudgetBytes &&
+      totalBytes <= policy.hardBudgetBytes - policy.usedBudgetBytes;
+}
 
 struct ShadowCaptureBudgetDecision {
   ShadowCapturePriority priority = ShadowCapturePriority::Medium;

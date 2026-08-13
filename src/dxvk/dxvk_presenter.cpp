@@ -71,6 +71,9 @@ namespace dxvk {
   VkResult Presenter::checkSwapChainStatus() {
     std::lock_guard lock(m_surfaceMutex);
 
+    if (m_device->getDeviceStatus() == VK_ERROR_DEVICE_LOST)
+      return VK_ERROR_DEVICE_LOST;
+
     if (!m_swapchain)
       return recreateSwapChain();
 
@@ -101,11 +104,17 @@ namespace dxvk {
     if (m_acquireStatus == VK_NOT_READY && m_swapchain) {
       PresenterSync sync = m_semaphores.at(m_frameIndex);
 
-      waitForSwapchainFence(sync);
+      const VkResult fenceStatus = waitForSwapchainFence(sync);
+      if (fenceStatus != VK_SUCCESS)
+        return softError(fenceStatus);
 
+      const uint32_t bindingSequenceBeforeAcquire =
+        m_device->deviceAddressBindingSequenceBeforeDriverCall();
       m_acquireStatus = m_vkd->vkAcquireNextImageKHR(m_vkd->device(),
         m_swapchain, std::numeric_limits<uint64_t>::max(),
         sync.acquire, VK_NULL_HANDLE, &m_imageIndex);
+      m_device->notifyDeviceErrorFromDriverResult(
+        m_acquireStatus, bindingSequenceBeforeAcquire);
     }
 
     // This is a normal occurence, but may be useful for
@@ -116,8 +125,12 @@ namespace dxvk {
     // If the swap chain is out of date, recreate it and retry. It
     // is possible that we do not get a new swap chain here, e.g.
     // because the window is minimized.
+    if (m_acquireStatus == VK_ERROR_DEVICE_LOST)
+      return m_acquireStatus;
+
     if (m_acquireStatus != VK_SUCCESS || !m_swapchain) {
       VkResult vr = recreateSwapChain();
+      m_device->notifyDeviceError(vr);
 
       if (vr == VK_NOT_READY && hasSwapchain)
         Logger::info("Presenter: Surface does not allow swapchain creation.");
@@ -127,9 +140,13 @@ namespace dxvk {
 
       PresenterSync sync = m_semaphores.at(m_frameIndex);
 
+      const uint32_t bindingSequenceBeforeAcquire =
+        m_device->deviceAddressBindingSequenceBeforeDriverCall();
       m_acquireStatus = m_vkd->vkAcquireNextImageKHR(m_vkd->device(),
         m_swapchain, std::numeric_limits<uint64_t>::max(),
         sync.acquire, VK_NULL_HANDLE, &m_imageIndex);
+      m_device->notifyDeviceErrorFromDriverResult(
+        m_acquireStatus, bindingSequenceBeforeAcquire);
 
       if (m_acquireStatus < 0) {
         Logger::info(str::format("Presenter: Got ", m_acquireStatus, " from fresh swapchain"));
@@ -172,6 +189,11 @@ namespace dxvk {
 
 
   VkResult Presenter::presentImage(uint64_t frameId, const Rc<DxvkLatencyTracker>& tracker) {
+    if (m_device->getDeviceStatus() == VK_ERROR_DEVICE_LOST) {
+      retireTerminalFrame(frameId, tracker);
+      return VK_ERROR_DEVICE_LOST;
+    }
+
     PresenterSync& currSync = m_semaphores.at(m_frameIndex);
 
     VkPresentIdKHR presentId = { VK_STRUCTURE_TYPE_PRESENT_ID_KHR };
@@ -209,8 +231,12 @@ namespace dxvk {
       fenceInfo.pNext = const_cast<void*>(std::exchange(info.pNext, &fenceInfo));
     }
 
+    const uint32_t bindingSequenceBeforePresent =
+      m_device->deviceAddressBindingSequenceBeforeDriverCall();
     VkResult status = m_vkd->vkQueuePresentKHR(
       m_device->queues().graphics.queueHandle, &info);
+    m_device->notifyDeviceErrorFromDriverResult(
+      status, bindingSequenceBeforePresent);
 
     // Maintain valid state if presentation succeeded, even if we want to
     // recreate the swapchain. Spec says that 'queue' operations, i.e. the
@@ -249,18 +275,26 @@ namespace dxvk {
     // order to hide potential delays from the application thread.
     if (status == VK_SUCCESS) {
       PresenterSync& nextSync = m_semaphores.at(m_frameIndex);
-      waitForSwapchainFence(nextSync);
+      status = waitForSwapchainFence(nextSync);
 
-      m_acquireStatus = m_vkd->vkAcquireNextImageKHR(m_vkd->device(),
-        m_swapchain, std::numeric_limits<uint64_t>::max(),
-        nextSync.acquire, VK_NULL_HANDLE, &m_imageIndex);
+      if (status == VK_SUCCESS) {
+        const uint32_t bindingSequenceBeforeAcquire =
+          m_device->deviceAddressBindingSequenceBeforeDriverCall();
+        m_acquireStatus = m_vkd->vkAcquireNextImageKHR(m_vkd->device(),
+          m_swapchain, std::numeric_limits<uint64_t>::max(),
+          nextSync.acquire, VK_NULL_HANDLE, &m_imageIndex);
+        m_device->notifyDeviceErrorFromDriverResult(
+          m_acquireStatus, bindingSequenceBeforeAcquire);
+        if (m_acquireStatus == VK_ERROR_DEVICE_LOST)
+          status = m_acquireStatus;
+      }
     }
 
     // Recreate the swapchain on the next acquire, even if we get suboptimal.
     // There is no guarantee that suboptimal state is returned by both functions.
     std::lock_guard lock(m_surfaceMutex);
 
-    if (status != VK_SUCCESS) {
+    if (status != VK_SUCCESS && status != VK_ERROR_DEVICE_LOST) {
       Logger::info(str::format("Presenter: Got ", status, ", recreating swapchain"));
 
       m_dirtySwapchain = true;
@@ -272,9 +306,37 @@ namespace dxvk {
   }
 
 
-  void Presenter::signalFrame(
+  void Presenter::retireTerminalFrame(
           uint64_t                frameId,
     const Rc<DxvkLatencyTracker>& tracker) {
+    VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
+    bool hasPresentWait = false;
+
+    { std::lock_guard lock(m_surfaceMutex);
+      mode = m_presentMode;
+      hasPresentWait = m_hasPresentWait;
+      m_presentPending = false;
+      m_surfaceCond.notify_one();
+    }
+
+    if (!hasPresentWait)
+      return;
+
+    { std::lock_guard lock(m_frameMutex);
+      auto& frame = m_frameQueue.emplace();
+      frame.frameId = frameId;
+      frame.tracker = tracker;
+      frame.mode = mode;
+      frame.result = VK_ERROR_DEVICE_LOST;
+      m_frameCond.notify_one();
+    }
+  }
+
+
+  void Presenter::signalFrame(
+          uint64_t                frameId,
+    const Rc<DxvkLatencyTracker>& tracker,
+          bool                    terminal) {
     if (m_signal == nullptr || !frameId)
       return;
 
@@ -290,7 +352,8 @@ namespace dxvk {
       if (canSignal)
         m_signal->signal(frameId);
     } else {
-      m_fpsLimiter.delay();
+      if (!terminal)
+        m_fpsLimiter.delay();
       m_signal->signal(frameId);
 
       if (tracker)
@@ -436,7 +499,12 @@ namespace dxvk {
     waitInfo.pSemaphores = &info.signalSemaphore;
     waitInfo.pValues = &info.value;
 
-    m_vkd->vkWaitSemaphores(m_vkd->device(), &waitInfo, ~0ull);
+    const uint32_t bindingSequenceBeforeWait =
+      m_device->deviceAddressBindingSequenceBeforeDriverCall();
+    VkResult vr = m_vkd->vkWaitSemaphores(
+      m_vkd->device(), &waitInfo, ~0ull);
+    m_device->notifyDeviceErrorFromDriverResult(
+      vr, bindingSequenceBeforeWait);
 
     auto t1 = dxvk::high_resolution_clock::now();
     return t1 - t0;
@@ -520,6 +588,9 @@ namespace dxvk {
 
 
   VkResult Presenter::recreateSwapChain() {
+    if (m_device->getDeviceStatus() == VK_ERROR_DEVICE_LOST)
+      return VK_ERROR_DEVICE_LOST;
+
     VkResult vr;
 
     if (m_swapchain)
@@ -539,6 +610,7 @@ namespace dxvk {
         vr = createSwapChain();
     }
 
+    m_device->notifyDeviceErrorFromDriverResult(vr);
     return vr;
   }
 
@@ -1256,21 +1328,37 @@ namespace dxvk {
   }
 
 
-  void Presenter::waitForSwapchainFence(
+  VkResult Presenter::waitForSwapchainFence(
           PresenterSync&            sync) {
-    if (!sync.fenceSignaled)
-      return;
+    if (m_device->getDeviceStatus() == VK_ERROR_DEVICE_LOST)
+      return VK_ERROR_DEVICE_LOST;
 
+    if (!sync.fenceSignaled)
+      return VK_SUCCESS;
+
+    const uint32_t bindingSequenceBeforeWait =
+      m_device->deviceAddressBindingSequenceBeforeDriverCall();
     VkResult vr = m_vkd->vkWaitForFences(m_vkd->device(),
       1, &sync.fence, VK_TRUE, ~0ull);
 
-    if (vr)
+    if (vr) {
       Logger::err(str::format("Presenter: Failed to wait for WSI fence: ", vr));
+      m_device->notifyDeviceErrorFromDriverResult(
+        vr, bindingSequenceBeforeWait);
+      return vr;
+    }
 
-    if ((vr = m_vkd->vkResetFences(m_vkd->device(), 1, &sync.fence)))
+    const uint32_t bindingSequenceBeforeReset =
+      m_device->deviceAddressBindingSequenceBeforeDriverCall();
+    if ((vr = m_vkd->vkResetFences(m_vkd->device(), 1, &sync.fence))) {
       Logger::err(str::format("Presenter: Failed to reset WSI fence: ", vr));
+      m_device->notifyDeviceErrorFromDriverResult(
+        vr, bindingSequenceBeforeReset);
+      return vr;
+    }
 
     sync.fenceSignaled = VK_FALSE;
+    return VK_SUCCESS;
   }
 
 
@@ -1300,9 +1388,14 @@ namespace dxvk {
       // If the present operation has succeeded, actually wait for it to complete.
       // Don't bother with it on MAILBOX / IMMEDIATE modes since doing so would
       // restrict us to the display refresh rate on some platforms (XWayland).
-      if (frame.result >= 0 && (frame.mode == VK_PRESENT_MODE_FIFO_KHR || frame.mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR)) {
+      bool terminal = frame.result == VK_ERROR_DEVICE_LOST
+                   || m_device->getDeviceStatus() == VK_ERROR_DEVICE_LOST;
+
+      if (!terminal && frame.result >= 0 && (frame.mode == VK_PRESENT_MODE_FIFO_KHR || frame.mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR)) {
         VkResult vr;
 
+        const uint32_t bindingSequenceBeforeWait =
+          m_device->deviceAddressBindingSequenceBeforeDriverCall();
         if (m_device->features().khrPresentWait2.presentWait2) {
           VkPresentWait2InfoKHR waitInfo = { VK_STRUCTURE_TYPE_PRESENT_WAIT_2_INFO_KHR };
           waitInfo.presentId = frame.frameId;
@@ -1314,6 +1407,9 @@ namespace dxvk {
             m_swapchain, frame.frameId, std::numeric_limits<uint64_t>::max());
         }
 
+        m_device->notifyDeviceErrorFromDriverResult(
+          vr, bindingSequenceBeforeWait);
+        terminal = m_device->getDeviceStatus() == VK_ERROR_DEVICE_LOST;
         if (vr < 0 && vr != VK_ERROR_OUT_OF_DATE_KHR && vr != VK_ERROR_SURFACE_LOST_KHR)
           Logger::err(str::format("Presenter: vkWaitForPresentKHR failed: ", vr));
       }
@@ -1328,7 +1424,8 @@ namespace dxvk {
       // Apply FPS limiter here to align it as closely with scanout as we can,
       // and delay signaling the frame latency event to emulate behaviour of a
       // low refresh rate display as closely as we can.
-      m_fpsLimiter.delay();
+      if (!terminal)
+        m_fpsLimiter.delay();
 
       // Wake up any thread that may be waiting for the queue to become empty
       bool canSignal = false;

@@ -23,6 +23,11 @@ The analyzer never launches, focuses, reprioritizes or stops Warcraft III.
 
 ## Required process configuration
 
+The production/default DLL is permanently Off for both observers. The
+environment variables below are meaningful only in a separate development or
+AutoTest build configured with `-Dwarvk_shadow_observers_dev=true`; that build
+is not eligible for deployment or release.
+
 The candidate must be launched from a fresh process with:
 
 ```text
@@ -33,8 +38,10 @@ DXVK_WAR3_PERF_HISTORY_FRAMES=12000
 DXVK_WAR3_PERF_AUTO_EXPORT_SEC=120
 ```
 
-Mode `1` is Observe. It computes predictions but does not alter output. Mode
-`2` is not authorized by this work.
+Mode `1` is Observe. It computes predictions but does not alter output. Even
+the development build maps mode `2`, every other integer, and the retired
+`DXVK_WAR3_CSM_TERRAIN_BOUNDS_CULL` boolean entry to Off. Observe evidence is
+not authorization to enable Consume.
 
 ## Admission contract
 

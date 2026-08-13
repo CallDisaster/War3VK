@@ -116,7 +116,7 @@ class Stage11ExactAttachmentFallbackStaticTests(unittest.TestCase):
 
         producer = source_block(
             self.device,
-            "uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer()",
+            "uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer(",
             "bool D3D9DeviceEx::War3DrainShadowCasterTombstones()",
         )
         self.assertIn("draw.vertexBlendEnabled = false;", producer)

@@ -1,4 +1,6 @@
 #include "../war3_shadow_replay_validation.h"
+#include "../war3_shadow_replay_binding_policy.h"
+#include "../war3_outline_mask_layout.h"
 
 #include <cassert>
 #include <limits>
@@ -30,8 +32,70 @@ War3ShadowReplayValidationInput ValidIndexed() {
 } // namespace
 
 int main() {
+  // A relocatable owner preserves the logical subrange while the physical
+  // backing base changes from A to B.
+  const auto logical = MakeWar3ShadowReplayLogicalRange(
+      1000u, 4096u, 1128u, 512u);
+  assert(logical.valid);
+  assert(logical.offset == 128u);
+  assert(logical.length == 512u);
+  uint64_t resolvedOffset = 0u;
+  uint64_t resolvedLength = 0u;
+  assert(ResolveWar3ShadowReplayLogicalRange(
+      9000u, 4096u, logical, resolvedOffset, resolvedLength));
+  assert(resolvedOffset == 9128u);
+  assert(resolvedLength == 512u);
+  // A pinned allocation deliberately resolves against capture-time A.
+  assert(ResolveWar3ShadowReplayLogicalRange(
+      1000u, 4096u, logical, resolvedOffset, resolvedLength));
+  assert(resolvedOffset == 1128u);
+  assert(!MakeWar3ShadowReplayLogicalRange(
+      1000u, 256u, 1200u, 128u).valid);
+  assert(!ResolveWar3ShadowReplayLogicalRange(
+      std::numeric_limits<uint64_t>::max() - 8u, 4096u,
+      logical, resolvedOffset, resolvedLength));
+
+  // Paged Stage11 snapshots share one buffer owner. Moving a draw from one
+  // suballocation to another must invalidate the capture identity, while a
+  // defrag that only changes the backing base leaves this producer identity
+  // and its logical range intact.
+  const auto capturedRange =
+      MakeWar3ShadowReplayCapturedRangeIdentity(1128u, 512u);
+  assert(capturedRange.valid);
+  assert(War3ShadowReplayCapturedRangeMatches(
+      capturedRange, 1128u, 512u));
+  assert(!War3ShadowReplayCapturedRangeMatches(
+      capturedRange, 1640u, 512u));
+  assert(!War3ShadowReplayCapturedRangeMatches(
+      capturedRange, 1128u, 256u));
+  assert(!War3ShadowReplayCapturedRangeMatches(
+      MakeWar3ShadowReplayCapturedRangeIdentity(1128u, 0u), 1128u, 0u));
+
   auto input = ValidIndexed();
   assert(ValidateWar3ShadowReplayDraw(input));
+
+  input.bufferBindingsResolved = false;
+  input.bufferBindingRejectReason = static_cast<uint32_t>(
+      War3ShadowReplayBindingRejectReason::RangeOutOfBounds);
+  auto unresolved = ValidateWar3ShadowReplayDraw(input);
+  assert(unresolved.reason ==
+         War3ShadowReplayRejectReason::UnresolvedBufferBinding);
+  assert(unresolved.requiredEnd == input.bufferBindingRejectReason);
+  input = ValidIndexed();
+
+  input.paletteRequired = true;
+  input.paletteCount = 2u;
+  input.paletteIndex = 1u;
+  input.paletteMatricesPerEntry = 256u;
+  assert(ValidateWar3ShadowReplayDraw(input));
+  input.paletteIndex = 2u;
+  assert(ValidateWar3ShadowReplayDraw(input).reason ==
+         War3ShadowReplayRejectReason::InvalidPaletteIndex);
+  input.paletteIndex = 0u;
+  input.paletteCount = 0u;
+  assert(ValidateWar3ShadowReplayDraw(input).reason ==
+         War3ShadowReplayRejectReason::InvalidPaletteIndex);
+  input.paletteRequired = false;
 
   input.drawMapEpoch = 6u;
   assert(ValidateWar3ShadowReplayDraw(input).reason ==
@@ -96,5 +160,39 @@ int main() {
   nonIndexed.firstVertex = 2u;
   nonIndexed.position.size = 72u;
   assert(ValidateWar3ShadowReplayDraw(nonIndexed));
+
+  // Outline and every other replay consumer validate an immutable batch
+  // before command recording. A malformed second draw rejects the entire
+  // batch rather than granting permission to submit the valid prefix.
+  War3ShadowReplayValidationInput batchInputs[2] = {
+      ValidIndexed(), ValidIndexed()};
+  auto batch = ValidateWar3ShadowReplayBatch(batchInputs, 2u);
+  assert(batch);
+  assert(batch.validatedCount == 2u);
+  batchInputs[1].position.size = 1u;
+  batch = ValidateWar3ShadowReplayBatch(batchInputs, 2u);
+  assert(!batch);
+  assert(batch.failureIndex == 1u);
+  assert(batch.validatedCount == 1u);
+  assert(batch.failure.reason ==
+         War3ShadowReplayRejectReason::PositionRangeOutOfBounds);
+  assert(!ValidateWar3ShadowReplayBatch(nullptr, 1u));
+
+  // First use discards UNDEFINED contents. Every later frame performs a real
+  // ShaderReadOnly -> ColorAttachment -> ShaderReadOnly round trip.
+  auto begin = PlanWar3OutlineMaskBegin(
+      War3OutlineMaskLayoutState::Undefined);
+  assert(begin);
+  assert(begin.discardContents);
+  assert(begin.newState == War3OutlineMaskLayoutState::ColorAttachment);
+  auto end = PlanWar3OutlineMaskEnd(begin.newState);
+  assert(end);
+  assert(end.newState == War3OutlineMaskLayoutState::ShaderReadOnly);
+  begin = PlanWar3OutlineMaskBegin(end.newState);
+  assert(begin);
+  assert(!begin.discardContents);
+  assert(!PlanWar3OutlineMaskBegin(begin.newState));
+  assert(!PlanWar3OutlineMaskEnd(
+      War3OutlineMaskLayoutState::Undefined));
   return 0;
 }

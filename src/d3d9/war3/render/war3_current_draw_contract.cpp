@@ -1,4 +1,8 @@
 #include "war3_current_draw_contract.h"
+#include "war3_classified_counter.h"
+#include "war3_current_draw_group_slot_summary.h"
+#include "war3_current_draw_palette_hash.h"
+#include "war3_current_draw_winner_filter_policy.h"
 
 #include "../../d3d9_war3_debug.h"
 #include "../../d3d9_war3_hook.h"
@@ -130,6 +134,13 @@ thread_local std::array<PaletteSnapshotEntry, kPaletteSnapshotCacheSize>
 thread_local std::array<CurrentDrawPreparedSliceRecord,
                         kPreparedSliceCacheSize>
     g_preparedSliceCache = {};
+// Exact (part, layer) misses historically scanned all 1024 prepared records to
+// locate the newest slice for the part. Keep a second direct-mapped projection
+// keyed only by part. It contains the same value the scan would select; cache
+// collisions fail back to that scan and therefore cannot create a false hit.
+thread_local std::array<CurrentDrawPreparedSliceRecord,
+                        kPreparedSliceCacheSize>
+    g_latestPreparedSliceByPart = {};
 thread_local std::array<CurrentDrawPreparedSliceInterest,
                         kPreparedSliceInterestCacheSize>
     g_preparedSliceInterestCache = {};
@@ -406,7 +417,6 @@ CurrentDrawContractRecord SnapshotRecordWithGrace(
 }
 
 std::atomic<uint64_t> g_publishAttemptCount{0u};
-std::atomic<uint64_t> g_publishReadyCount{0u};
 std::atomic<uint64_t> g_publishMissNoRenderablePart{0u};
 std::atomic<uint64_t> g_publishMissNoMeshPayload{0u};
 std::atomic<uint64_t> g_publishMissInvalidPaletteSlot{0u};
@@ -415,12 +425,10 @@ std::atomic<uint64_t> g_publishMissNoGlobalPalette{0u};
 std::atomic<uint64_t> g_publishSkippedNonWorldContext{0u};
 std::atomic<uint64_t> g_publishSkippedSmallViewport{0u};
 std::atomic<uint64_t> g_queryAttemptCount{0u};
-std::atomic<uint64_t> g_queryHitCount{0u};
 std::atomic<uint64_t> g_queryMissNoRecord{0u};
 std::atomic<uint64_t> g_queryMissFrameTagMismatch{0u};
 std::atomic<uint64_t> g_queryMissCacheCollision{0u};
 std::atomic<uint64_t> g_capturedPaletteQueryAttemptCount{0u};
-std::atomic<uint64_t> g_capturedPaletteQueryHitCount{0u};
 std::atomic<uint64_t> g_capturedPaletteMissNoContract{0u};
 std::atomic<uint64_t> g_capturedPaletteMissInvalidCount{0u};
 std::atomic<uint64_t> g_capturedPaletteMissNoSnapshot{0u};
@@ -431,7 +439,6 @@ std::atomic<uint64_t> g_paletteAttributionSnapshotHitCount{0u};
 // Phase 7.30 Action B 第二刀：capture 端 trusted palette 源使用情况。
 // TrustedHit = Hook_RuntimeMatrixWrite 缓存命中，作为 snapshot 的真源；
 // TrustedMiss = 未命中，回退到 globalPaletteBuffer raw memcpy（老路径）。
-std::atomic<uint64_t> g_paletteCaptureTrustedSourceHitCount{0u};
 std::atomic<uint64_t> g_paletteCaptureTrustedSourceMissCount{0u};
 // Phase 7.34 线 A：严格仲裁拒绝 raw arena 时的丢弃次数。
 // 数值越高说明 trusted 覆盖率越低；应配合 `runtimeMatrixRangeCopyPalettePublishHitCount`
@@ -515,7 +522,6 @@ std::atomic<uint64_t> g_submitLiveRebuildHitCount{0u};
 std::atomic<uint64_t> g_submitLiveRebuildMissCount{0u};
 std::atomic<uint64_t> g_submitLiveRebuildAppliedCount{0u};
 std::atomic<uint64_t> g_groupSlotDecodeAttemptCount{0u};
-std::atomic<uint64_t> g_groupSlotDecodeHitCount{0u};
 std::atomic<uint64_t> g_groupSlotDecodeMissDisabledStream{0u};
 std::atomic<uint64_t> g_groupSlotDecodeMissNoStream{0u};
 std::atomic<uint64_t> g_groupSlotDecodeMissUnreadableStream{0u};
@@ -771,6 +777,22 @@ struct CurrentDrawSnapshotPartKeyHash {
     hash = bit::fnv1a_iter(hash, key.payloadWord11C);
     return size_t(hash);
   }
+};
+
+// A snapshot can visit at most kContractCacheSize TLS records in the common
+// release path. Keep the exact part-slice index at <= 50% load so lookup does
+// not allocate nodes or buckets. Global publication is a diagnostic fallback
+// and may exceed that bound; callers retain an exact linear fallback when the
+// fixed table cannot accept another unique key.
+static constexpr size_t kCurrentDrawSnapshotDedupeIndexSize =
+    kContractCacheSize * 2u;
+static_assert((kCurrentDrawSnapshotDedupeIndexSize &
+               (kCurrentDrawSnapshotDedupeIndexSize - 1u)) == 0u);
+
+struct CurrentDrawSnapshotDedupeIndexEntry {
+  CurrentDrawSnapshotPartKey key = {};
+  size_t recordIndex = 0u;
+  uint64_t generation = 0u;
 };
 
 class CurrentDrawSnapshotRecordRawTiming final {
@@ -1084,6 +1106,14 @@ ContractLookupStatus LookupCurrentDrawContractRecord(
         break;
       }
     }
+    // Release defaults to TLS/local publication only. In that mode the
+    // mutex-backed compatibility maps have no writers, so do not serialize
+    // every cache miss just to prove that an empty map is still empty.
+    if (!GlobalCurrentDrawPublishEnabled()) {
+      return occupiedCollision
+          ? ContractLookupStatus::CacheCollision
+          : ContractLookupStatus::MissingRecord;
+    }
     std::lock_guard<std::mutex> lock(g_publishedCurrentDrawMutex);
     const auto globalIt = g_publishedCurrentDrawByPart.find(renderablePart);
     if (globalIt == g_publishedCurrentDrawByPart.end()) {
@@ -1295,9 +1325,12 @@ void ClearPublishedCurrentDrawReadyRecord(void* renderablePart) {
 bool DecodeCapturedPaletteForRecord(const CurrentDrawContractRecord& record,
                                     std::vector<Matrix4>& outPalette,
                                     uint32_t& outGroupCount,
-                                    bool countAttempt) {
+                                    bool countAttempt,
+                                    uint64_t* outPaletteHash) {
   outPalette.clear();
   outGroupCount = 0u;
+  if (outPaletteHash != nullptr)
+    *outPaletteHash = 0u;
   if (countAttempt)
     g_capturedPaletteQueryAttemptCount.fetch_add(1u,
                                                  std::memory_order_relaxed);
@@ -1320,6 +1353,7 @@ bool DecodeCapturedPaletteForRecord(const CurrentDrawContractRecord& record,
 
   outPalette.resize(record.capturedPaletteCount);
   const auto decodePaletteBytes = [&](const uint8_t* paletteBytes) {
+    CurrentDrawPaletteHashSummary paletteHash = {};
     for (uint32_t i = 0u; i < record.capturedPaletteCount; ++i) {
       const float* m =
           reinterpret_cast<const float*>(paletteBytes + size_t(i) * 48u);
@@ -1328,7 +1362,11 @@ bool DecodeCapturedPaletteForRecord(const CurrentDrawContractRecord& record,
                   Vector4(m[3], m[4], m[5], 0.0f),
                   Vector4(m[6], m[7], m[8], 0.0f),
                   Vector4(m[9], m[10], m[11], 1.0f));
+      if (outPaletteHash != nullptr)
+        paletteHash.include(outPalette[i]);
     }
+    if (outPaletteHash != nullptr)
+      *outPaletteHash = paletteHash.finish();
   };
 
   const PaletteSnapshotEntry* snapshot =
@@ -1340,13 +1378,12 @@ bool DecodeCapturedPaletteForRecord(const CurrentDrawContractRecord& record,
        snapshot->frameTag == record.frameTag)) {
     decodePaletteBytes(snapshot->bytes.data());
     outGroupCount = record.capturedPaletteCount;
-    g_capturedPaletteQueryHitCount.fetch_add(1u, std::memory_order_relaxed);
     g_lastMissReason.store(uint32_t(CurrentDrawMissReason::None),
                            std::memory_order_relaxed);
     return true;
   }
 
-  {
+  if (GlobalCurrentDrawPublishEnabled()) {
     std::lock_guard<std::mutex> lock(g_publishedCurrentDrawMutex);
     const auto globalIt =
         g_publishedPaletteSnapshotByPart.find(record.renderablePart);
@@ -1358,8 +1395,6 @@ bool DecodeCapturedPaletteForRecord(const CurrentDrawContractRecord& record,
            globalSnapshot.frameTag == record.frameTag)) {
         decodePaletteBytes(globalSnapshot.bytes.data());
         outGroupCount = record.capturedPaletteCount;
-        g_capturedPaletteQueryHitCount.fetch_add(1u,
-                                                 std::memory_order_relaxed);
         g_lastMissReason.store(uint32_t(CurrentDrawMissReason::None),
                                std::memory_order_relaxed);
         return true;
@@ -1384,8 +1419,6 @@ bool DecodeCapturedPaletteForRecord(const CurrentDrawContractRecord& record,
                attrSnapshot.frameTag == record.frameTag)) {
             decodePaletteBytes(attrSnapshot.bytes.data());
             outGroupCount = record.capturedPaletteCount;
-            g_capturedPaletteQueryHitCount.fetch_add(
-                1u, std::memory_order_relaxed);
             g_paletteAttributionSnapshotHitCount.fetch_add(
                 1u, std::memory_order_relaxed);
             g_lastMissReason.store(uint32_t(CurrentDrawMissReason::None),
@@ -1662,6 +1695,8 @@ void ResetCurrentDrawContractCache() {
     snapshot = {};
   for (auto& prepared : g_preparedSliceCache)
     prepared = {};
+  for (auto& prepared : g_latestPreparedSliceByPart)
+    prepared = {};
   for (auto& interest : g_preparedSliceInterestCache)
     interest = {};
   for (auto& entry : g_currentDrawGeometryLedger)
@@ -1671,7 +1706,6 @@ void ResetCurrentDrawContractCache() {
   g_captureSerialCounter.store(0u, std::memory_order_relaxed);
   g_preparedSliceSerialCounter.store(0u, std::memory_order_relaxed);
   g_publishAttemptCount.store(0u, std::memory_order_relaxed);
-  g_publishReadyCount.store(0u, std::memory_order_relaxed);
   g_publishMissNoRenderablePart.store(0u, std::memory_order_relaxed);
   g_publishMissNoMeshPayload.store(0u, std::memory_order_relaxed);
   g_publishMissInvalidPaletteSlot.store(0u, std::memory_order_relaxed);
@@ -1680,18 +1714,15 @@ void ResetCurrentDrawContractCache() {
   g_publishSkippedNonWorldContext.store(0u, std::memory_order_relaxed);
   g_publishSkippedSmallViewport.store(0u, std::memory_order_relaxed);
   g_queryAttemptCount.store(0u, std::memory_order_relaxed);
-  g_queryHitCount.store(0u, std::memory_order_relaxed);
   g_queryMissNoRecord.store(0u, std::memory_order_relaxed);
   g_queryMissFrameTagMismatch.store(0u, std::memory_order_relaxed);
   g_queryMissCacheCollision.store(0u, std::memory_order_relaxed);
   g_capturedPaletteQueryAttemptCount.store(0u, std::memory_order_relaxed);
-  g_capturedPaletteQueryHitCount.store(0u, std::memory_order_relaxed);
   g_capturedPaletteMissNoContract.store(0u, std::memory_order_relaxed);
   g_capturedPaletteMissInvalidCount.store(0u, std::memory_order_relaxed);
   g_capturedPaletteMissNoSnapshot.store(0u, std::memory_order_relaxed);
   g_capturedPaletteMissUnreadablePalette.store(0u, std::memory_order_relaxed);
   g_groupSlotDecodeAttemptCount.store(0u, std::memory_order_relaxed);
-  g_groupSlotDecodeHitCount.store(0u, std::memory_order_relaxed);
   g_groupSlotDecodeMissDisabledStream.store(0u, std::memory_order_relaxed);
   g_groupSlotDecodeMissNoStream.store(0u, std::memory_order_relaxed);
   g_groupSlotDecodeMissUnreadableStream.store(0u, std::memory_order_relaxed);
@@ -1788,6 +1819,15 @@ CurrentDrawRetireResult RetireCurrentDrawContracts(
         retiredParts.find(prepared.renderablePart) != retiredParts.end()) {
       prepared = {};
       result.localPreparedSliceCount++;
+    }
+  }
+  for (auto& prepared : g_latestPreparedSliceByPart) {
+    const bool directPartMatch =
+        tombstone.identity.renderablePart != nullptr &&
+        prepared.renderablePart == tombstone.identity.renderablePart;
+    if (directPartMatch ||
+        retiredParts.find(prepared.renderablePart) != retiredParts.end()) {
+      prepared = {};
     }
   }
   for (auto& interest : g_preparedSliceInterestCache) {
@@ -1923,6 +1963,9 @@ void PublishCurrentDrawPreparedSlice(
       ((key >> 4u) ^ uint64_t(stored.layerIndex)) &
       (g_preparedSliceCache.size() - 1u);
   g_preparedSliceCache[slot] = stored;
+  const size_t partSlot =
+      (key >> 4u) & (g_latestPreparedSliceByPart.size() - 1u);
+  g_latestPreparedSliceByPart[partSlot] = stored;
   g_preparedSliceRecordedCount.fetch_add(1u, std::memory_order_relaxed);
 }
 
@@ -1980,13 +2023,29 @@ bool QueryCurrentDrawPreparedSlice(void* renderablePart,
   if (!record.known || record.renderablePart != renderablePart ||
       record.layerIndex != layerIndex || record.preparedCount == 0u ||
       record.primitiveType == 0u) {
-    const CurrentDrawPreparedSliceRecord* best = nullptr;
-    for (const auto& candidate : g_preparedSliceCache) {
-      if (!candidate.known || candidate.renderablePart != renderablePart ||
-          candidate.preparedCount == 0u || candidate.primitiveType == 0u)
-        continue;
-      if (best == nullptr || candidate.captureSerial > best->captureSerial)
-        best = &candidate;
+    const size_t partSlot =
+        (key >> 4u) & (g_latestPreparedSliceByPart.size() - 1u);
+    const auto& latest = g_latestPreparedSliceByPart[partSlot];
+    const size_t latestExactSlot =
+        ((key >> 4u) ^ uint64_t(latest.layerIndex)) &
+        (g_preparedSliceCache.size() - 1u);
+    const auto& latestExact = g_preparedSliceCache[latestExactSlot];
+    const CurrentDrawPreparedSliceRecord* best =
+        latest.known && latest.renderablePart == renderablePart &&
+                latest.preparedCount != 0u && latest.primitiveType != 0u
+                && latestExact.renderablePart == renderablePart &&
+                latestExact.layerIndex == latest.layerIndex &&
+                latestExact.captureSerial == latest.captureSerial
+            ? &latest
+            : nullptr;
+    if (best == nullptr) {
+      for (const auto& candidate : g_preparedSliceCache) {
+        if (!candidate.known || candidate.renderablePart != renderablePart ||
+            candidate.preparedCount == 0u || candidate.primitiveType == 0u)
+          continue;
+        if (best == nullptr || candidate.captureSerial > best->captureSerial)
+          best = &candidate;
+      }
     }
     if (best != nullptr) {
       out = *best;
@@ -2261,43 +2320,28 @@ void PublishCurrentDrawContract(const CurrentDrawContractRecord& record,
   //      `DXVK_WAR3_PALETTE_ARBITRATION_STRICT=0` 兼容模式：回退到原 raw arena
   //      行为，供临时回滚调试。
   //   3. raw arena 永远标记 `PaletteProvenance::RawGlobalArena`，仅做诊断。
-  // 2026-07-21 优化：12 KB 栈数组改为 thread_local 复用且不做零初始化。
-  // 下游消费只 memcpy `requiredBytes`（= capturedPaletteCount * 48）前缀，
-  // 数组尾部从不读取；该 publish 路径每帧可达 10K-30K 次，原 `= {}` 每次
-  // 产生 12 KB 无效写带宽（数十 MB/帧）。
-  thread_local std::array<uint8_t, kMaxPaletteMatrices * 48u> trustedPaletteBytes;
+  // Exact writer-backed palettes validate the complete slot range first and
+  // then pack directly into the selected local snapshot. This removes the
+  // former 12 KB thread-local staging buffer and its second memcpy without
+  // allowing a failed query to partially replace the last complete snapshot.
+  const size_t snapshotSlot =
+      SelectLocalPaletteSnapshotSlot(record.renderablePart);
+  auto& snapshot = g_paletteSnapshotCache[snapshotSlot];
   const uint8_t* paletteSource = nullptr;
   PaletteProvenance provenance = PaletteProvenance::Unknown;
+  bool paletteAlreadyStoredInSnapshot = false;
   {
     CurrentDrawFixedPhaseScope trustedPalettePhase(
         dxvk::war3::hooks::War3HotHookId::
             CurrentDrawPublishTrustedPaletteQueryPack,
         breakdownSampleWeight);
-    // 2026-07-21 优化：trusted 查询的临时 vector 改 thread_local 复用容量，
-    // 避免每次 ready publish 都产生一次堆分配。本函数在同一线程内不可重入，
-    // 复用安全。
-    thread_local std::vector<Matrix4> trustedPalette;
-    trustedPalette.clear();
     if (PaletteAttributionSnapshotEnabled() &&
-        dxvk::war3::model::QueryBlendedPaletteBySlotIndexExact(
+        dxvk::war3::model::CopyBlendedPaletteBytesBySlotIndexExact(
             record.paletteSlotIndex, record.capturedPaletteCount,
-            record.frameTag, &trustedPalette) &&
-        // Phase 7.34 防御：Exact 版本已经保证 size == expected，这里再 double
-        // check 避免任何下游跳变。
-        trustedPalette.size() == record.capturedPaletteCount) {
-      for (uint32_t i = 0u; i < record.capturedPaletteCount; ++i) {
-        const Matrix4& m = trustedPalette[i];
-        float* dst = reinterpret_cast<float*>(
-            trustedPaletteBytes.data() + size_t(i) * 48u);
-        dst[0] = m[0][0]; dst[1] = m[0][1]; dst[2] = m[0][2];
-        dst[3] = m[1][0]; dst[4] = m[1][1]; dst[5] = m[1][2];
-        dst[6] = m[2][0]; dst[7] = m[2][1]; dst[8] = m[2][2];
-        dst[9] = m[3][0]; dst[10] = m[3][1]; dst[11] = m[3][2];
-      }
-      paletteSource = trustedPaletteBytes.data();
+            record.frameTag, snapshot.bytes.data(), snapshot.bytes.size())) {
+      paletteSource = snapshot.bytes.data();
       provenance = PaletteProvenance::TrustedBlendedWriter;
-      g_paletteCaptureTrustedSourceHitCount.fetch_add(
-          1u, std::memory_order_relaxed);
+      paletteAlreadyStoredInSnapshot = true;
       if (CurrentDrawRedundantAtomicsLegacyRuntime()) {
         g_publishTrustedHitCumulative.fetch_add(
             1u, std::memory_order_relaxed);
@@ -2384,10 +2428,6 @@ void PublishCurrentDrawContract(const CurrentDrawContractRecord& record,
       }
     }
 
-    const size_t snapshotSlot =
-        SelectLocalPaletteSnapshotSlot(record.renderablePart);
-    auto& snapshot = g_paletteSnapshotCache[snapshotSlot];
-
     // Phase 7.34 第三轮曾尝试不让 RawGlobalArena 降级覆盖已有 trusted snapshot。
   // 根因：用户观察到"视角边缘对象（门）在压力下闪烁"。
   // 机制：某帧视锥边缘对象的 trusted cache miss → 若允许 raw arena 覆写
@@ -2412,7 +2452,8 @@ void PublishCurrentDrawContract(const CurrentDrawContractRecord& record,
     snapshot.matrixCount = record.capturedPaletteCount;
     if (!preserveTrustedSnapshot) {
       snapshot.paletteProvenance = provenance;
-      std::memcpy(snapshot.bytes.data(), paletteSource, requiredBytes);
+      if (!paletteAlreadyStoredInSnapshot)
+        std::memcpy(snapshot.bytes.data(), paletteSource, requiredBytes);
     } else {
       g_paletteSnapshotTrustedPreservedCount.fetch_add(
           1u, std::memory_order_relaxed);
@@ -2472,7 +2513,6 @@ void PublishCurrentDrawContract(const CurrentDrawContractRecord& record,
       }
     }
   }
-  g_publishReadyCount.fetch_add(1u, std::memory_order_relaxed);
   g_lastMissReason.store(uint32_t(CurrentDrawMissReason::None),
                          std::memory_order_relaxed);
 }
@@ -2482,8 +2522,6 @@ QueryCurrentDrawContractDiagnosticsSummary() {
   CurrentDrawContractDiagnosticsSummary summary = {};
   summary.publishAttemptCount =
       g_publishAttemptCount.load(std::memory_order_relaxed);
-  summary.publishReadyCount =
-      g_publishReadyCount.load(std::memory_order_relaxed);
   summary.publishMissNoRenderablePart =
       g_publishMissNoRenderablePart.load(std::memory_order_relaxed);
   summary.publishMissNoMeshPayload =
@@ -2494,24 +2532,36 @@ QueryCurrentDrawContractDiagnosticsSummary() {
       g_publishMissInvalidPaletteCount.load(std::memory_order_relaxed);
   summary.publishMissNoGlobalPalette =
       g_publishMissNoGlobalPalette.load(std::memory_order_relaxed);
+  const uint64_t publishRejectedNoTrusted =
+      g_publishRejectedNoTrustedCumulative.load(std::memory_order_relaxed);
+  summary.publishReadyCount = DeriveClassifiedSuccessCount(
+      summary.publishAttemptCount,
+      std::array<uint64_t, 4>{
+          summary.publishMissNoRenderablePart,
+          summary.publishMissInvalidPaletteSlot,
+          summary.publishMissInvalidPaletteCount,
+          summary.publishMissNoGlobalPalette},
+      publishRejectedNoTrusted);
   summary.publishSkippedNonWorldContext =
       g_publishSkippedNonWorldContext.load(std::memory_order_relaxed);
   summary.publishSkippedSmallViewport =
       g_publishSkippedSmallViewport.load(std::memory_order_relaxed);
   summary.queryAttemptCount =
       g_queryAttemptCount.load(std::memory_order_relaxed);
-  summary.queryHitCount =
-      g_queryHitCount.load(std::memory_order_relaxed);
   summary.queryMissNoRecord =
       g_queryMissNoRecord.load(std::memory_order_relaxed);
   summary.queryMissFrameTagMismatch =
       g_queryMissFrameTagMismatch.load(std::memory_order_relaxed);
   summary.queryMissCacheCollision =
       g_queryMissCacheCollision.load(std::memory_order_relaxed);
+  summary.queryHitCount = DeriveClassifiedSuccessCount(
+      summary.queryAttemptCount,
+      std::array<uint64_t, 3>{
+          summary.queryMissNoRecord,
+          summary.queryMissFrameTagMismatch,
+          summary.queryMissCacheCollision});
   summary.capturedPaletteQueryAttemptCount =
       g_capturedPaletteQueryAttemptCount.load(std::memory_order_relaxed);
-  summary.capturedPaletteQueryHitCount =
-      g_capturedPaletteQueryHitCount.load(std::memory_order_relaxed);
   summary.capturedPaletteMissNoContract =
       g_capturedPaletteMissNoContract.load(std::memory_order_relaxed);
   summary.capturedPaletteMissInvalidCount =
@@ -2520,10 +2570,17 @@ QueryCurrentDrawContractDiagnosticsSummary() {
       g_capturedPaletteMissNoSnapshot.load(std::memory_order_relaxed);
   summary.capturedPaletteMissUnreadablePalette =
       g_capturedPaletteMissUnreadablePalette.load(std::memory_order_relaxed);
+  summary.capturedPaletteQueryHitCount = DeriveClassifiedSuccessCount(
+      summary.capturedPaletteQueryAttemptCount,
+      std::array<uint64_t, 4>{
+          summary.capturedPaletteMissNoContract,
+          summary.capturedPaletteMissInvalidCount,
+          summary.capturedPaletteMissNoSnapshot,
+          summary.capturedPaletteMissUnreadablePalette});
   summary.paletteAttributionSnapshotHitCount =
       g_paletteAttributionSnapshotHitCount.load(std::memory_order_relaxed);
   summary.paletteCaptureTrustedSourceHitCount =
-      g_paletteCaptureTrustedSourceHitCount.load(std::memory_order_relaxed);
+      dxvk::war3::model::QueryBlendedPaletteExactHitCount();
   summary.paletteCaptureTrustedSourceMissCount =
       g_paletteCaptureTrustedSourceMissCount.load(std::memory_order_relaxed);
   // Phase 7.34：严格仲裁下 raw-arena 拒绝次数。
@@ -2588,8 +2645,6 @@ QueryCurrentDrawContractDiagnosticsSummary() {
       g_submitLiveRebuildAppliedCount.load(std::memory_order_relaxed);
   summary.groupSlotDecodeAttemptCount =
       g_groupSlotDecodeAttemptCount.load(std::memory_order_relaxed);
-  summary.groupSlotDecodeHitCount =
-      g_groupSlotDecodeHitCount.load(std::memory_order_relaxed);
   summary.groupSlotDecodeMissDisabledStream =
       g_groupSlotDecodeMissDisabledStream.load(std::memory_order_relaxed);
   summary.groupSlotDecodeMissNoStream =
@@ -2598,6 +2653,13 @@ QueryCurrentDrawContractDiagnosticsSummary() {
       g_groupSlotDecodeMissUnreadableStream.load(std::memory_order_relaxed);
   summary.groupSlotDecodeMissGroupOutOfRange =
       g_groupSlotDecodeMissGroupOutOfRange.load(std::memory_order_relaxed);
+  summary.groupSlotDecodeHitCount = DeriveClassifiedSuccessCount(
+      summary.groupSlotDecodeAttemptCount,
+      std::array<uint64_t, 4>{
+          summary.groupSlotDecodeMissDisabledStream,
+          summary.groupSlotDecodeMissNoStream,
+          summary.groupSlotDecodeMissUnreadableStream,
+          summary.groupSlotDecodeMissGroupOutOfRange});
   summary.preparedSliceProbeAttemptCount =
       g_preparedSliceProbeAttemptCount.load(std::memory_order_relaxed);
   summary.preparedSliceProbeContextReadyCount =
@@ -2666,12 +2728,11 @@ QueryCurrentDrawContractDiagnosticsSummary() {
   summary.publishTrustedHitCumulative =
       CurrentDrawRedundantAtomicsLegacyRuntime()
           ? g_publishTrustedHitCumulative.load(std::memory_order_relaxed)
-          : g_paletteCaptureTrustedSourceHitCount.load(
-                std::memory_order_relaxed);
+          : dxvk::war3::model::QueryBlendedPaletteExactHitCount();
   summary.publishRawFallbackCumulative =
       g_publishRawFallbackCumulative.load(std::memory_order_relaxed);
   summary.publishRejectedNoTrustedCumulative =
-      g_publishRejectedNoTrustedCumulative.load(std::memory_order_relaxed);
+      publishRejectedNoTrusted;
   summary.publishRecordFrameTagSameRunMax =
       g_publishRecordFrameTagSameRunMax.load(std::memory_order_relaxed);
   summary.publishRecordFrameTagCurrentSameRun =
@@ -2799,7 +2860,6 @@ bool QueryCurrentDrawContract(void* renderablePart,
 
   out = *entry;
   out.known = true;
-  g_queryHitCount.fetch_add(1u, std::memory_order_relaxed);
   return true;
 }
 
@@ -2855,9 +2915,12 @@ bool QueryCurrentDrawGeometryContract(
 bool QueryCurrentDrawContractCapturedPalette(
     void* renderablePart,
     std::vector<Matrix4>& outPalette,
-    uint32_t& outGroupCount) {
+    uint32_t& outGroupCount,
+    uint64_t* outPaletteHash) {
   outPalette.clear();
   outGroupCount = 0u;
+  if (outPaletteHash != nullptr)
+    *outPaletteHash = 0u;
 
   const CurrentDrawContractRecord* entry = nullptr;
   if (LookupCurrentDrawContractRecord(renderablePart, entry) !=
@@ -2872,7 +2935,7 @@ bool QueryCurrentDrawContractCapturedPalette(
   CurrentDrawContractRecord record = *entry;
   record.known = true;
   return DecodeCapturedPaletteForRecord(record, outPalette, outGroupCount,
-                                        true);
+                                        true, outPaletteHash);
 }
 
 bool DecodeCurrentDrawGroupSlots(const CurrentDrawContractRecord& record,
@@ -2880,10 +2943,19 @@ bool DecodeCurrentDrawGroupSlots(const CurrentDrawContractRecord& record,
                                  uint32_t paletteCount,
                                  std::vector<uint8_t>& outGroupSlots,
                                  uint64_t& outGroupHash,
+                                 uint64_t& outStableGroupHash,
+                                 uint32_t& outMaxGroupSlot,
                                  const CurrentDrawResolveTrace* trace,
-                                 const CurrentDrawRangeValidator* rangeValidator) {
+                                 const CurrentDrawRangeValidator* rangeValidator,
+                                 const CurrentDrawImmutableGroupSlotHint*
+                                     immutableHint,
+                                 bool* outBorrowedImmutableHint) {
   outGroupSlots.clear();
+  if (outBorrowedImmutableHint != nullptr)
+    *outBorrowedImmutableHint = false;
   outGroupHash = 0u;
+  outStableGroupHash = 0u;
+  outMaxGroupSlot = 0u;
   g_groupSlotDecodeAttemptCount.fetch_add(1u, std::memory_order_relaxed);
 
   if (!record.known || record.stream1Ptr == nullptr || vertexCount == 0u ||
@@ -2928,8 +3000,33 @@ bool DecodeCurrentDrawGroupSlots(const CurrentDrawContractRecord& record,
 
   if (trace != nullptr)
     trace->note(CurrentDrawResolveTracePhase::GroupDecodeLoop);
+  if (immutableHint != nullptr &&
+      immutableHint->matches(streamBase, vertexCount, paletteCount)) {
+    if (outBorrowedImmutableHint != nullptr)
+      *outBorrowedImmutableHint = true;
+    else
+      outGroupSlots.assign(immutableHint->bytes,
+                           immutableHint->bytes + vertexCount);
+    const CurrentDrawGroupSlotSummary summary = immutableHint->summary();
+    outGroupHash = summary.diagnosticHash(
+        reinterpret_cast<uintptr_t>(record.stream1Ptr),
+        kCurrentDrawGroupSlotStep, record.payloadWord48,
+        record.payloadWord108, record.payloadWord11C, record.layerIndex);
+    if (trace != nullptr)
+      trace->note(CurrentDrawResolveTracePhase::GroupFinalize);
+    outStableGroupHash = summary.stableHash(
+        kCurrentDrawGroupSlotStep, record.payloadWord48,
+        record.payloadWord108, record.payloadWord11C, record.layerIndex);
+    if (trace != nullptr)
+      trace->note(CurrentDrawResolveTracePhase::StableHash);
+    outMaxGroupSlot = summary.maxGroupSlot;
+    g_lastMissReason.store(uint32_t(CurrentDrawMissReason::None),
+                           std::memory_order_relaxed);
+    return true;
+  }
+
   outGroupSlots.resize(vertexCount);
-  uint64_t hash = bit::fnv1a_init();
+  CurrentDrawGroupSlotSummary summary = {};
   for (uint32_t i = 0u; i < vertexCount; ++i) {
     const uint32_t groupSlot =
         uint32_t(streamBase[size_t(i) * size_t(kCurrentDrawGroupSlotStep)]);
@@ -2944,20 +3041,21 @@ bool DecodeCurrentDrawGroupSlots(const CurrentDrawContractRecord& record,
     }
 
     outGroupSlots[i] = uint8_t(groupSlot);
-    hash = bit::fnv1a_iter(hash, groupSlot);
+    summary.include(groupSlot);
   }
 
   if (trace != nullptr)
     trace->note(CurrentDrawResolveTracePhase::GroupFinalize);
-  hash = bit::fnv1a_iter(hash,
-                         reinterpret_cast<uintptr_t>(record.stream1Ptr));
-  hash = bit::fnv1a_iter(hash, kCurrentDrawGroupSlotStep);
-  hash = bit::fnv1a_iter(hash, record.payloadWord48);
-  hash = bit::fnv1a_iter(hash, record.payloadWord108);
-  hash = bit::fnv1a_iter(hash, record.payloadWord11C);
-  hash = bit::fnv1a_iter(hash, record.layerIndex);
-  outGroupHash = hash;
-  g_groupSlotDecodeHitCount.fetch_add(1u, std::memory_order_relaxed);
+  outGroupHash = summary.diagnosticHash(
+      reinterpret_cast<uintptr_t>(record.stream1Ptr),
+      kCurrentDrawGroupSlotStep, record.payloadWord48, record.payloadWord108,
+      record.payloadWord11C, record.layerIndex);
+  if (trace != nullptr)
+    trace->note(CurrentDrawResolveTracePhase::StableHash);
+  outStableGroupHash = summary.stableHash(
+      kCurrentDrawGroupSlotStep, record.payloadWord48, record.payloadWord108,
+      record.payloadWord11C, record.layerIndex);
+  outMaxGroupSlot = summary.maxGroupSlot;
   g_lastMissReason.store(uint32_t(CurrentDrawMissReason::None),
                          std::memory_order_relaxed);
   return true;
@@ -2991,6 +3089,17 @@ std::vector<CurrentDrawContractRecord> SnapshotPublishedCurrentDrawContracts(
 
 std::vector<CurrentDrawContractRecord> SnapshotPublishedCurrentDrawContracts(
     const CurrentDrawContractSnapshotOptions& options) {
+  std::vector<CurrentDrawContractRecord> out;
+  SnapshotPublishedCurrentDrawContracts(options, out);
+  return out;
+}
+
+void SnapshotPublishedCurrentDrawContracts(
+    const CurrentDrawContractSnapshotOptions& options,
+    std::vector<CurrentDrawContractRecord>& out) {
+  out.clear();
+  if (options.summary != nullptr)
+    *options.summary = {};
   const bool traceSnapshot = CurrentDrawSnapshotBreakdownEnabled();
   const uint32_t snapshotTracePeriod = traceSnapshot
       ? CurrentDrawSnapshotTraceSamplePeriod()
@@ -3015,6 +3124,12 @@ std::vector<CurrentDrawContractRecord> SnapshotPublishedCurrentDrawContracts(
   const bool batchedBoundedSnapshot = batchedBoundedSnapshotRequested &&
       !globalPublishEnabled &&
       localSnapshotUpperBound <= size_t(options.maxRecords);
+  // The deferred route retains only TLS slot indexes until canonical dedupe and
+  // ordering have finished. It is deliberately absent from profiler traces,
+  // global compatibility publication and the historical online top-K route.
+  const bool deferredCanonicalWinnerFilter =
+      batchedBoundedSnapshot && activeSlotSnapshot && !traceSnapshot &&
+      options.canonicalWinnerFilter.valid();
   std::array<uint64_t, kCurrentDrawSnapshotRecordPhaseCount>
       snapshotRecordPhaseTicks = {};
   std::array<uint32_t, kCurrentDrawSnapshotRecordPhaseCount>
@@ -3030,7 +3145,6 @@ std::vector<CurrentDrawContractRecord> SnapshotPublishedCurrentDrawContracts(
   };
 
   enterSnapshotPhase("SnapshotOutputReserve");
-  std::vector<CurrentDrawContractRecord> out;
   const size_t reserveCount =
       options.maxRecords != 0u
           ? std::min<size_t>(localSnapshotUpperBound,
@@ -3039,39 +3153,63 @@ std::vector<CurrentDrawContractRecord> SnapshotPublishedCurrentDrawContracts(
   out.reserve(reserveCount);
 
   enterSnapshotPhase("SnapshotPreferredSet");
+  const auto& preferredSelectionKeys =
+      options.preferredSelectionKeysView != nullptr
+          ? *options.preferredSelectionKeysView
+          : options.preferredSelectionKeys;
   // DirectGrouped already supplies a sorted/unique lease vector. Keep the
   // public API's arbitrary-order semantics, but use binary search for that hot
   // path instead of rebuilding a node-based hash set every semantic frame.
   // Unsorted callers retain the historical set-membership behavior.
   const bool preferredKeysSorted =
-      std::is_sorted(options.preferredSelectionKeys.begin(),
-                     options.preferredSelectionKeys.end());
+      options.preferredSelectionKeysView != nullptr &&
+          options.preferredSelectionKeysViewSortedUnique
+      ? true
+      : std::is_sorted(preferredSelectionKeys.begin(),
+                       preferredSelectionKeys.end());
   static thread_local std::unordered_set<uint64_t> s_preferredKeySet;
   s_preferredKeySet.clear();
-  if (!preferredKeysSorted && !options.preferredSelectionKeys.empty()) {
+  if (!preferredKeysSorted && !preferredSelectionKeys.empty()) {
     const size_t retainedCapacity = size_t(
         double(s_preferredKeySet.bucket_count()) *
         double(s_preferredKeySet.max_load_factor()));
-    if (retainedCapacity < options.preferredSelectionKeys.size())
-      s_preferredKeySet.reserve(options.preferredSelectionKeys.size());
-    s_preferredKeySet.insert(options.preferredSelectionKeys.begin(),
-                             options.preferredSelectionKeys.end());
+    if (retainedCapacity < preferredSelectionKeys.size())
+      s_preferredKeySet.reserve(preferredSelectionKeys.size());
+    s_preferredKeySet.insert(preferredSelectionKeys.begin(),
+                             preferredSelectionKeys.end());
   }
   const auto& preferredKeySet = s_preferredKeySet;
   const auto containsPreferredKey = [&](uint64_t key) {
     return preferredKeysSorted
-        ? std::binary_search(options.preferredSelectionKeys.begin(),
-                             options.preferredSelectionKeys.end(), key)
+        ? std::binary_search(preferredSelectionKeys.begin(),
+                             preferredSelectionKeys.end(), key)
         : preferredKeySet.find(key) != preferredKeySet.end();
   };
-  const bool hasPreferredKeys = !options.preferredSelectionKeys.empty();
+  const bool hasPreferredKeys = !preferredSelectionKeys.empty();
 
   enterSnapshotPhase("SnapshotScratchSetup");
-  // Phase 7.81：thread_local 复用 preferredVisibleKeyCache。
-  static thread_local std::unordered_map<uint64_t, uint64_t>
-      s_preferredVisibleKeyCache;
-  s_preferredVisibleKeyCache.clear();
-  auto& preferredVisibleKeyCache = s_preferredVisibleKeyCache;
+  // Sorting/top-K comparison may ask for the same part/layer identity many
+  // times. A node map charged allocation/bucket work on every snapshot and
+  // keyed only by a folded hash. Keep an exact-key, generation-tagged direct
+  // cache instead: collisions merely recompute the canonical registry query.
+  struct PreferredVisibleKeyCacheEntry {
+    void* renderablePart = nullptr;
+    uint32_t layerIndex = 0u;
+    uint64_t value = 0u;
+    uint64_t generation = 0u;
+  };
+  static constexpr size_t kPreferredVisibleKeyCacheEntries = 512u;
+  static thread_local std::array<PreferredVisibleKeyCacheEntry,
+                                 kPreferredVisibleKeyCacheEntries>
+      s_preferredVisibleKeyCache = {};
+  static thread_local uint64_t s_preferredVisibleKeyCacheGeneration = 0u;
+  uint64_t preferredVisibleKeyCacheGeneration =
+      ++s_preferredVisibleKeyCacheGeneration;
+  if (preferredVisibleKeyCacheGeneration == 0u) {
+    s_preferredVisibleKeyCache = {};
+    preferredVisibleKeyCacheGeneration =
+        ++s_preferredVisibleKeyCacheGeneration;
+  }
   const auto makePreferredKey = [](uint32_t tag, uint64_t value) -> uint64_t {
     uint64_t hash = bit::fnv1a_init();
     hash = bit::fnv1a_iter(hash, tag);
@@ -3082,18 +3220,29 @@ std::vector<CurrentDrawContractRecord> SnapshotPublishedCurrentDrawContracts(
       [&](const CurrentDrawContractRecord& record) -> uint64_t {
     if (record.renderablePart == nullptr)
       return 0u;
-    uint64_t cacheKey = bit::fnv1a_init();
-    cacheKey = bit::fnv1a_iter(
-        cacheKey, uint64_t(reinterpret_cast<uintptr_t>(record.renderablePart)));
-    cacheKey = bit::fnv1a_iter(cacheKey, record.layerIndex);
-    const auto cached = preferredVisibleKeyCache.find(cacheKey);
-    if (cached != preferredVisibleKeyCache.end())
-      return cached->second;
+    uint64_t cacheHash = bit::fnv1a_init();
+    cacheHash = bit::fnv1a_iter(
+        cacheHash,
+        uint64_t(reinterpret_cast<uintptr_t>(record.renderablePart)));
+    cacheHash = bit::fnv1a_iter(cacheHash, record.layerIndex);
+    auto& cached = s_preferredVisibleKeyCache[
+        size_t(cacheHash) & (kPreferredVisibleKeyCacheEntries - 1u)];
+    if (cached.generation == preferredVisibleKeyCacheGeneration &&
+        cached.renderablePart == record.renderablePart &&
+        cached.layerIndex == record.layerIndex) {
+      return cached.value;
+    }
 
     uint64_t key = 0u;
     VisibleRenderableRecord visible = {};
-    if (VisibleRenderableRegistry::instance().queryByRenderablePartAndLayer(
-            record.renderablePart, record.layerIndex, visible)) {
+    const auto& visibleRegistry = VisibleRenderableRegistry::instance();
+    const bool foundVisible = options.visiblePartLayerQueryCache != nullptr
+        ? options.visiblePartLayerQueryCache->query(
+              visibleRegistry, record.renderablePart, record.layerIndex,
+              visible)
+        : visibleRegistry.queryByRenderablePartAndLayer(
+              record.renderablePart, record.layerIndex, visible);
+    if (foundVisible) {
       const auto ptrValue = [](const void* ptr) -> uint64_t {
         return uint64_t(reinterpret_cast<uintptr_t>(ptr));
       };
@@ -3109,7 +3258,8 @@ std::vector<CurrentDrawContractRecord> SnapshotPublishedCurrentDrawContracts(
       else if (visible.sceneNode != nullptr)
         key = makePreferredKey(5u, ptrValue(visible.sceneNode));
     }
-    preferredVisibleKeyCache.emplace(cacheKey, key);
+    cached = {record.renderablePart, record.layerIndex, key,
+              preferredVisibleKeyCacheGeneration};
     return key;
   };
   const auto isPreferredWithIdentity =
@@ -3127,40 +3277,139 @@ std::vector<CurrentDrawContractRecord> SnapshotPublishedCurrentDrawContracts(
                                    SnapshotStableIdentityKey(record));
   };
   const auto betterRecord = [&](const CurrentDrawContractRecord& a,
-                                const CurrentDrawContractRecord& b) {
+                                 const CurrentDrawContractRecord& b) {
     const bool pa = isPreferred(a);
     const bool pb = isPreferred(b);
     if (pa != pb)
       return pa;
     return BetterSnapshotRecord(a, b, options.unitsOnly);
   };
-  // Phase 7.81：thread_local 复用 unlimitedDedupeIndex，避免每帧多次调用
-  // SnapshotPublishedCurrentDrawContracts 时反复 alloc/free + reserve(4096)。
-  static thread_local std::unordered_map<uint64_t, size_t>
-      s_unlimitedDedupeIndex;
-  s_unlimitedDedupeIndex.clear();
-  auto& unlimitedDedupeIndex = s_unlimitedDedupeIndex;
-  auto unlimitedDedupeKey = [](const CurrentDrawContractRecord& r) -> uint64_t {
-    uint64_t h = bit::fnv1a_init();
-    h = bit::fnv1a_iter(h, uint64_t(reinterpret_cast<uintptr_t>(r.renderablePart)));
-    h = bit::fnv1a_iter(h, r.layerIndex);
-    h = bit::fnv1a_iter(h, r.payloadWord108);
-    h = bit::fnv1a_iter(h, r.payloadWord11C);
-    return h;
+  struct SnapshotSortKey {
+    bool preferred = false;
+    uint32_t priority = 0u;
+    uint64_t identity = 0u;
+    uint64_t part = 0u;
+    uint64_t visibleFrameSerial = 0u;
+    uint32_t renderFrameIndex = 0u;
+    uint64_t captureSerial = 0u;
+    size_t sourceIndex = 0u;
   };
-  if (options.maxRecords == 0u)
-    unlimitedDedupeIndex.reserve(kContractCacheSize);
-
-  static thread_local std::unordered_map<
-      CurrentDrawSnapshotPartKey, size_t, CurrentDrawSnapshotPartKeyHash>
-      s_batchedBoundedDedupeIndex;
-  s_batchedBoundedDedupeIndex.clear();
-  auto& batchedBoundedDedupeIndex = s_batchedBoundedDedupeIndex;
-  if (batchedBoundedSnapshot)
-    batchedBoundedDedupeIndex.reserve(kContractCacheSize);
+  const auto makeSortKey = [&](const CurrentDrawContractRecord& record,
+                               size_t sourceIndex) {
+    const uint64_t identity = SnapshotStableIdentityKey(record);
+    return SnapshotSortKey{
+        isPreferredWithIdentity(record, identity),
+        SnapshotPriorityOf(record, options.unitsOnly),
+        identity,
+        SnapshotStablePartKey(record),
+        record.visibleFrameSerial,
+        record.renderFrameIndex,
+        record.captureSerial,
+        sourceIndex,
+    };
+  };
+  const auto sortKeyLess = [](const SnapshotSortKey& a,
+                              const SnapshotSortKey& b) {
+    if (a.preferred != b.preferred)
+      return a.preferred;
+    if (a.priority != b.priority)
+      return a.priority > b.priority;
+    if (a.identity != b.identity)
+      return a.identity < b.identity;
+    if (a.part != b.part)
+      return a.part < b.part;
+    if (a.visibleFrameSerial != b.visibleFrameSerial)
+      return a.visibleFrameSerial > b.visibleFrameSerial;
+    if (a.renderFrameIndex != b.renderFrameIndex)
+      return a.renderFrameIndex > b.renderFrameIndex;
+    if (a.captureSerial != b.captureSerial)
+      return a.captureSerial > b.captureSerial;
+    return a.sourceIndex < b.sourceIndex;
+  };
+  static thread_local std::vector<SnapshotSortKey> s_sortKeys;
+  // The cache is thread-local and the whole snapshot is synchronous, so an
+  // ascending slot index remains stable until this function returns. Retain
+  // only those scalar indexes; copying the large record here would recreate
+  // the very SnapshotPreselect cost this route removes.
+  static thread_local std::vector<size_t> s_deferredWinnerSlots;
+  s_deferredWinnerSlots.clear();
+  // Unlimited and batched-bounded snapshots both need the same exact
+  // part-slice dedupe semantics. A generation-tagged fixed index avoids the
+  // per-snapshot unordered_map clear/node work and also removes the old
+  // unlimited path's folded-hash-as-identity collision risk.
+  static thread_local std::array<CurrentDrawSnapshotDedupeIndexEntry,
+                                 kCurrentDrawSnapshotDedupeIndexSize>
+      s_snapshotDedupeIndex = {};
+  static thread_local uint64_t s_snapshotDedupeIndexGeneration = 0u;
+  uint64_t snapshotDedupeIndexGeneration =
+      ++s_snapshotDedupeIndexGeneration;
+  if (snapshotDedupeIndexGeneration == 0u) {
+    s_snapshotDedupeIndex = {};
+    snapshotDedupeIndexGeneration = ++s_snapshotDedupeIndexGeneration;
+  }
+  bool snapshotDedupeIndexOverflowed = false;
+  const auto snapshotDedupeKey = [](const CurrentDrawContractRecord& record) {
+    return CurrentDrawSnapshotPartKey{
+        uintptr_t(record.renderablePart), record.layerIndex,
+        record.payloadWord108, record.payloadWord11C};
+  };
+  const auto findSnapshotDedupeIndex =
+      [&](const CurrentDrawSnapshotPartKey& key) -> size_t {
+    const size_t first = CurrentDrawSnapshotPartKeyHash{}(key) &
+        (kCurrentDrawSnapshotDedupeIndexSize - 1u);
+    for (size_t probe = 0u;
+         probe < kCurrentDrawSnapshotDedupeIndexSize; ++probe) {
+      const auto& entry = s_snapshotDedupeIndex[
+          (first + probe) & (kCurrentDrawSnapshotDedupeIndexSize - 1u)];
+      if (entry.generation != snapshotDedupeIndexGeneration)
+        return std::numeric_limits<size_t>::max();
+      if (entry.key == key)
+        return entry.recordIndex;
+    }
+    return std::numeric_limits<size_t>::max();
+  };
+  const auto storeSnapshotDedupeIndex =
+      [&](const CurrentDrawSnapshotPartKey& key, size_t recordIndex) {
+    const size_t first = CurrentDrawSnapshotPartKeyHash{}(key) &
+        (kCurrentDrawSnapshotDedupeIndexSize - 1u);
+    for (size_t probe = 0u;
+         probe < kCurrentDrawSnapshotDedupeIndexSize; ++probe) {
+      auto& entry = s_snapshotDedupeIndex[
+          (first + probe) & (kCurrentDrawSnapshotDedupeIndexSize - 1u)];
+      if (entry.generation != snapshotDedupeIndexGeneration ||
+          entry.key == key) {
+        entry = {key, recordIndex, snapshotDedupeIndexGeneration};
+        return true;
+      }
+    }
+    return false;
+  };
+  const auto findSnapshotDedupeLinear =
+      [&](const CurrentDrawSnapshotPartKey& key) -> size_t {
+    if (deferredCanonicalWinnerFilter) {
+      const auto duplicate = std::find_if(
+          s_deferredWinnerSlots.begin(), s_deferredWinnerSlots.end(),
+          [&](size_t slot) {
+            return slot < g_currentDrawContractCache.size() &&
+                snapshotDedupeKey(g_currentDrawContractCache[slot]) == key;
+          });
+      return duplicate != s_deferredWinnerSlots.end()
+          ? size_t(std::distance(s_deferredWinnerSlots.begin(), duplicate))
+          : std::numeric_limits<size_t>::max();
+    }
+    const auto duplicate = std::find_if(
+        out.begin(), out.end(), [&](const CurrentDrawContractRecord& existing) {
+          return snapshotDedupeKey(existing) == key;
+        });
+    return duplicate != out.end()
+        ? size_t(std::distance(out.begin(), duplicate))
+        : std::numeric_limits<size_t>::max();
+  };
 
   enterSnapshotPhase("SnapshotRecordPolicySetup");
-  auto considerRecord = [&](const CurrentDrawContractRecord& record) {
+  const size_t invalidLocalSlot = std::numeric_limits<size_t>::max();
+  auto considerRecord = [&](const CurrentDrawContractRecord& record,
+                            size_t localSlot) {
     const bool traceRecord = traceActiveSlotRecords &&
         SampleCurrentDrawSnapshotRecord(snapshotTracePeriod);
     CurrentDrawSnapshotRecordRawTiming recordTiming(
@@ -3178,14 +3427,34 @@ std::vector<CurrentDrawContractRecord> SnapshotPublishedCurrentDrawContracts(
       return;
     if (batchedBoundedSnapshot) {
       recordTiming.enter(CurrentDrawSnapshotRecordPhase::DedupeKey);
-      const CurrentDrawSnapshotPartKey dedupeKey = {
-          uintptr_t(record.renderablePart), record.layerIndex,
-          record.payloadWord108, record.payloadWord11C};
+      const CurrentDrawSnapshotPartKey dedupeKey = snapshotDedupeKey(record);
       recordTiming.enter(CurrentDrawSnapshotRecordPhase::DedupeLookup);
-      const auto duplicate = batchedBoundedDedupeIndex.find(dedupeKey);
-      if (duplicate != batchedBoundedDedupeIndex.end() &&
-          duplicate->second < out.size()) {
-        CurrentDrawContractRecord& existing = out[duplicate->second];
+      size_t duplicateIndex = findSnapshotDedupeIndex(dedupeKey);
+      if (duplicateIndex == std::numeric_limits<size_t>::max() &&
+          snapshotDedupeIndexOverflowed) {
+        duplicateIndex = findSnapshotDedupeLinear(dedupeKey);
+      }
+      if (deferredCanonicalWinnerFilter) {
+        if (duplicateIndex < s_deferredWinnerSlots.size()) {
+          const size_t existingSlot = s_deferredWinnerSlots[duplicateIndex];
+          const auto& existing = g_currentDrawContractCache[existingSlot];
+          recordTiming.enter(CurrentDrawSnapshotRecordPhase::DuplicateCompare);
+          if (betterRecord(record, existing)) {
+            recordTiming.enter(CurrentDrawSnapshotRecordPhase::DuplicateReplace);
+            s_deferredWinnerSlots[duplicateIndex] = localSlot;
+          }
+          return;
+        }
+        recordTiming.enter(CurrentDrawSnapshotRecordPhase::IndexPublish);
+        if (!storeSnapshotDedupeIndex(dedupeKey,
+                                      s_deferredWinnerSlots.size()))
+          snapshotDedupeIndexOverflowed = true;
+        recordTiming.enter(CurrentDrawSnapshotRecordPhase::RecordAppend);
+        s_deferredWinnerSlots.push_back(localSlot);
+        return;
+      }
+      if (duplicateIndex < out.size()) {
+        CurrentDrawContractRecord& existing = out[duplicateIndex];
         recordTiming.enter(CurrentDrawSnapshotRecordPhase::DuplicateCompare);
         if (betterRecord(record, existing)) {
           recordTiming.enter(CurrentDrawSnapshotRecordPhase::DuplicateReplace);
@@ -3194,19 +3463,23 @@ std::vector<CurrentDrawContractRecord> SnapshotPublishedCurrentDrawContracts(
         return;
       }
       recordTiming.enter(CurrentDrawSnapshotRecordPhase::IndexPublish);
-      batchedBoundedDedupeIndex.emplace(dedupeKey, out.size());
+      if (!storeSnapshotDedupeIndex(dedupeKey, out.size()))
+        snapshotDedupeIndexOverflowed = true;
       recordTiming.enter(CurrentDrawSnapshotRecordPhase::RecordAppend);
       out.push_back(SnapshotRecordWithGrace(record));
       return;
     }
     if (options.maxRecords == 0u) {
       recordTiming.enter(CurrentDrawSnapshotRecordPhase::DedupeKey);
-      const uint64_t dedupeKey = unlimitedDedupeKey(record);
+      const CurrentDrawSnapshotPartKey dedupeKey = snapshotDedupeKey(record);
       recordTiming.enter(CurrentDrawSnapshotRecordPhase::DedupeLookup);
-      const auto duplicate = unlimitedDedupeIndex.find(dedupeKey);
-      if (duplicate != unlimitedDedupeIndex.end() &&
-          duplicate->second < out.size()) {
-        CurrentDrawContractRecord& existing = out[duplicate->second];
+      size_t duplicateIndex = findSnapshotDedupeIndex(dedupeKey);
+      if (duplicateIndex == std::numeric_limits<size_t>::max() &&
+          snapshotDedupeIndexOverflowed) {
+        duplicateIndex = findSnapshotDedupeLinear(dedupeKey);
+      }
+      if (duplicateIndex < out.size()) {
+        CurrentDrawContractRecord& existing = out[duplicateIndex];
         recordTiming.enter(CurrentDrawSnapshotRecordPhase::DuplicateCompare);
         const bool replaceExisting = betterRecord(record, existing);
         if (replaceExisting) {
@@ -3216,7 +3489,8 @@ std::vector<CurrentDrawContractRecord> SnapshotPublishedCurrentDrawContracts(
         return;
       }
       recordTiming.enter(CurrentDrawSnapshotRecordPhase::IndexPublish);
-      unlimitedDedupeIndex.emplace(dedupeKey, out.size());
+      if (!storeSnapshotDedupeIndex(dedupeKey, out.size()))
+        snapshotDedupeIndexOverflowed = true;
       recordTiming.enter(CurrentDrawSnapshotRecordPhase::RecordAppend);
       out.push_back(SnapshotRecordWithGrace(record));
       return;
@@ -3261,13 +3535,13 @@ std::vector<CurrentDrawContractRecord> SnapshotPublishedCurrentDrawContracts(
         const uint32_t bitIndex = uint32_t(__builtin_ctzll(occupied));
         const size_t slot = (wordIndex << 6u) + bitIndex;
         if (slot < g_currentDrawContractCache.size())
-          considerRecord(g_currentDrawContractCache[slot]);
+          considerRecord(g_currentDrawContractCache[slot], slot);
         occupied &= occupied - 1u;
       }
     }
   } else {
-    for (const auto& record : g_currentDrawContractCache)
-      considerRecord(record);
+    for (size_t slot = 0u; slot < g_currentDrawContractCache.size(); ++slot)
+      considerRecord(g_currentDrawContractCache[slot], slot);
   }
   traceActiveSlotRecords = false;
 
@@ -3304,65 +3578,65 @@ std::vector<CurrentDrawContractRecord> SnapshotPublishedCurrentDrawContracts(
         options.readyOnly ? g_publishedCurrentDrawReadyByPart
                           : g_publishedCurrentDrawByPart;
     for (const auto& [_, record] : source)
-      considerRecord(record);
+      considerRecord(record, invalidLocalSlot);
   }
 
   if (batchedBoundedSnapshot) {
     enterSnapshotPhase("SnapshotBatchedOrder");
+    if (deferredCanonicalWinnerFilter) {
+      s_sortKeys.clear();
+      s_sortKeys.reserve(s_deferredWinnerSlots.size());
+      for (size_t i = 0u; i < s_deferredWinnerSlots.size(); ++i) {
+        const size_t slot = s_deferredWinnerSlots[i];
+        s_sortKeys.push_back(
+            makeSortKey(g_currentDrawContractCache[slot], i));
+      }
+      std::sort(s_sortKeys.begin(), s_sortKeys.end(), sortKeyLess);
+
+      uint32_t canonicalLayerNonZeroCount = 0u;
+      const auto outcome = MaterializeCurrentDrawCanonicalWinnerPrefix(
+          s_sortKeys, size_t(options.maxRecords),
+          [&](const SnapshotSortKey& key)
+              -> const CurrentDrawContractRecord& {
+            return g_currentDrawContractCache[
+                s_deferredWinnerSlots[key.sourceIndex]];
+          },
+          [&](const CurrentDrawContractRecord& record) {
+            if (record.layerIndex != 0u)
+              canonicalLayerNonZeroCount++;
+          },
+          [&](const CurrentDrawContractRecord& record) {
+            return options.canonicalWinnerFilter.accepts(record);
+          },
+          [&](const CurrentDrawContractRecord& record) {
+            out.push_back(SnapshotRecordWithGrace(record));
+          });
+      if (options.summary != nullptr) {
+        options.summary->canonicalWinnerCount = outcome.canonicalWinnerCount;
+        options.summary->filteredCanonicalWinnerCount =
+            outcome.filteredWinnerCount;
+        options.summary->canonicalLayerNonZeroCount =
+            canonicalLayerNonZeroCount;
+        options.summary->canonicalWinnerFilterApplied = true;
+      }
+      enterSnapshotPhase("SnapshotFinalize");
+      return;
+    }
     if (out.size() > 1u) {
     // The old stable_sort comparator recomputed preferred membership,
     // priority and three stable hashes O(N log N) times. Decorate every
     // immutable snapshot record once, sort the compact keys, then copy records
     // in key order. sourceIndex is the final ascending tie-break, which is
     // exactly stable_sort's input-order rule for otherwise equivalent keys.
-    struct SnapshotSortKey {
-      bool preferred = false;
-      uint32_t priority = 0u;
-      uint64_t identity = 0u;
-      uint64_t part = 0u;
-      uint64_t visibleFrameSerial = 0u;
-      uint32_t renderFrameIndex = 0u;
-      uint64_t captureSerial = 0u;
-      size_t sourceIndex = 0u;
-    };
-    static thread_local std::vector<SnapshotSortKey> s_sortKeys;
     static thread_local std::vector<CurrentDrawContractRecord>
         s_sortedSnapshotScratch;
     s_sortKeys.clear();
     s_sortKeys.reserve(out.size());
     for (size_t i = 0u; i < out.size(); ++i) {
       const auto& record = out[i];
-      const uint64_t identity = SnapshotStableIdentityKey(record);
-      s_sortKeys.push_back({
-          isPreferredWithIdentity(record, identity),
-          SnapshotPriorityOf(record, options.unitsOnly),
-          identity,
-          SnapshotStablePartKey(record),
-          record.visibleFrameSerial,
-          record.renderFrameIndex,
-          record.captureSerial,
-          i,
-      });
+      s_sortKeys.push_back(makeSortKey(record, i));
     }
-    std::sort(
-        s_sortKeys.begin(), s_sortKeys.end(),
-        [](const SnapshotSortKey& a, const SnapshotSortKey& b) {
-          if (a.preferred != b.preferred)
-            return a.preferred;
-          if (a.priority != b.priority)
-            return a.priority > b.priority;
-          if (a.identity != b.identity)
-            return a.identity < b.identity;
-          if (a.part != b.part)
-            return a.part < b.part;
-          if (a.visibleFrameSerial != b.visibleFrameSerial)
-            return a.visibleFrameSerial > b.visibleFrameSerial;
-          if (a.renderFrameIndex != b.renderFrameIndex)
-            return a.renderFrameIndex > b.renderFrameIndex;
-          if (a.captureSerial != b.captureSerial)
-            return a.captureSerial > b.captureSerial;
-          return a.sourceIndex < b.sourceIndex;
-        });
+    std::sort(s_sortKeys.begin(), s_sortKeys.end(), sortKeyLess);
 
     s_sortedSnapshotScratch.clear();
     s_sortedSnapshotScratch.reserve(out.size());
@@ -3374,8 +3648,17 @@ std::vector<CurrentDrawContractRecord> SnapshotPublishedCurrentDrawContracts(
       out.resize(size_t(options.maxRecords));
   }
 
+  if (options.summary != nullptr) {
+    options.summary->canonicalWinnerCount = uint32_t(out.size());
+    options.summary->filteredCanonicalWinnerCount = 0u;
+    options.summary->canonicalLayerNonZeroCount = uint32_t(std::count_if(
+        out.begin(), out.end(), [](const CurrentDrawContractRecord& record) {
+          return record.layerIndex != 0u;
+        }));
+    options.summary->canonicalWinnerFilterApplied = false;
+  }
+
   enterSnapshotPhase("SnapshotFinalize");
-  return out;
 }
 
 CurrentDrawResolveStatus ResolveCurrentDrawAuthoritativeSample(
@@ -3383,7 +3666,7 @@ CurrentDrawResolveStatus ResolveCurrentDrawAuthoritativeSample(
     uint32_t vertexCount,
     uint64_t expectedVisibleFrameSerial,
     CurrentDrawAuthoritativeSample& out) {
-  out = {};
+  ResetCurrentDrawAuthoritativeSamplePreserveScratch(out);
   if (!QueryCurrentDrawContract(renderablePart, out.contract)) {
     out.status = CurrentDrawResolveStatus::MissingContract;
     return out.status;
@@ -3393,19 +3676,16 @@ CurrentDrawResolveStatus ResolveCurrentDrawAuthoritativeSample(
       out.contract.visibleFrameSerial < expectedVisibleFrameSerial) {
     g_lastMissReason.store(uint32_t(CurrentDrawMissReason::StaleVisibleFrame),
                            std::memory_order_relaxed);
-    out = {};
+    ResetCurrentDrawAuthoritativeSamplePreserveScratch(out);
     out.status = CurrentDrawResolveStatus::StaleVisibleFrame;
     return out.status;
   }
 
   QueryCurrentDrawContractCapturedPalette(renderablePart, out.palette,
-                                          out.paletteCount);
+                                          out.paletteCount, &out.paletteHash);
   if (out.paletteCount != 0u && out.palette.size() >= out.paletteCount) {
     if (out.palette.size() > out.paletteCount)
       out.palette.resize(out.paletteCount);
-    out.paletteHash =
-        bit::fnv1a_hash(reinterpret_cast<const uint8_t*>(out.palette.data()),
-                        out.palette.size() * sizeof(Matrix4));
     // Phase 1：从 thread-local snapshot 读取 provenance。
     const PaletteSnapshotEntry* snapshot =
         FindLocalPaletteSnapshot(renderablePart);
@@ -3419,13 +3699,12 @@ CurrentDrawResolveStatus ResolveCurrentDrawAuthoritativeSample(
   }
 
   if (!DecodeCurrentDrawGroupSlots(out.contract, vertexCount, out.paletteCount,
-                                   out.groupSlots, out.groupHash)) {
+                                   out.groupSlots, out.groupHash,
+                                   out.stableGroupHash, out.maxGroupSlot)) {
     out.status = CurrentDrawResolveStatus::MissingGroupSlots;
     return out.status;
   }
 
-  out.stableGroupHash =
-      ComputeStableGroupContentHash(out.contract, out.groupSlots);
   out.status = CurrentDrawResolveStatus::Ready;
   return out.status;
 }
@@ -3436,12 +3715,11 @@ CurrentDrawResolveStatus ResolveCurrentDrawAuthoritativeSampleFromRecord(
     uint64_t expectedVisibleFrameSerial,
     CurrentDrawAuthoritativeSample& out,
     const CurrentDrawResolveTrace* trace,
-    const CurrentDrawRangeValidator* rangeValidator) {
-  out = {};
+    const CurrentDrawRangeValidator* rangeValidator,
+    const CurrentDrawImmutableGroupSlotHint* immutableGroupSlotHint) {
+  ResetCurrentDrawAuthoritativeSamplePreserveScratch(out);
   out.contract = record;
-  out.contract.known =
-      record.known || (record.renderablePart != nullptr &&
-                       record.meshPayloadPtr != nullptr);
+  out.contract.known = CurrentDrawContractHasCanonicalIdentity(record);
   if (!out.contract.known) {
     out.status = CurrentDrawResolveStatus::MissingContract;
     return out.status;
@@ -3452,7 +3730,7 @@ CurrentDrawResolveStatus ResolveCurrentDrawAuthoritativeSampleFromRecord(
       out.contract.visibleFrameSerial < expectedVisibleFrameSerial) {
     g_lastMissReason.store(uint32_t(CurrentDrawMissReason::StaleVisibleFrame),
                            std::memory_order_relaxed);
-    out = {};
+    ResetCurrentDrawAuthoritativeSamplePreserveScratch(out);
     out.status = CurrentDrawResolveStatus::StaleVisibleFrame;
     return out.status;
   }
@@ -3460,15 +3738,12 @@ CurrentDrawResolveStatus ResolveCurrentDrawAuthoritativeSampleFromRecord(
   if (trace != nullptr)
     trace->note(CurrentDrawResolveTracePhase::PaletteDecode);
   DecodeCapturedPaletteForRecord(out.contract, out.palette, out.paletteCount,
-                                 true);
+                                 true, &out.paletteHash);
   if (out.paletteCount != 0u && out.palette.size() >= out.paletteCount) {
     if (out.palette.size() > out.paletteCount)
       out.palette.resize(out.paletteCount);
     if (trace != nullptr)
       trace->note(CurrentDrawResolveTracePhase::PaletteHash);
-    out.paletteHash =
-        bit::fnv1a_hash(reinterpret_cast<const uint8_t*>(out.palette.data()),
-                        out.palette.size() * sizeof(Matrix4));
   }
 
   if (!out.paletteReady()) {
@@ -3479,16 +3754,15 @@ CurrentDrawResolveStatus ResolveCurrentDrawAuthoritativeSampleFromRecord(
   if (trace != nullptr)
     trace->note(CurrentDrawResolveTracePhase::GroupGate);
   if (!DecodeCurrentDrawGroupSlots(out.contract, vertexCount, out.paletteCount,
-                                   out.groupSlots, out.groupHash, trace,
-                                   rangeValidator)) {
+                                   out.groupSlots, out.groupHash,
+                                   out.stableGroupHash, out.maxGroupSlot, trace,
+                                   rangeValidator,
+                                   immutableGroupSlotHint,
+                                   &out.groupSlotsBorrowedFromImmutableHint)) {
     out.status = CurrentDrawResolveStatus::MissingGroupSlots;
     return out.status;
   }
 
-  if (trace != nullptr)
-    trace->note(CurrentDrawResolveTracePhase::StableHash);
-  out.stableGroupHash =
-      ComputeStableGroupContentHash(out.contract, out.groupSlots);
   out.status = CurrentDrawResolveStatus::Ready;
   return out.status;
 }

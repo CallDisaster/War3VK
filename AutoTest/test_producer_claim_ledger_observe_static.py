@@ -18,15 +18,22 @@ PERF_CPP = (ROOT / "src/d3d9/war3/tools/war3_perf_monitor.cpp").read_text(
 
 class ProducerClaimLedgerObserveContracts(unittest.TestCase):
     def test_release_default_is_off_and_consume_is_denied(self) -> None:
-        self.assertIn(
-            'War3GetEnvU32("DXVK_WAR3_SEMANTIC_PRODUCER_CLAIM_LEDGER", 0u)',
-            DEVICE,
-        )
         mode = DEVICE[
             DEVICE.index("enum class War3ProducerClaimObserveMode") :
             DEVICE.index("inline bool War3LegacyPerDrawSemanticScopesRuntime")
         ]
+        self.assertIn(
+            '"DXVK_WAR3_SEMANTIC_PRODUCER_CLAIM_LEDGER", 0u', mode
+        )
         self.assertIn("Consume = 2u", mode)
+        self.assertIn("kDevelopmentShadowObserversEnabled", mode)
+        self.assertIn("ParseShadowObserverBuildMode", mode)
+        runtime = mode[
+            mode.index("War3ProducerClaimObserveModeRuntime") :
+        ]
+        self.assertIn("War3ProducerClaimObserveMode::Observe", runtime)
+        self.assertIn("War3ProducerClaimObserveMode::Off", runtime)
+        self.assertNotIn("War3ProducerClaimObserveMode::Consume", runtime)
         direct = DEVICE[DEVICE.index("producerClaimObserveMode =") :]
         direct = direct[: direct.index("m_war3CompactWorkTable.reset")]
         self.assertIn("semanticSceneProducerClaimConsumeDeniedCount++", direct)

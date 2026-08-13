@@ -165,6 +165,47 @@ struct ShadowPoseFullTraceStatus {
   std::string path;
 };
 
+// Compact, by-value snapshot for the per-frame GPU flight recorder.  The full
+// bridge summary contains hundreds of unrelated counters and is reserved for
+// low-frequency control-plane queries.
+struct ShadowProducerRuntimeDiagnostics {
+  uint64_t producerSealFrameSerial = 0;
+  uint64_t producerSealMapEpoch = 0;
+  uint64_t producerSealDeviceEpoch = 0;
+  uint64_t producerRequiredCasterOmissionCount = 0;
+  uint64_t producerExactBudgetDeferredUniqueCasterCount = 0;
+  uint64_t producerPositionAllocBudgetCount = 0;
+  uint64_t producerUvAllocBudgetCount = 0;
+  uint64_t producerIndexAllocBudgetCount = 0;
+  uint64_t producerAllocationFailureCount = 0;
+  uint64_t producerFallbackByteBudgetCount = 0;
+  uint64_t producerArenaAdmissionCount = 0;
+  uint64_t producerFreezeFailureCount = 0;
+  uint64_t producerSoftPriorityBudgetCount = 0;
+  uint64_t producerCompletenessReasonMask = 0;
+  uint64_t producerCompletenessSealed = 0;
+  uint64_t producerCompletenessCounterOverflow = 0;
+  uint64_t drawTimeVBCacheStaticLiveBytes = 0;
+  uint64_t drawTimeVBCacheStaticProtectedBytes = 0;
+  uint64_t drawTimeVBCacheStaticOverCapBytes = 0;
+  uint64_t drawTimeVBCacheStaticOverCapFrameCount = 0;
+  uint64_t drawTimeVBCacheStaticEvictedBytes = 0;
+  uint64_t drawTimeVBCacheStaticEvictedEntryCount = 0;
+  uint64_t drawTimeSnapshotPageResidentBytes = 0;
+  uint64_t drawTimeSnapshotPageUsedBytes = 0;
+  uint64_t drawTimeSnapshotPageCreateCount = 0;
+  uint64_t drawTimeSnapshotSuballocationCount = 0;
+  uint64_t drawTimeSnapshotSuballocationBytes = 0;
+  uint64_t drawTimeSnapshotPageReclaimedCount = 0;
+  uint64_t drawTimeSnapshotPageCapacityRejectCount = 0;
+  uint64_t drawTimeSnapshotPageAllocationFailureCount = 0;
+  uint64_t drawTimeVBCacheIndexedUnknownRangeFallbackCount = 0;
+  uint64_t drawTimeGenerationBackedPositionReuseCount = 0;
+  uint64_t drawTimeGenerationBackedUvReuseCount = 0;
+  uint64_t drawTimeGenerationBackedIndexReuseCount = 0;
+  uint64_t drawTimeGenerationBackedCopyBytesSaved = 0;
+};
+
 struct ShadowRuntimeBridgeSummary {
   uint64_t runtimeChildLinkBuildCount = 0;
   uint64_t runtimeChildLinkBuiltChildCount = 0;
@@ -979,6 +1020,41 @@ struct ShadowRuntimeBridgeSummary {
   uint64_t semanticSceneReplayDrawsCount = 0;
   uint64_t semanticSceneShadowMapDrawnCasters = 0;
   uint64_t semanticSceneShadowMapCascadeCulledCount = 0;
+  uint64_t producerSealFrameSerial = 0;
+  uint64_t producerSealMapEpoch = 0;
+  uint64_t producerSealDeviceEpoch = 0;
+  uint64_t producerRequiredCasterOmissionCount = 0;
+  uint64_t producerExactBudgetDeferredUniqueCasterCount = 0;
+  uint64_t producerPositionAllocBudgetCount = 0;
+  uint64_t producerUvAllocBudgetCount = 0;
+  uint64_t producerIndexAllocBudgetCount = 0;
+  uint64_t producerAllocationFailureCount = 0;
+  uint64_t producerFallbackByteBudgetCount = 0;
+  uint64_t producerArenaAdmissionCount = 0;
+  uint64_t producerFreezeFailureCount = 0;
+  uint64_t producerSoftPriorityBudgetCount = 0;
+  uint64_t producerCompletenessReasonMask = 0;
+  uint64_t producerCompletenessSealed = 0;
+  uint64_t producerCompletenessCounterOverflow = 0;
+  uint64_t drawTimeVBCacheStaticLiveBytes = 0;
+  uint64_t drawTimeVBCacheStaticProtectedBytes = 0;
+  uint64_t drawTimeVBCacheStaticOverCapBytes = 0;
+  uint64_t drawTimeVBCacheStaticOverCapFrameCount = 0;
+  uint64_t drawTimeVBCacheStaticEvictedBytes = 0;
+  uint64_t drawTimeVBCacheStaticEvictedEntryCount = 0;
+  uint64_t drawTimeSnapshotPageResidentBytes = 0;
+  uint64_t drawTimeSnapshotPageUsedBytes = 0;
+  uint64_t drawTimeSnapshotPageCreateCount = 0;
+  uint64_t drawTimeSnapshotSuballocationCount = 0;
+  uint64_t drawTimeSnapshotSuballocationBytes = 0;
+  uint64_t drawTimeSnapshotPageReclaimedCount = 0;
+  uint64_t drawTimeSnapshotPageCapacityRejectCount = 0;
+  uint64_t drawTimeSnapshotPageAllocationFailureCount = 0;
+  uint64_t drawTimeVBCacheIndexedUnknownRangeFallbackCount = 0;
+  uint64_t drawTimeGenerationBackedPositionReuseCount = 0;
+  uint64_t drawTimeGenerationBackedUvReuseCount = 0;
+  uint64_t drawTimeGenerationBackedIndexReuseCount = 0;
+  uint64_t drawTimeGenerationBackedCopyBytesSaved = 0;
   uint64_t semanticSceneTerrainBoundsCullMode = 0;
   uint64_t semanticSceneTerrainBoundsCandidateCount = 0;
   uint64_t semanticSceneTerrainBoundsProofAcceptedCount = 0;
@@ -2372,6 +2448,9 @@ void NoteFinalShadowCasterFrame(
 void NoteCurrentDrawSnapshotFrame(
     const std::vector<CurrentDrawContractRecord>& records,
     uint64_t frameSerial);
+// Lock-free render-thread probe used to keep full CurrentDraw trace snapshots
+// byte-for-byte complete. It performs no trace initialization or I/O.
+bool ShadowPoseFullTraceFastEnabledForRenderThread() noexcept;
 void StartShadowPoseFullTrace(uint32_t maxSeconds = 15u,
                               bool includeMatrixBytes = false,
                               uint32_t maxPoseRecords = 0u,
@@ -2397,6 +2476,7 @@ void NoteShadowRuntimeSpriteFramePose(void* runtimeModelPtr, void* spritePtr,
 
 ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
     bool refreshSemanticFrameIfStale = false);
+ShadowProducerRuntimeDiagnostics QueryShadowProducerRuntimeDiagnostics();
 ShadowRuntimeBridgeTrackingDecision ComputeShadowRuntimeBridgeTracking();
 void FinalizeWorldObjectsPhase1PreviousFrameWithoutNewDecision() noexcept;
 void ResetShadowRuntimeBridgeState();

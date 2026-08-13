@@ -523,12 +523,12 @@ bool BackfillVisibleUnitGeosetBindingFromCache(ShadowRenderableRecord& record) {
     return false;
 
   auto& resourceCache = model::ShadowModelResourceCache::instance();
-  model::ShadowGeosetResourceRecord geoset = {};
+  model::ShadowReadyGeosetBinding geoset = {};
   if (!((record.runtimeGeosetPtr != nullptr &&
-         resourceCache.findGeosetByPtr(record.runtimeGeosetPtr, geoset) &&
-         geoset.readyForShadowConsumer()) ||
-        (resourceCache.findGeosetByData(record.runtimeGeosetDataPtr, geoset) &&
-         geoset.readyForShadowConsumer()))) {
+         resourceCache.findReadyGeosetBindingByPtr(
+             record.runtimeGeosetPtr, geoset)) ||
+        resourceCache.findReadyGeosetBindingByData(
+            record.runtimeGeosetDataPtr, geoset))) {
     return false;
   }
 
@@ -545,17 +545,15 @@ bool BackfillVisibleUnitGeosetBindingFromCache(ShadowRenderableRecord& record) {
   return true;
 }
 
-void MaybePublishVisibleUnitGeosetBinding(ShadowRenderableRecord& record) {
+bool TryPublishMissingVisibleUnitGeosetBinding(
+    ShadowRenderableRecord& record) {
   if (!IsContractUnitCandidate(record))
-    return;
+    return false;
   if (record.runtimeModelPtr == nullptr ||
       record.runtimeGeosetDataPtr == nullptr ||
       record.geosetIndex == model::kInvalidShadowGeosetIndex) {
-    return;
+    return false;
   }
-
-  if (BackfillVisibleUnitGeosetBindingFromCache(record))
-    return;
 
   // This is intentionally a demand-fill, not a per-frame refresh.  The current
   // visible render path often exposes CGeosetData* directly at renderable+0x0C;
@@ -567,7 +565,7 @@ void MaybePublishVisibleUnitGeosetBinding(ShadowRenderableRecord& record) {
       record.runtimeModelPtr, record.geosetIndex, record.runtimeGeosetPtr,
       record.runtimeGeosetDataPtr, record.modelResourcePtr, record.modelKey);
 
-  BackfillVisibleUnitGeosetBindingFromCache(record);
+  return BackfillVisibleUnitGeosetBindingFromCache(record);
 }
 
 void DemandFillVisibleUnitGeosetBindings(ShadowFrameManifest& manifest) {
@@ -575,18 +573,23 @@ void DemandFillVisibleUnitGeosetBindings(ShadowFrameManifest& manifest) {
       "War3SemanticScene/CaptureContract/VisibleGeosetDemandFill");
   constexpr uint32_t kMaxDemandFillPerCapture = 64u;
   static std::atomic<uint64_t> s_demandFillCursor{0u};
-  std::unordered_set<void*> seenMissingGeosetData;
+  std::array<void*, kMaxDemandFillPerCapture> seenMissingGeosetData = {};
+  size_t seenMissingCount = 0u;
   uint32_t capturedThisFrame = 0u;
   if (manifest.records.empty())
     return;
 
   const size_t recordCount = manifest.records.size();
+  // A byte per manifest record avoids repeating a successful scalar binding
+  // lookup in the final repair sweep. No pointer or identity crosses frames.
+  std::vector<uint8_t> readyBinding(recordCount, uint8_t(0u));
   const size_t startIndex =
       size_t(s_demandFillCursor.fetch_add(1u, std::memory_order_relaxed) %
              uint64_t(recordCount));
 
   for (size_t offset = 0u; offset < recordCount; ++offset) {
-    auto& record = manifest.records[(startIndex + offset) % recordCount];
+    const size_t recordIndex = (startIndex + offset) % recordCount;
+    auto& record = manifest.records[recordIndex];
     if (!IsContractUnitCandidate(record))
       continue;
     if (record.runtimeModelPtr == nullptr ||
@@ -594,19 +597,30 @@ void DemandFillVisibleUnitGeosetBindings(ShadowFrameManifest& manifest) {
         record.geosetIndex == model::kInvalidShadowGeosetIndex) {
       continue;
     }
-    if (BackfillVisibleUnitGeosetBindingFromCache(record))
+    if (BackfillVisibleUnitGeosetBindingFromCache(record)) {
+      readyBinding[recordIndex] = uint8_t(1u);
       continue;
-    if (!seenMissingGeosetData.insert(record.runtimeGeosetDataPtr).second)
-      continue;
+    }
     if (capturedThisFrame >= kMaxDemandFillPerCapture)
       continue;
 
-    MaybePublishVisibleUnitGeosetBinding(record);
+    const auto seenEnd = seenMissingGeosetData.begin() + seenMissingCount;
+    if (std::find(seenMissingGeosetData.begin(), seenEnd,
+                  record.runtimeGeosetDataPtr) != seenEnd) {
+      continue;
+    }
+    seenMissingGeosetData[seenMissingCount++] =
+        record.runtimeGeosetDataPtr;
+
+    if (TryPublishMissingVisibleUnitGeosetBinding(record))
+      readyBinding[recordIndex] = uint8_t(1u);
     ++capturedThisFrame;
   }
 
-  for (auto& record : manifest.records)
-    BackfillVisibleUnitGeosetBindingFromCache(record);
+  for (size_t i = 0u; i < recordCount; ++i) {
+    if (readyBinding[i] == 0u)
+      BackfillVisibleUnitGeosetBindingFromCache(manifest.records[i]);
+  }
 }
 
 ShadowRenderableRecord ConvertVisible(
@@ -813,10 +827,9 @@ void HydrateManifestRuntimeOwnersFromIndexedCache(
       continue;
     }
 
-    model::ShadowModelResourceRecord owner = {};
-    if (!resourceCache.findRuntimeModelOwnerIndexed(record.runtimeGeosetPtr,
-                                                    record.runtimeGeosetDataPtr,
-                                                    owner)) {
+    model::ShadowRuntimeModelOwnerBinding owner = {};
+    if (!resourceCache.findRuntimeModelOwnerBindingIndexed(
+            record.runtimeGeosetPtr, record.runtimeGeosetDataPtr, owner)) {
       continue;
     }
 
@@ -830,14 +843,25 @@ void HydrateManifestRuntimeOwnersFromIndexedCache(
 
 ShadowModelResourceRecord ConvertGeoset(
     const model::ShadowGeosetResourceRecord& src,
-    uint64_t frameSerial) {
+    uint64_t frameSerial,
+    const model::ShadowGeosetResourceRecord* alias = nullptr) {
   ShadowModelResourceRecord dst = {};
-  dst.runtimeGeosetPtr = src.geosetPtr;
-  dst.runtimeGeosetDataPtr = src.geosetDataPtr;
-  dst.modelResourcePtr = src.modelResourcePtr;
-  dst.modelKey = src.modelKey;
-  dst.prefersRuntimeContract = src.prefersRuntimeContract;
-  dst.geosetIndex = src.geosetIndex;
+  dst.runtimeGeosetPtr = alias != nullptr && alias->geosetPtr != nullptr
+      ? alias->geosetPtr : src.geosetPtr;
+  dst.runtimeGeosetDataPtr =
+      alias != nullptr && alias->geosetDataPtr != nullptr
+          ? alias->geosetDataPtr : src.geosetDataPtr;
+  dst.modelResourcePtr =
+      alias != nullptr && alias->modelResourcePtr != nullptr
+          ? alias->modelResourcePtr : src.modelResourcePtr;
+  dst.modelKey = alias != nullptr && alias->modelKey != 0u
+      ? alias->modelKey : src.modelKey;
+  dst.prefersRuntimeContract = src.prefersRuntimeContract ||
+      (alias != nullptr && alias->prefersRuntimeContract);
+  dst.geosetIndex =
+      alias != nullptr &&
+              alias->geosetIndex != model::kInvalidShadowGeosetIndex
+          ? alias->geosetIndex : src.geosetIndex;
   dst.vertexCount = src.vertexCount;
   dst.positions = src.positions;
   dst.normals = src.normals;
@@ -854,7 +878,8 @@ ShadowModelResourceRecord ConvertGeoset(
   for (const auto& uvLayer : src.uvLayers)
     dst.uvLayers.push_back(uvLayer.uvPairs);
   dst.contentHash = src.contentHash;
-  dst.mapEpoch = src.mapEpoch;
+  dst.mapEpoch = alias != nullptr && alias->mapEpoch != 0u
+      ? alias->mapEpoch : src.mapEpoch;
   dst.immutableModelGeneration = src.immutableModelGeneration;
   dst.localBounds = src.localBounds;
   dst.frameSerial = frameSerial;
@@ -1268,7 +1293,8 @@ void SupplementPosesFromLiveCModels(
           kMaxDirectPoseAttemptsPerFrame) {
     constexpr size_t kColdStartSweepBudget = 64u;
     size_t coldStartAttempts = 0u;
-    for (const auto& runtimeRecord : resourceCache.snapshotRuntimeModels()) {
+    for (const auto& runtimeRecord :
+         resourceCache.snapshotRuntimeModelAliases()) {
       if (coldStartAttempts >= kColdStartSweepBudget)
         break;
       const size_t attemptsBefore = stats.directPoseSupplementAttemptCount;
@@ -3160,6 +3186,15 @@ void ShadowModelResourceStore::clear() {
   m_byModelResource.clear();
 }
 
+void ShadowModelResourceStore::reserve(size_t geosetRecordCapacity,
+                                       size_t runtimeAliasCapacity) {
+  m_records.reserve(geosetRecordCapacity);
+  m_byRuntimeGeoset.reserve(geosetRecordCapacity);
+  m_byRuntimeGeosetData.reserve(geosetRecordCapacity);
+  m_byModelResource.reserve(geosetRecordCapacity);
+  m_byRuntimeModel.reserve(runtimeAliasCapacity);
+}
+
 void ShadowModelResourceStore::add(ShadowModelResourceRecord record) {
   const size_t index = m_records.size();
   m_records.emplace_back(std::move(record));
@@ -3190,37 +3225,28 @@ void ShadowModelResourceStore::bindRuntimeModelAlias(void* runtimeModelPtr,
 
   if (modelResourcePtr != nullptr) {
     const auto it = m_byModelResource.find({modelResourcePtr, geosetIndex});
-    if (it != m_byModelResource.end() && it->second < m_records.size() &&
-        m_records[it->second].prefersRuntimeContract) {
+    if (it != m_byModelResource.end() && it->second < m_records.size()) {
       m_byRuntimeModel[{runtimeModelPtr, geosetIndex}] = it->second;
-      return;
     }
+    // add() keeps this exact-key index pointed at a runtime-preferred record
+    // whenever one exists.  A miss therefore cannot be repaired by scanning
+    // records with the same non-null model resource, and a hit is already the
+    // best available fallback for the alias.
+    return;
   }
 
   for (size_t i = 0; i < m_records.size(); ++i) {
     const auto& record = m_records[i];
     if (record.geosetIndex == geosetIndex &&
-        record.prefersRuntimeContract &&
-        (modelResourcePtr == nullptr ||
-         record.modelResourcePtr == modelResourcePtr)) {
+        record.prefersRuntimeContract) {
       m_byRuntimeModel[{runtimeModelPtr, geosetIndex}] = i;
       return;
     }
   }
 
-  if (modelResourcePtr != nullptr) {
-    const auto it = m_byModelResource.find({modelResourcePtr, geosetIndex});
-    if (it != m_byModelResource.end()) {
-      m_byRuntimeModel[{runtimeModelPtr, geosetIndex}] = it->second;
-      return;
-    }
-  }
-
   for (size_t i = 0; i < m_records.size(); ++i) {
     const auto& record = m_records[i];
-    if (record.geosetIndex == geosetIndex &&
-        (modelResourcePtr == nullptr ||
-         record.modelResourcePtr == modelResourcePtr)) {
+    if (record.geosetIndex == geosetIndex) {
       m_byRuntimeModel[{runtimeModelPtr, geosetIndex}] = i;
       return;
     }
@@ -3951,22 +3977,26 @@ void ShadowRuntimeContractCache::captureLiveState() {
     auto resourceStoreScope = ContractCpuScope(
         "War3SemanticScene/CaptureContract/ResourceStoreBuild");
     auto freshResources = std::make_shared<ShadowModelResourceStore>();
-    for (const auto& geoset : resourceCache.snapshotGeosets())
-      freshResources->add(ConvertGeoset(geoset, manifest.frameSerial));
+    const auto capacityHint = resourceCache.resourceStoreCapacityHint();
+    freshResources->reserve(capacityHint.geosetRecordUpperBound,
+                            capacityHint.runtimeAliasUpperBound);
+    resourceCache.forEachGeosetContractSource(
+        [&](const model::ShadowGeosetResourceRecord& geoset,
+            const model::ShadowGeosetResourceRecord* alias) {
+          freshResources->add(
+              ConvertGeoset(geoset, manifest.frameSerial, alias));
+        });
 
-    // 先补 modelResource->runtimeModel alias，再补纯 runtimeModel alias。
-    for (const auto& modelRecord : resourceCache.snapshotModels()) {
-      for (uint32_t i = 0; i < modelRecord.geosetCount; ++i) {
-        freshResources->bindRuntimeModelAlias(modelRecord.runtimeModelPtr, i,
-                                              modelRecord.modelResourcePtr);
-      }
-    }
-    for (const auto& runtimeRecord : resourceCache.snapshotRuntimeModels()) {
-      for (uint32_t i = 0; i < runtimeRecord.geosetCount; ++i) {
-        freshResources->bindRuntimeModelAlias(runtimeRecord.runtimeModelPtr, i,
-                                              runtimeRecord.modelResourcePtr);
-      }
-    }
+    // Keep the historical model-resource aliases first and runtime-model
+    // aliases second, but consume their scalar projections directly instead
+    // of allocating two short-lived snapshot vectors.
+    resourceCache.forEachResourceStoreAlias(
+        [&](const model::ShadowModelAliasSnapshotRecord& alias) {
+          for (uint32_t i = 0; i < alias.geosetCount; ++i) {
+            freshResources->bindRuntimeModelAlias(
+                alias.runtimeModelPtr, i, alias.modelResourcePtr);
+          }
+        });
     return freshResources;
   };
   std::shared_ptr<ShadowModelResourceStore> resourcesPtr;
@@ -4009,18 +4039,14 @@ void ShadowRuntimeContractCache::captureLiveState() {
     }
   }
 
-  if (resourcesPtr == nullptr) {
-    resourcesPtr = buildResourceStore();
-    rebuiltResourceStore = true;
-  }
-
   auto& instanceRegistry = model::ModelInstanceRegistry::instance();
   auto& shadowRegistry = render::ShadowObjectRegistry::instance();
   {
     auto snapshotScope = ContractCpuScope(
         "War3SemanticScene/CaptureContract/SnapshotPoseAttachment");
-    for (const auto& pose : poseRegistry.snapshot())
+    poseRegistry.forEachSnapshotPose([&](const model::PoseRecord& pose) {
       poses.add(ConvertPose(pose, manifest.frameSerial));
+    });
     if constexpr (kCaptureAttachmentRigidContracts) {
       for (const auto& attachment : attachmentRegistry.snapshot()) {
         auto contractAttachment =
@@ -4040,9 +4066,18 @@ void ShadowRuntimeContractCache::captureLiveState() {
   }
   const uint64_t postAttachmentResourceRevision = resourceCache.revision();
   if (postAttachmentResourceRevision != resourceRevision) {
+    // Attachment/pose supplementation may publish new immutable geoset or
+    // alias facts. Any store selected above belongs to the earlier revision;
+    // discard that reference, but do not build twice in one capture.
+    resourcesPtr.reset();
+    resourceRevision = postAttachmentResourceRevision;
+  }
+  // No stage between the initial coverage check and this point consumes the
+  // resource store. Build at the final resource revision exactly once, after
+  // all pose/attachment cache mutations have settled for this capture.
+  if (resourcesPtr == nullptr) {
     resourcesPtr = buildResourceStore();
     rebuiltResourceStore = true;
-    resourceRevision = postAttachmentResourceRevision;
   }
   {
     auto rootSupplementScope = ContractCpuScope(
@@ -4193,8 +4228,9 @@ void ShadowRuntimeContractCache::capturePoseOnlyLiveState() {
   poses.reserve(poseRegistry.recordCount() + manifestPtr->records.size() * 3u +
                 32u);
 
-  for (const auto& pose : poseRegistry.snapshot())
+  poseRegistry.forEachSnapshotPose([&](const model::PoseRecord& pose) {
     poses.add(ConvertPose(pose, poseFrameSerial));
+  });
 
   stats.frameSerial = poseFrameSerial;
   stats.publishRevision = manifestPtr->publishRevision;

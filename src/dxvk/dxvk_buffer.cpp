@@ -20,7 +20,8 @@ namespace dxvk {
     m_allocator->registerResource(this);
 
     // Assign debug name to buffer
-    if (device->debugFlags().test(DxvkDebugFlag::Capture)) {
+    if (device->debugFlags().test(DxvkDebugFlag::Capture) ||
+        DxvkDeviceAddressBindingBuildEnabled) {
       m_debugName = createDebugName(createInfo.debugName);
       m_info.debugName = m_debugName.c_str();
     } else {

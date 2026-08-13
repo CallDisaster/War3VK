@@ -4,6 +4,20 @@ option('enable_d3d9',  type : 'boolean', value : true, description: 'Build D3D9'
 option('enable_d3d10', type : 'boolean', value : true, description: 'Build D3D10')
 option('enable_d3d11', type : 'boolean', value : true, description: 'Build D3D11')
 option('build_id',     type : 'boolean', value : false)
+option('warvk_shadow_observers_dev', type : 'boolean', value : false,
+  description : 'Enable AutoTest/development-only WarVK shadow Observe routes; Consume remains unavailable')
+option('warvk_rts_shadow_candidate_dev', type : 'boolean', value : false,
+  description : 'Enable the development-only RTS receiver-band directional-shadow candidate; Release remains unchanged')
+option('warvk_coherent_up_index_trim_dev', type : 'boolean', value : false,
+  description : 'Enable development-only current-draw coherent UP index trim Observe/Consume; Release remains unchanged')
+option('warvk_current_up_shadow_replay_dev', type : 'boolean', value : false,
+  description : 'Enable development-only current-UP position replay Observe/Consume; Release remains unchanged')
+option('warvk_coherent_real_index_trim_dev', type : 'boolean', value : false,
+  description : 'Enable development-only same-draw REAL position/index snapshot trim Observe/Consume; Release remains unchanged')
+option('warvk_coherent_real_perf_candidate_dev', type : 'boolean', value : false,
+  description : 'Compile development-only coherent REAL diagnostics and opt-in routes; runtime defaults remain Off after foreground performance rejection')
+option('warvk_device_address_binding_report_dev', type : 'boolean', value : false,
+  description : 'Enable development-only bounded VK_EXT_device_address_binding_report crash correlation')
 option('native_glfw',  type : 'feature', value : 'auto', description: 'Enable GLFW WSI for DXVK Native')
 option('native_sdl2',  type : 'feature', value : 'auto', description: 'Enable SDL2 WSI for DXVK Native')
 option('native_sdl3',  type : 'feature', value : 'auto', description: 'Enable SDL3 WSI for DXVK Native')

@@ -117,7 +117,7 @@ class PersistentPackageStage11ObserveAdapterContracts(unittest.TestCase):
 
     def test_hook_is_after_final_caster_and_exact_submitted_witness(self) -> None:
         function = self.device.split(
-            "uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer()", 1
+            "uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer(", 1
         )[1].split("bool D3D9DeviceEx::War3DrainShadowCasterTombstones()", 1)[0]
         instances = function.index("m_war3Scene.shadowInstances.emplace_back")
         casters = function.index("m_war3Scene.shadowCasters.emplace_back")
@@ -134,7 +134,7 @@ class PersistentPackageStage11ObserveAdapterContracts(unittest.TestCase):
         mode = function.index(
             "War3PersistentPackageStage11EvidenceModeRuntime()"
         )
-        loop = function.index("for (auto& [cacheKey, entry]")
+        loop = function.index("while (nextDrawTimeEntry(")
         off_gate = function.index(
             "War3PersistentGpuPackageStage11ObserveAdapter::Mode::Off"
         )
@@ -145,7 +145,7 @@ class PersistentPackageStage11ObserveAdapterContracts(unittest.TestCase):
         bridge = self.device.split(
             "void D3D9DeviceEx::War3ObservePersistentPackageStage11Evidence(", 1
         )[1].split(
-            "uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer()", 1
+            "uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer(", 1
         )[0]
         self.assertEqual(bridge.count("findGeosetStampByDataForEpoch("), 1)
         for forbidden in (
@@ -175,7 +175,7 @@ class PersistentPackageStage11ObserveAdapterContracts(unittest.TestCase):
         bridge = self.device.split(
             "void D3D9DeviceEx::War3ObservePersistentPackageStage11Evidence(", 1
         )[1].split(
-            "uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer()", 1
+            "uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer(", 1
         )[0]
         begin = bridge.index("high_resolution_clock::get_counter()")
         lookup = bridge.index("findGeosetStampByDataForEpoch(")

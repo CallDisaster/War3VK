@@ -2,7 +2,7 @@
  * @file war3_shader_api.cpp
  * @brief War3MapReforge 外部 Shader API 实现
  * 
- * @version 1.2.0 Release
+ * @version 1.2003
  * @date 2024-12-21
  */
 
@@ -762,6 +762,8 @@ WAR3_SHADER_API bool SetShadowAlphaUseMip(bool enabled) {
 }
 
 WAR3_SHADER_API bool SetShadowAlphaMipLodBias(float bias) {
+    if (!std::isfinite(bias))
+        return false;
     auto settings = GetMutableSettings();
     if (!settings)
         return false;
@@ -770,10 +772,12 @@ WAR3_SHADER_API bool SetShadowAlphaMipLodBias(float bias) {
 }
 
 WAR3_SHADER_API bool SetShadowAlphaFarAlphaRefBias(float bias) {
+    if (!std::isfinite(bias))
+        return false;
     auto settings = GetMutableSettings();
     if (!settings)
         return false;
-    settings->shadows.alphaShadowFarAlphaRefBias = std::max(0.0f, bias);
+    settings->shadows.alphaShadowFarAlphaRefBias = std::clamp(bias, 0.0f, 1.0f);
     return true;
 }
 
@@ -1466,6 +1470,10 @@ WAR3_SHADER_API void* GetVulkanCommandBuffer() {
 //=============================================================================
 
 namespace internal {
+
+void ValidateWar3ShaderContextAbi(
+    ::dxvk::War3ShaderContextAbi) noexcept {
+}
 
 /**
  * @brief 检查是否禁用内置阴影

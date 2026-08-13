@@ -21,6 +21,7 @@
 #include "../hooks/war3_hook_install_util.h"
 #include "../hooks/war3_hook_render.h"
 #include "../core/war3_runtime_profile.h"
+#include "../memory/war3_shadow_arena.h"
 #include "../model/war3_model_registry.h"
 #include "../render/war3_shadow_object_registry.h"
 #include "../render/war3_shadow_lifecycle.h"
@@ -936,6 +937,7 @@ std::string BuildPerfEnvJson() {
       "DXVK_WAR3_SEMANTIC_GENERIC_APPEND_STATS_REUSE",
       "DXVK_WAR3_SEMANTIC_GENERIC_APPEND_STATS_REUSE_VERIFY",
       "DXVK_WAR3_SEMANTIC_DYNAMIC_EVIDENCE_STATS",
+      "DXVK_WAR3_SEMANTIC_PALETTE_DIAGNOSTICS",
       "DXVK_WAR3_SHADOW_POSE_FULL_TRACE",
       "DXVK_WAR3_SHADOW_POSE_FULL_TRACE_CASTERS",
       "DXVK_WAR3_SHADOW_POSE_FULL_TRACE_MAX_CASTERS",
@@ -1193,6 +1195,14 @@ void War3PerfMonitor::noteShadowBudgetFrame(
       stats.drawTimeVBCacheRejectContractSlice;
   m_currentFrameWorkload.drawTimeVBCacheSameFrameDedupMiss =
       stats.drawTimeVBCacheSameFrameDedupMiss;
+  m_currentFrameWorkload.drawTimeGenerationBackedPositionReuseCount =
+      stats.drawTimeGenerationBackedPositionReuseCount;
+  m_currentFrameWorkload.drawTimeGenerationBackedUvReuseCount =
+      stats.drawTimeGenerationBackedUvReuseCount;
+  m_currentFrameWorkload.drawTimeGenerationBackedIndexReuseCount =
+      stats.drawTimeGenerationBackedIndexReuseCount;
+  m_currentFrameWorkload.drawTimeGenerationBackedCopyBytesSaved =
+      stats.drawTimeGenerationBackedCopyBytesSaved;
   m_currentFrameWorkload.semanticSceneSubmitted =
       stats.semanticSceneSubmitted;
   m_currentFrameWorkload.semanticSceneSubmittedSkinned =
@@ -1234,6 +1244,72 @@ void War3PerfMonitor::noteShadowBudgetFrame(
   agg.stage13ReplayDrawCount +=
       stats.semanticSceneStage13ReplayDrawCount;
   agg.framesBudgetExceeded += stats.budgetExceeded != 0 ? 1u : 0u;
+  const bool producerIncomplete = stats.producerCompletenessSealed != 0u &&
+      (stats.producerRequiredCasterOmissionCount != 0u ||
+       stats.producerCompletenessCounterOverflow != 0u);
+  agg.framesIncomplete += producerIncomplete ? 1u : 0u;
+  agg.framesProducerIncomplete += producerIncomplete ? 1u : 0u;
+  agg.producerRequiredCasterOmissionCount +=
+      stats.producerRequiredCasterOmissionCount;
+  agg.producerExactBudgetDeferredUniqueCasterCount +=
+      stats.producerExactBudgetDeferredUniqueCasterCount;
+  agg.producerPositionAllocBudgetCount +=
+      stats.producerPositionAllocBudgetCount;
+  agg.producerUvAllocBudgetCount += stats.producerUvAllocBudgetCount;
+  agg.producerIndexAllocBudgetCount += stats.producerIndexAllocBudgetCount;
+  agg.producerAllocationFailureCount += stats.producerAllocationFailureCount;
+  agg.producerFallbackByteBudgetCount +=
+      stats.producerFallbackByteBudgetCount;
+  agg.producerArenaAdmissionCount += stats.producerArenaAdmissionCount;
+  agg.producerFreezeFailureCount += stats.producerFreezeFailureCount;
+  agg.producerSoftPriorityBudgetCount +=
+      stats.producerSoftPriorityBudgetCount;
+  agg.producerCompletenessCounterOverflowFrames +=
+      stats.producerCompletenessCounterOverflow != 0u ? 1u : 0u;
+  agg.producerSealFrameSerialLast = stats.producerSealFrameSerial;
+  agg.producerSealMapEpochLast = stats.producerSealMapEpoch;
+  agg.producerSealDeviceEpochLast = stats.producerSealDeviceEpoch;
+  agg.drawTimeVBCacheStaticLiveBytesLast =
+      stats.drawTimeVBCacheStaticLiveBytes;
+  agg.drawTimeVBCacheStaticProtectedBytesLast =
+      stats.drawTimeVBCacheStaticProtectedBytes;
+  agg.drawTimeVBCacheStaticOverCapBytesLast =
+      stats.drawTimeVBCacheStaticOverCapBytes;
+  agg.drawTimeVBCacheStaticOverCapFrameCountLast =
+      stats.drawTimeVBCacheStaticOverCapFrameCount;
+  agg.drawTimeVBCacheStaticEvictedBytes +=
+      stats.drawTimeVBCacheStaticEvictedBytes;
+  agg.drawTimeVBCacheStaticEvictedEntryCount +=
+      stats.drawTimeVBCacheStaticEvictedEntryCount;
+  agg.drawTimeSnapshotPageResidentBytesLast =
+      stats.drawTimeSnapshotPageResidentBytes;
+  agg.drawTimeSnapshotPageUsedBytesLast =
+      stats.drawTimeSnapshotPageUsedBytes;
+  agg.drawTimeSnapshotPageCreateCount +=
+      stats.drawTimeSnapshotPageCreateCount;
+  agg.drawTimeSnapshotSuballocationCount +=
+      stats.drawTimeSnapshotSuballocationCount;
+  agg.drawTimeSnapshotSuballocationBytes +=
+      stats.drawTimeSnapshotSuballocationBytes;
+  agg.drawTimeSnapshotPageReclaimedCountLast =
+      stats.drawTimeSnapshotPageReclaimedCount;
+  agg.drawTimeSnapshotPageCapacityRejectCount +=
+      stats.drawTimeSnapshotPageCapacityRejectCount;
+  agg.drawTimeSnapshotPageAllocationFailureCount +=
+      stats.drawTimeSnapshotPageAllocationFailureCount;
+  agg.drawTimeVBCacheIndexedUnknownRangeFallbackCount +=
+      stats.drawTimeVBCacheIndexedUnknownRangeFallbackCount;
+  const auto arenaDiagnostics = memory::ShadowArena_QueryDiagnostics();
+  agg.coherentRealTrimObservedCountLast =
+      arenaDiagnostics.coherentRealTrimObservedCount;
+  agg.coherentRealTrimEligibleCountLast =
+      arenaDiagnostics.coherentRealTrimEligibleCount;
+  agg.coherentRealTrimWouldSaveBytesLast =
+      arenaDiagnostics.coherentRealTrimWouldSaveBytes;
+  agg.coherentRealTrimConsumedCountLast =
+      arenaDiagnostics.coherentRealTrimConsumedCount;
+  agg.coherentRealTrimConsumedBytesSavedLast =
+      arenaDiagnostics.coherentRealTrimConsumedBytesSaved;
   agg.totalBudgetBytes += stats.fallbackBudgetBytes;
   agg.totalUsedBytes += stats.fallbackBudgetUsedBytes;
   agg.maxBudgetBytes =
@@ -1271,10 +1347,84 @@ void War3PerfMonitor::noteShadowBudgetFrame(
   agg.drawTimeVBCacheCaptureCount += stats.drawTimeVBCacheCaptureCount;
   agg.drawTimeVBCacheConsumeHitCount += stats.drawTimeVBCacheConsumeHitCount;
   agg.drawTimeVBCacheConsumeMissCount += stats.drawTimeVBCacheConsumeMissCount;
+  agg.drawTimeAllocObserverFrames +=
+      stats.drawTimeAllocObserverEnabled != 0u ? 1u : 0u;
+  agg.drawTimePositionAllocRequestCount +=
+      stats.drawTimePositionAllocRequestCount;
+  agg.drawTimePositionAllocNewEntryCount +=
+      stats.drawTimePositionAllocNewEntryCount;
+  agg.drawTimePositionAllocMissingBackingCount +=
+      stats.drawTimePositionAllocMissingBackingCount;
+  agg.drawTimePositionAllocCapacityGrowthCount +=
+      stats.drawTimePositionAllocCapacityGrowthCount;
+  agg.drawTimePositionAllocLeaseDetachCount +=
+      stats.drawTimePositionAllocLeaseDetachCount;
+  agg.drawTimePositionAllocStaticRequestCount +=
+      stats.drawTimePositionAllocStaticRequestCount;
+  agg.drawTimePositionAllocDynamicRequestCount +=
+      stats.drawTimePositionAllocDynamicRequestCount;
+  agg.drawTimePositionDeferredNewEntryCount +=
+      stats.drawTimePositionDeferredNewEntryCount;
+  agg.drawTimePositionDeferredMissingBackingCount +=
+      stats.drawTimePositionDeferredMissingBackingCount;
+  agg.drawTimePositionDeferredCapacityGrowthCount +=
+      stats.drawTimePositionDeferredCapacityGrowthCount;
+  agg.drawTimePositionDeferredLeaseDetachCount +=
+      stats.drawTimePositionDeferredLeaseDetachCount;
+  agg.drawTimePositionProofUniqueCount +=
+      stats.drawTimePositionProofUniqueCount;
+  agg.drawTimePositionProofDuplicateCount +=
+      stats.drawTimePositionProofDuplicateCount;
+  agg.drawTimePositionProofInvalidCount +=
+      stats.drawTimePositionProofInvalidCount;
+  agg.drawTimePositionProofSetOverflowCount +=
+      stats.drawTimePositionProofSetOverflowCount;
+  agg.drawTimePositionProofUniqueBytes +=
+      stats.drawTimePositionProofUniqueBytes;
+  agg.drawTimePositionProofDuplicateBytes +=
+      stats.drawTimePositionProofDuplicateBytes;
+  agg.drawTimeDirectStaticPositionBindCount +=
+      stats.drawTimeDirectStaticPositionBindCount;
+  agg.drawTimeDirectStaticPositionBytes +=
+      stats.drawTimeDirectStaticPositionBytes;
+  agg.drawTimeDirectStaticIndexBindCount +=
+      stats.drawTimeDirectStaticIndexBindCount;
+  agg.drawTimeDirectStaticIndexBytes +=
+      stats.drawTimeDirectStaticIndexBytes;
+  agg.drawTimeDirectUploadPositionBindCount +=
+      stats.drawTimeDirectUploadPositionBindCount;
+  agg.drawTimeDirectUploadPositionBytes +=
+      stats.drawTimeDirectUploadPositionBytes;
+  agg.drawTimeDirectUploadUvBindCount +=
+      stats.drawTimeDirectUploadUvBindCount;
+  agg.drawTimeDirectUploadUvBytes +=
+      stats.drawTimeDirectUploadUvBytes;
+  agg.drawTimeDirectUploadIndexBindCount +=
+      stats.drawTimeDirectUploadIndexBindCount;
+  agg.drawTimeDirectUploadIndexBytes +=
+      stats.drawTimeDirectUploadIndexBytes;
+  agg.drawTimeDirectUploadCandidateCount +=
+      stats.drawTimeDirectUploadCandidateCount;
+  agg.drawTimeDirectUploadRejectNoProofCount +=
+      stats.drawTimeDirectUploadRejectNoProofCount;
+  agg.drawTimeDirectUploadRejectNoStorageCount +=
+      stats.drawTimeDirectUploadRejectNoStorageCount;
+  agg.drawTimeDirectUploadRejectRangeCount +=
+      stats.drawTimeDirectUploadRejectRangeCount;
+  agg.drawTimePositionAllocDirectMutableRequestCount +=
+      stats.drawTimePositionAllocDirectMutableRequestCount;
   agg.drawTimeVBCacheRejectNoLayerContext +=
       stats.drawTimeVBCacheRejectNoLayerContext;
   agg.drawTimeVBCacheSameFrameDedupMiss +=
       stats.drawTimeVBCacheSameFrameDedupMiss;
+  agg.drawTimeGenerationBackedPositionReuseCount +=
+      stats.drawTimeGenerationBackedPositionReuseCount;
+  agg.drawTimeGenerationBackedUvReuseCount +=
+      stats.drawTimeGenerationBackedUvReuseCount;
+  agg.drawTimeGenerationBackedIndexReuseCount +=
+      stats.drawTimeGenerationBackedIndexReuseCount;
+  agg.drawTimeGenerationBackedCopyBytesSaved +=
+      stats.drawTimeGenerationBackedCopyBytesSaved;
   agg.semanticBridgeHit += stats.semanticBridgeHit;
   agg.semanticBridgeMiss += stats.semanticBridgeMiss;
   agg.semanticBridgeBypassed += stats.semanticBridgeBypassed;
@@ -1977,12 +2127,86 @@ void War3PerfMonitor::noteShadowBudgetFrame(
   agg.semanticSceneTerrainBoundsCullMode = std::max(
       agg.semanticSceneTerrainBoundsCullMode,
       uint64_t(stats.semanticSceneTerrainBoundsCullMode));
+#define WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(name) \
+  agg.name += stats.name
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerS1AttemptCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerFallbackAttemptCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerExactRangeCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerMissingExactRangeCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerUpSourceAttemptCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerMappedSourceAttemptCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerNoSourceCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerSpanAcceptedCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerSpanRejectedCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerSpanNullBaseRejectCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerSpanNotCpuReadableRejectCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerSpanMissingOwnerRejectCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerSpanMissingGenerationRejectCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerSpanRangeRejectCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerSpanAddressOverflowRejectCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerComputeSuccessCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerComputeFailureCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerValidSphereCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerInvalidSphereCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerPublishedExactCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerDomainCacheLookupCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerDomainCacheHitCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerDomainCacheMissCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerDomainCacheCollisionMissCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerDomainCacheStoreCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerDomainCacheEvictionCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerHintComparableCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerHintExactCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerHintSupersetCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerHintUnderCoverageCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerHintInvalidCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerHintRangeAcceptedCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerHintRangeRejectedCount);
+#undef WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD
   agg.semanticSceneTerrainBoundsCandidateCount +=
       stats.semanticSceneTerrainBoundsCandidateCount;
   agg.semanticSceneTerrainBoundsProofAcceptedCount +=
       stats.semanticSceneTerrainBoundsProofAcceptedCount;
   agg.semanticSceneTerrainBoundsFailVisibleCount +=
       stats.semanticSceneTerrainBoundsFailVisibleCount;
+  for (uint32_t i = 0u;
+       i < render::kWar3ShadowBoundsCullRejectReasonCount; ++i) {
+    agg.semanticSceneTerrainBoundsRejectReasonHistogram[i] +=
+        stats.semanticSceneTerrainBoundsRejectReasonHistogram[i];
+  }
   agg.semanticSceneTerrainBoundsWouldCullCount +=
       stats.semanticSceneTerrainBoundsWouldCullCount;
   agg.semanticSceneTerrainBoundsAppliedCullCount +=
@@ -2001,6 +2225,11 @@ void War3PerfMonitor::noteShadowBudgetFrame(
       stats.semanticSceneObjectBoundsProofAcceptedCount;
   agg.semanticSceneObjectBoundsFailVisibleCount +=
       stats.semanticSceneObjectBoundsFailVisibleCount;
+  for (uint32_t i = 0u;
+       i < render::kWar3ShadowBoundsCullRejectReasonCount; ++i) {
+    agg.semanticSceneObjectBoundsRejectReasonHistogram[i] +=
+        stats.semanticSceneObjectBoundsRejectReasonHistogram[i];
+  }
   agg.semanticSceneObjectBoundsWouldCullCount +=
       stats.semanticSceneObjectBoundsWouldCullCount;
   agg.semanticSceneObjectBoundsAppliedCullCount +=
@@ -2308,6 +2537,27 @@ void War3PerfMonitor::notePersistentGeometryFrame(
       stats.s1EarlySourceMismatchEvictCount;
   if (stats.s1EarlyReplayClosureMismatch)
     agg.persistentS1EarlyReplayClosureMismatchFrames++;
+  agg.persistentS1GenerationProofEntryCountLast =
+      stats.s1GenerationProofEntryCount;
+  agg.persistentS1GenerationProofEntryCountMax =
+      (std::max)(agg.persistentS1GenerationProofEntryCountMax,
+                 stats.s1GenerationProofEntryCount);
+  agg.persistentS1GenerationProofEligibleCount +=
+      stats.s1GenerationProofEligibleCount;
+  agg.persistentS1GenerationProofFirstCount +=
+      stats.s1GenerationProofFirstCount;
+  agg.persistentS1GenerationProofSameFrameCount +=
+      stats.s1GenerationProofSameFrameCount;
+  agg.persistentS1GenerationProofAdvancedCount +=
+      stats.s1GenerationProofAdvancedCount;
+  agg.persistentS1GenerationProofChangedCount +=
+      stats.s1GenerationProofChangedCount;
+  agg.persistentS1GenerationProofStaleRestartCount +=
+      stats.s1GenerationProofStaleRestartCount;
+  agg.persistentS1GenerationProofPromotionReadyCount +=
+      stats.s1GenerationProofPromotionReadyCount;
+  agg.persistentS1GenerationProofCapacityRejectCount +=
+      stats.s1GenerationProofCapacityRejectCount;
 }
 
 void War3PerfMonitor::noteShadowMapFallback(bool reusedLastComplete,
@@ -3255,8 +3505,20 @@ void War3PerfMonitor::tick() {
         vk->device(), beginHandle.first, beginHandle.second, 1,
         sizeof(uint64_t), &beginTs, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
 
+    const auto dropCurrentSample = [&]() {
+      ++m_profilerCounters.gpuSamplesDropped;
+      m_pending[i] = std::move(m_pending.back());
+      m_pending.pop_back();
+    };
+
     if (beginRes == VK_NOT_READY) {
       i++;
+      continue;
+    }
+
+    if (beginRes != VK_SUCCESS) {
+      m_device->notifyDeviceErrorFromDriverResult(beginRes);
+      dropCurrentSample();
       continue;
     }
 
@@ -3269,10 +3531,9 @@ void War3PerfMonitor::tick() {
       continue;
     }
 
-    if (beginRes != VK_SUCCESS || endRes != VK_SUCCESS) {
-      ++m_profilerCounters.gpuSamplesDropped;
-      m_pending[i] = std::move(m_pending.back());
-      m_pending.pop_back();
+    if (endRes != VK_SUCCESS) {
+      m_device->notifyDeviceErrorFromDriverResult(endRes);
+      dropCurrentSample();
       continue;
     }
 
@@ -5760,6 +6021,76 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
   json << "  \"shadowBudgetSummary\": {\n";
   json << "    \"framesObserved\": " << shadowAgg.framesObserved << ",\n";
   json << "    \"framesIncomplete\": " << shadowAgg.framesIncomplete << ",\n";
+  json << "    \"framesProducerIncomplete\": "
+       << shadowAgg.framesProducerIncomplete << ",\n";
+  json << "    \"producerRequiredCasterOmissionCount\": "
+       << shadowAgg.producerRequiredCasterOmissionCount << ",\n";
+  json << "    \"producerExactBudgetDeferredUniqueCasterCount\": "
+       << shadowAgg.producerExactBudgetDeferredUniqueCasterCount << ",\n";
+  json << "    \"producerPositionAllocBudgetCount\": "
+       << shadowAgg.producerPositionAllocBudgetCount << ",\n";
+  json << "    \"producerUvAllocBudgetCount\": "
+       << shadowAgg.producerUvAllocBudgetCount << ",\n";
+  json << "    \"producerIndexAllocBudgetCount\": "
+       << shadowAgg.producerIndexAllocBudgetCount << ",\n";
+  json << "    \"producerAllocationFailureCount\": "
+       << shadowAgg.producerAllocationFailureCount << ",\n";
+  json << "    \"producerFallbackByteBudgetCount\": "
+       << shadowAgg.producerFallbackByteBudgetCount << ",\n";
+  json << "    \"producerArenaAdmissionCount\": "
+       << shadowAgg.producerArenaAdmissionCount << ",\n";
+  json << "    \"producerFreezeFailureCount\": "
+       << shadowAgg.producerFreezeFailureCount << ",\n";
+  json << "    \"producerSoftPriorityBudgetCount\": "
+       << shadowAgg.producerSoftPriorityBudgetCount << ",\n";
+  json << "    \"producerCompletenessCounterOverflowFrames\": "
+       << shadowAgg.producerCompletenessCounterOverflowFrames << ",\n";
+  json << "    \"producerSealFrameSerialLast\": "
+       << shadowAgg.producerSealFrameSerialLast << ",\n";
+  json << "    \"producerSealMapEpochLast\": "
+       << shadowAgg.producerSealMapEpochLast << ",\n";
+  json << "    \"producerSealDeviceEpochLast\": "
+       << shadowAgg.producerSealDeviceEpochLast << ",\n";
+  json << "    \"drawTimeVBCacheStaticLiveBytesLast\": "
+       << shadowAgg.drawTimeVBCacheStaticLiveBytesLast << ",\n";
+  json << "    \"drawTimeVBCacheStaticProtectedBytesLast\": "
+       << shadowAgg.drawTimeVBCacheStaticProtectedBytesLast << ",\n";
+  json << "    \"drawTimeVBCacheStaticOverCapBytesLast\": "
+       << shadowAgg.drawTimeVBCacheStaticOverCapBytesLast << ",\n";
+  json << "    \"drawTimeVBCacheStaticOverCapFrameCountLast\": "
+       << shadowAgg.drawTimeVBCacheStaticOverCapFrameCountLast << ",\n";
+  json << "    \"drawTimeVBCacheStaticEvictedBytes\": "
+       << shadowAgg.drawTimeVBCacheStaticEvictedBytes << ",\n";
+  json << "    \"drawTimeVBCacheStaticEvictedEntryCount\": "
+       << shadowAgg.drawTimeVBCacheStaticEvictedEntryCount << ",\n";
+  json << "    \"drawTimeSnapshotPageResidentBytesLast\": "
+       << shadowAgg.drawTimeSnapshotPageResidentBytesLast << ",\n";
+  json << "    \"drawTimeSnapshotPageUsedBytesLast\": "
+       << shadowAgg.drawTimeSnapshotPageUsedBytesLast << ",\n";
+  json << "    \"drawTimeSnapshotPageCreateCount\": "
+       << shadowAgg.drawTimeSnapshotPageCreateCount << ",\n";
+  json << "    \"drawTimeSnapshotSuballocationCount\": "
+       << shadowAgg.drawTimeSnapshotSuballocationCount << ",\n";
+  json << "    \"drawTimeSnapshotSuballocationBytes\": "
+       << shadowAgg.drawTimeSnapshotSuballocationBytes << ",\n";
+  json << "    \"drawTimeSnapshotPageReclaimedCountLast\": "
+       << shadowAgg.drawTimeSnapshotPageReclaimedCountLast << ",\n";
+  json << "    \"drawTimeSnapshotPageCapacityRejectCount\": "
+       << shadowAgg.drawTimeSnapshotPageCapacityRejectCount << ",\n";
+  json << "    \"drawTimeSnapshotPageAllocationFailureCount\": "
+       << shadowAgg.drawTimeSnapshotPageAllocationFailureCount << ",\n";
+  json << "    \"drawTimeVBCacheIndexedUnknownRangeFallbackCount\": "
+       << shadowAgg.drawTimeVBCacheIndexedUnknownRangeFallbackCount << ",\n";
+  json << "    \"coherentRealTrimObservedCountLast\": "
+       << shadowAgg.coherentRealTrimObservedCountLast << ",\n";
+  json << "    \"coherentRealTrimEligibleCountLast\": "
+       << shadowAgg.coherentRealTrimEligibleCountLast << ",\n";
+  json << "    \"coherentRealTrimWouldSaveBytesLast\": "
+       << shadowAgg.coherentRealTrimWouldSaveBytesLast << ",\n";
+  json << "    \"coherentRealTrimConsumedCountLast\": "
+       << shadowAgg.coherentRealTrimConsumedCountLast << ",\n";
+  json << "    \"coherentRealTrimConsumedBytesSavedLast\": "
+       << shadowAgg.coherentRealTrimConsumedBytesSavedLast << ",\n";
   json << "    \"framesBudgetExceeded\": " << shadowAgg.framesBudgetExceeded
        << ",\n";
   json << "    \"framesReuseLastComplete\": "
@@ -5888,10 +6219,84 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg.drawTimeVBCacheConsumeHitCount << ",\n";
   json << "    \"drawTimeVBCacheConsumeMissCount\": "
        << shadowAgg.drawTimeVBCacheConsumeMissCount << ",\n";
+  json << "    \"drawTimeAllocObserverFrames\": "
+       << shadowAgg.drawTimeAllocObserverFrames << ",\n";
+  json << "    \"drawTimePositionAllocRequestCount\": "
+       << shadowAgg.drawTimePositionAllocRequestCount << ",\n";
+  json << "    \"drawTimePositionAllocNewEntryCount\": "
+       << shadowAgg.drawTimePositionAllocNewEntryCount << ",\n";
+  json << "    \"drawTimePositionAllocMissingBackingCount\": "
+       << shadowAgg.drawTimePositionAllocMissingBackingCount << ",\n";
+  json << "    \"drawTimePositionAllocCapacityGrowthCount\": "
+       << shadowAgg.drawTimePositionAllocCapacityGrowthCount << ",\n";
+  json << "    \"drawTimePositionAllocLeaseDetachCount\": "
+       << shadowAgg.drawTimePositionAllocLeaseDetachCount << ",\n";
+  json << "    \"drawTimePositionAllocStaticRequestCount\": "
+       << shadowAgg.drawTimePositionAllocStaticRequestCount << ",\n";
+  json << "    \"drawTimePositionAllocDynamicRequestCount\": "
+       << shadowAgg.drawTimePositionAllocDynamicRequestCount << ",\n";
+  json << "    \"drawTimePositionDeferredNewEntryCount\": "
+       << shadowAgg.drawTimePositionDeferredNewEntryCount << ",\n";
+  json << "    \"drawTimePositionDeferredMissingBackingCount\": "
+       << shadowAgg.drawTimePositionDeferredMissingBackingCount << ",\n";
+  json << "    \"drawTimePositionDeferredCapacityGrowthCount\": "
+       << shadowAgg.drawTimePositionDeferredCapacityGrowthCount << ",\n";
+  json << "    \"drawTimePositionDeferredLeaseDetachCount\": "
+       << shadowAgg.drawTimePositionDeferredLeaseDetachCount << ",\n";
+  json << "    \"drawTimePositionProofUniqueCount\": "
+       << shadowAgg.drawTimePositionProofUniqueCount << ",\n";
+  json << "    \"drawTimePositionProofDuplicateCount\": "
+       << shadowAgg.drawTimePositionProofDuplicateCount << ",\n";
+  json << "    \"drawTimePositionProofInvalidCount\": "
+       << shadowAgg.drawTimePositionProofInvalidCount << ",\n";
+  json << "    \"drawTimePositionProofSetOverflowCount\": "
+       << shadowAgg.drawTimePositionProofSetOverflowCount << ",\n";
+  json << "    \"drawTimePositionProofUniqueBytes\": "
+       << shadowAgg.drawTimePositionProofUniqueBytes << ",\n";
+  json << "    \"drawTimePositionProofDuplicateBytes\": "
+       << shadowAgg.drawTimePositionProofDuplicateBytes << ",\n";
+  json << "    \"drawTimeDirectStaticPositionBindCount\": "
+       << shadowAgg.drawTimeDirectStaticPositionBindCount << ",\n";
+  json << "    \"drawTimeDirectStaticPositionBytes\": "
+       << shadowAgg.drawTimeDirectStaticPositionBytes << ",\n";
+  json << "    \"drawTimeDirectStaticIndexBindCount\": "
+       << shadowAgg.drawTimeDirectStaticIndexBindCount << ",\n";
+  json << "    \"drawTimeDirectStaticIndexBytes\": "
+       << shadowAgg.drawTimeDirectStaticIndexBytes << ",\n";
+  json << "    \"drawTimeDirectUploadPositionBindCount\": "
+       << shadowAgg.drawTimeDirectUploadPositionBindCount << ",\n";
+  json << "    \"drawTimeDirectUploadPositionBytes\": "
+       << shadowAgg.drawTimeDirectUploadPositionBytes << ",\n";
+  json << "    \"drawTimeDirectUploadUvBindCount\": "
+       << shadowAgg.drawTimeDirectUploadUvBindCount << ",\n";
+  json << "    \"drawTimeDirectUploadUvBytes\": "
+       << shadowAgg.drawTimeDirectUploadUvBytes << ",\n";
+  json << "    \"drawTimeDirectUploadIndexBindCount\": "
+       << shadowAgg.drawTimeDirectUploadIndexBindCount << ",\n";
+  json << "    \"drawTimeDirectUploadIndexBytes\": "
+       << shadowAgg.drawTimeDirectUploadIndexBytes << ",\n";
+  json << "    \"drawTimeDirectUploadCandidateCount\": "
+       << shadowAgg.drawTimeDirectUploadCandidateCount << ",\n";
+  json << "    \"drawTimeDirectUploadRejectNoProofCount\": "
+       << shadowAgg.drawTimeDirectUploadRejectNoProofCount << ",\n";
+  json << "    \"drawTimeDirectUploadRejectNoStorageCount\": "
+       << shadowAgg.drawTimeDirectUploadRejectNoStorageCount << ",\n";
+  json << "    \"drawTimeDirectUploadRejectRangeCount\": "
+       << shadowAgg.drawTimeDirectUploadRejectRangeCount << ",\n";
+  json << "    \"drawTimePositionAllocDirectMutableRequestCount\": "
+       << shadowAgg.drawTimePositionAllocDirectMutableRequestCount << ",\n";
   json << "    \"drawTimeVBCacheRejectNoLayerContext\": "
        << shadowAgg.drawTimeVBCacheRejectNoLayerContext << ",\n";
   json << "    \"drawTimeVBCacheSameFrameDedupMiss\": "
        << shadowAgg.drawTimeVBCacheSameFrameDedupMiss << ",\n";
+  json << "    \"drawTimeGenerationBackedPositionReuseCount\": "
+       << shadowAgg.drawTimeGenerationBackedPositionReuseCount << ",\n";
+  json << "    \"drawTimeGenerationBackedUvReuseCount\": "
+       << shadowAgg.drawTimeGenerationBackedUvReuseCount << ",\n";
+  json << "    \"drawTimeGenerationBackedIndexReuseCount\": "
+       << shadowAgg.drawTimeGenerationBackedIndexReuseCount << ",\n";
+  json << "    \"drawTimeGenerationBackedCopyBytesSaved\": "
+       << shadowAgg.drawTimeGenerationBackedCopyBytesSaved << ",\n";
   json << "    \"semanticBridgeHit\": " << shadowAgg.semanticBridgeHit
        << ",\n";
   json << "    \"semanticBridgeMiss\": " << shadowAgg.semanticBridgeMiss
@@ -6721,12 +7126,54 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg.semanticSceneShadowMapCascadeCulledCount << ",\n";
   json << "    \"semanticSceneTerrainBoundsCullMode\": "
        << shadowAgg.semanticSceneTerrainBoundsCullMode << ",\n";
+  json << "    \"semanticSceneTerrainBoundsProducerHistogram\": ["
+       << shadowAgg.semanticSceneTerrainBoundsProducerS1AttemptCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerFallbackAttemptCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerExactRangeCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerMissingExactRangeCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerUpSourceAttemptCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerMappedSourceAttemptCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerNoSourceCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerSpanAcceptedCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerSpanRejectedCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerSpanNullBaseRejectCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerSpanNotCpuReadableRejectCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerSpanMissingOwnerRejectCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerSpanMissingGenerationRejectCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerSpanRangeRejectCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerSpanAddressOverflowRejectCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerComputeSuccessCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerComputeFailureCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerValidSphereCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerInvalidSphereCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerPublishedExactCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerDomainCacheLookupCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerDomainCacheHitCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerDomainCacheMissCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerDomainCacheCollisionMissCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerDomainCacheStoreCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerDomainCacheEvictionCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerHintComparableCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerHintExactCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerHintSupersetCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerHintUnderCoverageCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerHintInvalidCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerHintRangeAcceptedCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerHintRangeRejectedCount << "],\n";
   json << "    \"semanticSceneTerrainBoundsCandidateCount\": "
        << shadowAgg.semanticSceneTerrainBoundsCandidateCount << ",\n";
   json << "    \"semanticSceneTerrainBoundsProofAcceptedCount\": "
        << shadowAgg.semanticSceneTerrainBoundsProofAcceptedCount << ",\n";
   json << "    \"semanticSceneTerrainBoundsFailVisibleCount\": "
        << shadowAgg.semanticSceneTerrainBoundsFailVisibleCount << ",\n";
+  json << "    \"semanticSceneTerrainBoundsRejectReasonHistogram\": [";
+  for (uint32_t i = 0u;
+       i < render::kWar3ShadowBoundsCullRejectReasonCount; ++i) {
+    if (i != 0u)
+      json << ", ";
+    json << shadowAgg.semanticSceneTerrainBoundsRejectReasonHistogram[i];
+  }
+  json << "],\n";
   json << "    \"semanticSceneTerrainBoundsWouldCullCount\": "
        << shadowAgg.semanticSceneTerrainBoundsWouldCullCount << ",\n";
   json << "    \"semanticSceneTerrainBoundsAppliedCullCount\": "
@@ -6745,6 +7192,14 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg.semanticSceneObjectBoundsProofAcceptedCount << ",\n";
   json << "    \"semanticSceneObjectBoundsFailVisibleCount\": "
        << shadowAgg.semanticSceneObjectBoundsFailVisibleCount << ",\n";
+  json << "    \"semanticSceneObjectBoundsRejectReasonHistogram\": [";
+  for (uint32_t i = 0u;
+       i < render::kWar3ShadowBoundsCullRejectReasonCount; ++i) {
+    if (i != 0u)
+      json << ", ";
+    json << shadowAgg.semanticSceneObjectBoundsRejectReasonHistogram[i];
+  }
+  json << "],\n";
   json << "    \"semanticSceneObjectBoundsWouldCullCount\": "
        << shadowAgg.semanticSceneObjectBoundsWouldCullCount << ",\n";
   json << "    \"semanticSceneObjectBoundsAppliedCullCount\": "
@@ -7094,6 +7549,26 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg.persistentS1EarlyReplayFallbackCount << ",\n";
   json << "    \"persistentS1EarlyReplayClosureMismatchFrames\": "
        << shadowAgg.persistentS1EarlyReplayClosureMismatchFrames << ",\n";
+  json << "    \"persistentS1GenerationProofEntryCount\": "
+       << shadowAgg.persistentS1GenerationProofEntryCountLast << ",\n";
+  json << "    \"persistentS1GenerationProofEntryCountMax\": "
+       << shadowAgg.persistentS1GenerationProofEntryCountMax << ",\n";
+  json << "    \"persistentS1GenerationProofEligibleCount\": "
+       << shadowAgg.persistentS1GenerationProofEligibleCount << ",\n";
+  json << "    \"persistentS1GenerationProofFirstCount\": "
+       << shadowAgg.persistentS1GenerationProofFirstCount << ",\n";
+  json << "    \"persistentS1GenerationProofSameFrameCount\": "
+       << shadowAgg.persistentS1GenerationProofSameFrameCount << ",\n";
+  json << "    \"persistentS1GenerationProofAdvancedCount\": "
+       << shadowAgg.persistentS1GenerationProofAdvancedCount << ",\n";
+  json << "    \"persistentS1GenerationProofChangedCount\": "
+       << shadowAgg.persistentS1GenerationProofChangedCount << ",\n";
+  json << "    \"persistentS1GenerationProofStaleRestartCount\": "
+       << shadowAgg.persistentS1GenerationProofStaleRestartCount << ",\n";
+  json << "    \"persistentS1GenerationProofPromotionReadyCount\": "
+       << shadowAgg.persistentS1GenerationProofPromotionReadyCount << ",\n";
+  json << "    \"persistentS1GenerationProofCapacityRejectCount\": "
+       << shadowAgg.persistentS1GenerationProofCapacityRejectCount << ",\n";
   json << "    \"semanticFallbackPruned\": "
        << shadowAgg.semanticFallbackPruned << ",\n";
   json << "    \"semanticFallbackPrunedByHandle\": "
@@ -7194,10 +7669,84 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg.drawTimeVBCacheConsumeHitCount << ",\n";
   json << "    \"drawTimeVBCacheConsumeMissCount\": "
        << shadowAgg.drawTimeVBCacheConsumeMissCount << ",\n";
+  json << "    \"drawTimeAllocObserverFrames\": "
+       << shadowAgg.drawTimeAllocObserverFrames << ",\n";
+  json << "    \"drawTimePositionAllocRequestCount\": "
+       << shadowAgg.drawTimePositionAllocRequestCount << ",\n";
+  json << "    \"drawTimePositionAllocNewEntryCount\": "
+       << shadowAgg.drawTimePositionAllocNewEntryCount << ",\n";
+  json << "    \"drawTimePositionAllocMissingBackingCount\": "
+       << shadowAgg.drawTimePositionAllocMissingBackingCount << ",\n";
+  json << "    \"drawTimePositionAllocCapacityGrowthCount\": "
+       << shadowAgg.drawTimePositionAllocCapacityGrowthCount << ",\n";
+  json << "    \"drawTimePositionAllocLeaseDetachCount\": "
+       << shadowAgg.drawTimePositionAllocLeaseDetachCount << ",\n";
+  json << "    \"drawTimePositionAllocStaticRequestCount\": "
+       << shadowAgg.drawTimePositionAllocStaticRequestCount << ",\n";
+  json << "    \"drawTimePositionAllocDynamicRequestCount\": "
+       << shadowAgg.drawTimePositionAllocDynamicRequestCount << ",\n";
+  json << "    \"drawTimePositionDeferredNewEntryCount\": "
+       << shadowAgg.drawTimePositionDeferredNewEntryCount << ",\n";
+  json << "    \"drawTimePositionDeferredMissingBackingCount\": "
+       << shadowAgg.drawTimePositionDeferredMissingBackingCount << ",\n";
+  json << "    \"drawTimePositionDeferredCapacityGrowthCount\": "
+       << shadowAgg.drawTimePositionDeferredCapacityGrowthCount << ",\n";
+  json << "    \"drawTimePositionDeferredLeaseDetachCount\": "
+       << shadowAgg.drawTimePositionDeferredLeaseDetachCount << ",\n";
+  json << "    \"drawTimePositionProofUniqueCount\": "
+       << shadowAgg.drawTimePositionProofUniqueCount << ",\n";
+  json << "    \"drawTimePositionProofDuplicateCount\": "
+       << shadowAgg.drawTimePositionProofDuplicateCount << ",\n";
+  json << "    \"drawTimePositionProofInvalidCount\": "
+       << shadowAgg.drawTimePositionProofInvalidCount << ",\n";
+  json << "    \"drawTimePositionProofSetOverflowCount\": "
+       << shadowAgg.drawTimePositionProofSetOverflowCount << ",\n";
+  json << "    \"drawTimePositionProofUniqueBytes\": "
+       << shadowAgg.drawTimePositionProofUniqueBytes << ",\n";
+  json << "    \"drawTimePositionProofDuplicateBytes\": "
+       << shadowAgg.drawTimePositionProofDuplicateBytes << ",\n";
+  json << "    \"drawTimeDirectStaticPositionBindCount\": "
+       << shadowAgg.drawTimeDirectStaticPositionBindCount << ",\n";
+  json << "    \"drawTimeDirectStaticPositionBytes\": "
+       << shadowAgg.drawTimeDirectStaticPositionBytes << ",\n";
+  json << "    \"drawTimeDirectStaticIndexBindCount\": "
+       << shadowAgg.drawTimeDirectStaticIndexBindCount << ",\n";
+  json << "    \"drawTimeDirectStaticIndexBytes\": "
+       << shadowAgg.drawTimeDirectStaticIndexBytes << ",\n";
+  json << "    \"drawTimeDirectUploadPositionBindCount\": "
+       << shadowAgg.drawTimeDirectUploadPositionBindCount << ",\n";
+  json << "    \"drawTimeDirectUploadPositionBytes\": "
+       << shadowAgg.drawTimeDirectUploadPositionBytes << ",\n";
+  json << "    \"drawTimeDirectUploadUvBindCount\": "
+       << shadowAgg.drawTimeDirectUploadUvBindCount << ",\n";
+  json << "    \"drawTimeDirectUploadUvBytes\": "
+       << shadowAgg.drawTimeDirectUploadUvBytes << ",\n";
+  json << "    \"drawTimeDirectUploadIndexBindCount\": "
+       << shadowAgg.drawTimeDirectUploadIndexBindCount << ",\n";
+  json << "    \"drawTimeDirectUploadIndexBytes\": "
+       << shadowAgg.drawTimeDirectUploadIndexBytes << ",\n";
+  json << "    \"drawTimeDirectUploadCandidateCount\": "
+       << shadowAgg.drawTimeDirectUploadCandidateCount << ",\n";
+  json << "    \"drawTimeDirectUploadRejectNoProofCount\": "
+       << shadowAgg.drawTimeDirectUploadRejectNoProofCount << ",\n";
+  json << "    \"drawTimeDirectUploadRejectNoStorageCount\": "
+       << shadowAgg.drawTimeDirectUploadRejectNoStorageCount << ",\n";
+  json << "    \"drawTimeDirectUploadRejectRangeCount\": "
+       << shadowAgg.drawTimeDirectUploadRejectRangeCount << ",\n";
+  json << "    \"drawTimePositionAllocDirectMutableRequestCount\": "
+       << shadowAgg.drawTimePositionAllocDirectMutableRequestCount << ",\n";
   json << "    \"drawTimeVBCacheRejectNoLayerContext\": "
        << shadowAgg.drawTimeVBCacheRejectNoLayerContext << ",\n";
   json << "    \"drawTimeVBCacheSameFrameDedupMiss\": "
        << shadowAgg.drawTimeVBCacheSameFrameDedupMiss << ",\n";
+  json << "    \"drawTimeGenerationBackedPositionReuseCount\": "
+       << shadowAgg.drawTimeGenerationBackedPositionReuseCount << ",\n";
+  json << "    \"drawTimeGenerationBackedUvReuseCount\": "
+       << shadowAgg.drawTimeGenerationBackedUvReuseCount << ",\n";
+  json << "    \"drawTimeGenerationBackedIndexReuseCount\": "
+       << shadowAgg.drawTimeGenerationBackedIndexReuseCount << ",\n";
+  json << "    \"drawTimeGenerationBackedCopyBytesSaved\": "
+       << shadowAgg.drawTimeGenerationBackedCopyBytesSaved << ",\n";
   json << "    \"semanticBridgeHit\": " << shadowAgg.semanticBridgeHit
        << ",\n";
   json << "    \"semanticBridgeMiss\": " << shadowAgg.semanticBridgeMiss
@@ -8062,6 +8611,40 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg.semanticSceneShadowMapCascadeCulledCount << ",\n";
   json << "    \"semanticSceneTerrainBoundsCullMode\": "
        << shadowAgg.semanticSceneTerrainBoundsCullMode << ",\n";
+  json << "    \"semanticSceneTerrainBoundsProducerHistogram\": ["
+       << shadowAgg.semanticSceneTerrainBoundsProducerS1AttemptCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerFallbackAttemptCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerExactRangeCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerMissingExactRangeCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerUpSourceAttemptCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerMappedSourceAttemptCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerNoSourceCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerSpanAcceptedCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerSpanRejectedCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerSpanNullBaseRejectCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerSpanNotCpuReadableRejectCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerSpanMissingOwnerRejectCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerSpanMissingGenerationRejectCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerSpanRangeRejectCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerSpanAddressOverflowRejectCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerComputeSuccessCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerComputeFailureCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerValidSphereCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerInvalidSphereCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerPublishedExactCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerDomainCacheLookupCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerDomainCacheHitCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerDomainCacheMissCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerDomainCacheCollisionMissCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerDomainCacheStoreCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerDomainCacheEvictionCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerHintComparableCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerHintExactCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerHintSupersetCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerHintUnderCoverageCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerHintInvalidCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerHintRangeAcceptedCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerHintRangeRejectedCount << "],\n";
   json << "    \"semanticSceneTerrainBoundsCandidateCount\": "
        << shadowAgg.semanticSceneTerrainBoundsCandidateCount << ",\n";
   json << "    \"semanticSceneTerrainBoundsProofAcceptedCount\": "
@@ -8393,6 +8976,26 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg.persistentS1EarlyReplayFallbackCount << ",\n";
   json << "    \"persistentS1EarlyReplayClosureMismatchFrames\": "
        << shadowAgg.persistentS1EarlyReplayClosureMismatchFrames << ",\n";
+  json << "    \"persistentS1GenerationProofEntryCount\": "
+       << shadowAgg.persistentS1GenerationProofEntryCountLast << ",\n";
+  json << "    \"persistentS1GenerationProofEntryCountMax\": "
+       << shadowAgg.persistentS1GenerationProofEntryCountMax << ",\n";
+  json << "    \"persistentS1GenerationProofEligibleCount\": "
+       << shadowAgg.persistentS1GenerationProofEligibleCount << ",\n";
+  json << "    \"persistentS1GenerationProofFirstCount\": "
+       << shadowAgg.persistentS1GenerationProofFirstCount << ",\n";
+  json << "    \"persistentS1GenerationProofSameFrameCount\": "
+       << shadowAgg.persistentS1GenerationProofSameFrameCount << ",\n";
+  json << "    \"persistentS1GenerationProofAdvancedCount\": "
+       << shadowAgg.persistentS1GenerationProofAdvancedCount << ",\n";
+  json << "    \"persistentS1GenerationProofChangedCount\": "
+       << shadowAgg.persistentS1GenerationProofChangedCount << ",\n";
+  json << "    \"persistentS1GenerationProofStaleRestartCount\": "
+       << shadowAgg.persistentS1GenerationProofStaleRestartCount << ",\n";
+  json << "    \"persistentS1GenerationProofPromotionReadyCount\": "
+       << shadowAgg.persistentS1GenerationProofPromotionReadyCount << ",\n";
+  json << "    \"persistentS1GenerationProofCapacityRejectCount\": "
+       << shadowAgg.persistentS1GenerationProofCapacityRejectCount << ",\n";
   json << "    \"semanticFallbackPruned\": "
        << shadowAgg.semanticFallbackPruned << ",\n";
   json << "    \"semanticFallbackPrunedByHandle\": "
@@ -8981,6 +9584,10 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
           "\"drawTimeVBCacheRejectContractInstance\", "
           "\"drawTimeVBCacheRejectContractSlice\", "
           "\"drawTimeVBCacheSameFrameDedupMiss\", "
+          "\"drawTimeGenerationBackedPositionReuseCount\", "
+          "\"drawTimeGenerationBackedUvReuseCount\", "
+          "\"drawTimeGenerationBackedIndexReuseCount\", "
+          "\"drawTimeGenerationBackedCopyBytesSaved\", "
           "\"semanticSceneSubmitted\", \"semanticSceneSubmittedSkinned\", "
           "\"skippedCasterCap\", \"skippedDistanceCull\", "
           "\"hasShadowReceiver\", \"replayCasterCount\", "
@@ -9089,6 +9696,10 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
          << w.drawTimeVBCacheRejectContractInstance << ", "
          << w.drawTimeVBCacheRejectContractSlice << ", "
          << w.drawTimeVBCacheSameFrameDedupMiss << ", "
+         << w.drawTimeGenerationBackedPositionReuseCount << ", "
+         << w.drawTimeGenerationBackedUvReuseCount << ", "
+         << w.drawTimeGenerationBackedIndexReuseCount << ", "
+         << w.drawTimeGenerationBackedCopyBytesSaved << ", "
          << w.semanticSceneSubmitted << ", "
          << w.semanticSceneSubmittedSkinned << ", " << w.skippedCasterCap
          << ", " << w.skippedDistanceCull << ", "

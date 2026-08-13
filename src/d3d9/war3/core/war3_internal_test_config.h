@@ -1043,9 +1043,20 @@ inline constexpr bool kShadowS1TerrainBoundsCacheUploadSourceKeyEnabled = true;
 // 当前专用地图验证显示 dynamic slice/content-key 路径命中率只有约 1-2%：
 // War3 会持续重建/搬移动面地形 VB。默认关闭，避免为低命中率额外采样。
 inline constexpr bool kShadowS1TerrainBoundsCacheDynamicSliceKeyEnabled = false;
-// S1 terrain bounds cache 低频诊断。按需开启，用于确认 bounds 裁剪是否
-// 命中静态 VB / UP source-key cache，或仍在动态上传路径反复扫描 VB。
+// S1 terrain bounds cache 低频诊断与 current-generation mapped-slice
+// 观察只存在于独立 observer 构建。后者仍把 owner/allocation/content
+// generation 和精确 draw range 全部写入 key，不授权跨代复用，也不启用
+// 实际剔除。Release 构建保持完全关闭。
+#if defined(WARVK_ENABLE_SHADOW_OBSERVERS_DEV) && \
+    WARVK_ENABLE_SHADOW_OBSERVERS_DEV
+inline constexpr bool
+    kShadowS1TerrainBoundsCacheCurrentGenerationObserverEnabled = true;
+inline constexpr bool kShadowS1TerrainBoundsCacheStatsLogging = true;
+#else
+inline constexpr bool
+    kShadowS1TerrainBoundsCacheCurrentGenerationObserverEnabled = false;
 inline constexpr bool kShadowS1TerrainBoundsCacheStatsLogging = false;
+#endif
 inline constexpr uint32_t kShadowS1TerrainBoundsCacheStatsInterval = 4096u;
 // 仅作用于 stage 1 terrain caster 的 shadow-map 深度偏移（NDC 深度）。
 // 目标：S1 仍可挡住高地单位阴影向低层穿透，但减少地形自身/悬崖边缘

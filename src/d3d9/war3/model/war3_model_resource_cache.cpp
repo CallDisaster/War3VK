@@ -4,6 +4,7 @@
 #include "../core/war3_game_structs.h"
 #include "../core/war3_memory.h"
 #include "../tools/war3_resource_residency_census.h"
+#include "../../../util/util_bit.h"
 
 #include <algorithm>
 #include <atomic>
@@ -984,6 +985,8 @@ void ReplaceGeosetImmutablePayload(ShadowGeosetResourceRecord& dst,
   dst.normals = src.normals;
   dst.vertexGroupCount = src.vertexGroupCount;
   dst.vertexGroupIndices = src.vertexGroupIndices;
+  dst.maxVertexGroupSlot = src.maxVertexGroupSlot;
+  dst.vertexGroupSlotWordHash = src.vertexGroupSlotWordHash;
   dst.uvLayerCount = src.uvLayerCount;
   dst.uvLayers = src.uvLayers;
   dst.primitiveCount = src.primitiveCount;
@@ -992,12 +995,30 @@ void ReplaceGeosetImmutablePayload(ShadowGeosetResourceRecord& dst,
   dst.indices = src.indices;
   dst.matrixGroupCount = src.matrixGroupCount;
   dst.matrixGroupSizes = src.matrixGroupSizes;
+  dst.maxMatrixGroupSize = src.maxMatrixGroupSize;
   dst.matrixIndexCount = src.matrixIndexCount;
   dst.matrixIndices = src.matrixIndices;
   dst.contentHash = src.contentHash;
   dst.immutableModelGeneration = 0u;
   dst.localBounds = {};
   dst.immutableCaptureStatus = src.immutableCaptureStatus;
+}
+
+void RefreshGeosetImmutableDerivedValues(
+    ShadowGeosetResourceRecord& record) noexcept {
+  record.maxVertexGroupSlot = 0u;
+  record.vertexGroupSlotWordHash = bit::fnv1a_init();
+  for (uint8_t slot : record.vertexGroupIndices) {
+    record.maxVertexGroupSlot = (std::max)(record.maxVertexGroupSlot,
+                                           uint32_t(slot));
+    record.vertexGroupSlotWordHash = bit::fnv1a_iter(
+        record.vertexGroupSlotWordHash, uint32_t(slot));
+  }
+
+  record.maxMatrixGroupSize = 0u;
+  for (uint32_t groupSize : record.matrixGroupSizes)
+    record.maxMatrixGroupSize = (std::max)(record.maxMatrixGroupSize,
+                                           groupSize);
 }
 
 void ShadowModelResourceCache::endFrame() {
@@ -1199,6 +1220,7 @@ ShadowGeosetResourceSnapshot ShadowModelResourceCache::storeGeosetRecord(
     }
   }
   merged.immutableModelGeneration = generation;
+  RefreshGeosetImmutableDerivedValues(merged);
   merged.localBounds = generation != 0u
       ? ComputeShadowGeosetLocalBounds(merged.positions, merged.vertexCount)
       : ShadowGeosetLocalBounds{};
@@ -1763,6 +1785,78 @@ bool ShadowModelResourceCache::findGeosetByData(
   return true;
 }
 
+namespace {
+
+void CopyReadyGeosetBinding(const ShadowGeosetResourceRecord& record,
+                            ShadowReadyGeosetBinding& out) {
+  out.geosetPtr = record.geosetPtr;
+  out.geosetDataPtr = record.geosetDataPtr;
+  out.modelResourcePtr = record.modelResourcePtr;
+  out.modelKey = record.modelKey;
+  out.geosetIndex = record.geosetIndex;
+}
+
+void MergeReadyGeosetAlias(const ShadowGeosetResourceRecord& alias,
+                           ShadowReadyGeosetBinding& out) {
+  if (alias.geosetPtr != nullptr)
+    out.geosetPtr = alias.geosetPtr;
+  if (alias.geosetDataPtr != nullptr)
+    out.geosetDataPtr = alias.geosetDataPtr;
+  if (alias.modelResourcePtr != nullptr)
+    out.modelResourcePtr = alias.modelResourcePtr;
+  if (alias.modelKey != 0u)
+    out.modelKey = alias.modelKey;
+  if (alias.geosetIndex != kInvalidShadowGeosetIndex)
+    out.geosetIndex = alias.geosetIndex;
+}
+
+} // namespace
+
+bool ShadowModelResourceCache::findReadyGeosetBindingByPtr(
+    void* geosetPtr, ShadowReadyGeosetBinding& out) const {
+  out = {};
+  if (geosetPtr == nullptr)
+    return false;
+
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
+  const auto aliasIt = m_byGeoset.find(geosetPtr);
+  if (aliasIt == m_byGeoset.end() ||
+      !aliasIt->second.readyForShadowConsumer() ||
+      aliasIt->second.geosetDataPtr == nullptr) {
+    return false;
+  }
+
+  const auto canonicalIt = m_byGeosetData.find(
+      aliasIt->second.geosetDataPtr);
+  if (canonicalIt == m_byGeosetData.end() ||
+      canonicalIt->second == nullptr ||
+      !canonicalIt->second->readyForShadowConsumer()) {
+    return false;
+  }
+
+  CopyReadyGeosetBinding(*canonicalIt->second, out);
+  MergeReadyGeosetAlias(aliasIt->second, out);
+  return true;
+}
+
+bool ShadowModelResourceCache::findReadyGeosetBindingByData(
+    void* geosetDataPtr, ShadowReadyGeosetBinding& out) const {
+  out = {};
+  if (geosetDataPtr == nullptr)
+    return false;
+
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
+  const auto canonicalIt = m_byGeosetData.find(geosetDataPtr);
+  if (canonicalIt == m_byGeosetData.end() ||
+      canonicalIt->second == nullptr ||
+      !canonicalIt->second->readyForShadowConsumer()) {
+    return false;
+  }
+
+  CopyReadyGeosetBinding(*canonicalIt->second, out);
+  return true;
+}
+
 ShadowGeosetResourceSnapshot
 ShadowModelResourceCache::findGeosetSnapshotByData(
     void* geosetDataPtr) const {
@@ -2084,6 +2178,137 @@ bool ShadowModelResourceCache::findRuntimeModelOwnerIndexed(
   return false;
 }
 
+bool ShadowModelResourceCache::findRuntimeModelOwnerBinding(
+    void* runtimeGeosetPtr, void* runtimeGeosetDataPtr, uint32_t geosetIndex,
+    void* modelResourcePtr, ShadowRuntimeModelOwnerBinding& out) const {
+  out = {};
+  if (runtimeGeosetPtr == nullptr && runtimeGeosetDataPtr == nullptr)
+    return false;
+
+  modelResourcePtr = TryResolveDirectModelResourcePtr(modelResourcePtr);
+
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
+  const auto project = [&](const ShadowModelResourceRecord& record) {
+    out.runtimeModelPtr = record.runtimeModelPtr;
+    out.modelResourcePtr = record.modelResourcePtr;
+    out.modelKey = record.modelKey;
+    out.geosetCount = record.geosetCount;
+  };
+  const auto tryIndexedOwner = [&](
+      const std::unordered_map<void*, void*>& index, void* key) -> bool {
+    if (key == nullptr)
+      return false;
+    const auto itOwner = index.find(key);
+    if (itOwner == index.end())
+      return false;
+    if (itOwner->second == nullptr)
+      return true;
+    const auto itRuntime = m_byRuntimeModel.find(itOwner->second);
+    if (itRuntime == m_byRuntimeModel.end())
+      return true;
+    project(itRuntime->second);
+    return true;
+  };
+
+  if (tryIndexedOwner(m_runtimeOwnerByGeoset, runtimeGeosetPtr))
+    return out.runtimeModelPtr != nullptr;
+  if (tryIndexedOwner(m_runtimeOwnerByGeosetData, runtimeGeosetDataPtr))
+    return out.runtimeModelPtr != nullptr;
+
+  const ShadowModelResourceRecord* best = nullptr;
+  int bestScore = -1;
+  bool ambiguous = false;
+  for (const auto& itRuntime : m_byRuntimeModel) {
+    const ShadowModelResourceRecord& runtimeRecord = itRuntime.second;
+    const int score = ScoreRuntimeOwnerCandidate(
+        runtimeRecord, runtimeGeosetPtr, runtimeGeosetDataPtr, geosetIndex,
+        modelResourcePtr);
+    if (score < 0)
+      continue;
+    if (score > bestScore) {
+      best = &runtimeRecord;
+      bestScore = score;
+      ambiguous = false;
+    } else if (score == bestScore && best != nullptr &&
+               best->runtimeModelPtr != runtimeRecord.runtimeModelPtr) {
+      ambiguous = true;
+    }
+  }
+
+  if (best == nullptr || ambiguous) {
+    out = {};
+    return false;
+  }
+  project(*best);
+  return out.runtimeModelPtr != nullptr;
+}
+
+bool ShadowModelResourceCache::findRuntimeModelOwnerBindingIndexed(
+    void* runtimeGeosetPtr, void* runtimeGeosetDataPtr,
+    ShadowRuntimeModelOwnerBinding& out) const {
+  out = {};
+  if (runtimeGeosetPtr == nullptr && runtimeGeosetDataPtr == nullptr)
+    return false;
+
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
+  const auto tryIndexedOwner = [&](
+      const std::unordered_map<void*, void*>& index, void* key) -> bool {
+    if (key == nullptr)
+      return false;
+    const auto itOwner = index.find(key);
+    if (itOwner == index.end() || itOwner->second == nullptr)
+      return false;
+    const auto itRuntime = m_byRuntimeModel.find(itOwner->second);
+    if (itRuntime == m_byRuntimeModel.end())
+      return false;
+    const ShadowModelResourceRecord& record = itRuntime->second;
+    out.runtimeModelPtr = record.runtimeModelPtr;
+    out.modelResourcePtr = record.modelResourcePtr;
+    out.modelKey = record.modelKey;
+    out.geosetCount = record.geosetCount;
+    return out.runtimeModelPtr != nullptr;
+  };
+
+  return tryIndexedOwner(m_runtimeOwnerByGeoset, runtimeGeosetPtr) ||
+      tryIndexedOwner(m_runtimeOwnerByGeosetData, runtimeGeosetDataPtr);
+}
+
+bool ShadowModelResourceCache::findModelBinding(
+    void* modelResourcePtr, ShadowRuntimeModelOwnerBinding& out) const {
+  out = {};
+  if (modelResourcePtr == nullptr)
+    return false;
+
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
+  const auto it = m_byModelResource.find(modelResourcePtr);
+  if (it == m_byModelResource.end())
+    return false;
+  const ShadowModelResourceRecord& record = it->second;
+  out.runtimeModelPtr = record.runtimeModelPtr;
+  out.modelResourcePtr = record.modelResourcePtr;
+  out.modelKey = record.modelKey;
+  out.geosetCount = record.geosetCount;
+  return true;
+}
+
+bool ShadowModelResourceCache::findRuntimeModelBinding(
+    void* runtimeModelPtr, ShadowRuntimeModelOwnerBinding& out) const {
+  out = {};
+  if (runtimeModelPtr == nullptr)
+    return false;
+
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
+  const auto it = m_byRuntimeModel.find(runtimeModelPtr);
+  if (it == m_byRuntimeModel.end())
+    return false;
+  const ShadowModelResourceRecord& record = it->second;
+  out.runtimeModelPtr = record.runtimeModelPtr;
+  out.modelResourcePtr = record.modelResourcePtr;
+  out.modelKey = record.modelKey;
+  out.geosetCount = record.geosetCount;
+  return true;
+}
+
 bool ShadowModelResourceCache::findModelResource(
     void *modelResourcePtr, ShadowModelResourceRecord &out) const {
   out = {};
@@ -2165,6 +2390,32 @@ ShadowModelResourceCache::snapshotRuntimeModels() const {
   return out;
 }
 
+std::vector<ShadowModelAliasSnapshotRecord>
+ShadowModelResourceCache::snapshotModelAliases() const {
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
+  std::vector<ShadowModelAliasSnapshotRecord> out;
+  out.reserve(m_byModelResource.size());
+  for (const auto& entry : m_byModelResource) {
+    const auto& record = entry.second;
+    out.push_back({record.runtimeModelPtr, record.modelResourcePtr,
+                   record.geosetCount});
+  }
+  return out;
+}
+
+std::vector<ShadowModelAliasSnapshotRecord>
+ShadowModelResourceCache::snapshotRuntimeModelAliases() const {
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
+  std::vector<ShadowModelAliasSnapshotRecord> out;
+  out.reserve(m_byRuntimeModel.size());
+  for (const auto& entry : m_byRuntimeModel) {
+    const auto& record = entry.second;
+    out.push_back({record.runtimeModelPtr, record.modelResourcePtr,
+                   record.geosetCount});
+  }
+  return out;
+}
+
 size_t ShadowModelResourceCache::geosetRecordCount() const {
   std::shared_lock<std::shared_mutex> lock(m_mutex);
   size_t count = m_byGeoset.size();
@@ -2209,6 +2460,28 @@ size_t ShadowModelResourceCache::modelResourceCount() const {
 size_t ShadowModelResourceCache::runtimeModelRecordCount() const {
   std::shared_lock<std::shared_mutex> lock(m_mutex);
   return m_byRuntimeModel.size();
+}
+
+ShadowResourceStoreCapacityHint
+ShadowModelResourceCache::resourceStoreCapacityHint() const {
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
+  ShadowResourceStoreCapacityHint result = {};
+  result.geosetRecordUpperBound = m_byGeoset.size() + m_byGeosetData.size();
+
+  const auto addAliasCapacity = [&result](
+      const std::unordered_map<void*, ShadowModelResourceRecord>& records) {
+    for (const auto& entry : records) {
+      if (entry.second.runtimeModelPtr == nullptr)
+        continue;
+      const size_t remaining = (std::numeric_limits<size_t>::max)() -
+          result.runtimeAliasUpperBound;
+      result.runtimeAliasUpperBound +=
+          (std::min)(remaining, size_t(entry.second.geosetCount));
+    }
+  };
+  addAliasCapacity(m_byModelResource);
+  addAliasCapacity(m_byRuntimeModel);
+  return result;
 }
 
 ShadowModelResourceMemorySnapshot

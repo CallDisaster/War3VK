@@ -123,6 +123,8 @@ d3d9_src = [
   'war3/render/war3_shadow_producer_policy.cpp',
   'war3/render/war3_shadow_replay_validation.cpp',
   'war3/render/war3_point_shadow_cpu_plan.cpp',
+  'war3/render/war3_gpu_workload_governor.cpp',
+  'war3/render/war3_volumetric_shader_work_admission.cpp',
   'war3/render/war3_union_consumer_visibility.cpp',
   'war3/render/war3_current_draw_contract.cpp',
   'war3/render/war3_scene_collector.cpp',
@@ -134,6 +136,7 @@ d3d9_src = [
   'war3/render/war3_render_queue_tracker.cpp',
   'war3/render/war3_render_exec_batch.cpp',
   'war3/render/war3_render_state.cpp',
+  'war3/render/war3_tracked_vk_pipeline.cpp',
   'war3/render/war3_upper_layer_shadow.cpp',
   'war3/render/war3_visible_renderables.cpp',
   'war3/render/war3_shadow_capture_frontend.cpp',
@@ -222,6 +225,33 @@ endif
 lib_dwmapi = cpp.find_library('dwmapi')
 lib_dbghelp = cpp.find_library('dbghelp')
 
+d3d9_cpp_args = []
+if get_option('warvk_shadow_observers_dev')
+  d3d9_cpp_args += [ '-DWARVK_ENABLE_SHADOW_OBSERVERS_DEV=1' ]
+endif
+if get_option('warvk_rts_shadow_candidate_dev')
+  d3d9_cpp_args += [ '-DWARVK_ENABLE_RTS_SHADOW_CANDIDATE_DEV=1' ]
+endif
+if get_option('warvk_coherent_up_index_trim_dev')
+  d3d9_cpp_args += [ '-DWARVK_ENABLE_COHERENT_UP_INDEX_TRIM_DEV=1' ]
+endif
+if get_option('warvk_current_up_shadow_replay_dev')
+  d3d9_cpp_args += [ '-DWARVK_ENABLE_CURRENT_UP_SHADOW_REPLAY_DEV=1' ]
+endif
+if get_option('warvk_coherent_real_perf_candidate_dev')
+  d3d9_cpp_args += [
+    '-DWARVK_ENABLE_COHERENT_REAL_INDEX_TRIM_DEV=1',
+    '-DWARVK_ENABLE_COHERENT_REAL_PERF_CANDIDATE_DEV=1',
+  ]
+elif get_option('warvk_coherent_real_index_trim_dev')
+  d3d9_cpp_args += [ '-DWARVK_ENABLE_COHERENT_REAL_INDEX_TRIM_DEV=1' ]
+endif
+if get_option('warvk_device_address_binding_report_dev')
+  # Keep the fixed-capacity tracker type identical across the DXVK static
+  # library and every D3D9 translation unit that includes its value snapshots.
+  d3d9_cpp_args += [ '-DWARVK_ENABLE_DEVICE_ADDRESS_BINDING_REPORT_DEV=1' ]
+endif
+
 d3d9_dll = shared_library(dxvk_name_prefix+'d3d9', d3d9_src,
   glsl_generator.process(d3d9_shaders), d3d9_war3_gpu_skin_ff_vs, d3d9_res,
   dependencies        : [ dxso_dep, dxvk_dep, imgui_dep, lib_dwmapi, lib_dbghelp ],
@@ -230,6 +260,7 @@ d3d9_dll = shared_library(dxvk_name_prefix+'d3d9', d3d9_src,
   vs_module_defs      : 'd3d9'+def_spec_ext,
   link_args           : d3d9_ld_args,
   link_depends        : [ d3d9_link_depends ],
+  cpp_args            : d3d9_cpp_args,
   kwargs              : dxvk_so_version,
 )
 
@@ -292,6 +323,372 @@ test(
   timeout : 30,
 )
 
+# Raw SPIR-V ShaderPack loading is compile-time developer-only.  Test both the
+# production default-deny policy and the one explicit development capability;
+# the production d3d9 shared library above never receives the enable macro.
+war3_shaderpack_policy_release_test = executable(
+  'war3_shaderpack_policy_release_test',
+  [
+    'war3/render/tests/war3_shaderpack_policy_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_shaderpack_policy_release',
+  war3_shaderpack_policy_release_test,
+  timeout : 30,
+)
+
+war3_shaderpack_policy_dev_test = executable(
+  'war3_shaderpack_policy_dev_test',
+  [
+    'war3/render/tests/war3_shaderpack_policy_test.cpp',
+  ],
+  cpp_args            : [
+    '-DWARVK_ENABLE_RAW_SHADERPACK_DEV=1',
+    '-DWARVK_EXPECT_RAW_SHADERPACK_DEV=1',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_shaderpack_policy_dev',
+  war3_shaderpack_policy_dev_test,
+  timeout : 30,
+)
+
+# Numerical CSM receiver oracle. It deliberately contains no Vulkan or game
+# state so its sub-texel, receiver-plane and cascade-boundary contracts run on
+# every Win32 build.
+war3_shadow_receiver_numeric_contract_test = executable(
+  'war3_shadow_receiver_numeric_contract_test',
+  [
+    'war3/render/tests/war3_shadow_receiver_numeric_contract_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_shadow_receiver_numeric_contract',
+  war3_shadow_receiver_numeric_contract_test,
+  timeout : 30,
+)
+
+# Pure one-pass current-draw group-slot aggregate. This locks the historical
+# stable identity hash while allowing BuildEligible to reuse the maximum
+# palette slot produced by the validating decode pass.
+war3_current_draw_group_slot_summary_test = executable(
+  'war3_current_draw_group_slot_summary_test',
+  [
+    'war3/render/tests/war3_current_draw_group_slot_summary_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_current_draw_group_slot_summary',
+  war3_current_draw_group_slot_summary_test,
+  timeout : 30,
+)
+
+# Exact-owner snapshot filtering is applied only to the already fixed canonical
+# prefix. A rejected winner never revives a weaker duplicate or backfills a
+# lower-priority record across the historical bound.
+war3_current_draw_winner_filter_policy_test = executable(
+  'war3_current_draw_winner_filter_policy_test',
+  [
+    'war3/render/tests/war3_current_draw_winner_filter_policy_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_current_draw_winner_filter_policy',
+  war3_current_draw_winner_filter_policy_test,
+  timeout : 30,
+)
+
+# Immutable CurrentDraw group-slot aliases are accepted only when the packet's
+# retained generation-backed owner proves the exact pointer and full range.
+war3_immutable_group_slot_binding_test = executable(
+  'war3_immutable_group_slot_binding_test',
+  [
+    'war3/render/tests/war3_immutable_group_slot_binding_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_immutable_group_slot_binding',
+  war3_immutable_group_slot_binding_test,
+  timeout : 30,
+)
+
+# Byte-exact War3 palette 3x4 pack contract. The hot publish path writes this
+# representation directly instead of materializing an intermediate vector.
+war3_palette_pack_test = executable(
+  'war3_palette_pack_test',
+  [
+    'war3/model/tests/war3_palette_pack_test.cpp',
+    '../util/util_matrix.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_palette_pack',
+  war3_palette_pack_test,
+  timeout : 30,
+)
+
+# Palette decoding already touches every matrix. Lock byte-for-byte identity
+# with the historical FNV oracle while producing that hash in the same pass.
+war3_current_draw_palette_hash_test = executable(
+  'war3_current_draw_palette_hash_test',
+  [
+    'war3/render/tests/war3_current_draw_palette_hash_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_current_draw_palette_hash',
+  war3_current_draw_palette_hash_test,
+  timeout : 30,
+)
+
+# CPU scene palettes retain only their live prefix. The upload boundary must
+# expand that prefix to the fixed 256-matrix shader stride with an identity
+# tail, preserving the historical GPU-visible representation.
+war3_shadow_palette_storage_test = executable(
+  'war3_shadow_palette_storage_test',
+  [
+    'war3/render/tests/war3_shadow_palette_storage_test.cpp',
+    '../util/util_matrix.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_shadow_palette_storage',
+  war3_shadow_palette_storage_test,
+  timeout : 30,
+)
+
+# Frame-local palette indexes retain their contiguous nodes across clear and
+# preserve multi-value collision lookup without per-entry map allocations.
+war3_frame_hash_index_test = executable(
+  'war3_frame_hash_index_test',
+  [
+    'war3/render/tests/war3_frame_hash_index_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_frame_hash_index',
+  war3_frame_hash_index_test,
+  timeout : 30,
+)
+
+# Current-frame visible owner projection requires at least one exact instance
+# alias and rejects every conflicting alias before bypassing registry lookup.
+war3_visible_instance_projection_test = executable(
+  'war3_visible_instance_projection_test',
+  [
+    'war3/render/tests/war3_visible_instance_projection_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_visible_instance_projection',
+  war3_visible_instance_projection_test,
+  timeout : 30,
+)
+
+# High-frequency classified counters keep only attempts and mutually exclusive
+# failure buckets; successful counts are derived when diagnostics are sampled.
+war3_classified_counter_test = executable(
+  'war3_classified_counter_test',
+  [
+    'war3/render/tests/war3_classified_counter_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_classified_counter',
+  war3_classified_counter_test,
+  timeout : 30,
+)
+
+# Pure CurrentDraw identity normalization shared by packet resolution and the
+# Stage11 exact-owner pre-build gate.
+war3_current_draw_identity_contract_test = executable(
+  'war3_current_draw_identity_contract_test',
+  [
+    'war3/render/tests/war3_current_draw_identity_contract_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path, include_directories('war3') ],
+  install             : false,
+)
+test(
+  'war3_current_draw_identity_contract',
+  war3_current_draw_identity_contract_test,
+  timeout : 30,
+)
+
+# DirectGrouped scratch reset keeps allocator capacity only. The runnable
+# proves identities, pointer aliases and shared owners never survive reuse.
+war3_direct_packet_scratch_test = executable(
+  'war3_direct_packet_scratch_test',
+  [
+    'war3/render/tests/war3_direct_packet_scratch_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path, include_directories('war3') ],
+  install             : false,
+)
+test(
+  'war3_direct_packet_scratch',
+  war3_direct_packet_scratch_test,
+  timeout : 30,
+)
+
+# Pure receiver-band clipmap fit used by the default-off RTS shadow candidate.
+# It exercises fixed world-texel density, snapping and fail-closed coverage
+# without loading the game or Vulkan.
+war3_rts_shadow_stability_contract_test = executable(
+  'war3_rts_shadow_stability_contract_test',
+  [
+    'war3/render/tests/war3_rts_shadow_stability_contract_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_rts_shadow_stability_contract',
+  war3_rts_shadow_stability_contract_test,
+  timeout : 30,
+)
+
+war3_shadow_producer_completeness_policy_test = executable(
+  'war3_shadow_producer_completeness_policy_test',
+  [
+    'war3/render/tests/war3_shadow_producer_completeness_policy_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_shadow_producer_completeness_policy',
+  war3_shadow_producer_completeness_policy_test,
+  timeout : 30,
+)
+
+# Release and development policy tests are separate pure executables. The
+# production DLL only receives the development macro through the explicit
+# Meson option above; neither policy can return Consume.
+war3_shadow_observer_build_policy_release_test = executable(
+  'war3_shadow_observer_build_policy_release_test',
+  [
+    'war3/render/tests/war3_shadow_observer_build_policy_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_shadow_observer_build_policy_release',
+  war3_shadow_observer_build_policy_release_test,
+  timeout : 30,
+)
+
+war3_shadow_observer_build_policy_dev_test = executable(
+  'war3_shadow_observer_build_policy_dev_test',
+  [
+    'war3/render/tests/war3_shadow_observer_build_policy_test.cpp',
+  ],
+  cpp_args            : [
+    '-DWARVK_ENABLE_SHADOW_OBSERVERS_DEV=1',
+    '-DWARVK_EXPECT_SHADOW_OBSERVERS_DEV=1',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_shadow_observer_build_policy_dev',
+  war3_shadow_observer_build_policy_dev_test,
+  timeout : 30,
+)
+
+# Frame-local exact Stage11 cache keys are value records with monotonic
+# activation ordinals. This locks rehash/erase/ABA behavior without creating a
+# D3D9 device or touching Vulkan.
+war3_drawtime_active_ledger_test = executable(
+  'war3_drawtime_active_ledger_test',
+  [
+    'war3/render/tests/war3_drawtime_active_ledger_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_drawtime_active_ledger',
+  war3_drawtime_active_ledger_test,
+  timeout : 30,
+)
+
+# Value-only live fallback diagnostics. Append is O(1); the production path
+# performs a full scan only after its sole semantic-prune erase operation.
+war3_shadow_fallback_breakdown_test = executable(
+  'war3_shadow_fallback_breakdown_test',
+  [
+    'war3/render/tests/war3_shadow_fallback_breakdown_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_shadow_fallback_breakdown',
+  war3_shadow_fallback_breakdown_test,
+  timeout : 30,
+)
+
+# Exact terrain bounds may consume a non-indexed draw range directly, but an
+# indexed draw must first prove its real domain from current IB bytes. This
+# policy test deliberately has no D3D9/Vulkan dependency.
+war3_terrain_bounds_provenance_test = executable(
+  'war3_terrain_bounds_provenance_test',
+  [
+    'war3/render/tests/war3_terrain_bounds_provenance_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_terrain_bounds_provenance',
+  war3_terrain_bounds_provenance_test,
+  timeout : 30,
+)
+
+# The production pipeline owner uses the same Rc lifetime semantics exercised
+# here: a cache may release immediately, while an in-flight command list holds
+# the final owner until its GPU completion notification.
+war3_tracked_vk_pipeline_test = executable(
+  'war3_tracked_vk_pipeline_test',
+  [
+    'war3/render/tests/war3_tracked_vk_pipeline_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_tracked_vk_pipeline',
+  war3_tracked_vk_pipeline_test,
+  timeout : 30,
+)
+
 # Pure Phase-1 math-expression and curve-runtime test. It compiles and
 # evaluates bounded bytecode without loading Warcraft or creating GPU state.
 war3_math_curve_runtime_test = executable(
@@ -324,6 +721,42 @@ war3_union_consumer_visibility_test = executable(
 test(
   'war3_union_consumer_visibility',
   war3_union_consumer_visibility_test,
+  timeout : 30,
+)
+
+# Pure all-or-nothing shadow workload reservation contract. The runnable has
+# no Vulkan or Warcraft dependency and covers arithmetic overflow as well as
+# per-consumer draw/vertex/index admission.
+war3_gpu_workload_governor_test = executable(
+  'war3_gpu_workload_governor_test',
+  [
+    'war3/render/war3_gpu_workload_governor.cpp',
+    'war3/render/tests/war3_gpu_workload_governor_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_gpu_workload_governor',
+  war3_gpu_workload_governor_test,
+  timeout : 30,
+)
+
+# Pure-value P0 shader-work admission. It proves that the ray-segment loop,
+# directional D32 taps, point-cube probes and full-resolution composite reads
+# are checked as one bounded request before the optional volume pass executes.
+war3_volumetric_shader_work_admission_test = executable(
+  'war3_volumetric_shader_work_admission_test',
+  [
+    'war3/render/war3_volumetric_shader_work_admission.cpp',
+    'war3/render/tests/war3_volumetric_shader_work_admission_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_volumetric_shader_work_admission',
+  war3_volumetric_shader_work_admission_test,
   timeout : 30,
 )
 
@@ -371,6 +804,20 @@ test(
   timeout : 30,
 )
 
+war3_owned_image_layout_test = executable(
+  'war3_owned_image_layout_test',
+  [
+    'war3/render/tests/war3_owned_image_layout_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_owned_image_layout',
+  war3_owned_image_layout_test,
+  timeout : 30,
+)
+
 war3_shadow_arena_lifecycle_test = executable(
   'war3_shadow_arena_lifecycle_test',
   [
@@ -382,6 +829,23 @@ war3_shadow_arena_lifecycle_test = executable(
 test(
   'war3_shadow_arena_lifecycle',
   war3_shadow_arena_lifecycle_test,
+  timeout : 30,
+)
+
+# Pure P1 residency admission policy. No Vulkan device is created: the test
+# proves release fallback, trusted memory-budget clamps and overflow-safe page
+# growth decisions independently from the Arena's GPU-owned generations.
+war3_shadow_arena_budget_test = executable(
+  'war3_shadow_arena_budget_test',
+  [
+    'war3/memory/tests/war3_shadow_arena_budget_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_shadow_arena_budget',
+  war3_shadow_arena_budget_test,
   timeout : 30,
 )
 
@@ -575,12 +1039,37 @@ war3_cpu_readable_buffer_span_test = executable(
     'war3/memory/war3_cpu_readable_buffer_span.cpp',
     'war3/memory/tests/war3_cpu_readable_buffer_span_test.cpp',
   ],
+  cpp_args            : [
+    '-DWARVK_ENABLE_COHERENT_UP_INDEX_TRIM_DEV=1',
+    '-DWARVK_ENABLE_CURRENT_UP_SHADOW_REPLAY_DEV=1',
+    '-DWARVK_ENABLE_COHERENT_REAL_INDEX_TRIM_DEV=1',
+  ],
   include_directories : [ dxvk_include_path ],
   install             : false,
 )
 test(
   'war3_cpu_readable_buffer_span',
   war3_cpu_readable_buffer_span_test,
+  timeout : 30,
+)
+
+# Development-candidate policy test. The production/default D3D9 target never
+# receives these macros unless the dedicated Meson option is selected.
+war3_coherent_real_perf_candidate_policy_test = executable(
+  'war3_coherent_real_perf_candidate_policy_test',
+  [
+    'war3/memory/tests/war3_coherent_real_perf_candidate_policy_test.cpp',
+  ],
+  cpp_args            : [
+    '-DWARVK_ENABLE_COHERENT_REAL_INDEX_TRIM_DEV=1',
+    '-DWARVK_ENABLE_COHERENT_REAL_PERF_CANDIDATE_DEV=1',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_coherent_real_perf_candidate_policy',
+  war3_coherent_real_perf_candidate_policy_test,
   timeout : 30,
 )
 
@@ -598,6 +1087,43 @@ war3_crash_capture_policy_test = executable(
 test(
   'war3_crash_capture_policy',
   war3_crash_capture_policy_test,
+  timeout : 30,
+)
+
+# Bounded text-only VK_EXT_device_fault capture. The runnable links no DXVK
+# device and uses a fake dispatch function to prove one-shot terminal policy.
+war3_dxvk_device_fault_capture_test = executable(
+  'war3_dxvk_device_fault_capture_test',
+  [
+    '../dxvk/dxvk_device_address_binding.cpp',
+    '../dxvk/dxvk_device_fault.cpp',
+    'war3/core/tests/dxvk_device_fault_capture_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_dxvk_device_fault_capture',
+  war3_dxvk_device_fault_capture_test,
+  timeout : 30,
+)
+
+# Development-only bounded VK_EXT_device_address_binding_report policy. This
+# runnable does not create a Vulkan instance and tests only the lock-free ring
+# and fault-range correlation value contract.
+war3_dxvk_device_address_binding_test = executable(
+  'war3_dxvk_device_address_binding_test',
+  [
+    '../dxvk/dxvk_device_address_binding.cpp',
+    'war3/core/tests/dxvk_device_address_binding_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  cpp_args            : [ '-DWARVK_ENABLE_DEVICE_ADDRESS_BINDING_REPORT_DEV=1' ],
+  install             : false,
+)
+test(
+  'war3_dxvk_device_address_binding',
+  war3_dxvk_device_address_binding_test,
   timeout : 30,
 )
 

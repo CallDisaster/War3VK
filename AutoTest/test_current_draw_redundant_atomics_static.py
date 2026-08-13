@@ -11,6 +11,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 CONTRACT_CPP = (
     ROOT / "src/d3d9/war3/render/war3_current_draw_contract.cpp"
 )
+MODEL_HOOK_CPP = ROOT / "src/d3d9/war3/model/war3_model_hook.cpp"
 MONITOR_CPP = ROOT / "src/d3d9/war3/tools/war3_perf_monitor.cpp"
 
 
@@ -18,6 +19,7 @@ class CurrentDrawRedundantAtomicTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.contract = CONTRACT_CPP.read_text(encoding="utf-8")
+        cls.model_hook = MODEL_HOOK_CPP.read_text(encoding="utf-8")
         cls.monitor = MONITOR_CPP.read_text(encoding="utf-8")
 
     def test_rollback_environment_is_reported(self) -> None:
@@ -48,7 +50,7 @@ class CurrentDrawRedundantAtomicTests(unittest.TestCase):
         )
         summary_tail = self.contract[summary : summary + 360]
         self.assertIn(
-            "g_paletteCaptureTrustedSourceHitCount.load", summary_tail
+            "QueryBlendedPaletteExactHitCount()", summary_tail
         )
         self.assertIn(
             "g_publishTrustedHitCumulative.load", summary_tail
@@ -59,7 +61,7 @@ class CurrentDrawRedundantAtomicTests(unittest.TestCase):
             "// Legacy-only diagnostic buckets"
         )
         block_end = self.contract.index(
-            "const size_t snapshotSlot", block_start
+            "const bool snapshotWasTrusted", block_start
         )
         block = self.contract[block_start:block_end]
         self.assertEqual(3, block.count(".fetch_add("))
@@ -71,19 +73,19 @@ class CurrentDrawRedundantAtomicTests(unittest.TestCase):
     def test_canonical_and_legacy_counters_have_one_relaxed_writer_and_no_reset(
         self,
     ) -> None:
-        canonical = "g_paletteCaptureTrustedSourceHitCount"
         duplicate = "g_publishTrustedHitCumulative"
-        self.assertEqual(
-            1, self.contract.count(f"{canonical}.fetch_add(")
-        )
+        self.assertNotIn("g_paletteCaptureTrustedSourceHitCount", self.contract)
+        canonical = "g_queryBlendedPaletteExactHitCount"
+        self.assertEqual(2, self.model_hook.count(f"{canonical}.fetch_add("))
         self.assertEqual(
             1, self.contract.count(f"{duplicate}.fetch_add(")
         )
-        for name in (canonical, duplicate):
-            write = self.contract.index(f"{name}.fetch_add(")
+        for name, source in ((canonical, self.model_hook),
+                             (duplicate, self.contract)):
+            write = source.index(f"{name}.fetch_add(")
             self.assertIn(
                 "std::memory_order_relaxed",
-                self.contract[write : write + 140],
+                source[write : write + 140],
             )
         reset_start = self.contract.index(
             "void ResetCurrentDrawContractCache()"
@@ -92,7 +94,7 @@ class CurrentDrawRedundantAtomicTests(unittest.TestCase):
             "void PublishCurrentDrawContract(", reset_start
         )
         reset = self.contract[reset_start:reset_end]
-        self.assertNotIn(canonical, reset)
+        self.assertNotIn("g_paletteCaptureTrustedSourceHitCount", reset)
         self.assertNotIn(duplicate, reset)
 
     def test_legacy_provenance_buckets_have_no_reader(self) -> None:

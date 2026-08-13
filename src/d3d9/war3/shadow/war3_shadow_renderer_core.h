@@ -8,6 +8,7 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <utility>
 #include <vector>
 
 namespace dxvk::war3::shadow {
@@ -50,6 +51,15 @@ struct ShadowPacketResource {
   uint32_t dynamicPrimitiveBaseIndex = 0;
   ShadowDynamicIndexSource dynamicIndexSource =
       ShadowDynamicIndexSource::None;
+  // True only when dynamicIndexStream addresses the immutable `indices`
+  // vector owned by resourceKeepAlive. Consumers must still range-check the
+  // slice; a generic raw pointer or an unrelated keep-alive never qualifies.
+  bool dynamicIndexBackedByResourceKeepAlive = false;
+  // True only when the authoritative CurrentDraw group stream matched the
+  // immutable geoset bytes exactly. vertexGroupIndices then aliases the
+  // generation-backed record retained by resourceKeepAlive; consumers must
+  // still validate owner identity, generation, pointer and range.
+  bool currentDrawGroupSlotsBackedByResourceKeepAlive = false;
   std::shared_ptr<const std::vector<uint16_t>> ownedDynamicIndices;
   std::shared_ptr<const void> resourceKeepAlive;
   std::vector<float> ownedPositions;
@@ -235,12 +245,49 @@ struct ShadowExplicitBlendSkinningResult {
   bool usedSpanRemap = false;
 };
 
+inline void ResetShadowExplicitBlendSkinningResultPreserveScratch(
+    ShadowExplicitBlendSkinningResult& result) noexcept {
+  auto weights = std::move(result.weights);
+  auto indices = std::move(result.indices);
+  auto runtimeGroupPalette = std::move(result.runtimeGroupPalette);
+  result = {};
+  weights.clear();
+  indices.clear();
+  runtimeGroupPalette.clear();
+  if (weights.capacity() > 200000u)
+    std::vector<std::array<float, 3>>().swap(weights);
+  if (indices.capacity() > 200000u)
+    std::vector<std::array<uint8_t, 4>>().swap(indices);
+  if (runtimeGroupPalette.capacity() > 256u)
+    std::vector<Matrix4>().swap(runtimeGroupPalette);
+  result.weights = std::move(weights);
+  result.indices = std::move(indices);
+  result.runtimeGroupPalette = std::move(runtimeGroupPalette);
+}
+
+// Non-owning input for the synchronous explicit-blend resolver. The caller
+// retains ownership for the duration of the call; the resolver copies only
+// the final prefix selected by maxGroupSlot into its result.
+struct ShadowMatrixPaletteView {
+  const Matrix4* data = nullptr;
+  uint32_t size = 0u;
+
+  bool empty() const {
+    return data == nullptr || size == 0u;
+  }
+
+  const Matrix4& operator[](uint32_t index) const {
+    return data[index];
+  }
+};
+
 bool TryResolveExplicitBlendSkinningForRenderable(
     const ShadowRenderableRecord& renderable,
     uint32_t vertexCount,
     uint32_t posePaletteLimit,
     uint32_t maxExpectedGroupSize,
-    const ShadowPoseRecord& pose,
+    ShadowMatrixPaletteView posePalette,
+    bool materializeRuntimeGroupPalette,
     ShadowExplicitBlendSkinningResult& outResult,
     ShadowResolveStats* ioStats = nullptr);
 

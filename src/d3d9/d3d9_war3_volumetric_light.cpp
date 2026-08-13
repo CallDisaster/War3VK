@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <mutex>
 #include <utility>
 
 namespace dxvk {
@@ -74,6 +75,36 @@ constexpr uint32_t kVolumetricFroxelMediumEffectDivisor = 8u;
 constexpr uint32_t kVolumetricFroxelHighEffectDivisor = 4u;
 constexpr uint32_t kVolumetricFroxelMediumTraversalSteps = 1024u;
 constexpr uint32_t kVolumetricFroxelHighTraversalSteps = 2048u;
+constexpr uint32_t kVolumetricDirectionalProbesPerSegment = 8u;
+constexpr uint32_t kVolumetricDirectionalCascadeSamples = 2u;
+constexpr uint32_t kVolumetricVolumeSunTapsPerCascade = 9u;
+constexpr uint32_t kVolumetricCsmTapsPerCascade = 4u;
+constexpr uint32_t kVolumetricPointProbesPerLight = 2u;
+// The low-resolution effect is reconstructed with one base-color read, one
+// centre-depth read, four effect reads and four guide-depth reads.
+constexpr uint32_t kVolumetricCompositeTextureReadsPerPixel = 10u;
+
+std::mutex g_volumetricShaderWorkDiagnosticsMutex;
+War3VolumetricShaderWorkRuntimeDiagnostics
+    g_volumetricShaderWorkRuntimeDiagnostics = {};
+
+void PublishVolumetricShaderWorkDiagnostics(
+    uint64_t frameSerial,
+    const war3::render::War3VolumetricShaderWorkEstimate& estimate) noexcept {
+  std::lock_guard<std::mutex> lock(g_volumetricShaderWorkDiagnosticsMutex);
+  auto& diagnostics = g_volumetricShaderWorkRuntimeDiagnostics;
+  diagnostics.frameSerial = frameSerial;
+  ++diagnostics.evaluatedFrameCount;
+  diagnostics.last = estimate;
+  if (estimate.accepted) {
+    ++diagnostics.acceptedFrameCount;
+  } else {
+    ++diagnostics.rejectedFrameCount;
+    if (estimate.rejectReason == war3::render::
+            War3VolumetricShaderWorkRejectReason::ArithmeticOverflow)
+      ++diagnostics.arithmeticOverflowCount;
+  }
+}
 
 struct VolumetricLightPushConstants {
   uint32_t colorSampler;
@@ -225,6 +256,38 @@ float finiteOr(float value, float fallback) {
 
 float clampFinite(float value, float lo, float hi, float fallback) {
   return std::clamp(finiteOr(value, fallback), lo, hi);
+}
+
+int ComputeVolumetricEffectiveSamples(
+    const War3VolumetricLightSettings& settings, float sunIntensity,
+    bool hasSunVolume, bool hasPointVolume, uint64_t effectPixelCount) {
+  int effectiveSamples = std::clamp(
+      settings.sampleCount, kVolumetricMinSamples, kVolumetricMaxSamples);
+  if (settings.adaptiveSampleCount) {
+    const float intensity =
+        clampFinite(settings.intensity, 0.0f, 4.0f, 0.0f);
+    const float intensity01 =
+        std::clamp(intensity / 0.35f, 0.55f, 1.0f);
+    const float source01 = hasSunVolume
+        ? std::clamp(sunIntensity, 0.45f, 1.0f)
+        : (hasPointVolume ? 1.0f : 0.55f);
+    const float quality = std::min(intensity01, source01);
+    const int adaptive =
+        static_cast<int>(std::lround(float(effectiveSamples) * quality));
+    const int adaptiveFloor = std::min(12, effectiveSamples);
+    effectiveSamples =
+        std::clamp(adaptive, adaptiveFloor, effectiveSamples);
+  }
+
+  const uint64_t budgetedSamples = effectPixelCount != 0u
+      ? kVolumetricRaySegmentBudget / effectPixelCount
+      : uint64_t(kVolumetricMinSamples);
+  return std::min(
+      effectiveSamples,
+      std::clamp<int>(
+          static_cast<int>(std::min<uint64_t>(
+              budgetedSamples, uint64_t(kVolumetricMaxSamples))),
+          kVolumetricMinSamples, kVolumetricMaxSamples));
 }
 
 Vector4 SanitizeVolumetricPointPosition(const War3PointLight& light) {
@@ -452,6 +515,12 @@ War3FogVolumeFrameSnapshot SelectVolumetricFogVolumes(
   return selected;
 }
 } // namespace
+
+War3VolumetricShaderWorkRuntimeDiagnostics
+QueryWar3VolumetricShaderWorkRuntimeDiagnostics() noexcept {
+  std::lock_guard<std::mutex> lock(g_volumetricShaderWorkDiagnosticsMutex);
+  return g_volumetricShaderWorkRuntimeDiagnostics;
+}
 
 War3VolumetricLightPass::War3VolumetricLightPass(D3D9DeviceEx* device)
     : m_parent(device), m_device(device->GetDXVKDevice()) {
@@ -693,11 +762,44 @@ void War3VolumetricLightPass::ensureResources(VkExtent3D extent,
                                                VkFormat depthFormat,
                                                uint32_t resolutionDivisor,
                                                bool storageEffect) {
-  if (!m_colorCopy || m_cachedExtent.width != extent.width ||
-      m_cachedExtent.height != extent.height || m_cachedFormat != colorFormat) {
-    m_cachedExtent = extent;
-    m_cachedFormat = colorFormat;
+  const bool replaceColor =
+      !m_colorCopy || !m_colorCopyView ||
+      m_cachedExtent.width != extent.width ||
+      m_cachedExtent.height != extent.height || m_cachedFormat != colorFormat;
+  const bool replaceDepth =
+      !m_depthCopy || !m_depthCopyView ||
+      m_cachedDepthExtent.width != extent.width ||
+      m_cachedDepthExtent.height != extent.height ||
+      m_cachedDepthFormat != depthFormat;
+  const uint32_t divisor = std::clamp<uint32_t>(
+      resolutionDivisor, kVolumetricLocalRoiResolutionDivisor,
+      kVolumetricMaxResolutionDivisor);
+  const VkExtent3D effectExtent = {
+      std::max<uint32_t>(1u, (extent.width + divisor - 1u) / divisor),
+      std::max<uint32_t>(1u, (extent.height + divisor - 1u) / divisor),
+      1u};
+  constexpr VkFormat effectFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+  const bool replaceEffect =
+      !m_effectImage || !m_effectView ||
+      m_cachedEffectExtent.width != effectExtent.width ||
+      m_cachedEffectExtent.height != effectExtent.height ||
+      m_cachedEffectFormat != effectFormat ||
+      m_effectStorageEnabled != storageEffect ||
+      (storageEffect && !m_effectStorageView);
 
+  // Rebuild the complete resource set as candidates. No cache key, layout
+  // state or published image changes until every required image and view has
+  // been created successfully. This keeps an allocation failure from pairing
+  // a new extent with an old, smaller image on the next optional-pass retry.
+  Rc<DxvkImage> candidateColor = m_colorCopy;
+  Rc<DxvkImageView> candidateColorView = m_colorCopyView;
+  Rc<DxvkImage> candidateDepth = m_depthCopy;
+  Rc<DxvkImageView> candidateDepthView = m_depthCopyView;
+  Rc<DxvkImage> candidateEffect = m_effectImage;
+  Rc<DxvkImageView> candidateEffectView = m_effectView;
+  Rc<DxvkImageView> candidateEffectStorageView = m_effectStorageView;
+
+  if (replaceColor) {
     DxvkImageCreateInfo info = {};
     info.type = VK_IMAGE_TYPE_2D;
     info.format = colorFormat;
@@ -708,14 +810,16 @@ void War3VolumetricLightPass::ensureResources(VkExtent3D extent,
     info.mipLevels = 1;
     info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                  VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    info.stages =
-        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+    info.stages = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                  VK_PIPELINE_STAGE_TRANSFER_BIT;
     info.access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT |
                   VK_ACCESS_TRANSFER_WRITE_BIT;
     info.tiling = VK_IMAGE_TILING_OPTIMAL;
     info.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-    m_colorCopy = m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    candidateColor =
+        m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
     DxvkImageViewKey viewInfo;
     viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
@@ -733,15 +837,10 @@ void War3VolumetricLightPass::ensureResources(VkExtent3D extent,
                                   VK_COMPONENT_SWIZZLE_IDENTITY};
     viewInfo.packedSwizzle = DxvkImageViewKey::packSwizzle(mapping);
 
-    m_colorCopyView = m_colorCopy->createView(viewInfo);
+    candidateColorView = candidateColor->createView(viewInfo);
   }
 
-  if (!m_depthCopy || m_cachedDepthExtent.width != extent.width ||
-      m_cachedDepthExtent.height != extent.height ||
-      m_cachedDepthFormat != depthFormat) {
-    m_cachedDepthExtent = extent;
-    m_cachedDepthFormat = depthFormat;
-
+  if (replaceDepth) {
     DxvkImageCreateInfo info = {};
     info.type = VK_IMAGE_TYPE_2D;
     info.format = depthFormat;
@@ -752,14 +851,16 @@ void War3VolumetricLightPass::ensureResources(VkExtent3D extent,
     info.mipLevels = 1;
     info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                  VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    info.stages =
-        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+    info.stages = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                  VK_PIPELINE_STAGE_TRANSFER_BIT;
     info.access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT |
                   VK_ACCESS_TRANSFER_WRITE_BIT;
     info.tiling = VK_IMAGE_TILING_OPTIMAL;
     info.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
 
-    m_depthCopy = m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    candidateDepth =
+        m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
     DxvkImageViewKey viewInfo;
     viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
@@ -777,25 +878,10 @@ void War3VolumetricLightPass::ensureResources(VkExtent3D extent,
                                   VK_COMPONENT_SWIZZLE_IDENTITY};
     viewInfo.packedSwizzle = DxvkImageViewKey::packSwizzle(mapping);
 
-    m_depthCopyView = m_depthCopy->createView(viewInfo);
+    candidateDepthView = candidateDepth->createView(viewInfo);
   }
 
-  const uint32_t divisor = std::clamp<uint32_t>(
-      resolutionDivisor, kVolumetricLocalRoiResolutionDivisor,
-      kVolumetricFroxelMediumTileSize);
-  VkExtent3D effectExtent = {
-      std::max<uint32_t>(1u, (extent.width + divisor - 1u) / divisor),
-      std::max<uint32_t>(1u, (extent.height + divisor - 1u) / divisor),
-      1u};
-  constexpr VkFormat effectFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
-  if (!m_effectImage || m_cachedEffectExtent.width != effectExtent.width ||
-      m_cachedEffectExtent.height != effectExtent.height ||
-      m_cachedEffectFormat != effectFormat ||
-      m_effectStorageEnabled != storageEffect) {
-    m_cachedEffectExtent = effectExtent;
-    m_cachedEffectFormat = effectFormat;
-    m_effectStorageEnabled = storageEffect;
-
+  if (replaceEffect) {
     DxvkImageCreateInfo info = {};
     info.type = VK_IMAGE_TYPE_2D;
     info.format = effectFormat;
@@ -819,7 +905,7 @@ void War3VolumetricLightPass::ensureResources(VkExtent3D extent,
     info.tiling = VK_IMAGE_TILING_OPTIMAL;
     info.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-    m_effectImage =
+    candidateEffect =
         m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
     DxvkImageViewKey viewInfo;
@@ -839,15 +925,38 @@ void War3VolumetricLightPass::ensureResources(VkExtent3D extent,
                                   VK_COMPONENT_SWIZZLE_IDENTITY};
     viewInfo.packedSwizzle = DxvkImageViewKey::packSwizzle(mapping);
 
-    m_effectView = m_effectImage->createView(viewInfo);
-
-    m_effectStorageView = nullptr;
+    candidateEffectView = candidateEffect->createView(viewInfo);
+    candidateEffectStorageView = nullptr;
     if (storageEffect) {
       viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
       viewInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT;
       viewInfo.layout = VK_IMAGE_LAYOUT_GENERAL;
-      m_effectStorageView = m_effectImage->createView(viewInfo);
+      candidateEffectStorageView = candidateEffect->createView(viewInfo);
     }
+  }
+
+  if (replaceColor) {
+    m_colorCopy = std::move(candidateColor);
+    m_colorCopyView = std::move(candidateColorView);
+    m_colorCopyLayout.reset();
+    m_cachedExtent = extent;
+    m_cachedFormat = colorFormat;
+  }
+  if (replaceDepth) {
+    m_depthCopy = std::move(candidateDepth);
+    m_depthCopyView = std::move(candidateDepthView);
+    m_depthCopyLayout.reset();
+    m_cachedDepthExtent = extent;
+    m_cachedDepthFormat = depthFormat;
+  }
+  if (replaceEffect) {
+    m_effectImage = std::move(candidateEffect);
+    m_effectView = std::move(candidateEffectView);
+    m_effectStorageView = std::move(candidateEffectStorageView);
+    m_effectLayout.reset();
+    m_cachedEffectExtent = effectExtent;
+    m_cachedEffectFormat = effectFormat;
+    m_effectStorageEnabled = storageEffect;
   }
 }
 
@@ -976,6 +1085,7 @@ void War3VolumetricLightPass::ensurePointShadowFallbackResources(
 
     m_pointShadowFallbackCube = std::move(newCube);
     m_pointShadowFallbackCubeView = std::move(newView);
+    m_pointShadowFallbackLayout.reset();
     m_pointShadowFallbackReady = false;
   }
 
@@ -985,20 +1095,20 @@ void War3VolumetricLightPass::ensurePointShadowFallbackResources(
   ctx->track(m_pointShadowFallbackCube, DxvkAccess::Write);
   const VkImageSubresourceRange range = {
       VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 6u};
-  VkImageMemoryBarrier2 toClear = {
-      VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
-  toClear.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
-  toClear.srcAccessMask = 0u;
-  toClear.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-  toClear.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-  toClear.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-  toClear.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-  toClear.image = m_pointShadowFallbackCube->handle();
-  toClear.subresourceRange = range;
+  const auto clearTransition = m_pointShadowFallbackLayout.plan(
+      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+      VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+      VK_ACCESS_2_TRANSFER_WRITE_BIT);
+  VkImageMemoryBarrier2 toClear =
+      war3::render::MakeWar3OwnedImageBarrier(
+          clearTransition, m_pointShadowFallbackCube->handle(), range);
   VkDependencyInfo depInfo = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
   depInfo.imageMemoryBarrierCount = 1u;
   depInfo.pImageMemoryBarriers = &toClear;
   ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &depInfo);
+  war3::render::CommitWar3OwnedImageLayout(
+      m_pointShadowFallbackLayout, clearTransition,
+      *m_pointShadowFallbackCube, range);
 
   VkClearColorValue clear = {};
   clear.float32[0] = 1.0f;
@@ -1010,19 +1120,19 @@ void War3VolumetricLightPass::ensurePointShadowFallbackResources(
                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                           &clear, 1u, &range);
 
-  VkImageMemoryBarrier2 toRead = {
-      VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
-  toRead.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-  toRead.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-  toRead.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
-                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-  toRead.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-  toRead.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-  toRead.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-  toRead.image = m_pointShadowFallbackCube->handle();
-  toRead.subresourceRange = range;
+  const auto readTransition = m_pointShadowFallbackLayout.plan(
+      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+      VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+      VK_ACCESS_2_SHADER_READ_BIT);
+  VkImageMemoryBarrier2 toRead =
+      war3::render::MakeWar3OwnedImageBarrier(
+          readTransition, m_pointShadowFallbackCube->handle(), range);
   depInfo.pImageMemoryBarriers = &toRead;
   ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &depInfo);
+  war3::render::CommitWar3OwnedImageLayout(
+      m_pointShadowFallbackLayout, readTransition,
+      *m_pointShadowFallbackCube, range);
   m_pointShadowFallbackReady = true;
 }
 
@@ -1031,7 +1141,9 @@ void War3VolumetricLightPass::copyColor(const Rc<DxvkCommandList>& ctx,
   if (!srcView || !m_colorCopy || !m_colorCopyView)
     return;
 
-  const VkImageLayout srcLayout = srcView->getLayout();
+  const auto srcSubresources = srcView->imageSubresources();
+  const VkImageLayout srcLayout =
+      srcView->image()->queryLayout(srcSubresources);
 
   VkImageMemoryBarrier2 barriers[2] = {};
   for (auto& b : barriers)
@@ -1044,22 +1156,22 @@ void War3VolumetricLightPass::copyColor(const Rc<DxvkCommandList>& ctx,
   barriers[0].oldLayout = srcLayout;
   barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
   barriers[0].image = srcView->image()->handle();
-  barriers[0].subresourceRange = srcView->imageSubresources();
+  barriers[0].subresourceRange = srcSubresources;
 
-  barriers[1].srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
-                             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-  barriers[1].srcAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-  barriers[1].dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-  barriers[1].dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-  barriers[1].oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-  barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-  barriers[1].image = m_colorCopy->handle();
-  barriers[1].subresourceRange = m_colorCopyView->imageSubresources();
+  const auto dstSubresources = m_colorCopyView->imageSubresources();
+  const auto dstWriteTransition = m_colorCopyLayout.plan(
+      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+      VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+      VK_ACCESS_2_TRANSFER_WRITE_BIT);
+  barriers[1] = war3::render::MakeWar3OwnedImageBarrier(
+      dstWriteTransition, m_colorCopy->handle(), dstSubresources);
 
   VkDependencyInfo depInfo = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
   depInfo.imageMemoryBarrierCount = 2;
   depInfo.pImageMemoryBarriers = barriers;
   ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &depInfo);
+  war3::render::CommitWar3OwnedImageLayout(
+      m_colorCopyLayout, dstWriteTransition, *m_colorCopy, dstSubresources);
 
   VkImageCopy2 copyRegion = {VK_STRUCTURE_TYPE_IMAGE_COPY_2};
   copyRegion.srcSubresource = toLayers(srcView->imageSubresources());
@@ -1083,15 +1195,17 @@ void War3VolumetricLightPass::copyColor(const Rc<DxvkCommandList>& ctx,
   barriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
   barriers[0].newLayout = srcLayout;
 
-  barriers[1].srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-  barriers[1].srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-  barriers[1].dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
-                             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-  barriers[1].dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-  barriers[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-  barriers[1].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  const auto dstReadTransition = m_colorCopyLayout.plan(
+      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+      VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+      VK_ACCESS_2_SHADER_READ_BIT);
+  barriers[1] = war3::render::MakeWar3OwnedImageBarrier(
+      dstReadTransition, m_colorCopy->handle(), dstSubresources);
 
   ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &depInfo);
+  war3::render::CommitWar3OwnedImageLayout(
+      m_colorCopyLayout, dstReadTransition, *m_colorCopy, dstSubresources);
 
   ctx->track(srcView->image(), DxvkAccess::Read);
   ctx->track(m_colorCopy, DxvkAccess::Write);
@@ -1102,7 +1216,9 @@ void War3VolumetricLightPass::copyDepth(const Rc<DxvkCommandList>& ctx,
   if (!srcView || !m_depthCopy || !m_depthCopyView)
     return;
 
-  const VkImageLayout srcLayout = srcView->getLayout();
+  const auto srcSubresources = srcView->imageSubresources();
+  const VkImageLayout srcLayout =
+      srcView->image()->queryLayout(srcSubresources);
 
   VkImageMemoryBarrier2 barriers[2] = {};
   for (auto& b : barriers)
@@ -1116,22 +1232,22 @@ void War3VolumetricLightPass::copyDepth(const Rc<DxvkCommandList>& ctx,
   barriers[0].oldLayout = srcLayout;
   barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
   barriers[0].image = srcView->image()->handle();
-  barriers[0].subresourceRange = srcView->imageSubresources();
+  barriers[0].subresourceRange = srcSubresources;
 
-  barriers[1].srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
-                             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-  barriers[1].srcAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-  barriers[1].dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-  barriers[1].dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-  barriers[1].oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-  barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-  barriers[1].image = m_depthCopy->handle();
-  barriers[1].subresourceRange = m_depthCopyView->imageSubresources();
+  const auto dstSubresources = m_depthCopyView->imageSubresources();
+  const auto dstWriteTransition = m_depthCopyLayout.plan(
+      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+      VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+      VK_ACCESS_2_TRANSFER_WRITE_BIT);
+  barriers[1] = war3::render::MakeWar3OwnedImageBarrier(
+      dstWriteTransition, m_depthCopy->handle(), dstSubresources);
 
   VkDependencyInfo depInfo = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
   depInfo.imageMemoryBarrierCount = 2;
   depInfo.pImageMemoryBarriers = barriers;
   ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &depInfo);
+  war3::render::CommitWar3OwnedImageLayout(
+      m_depthCopyLayout, dstWriteTransition, *m_depthCopy, dstSubresources);
 
   VkImageCopy2 copyRegion = {VK_STRUCTURE_TYPE_IMAGE_COPY_2};
   copyRegion.srcSubresource = toLayers(srcView->imageSubresources());
@@ -1155,15 +1271,17 @@ void War3VolumetricLightPass::copyDepth(const Rc<DxvkCommandList>& ctx,
   barriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
   barriers[0].newLayout = srcLayout;
 
-  barriers[1].srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-  barriers[1].srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-  barriers[1].dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
-                             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-  barriers[1].dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-  barriers[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-  barriers[1].newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+  const auto dstReadTransition = m_depthCopyLayout.plan(
+      VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+      VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+      VK_ACCESS_2_SHADER_READ_BIT);
+  barriers[1] = war3::render::MakeWar3OwnedImageBarrier(
+      dstReadTransition, m_depthCopy->handle(), dstSubresources);
 
   ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &depInfo);
+  war3::render::CommitWar3OwnedImageLayout(
+      m_depthCopyLayout, dstReadTransition, *m_depthCopy, dstSubresources);
 
   ctx->track(srcView->image(), DxvkAccess::Read);
   ctx->track(m_depthCopy, DxvkAccess::Write);
@@ -1177,7 +1295,7 @@ bool War3VolumetricLightPass::drawVolumetricLight(
         selectedPointIndices,
     uint32_t selectedPointCount, const Vector4& cameraPos,
     float farClearRaw, float rawDepthQuantum, bool farIsOne,
-    const VkRect2D& effectScissor,
+    const VkRect2D& effectScissor, int effectiveSamples,
     uint32_t& outPointShadowedLightCount) {
   outPointShadowedLightCount = 0u;
   if (!m_layout || !m_linearSampler || !m_colorCopyView || !m_depthCopyView ||
@@ -1349,20 +1467,21 @@ bool War3VolumetricLightPass::drawVolumetricLight(
   VkExtent3D effectExtent = effectImage->info().extent;
 
   {
-    VkImageMemoryBarrier2 toWrite = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
-    toWrite.srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-    toWrite.srcAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-    toWrite.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    toWrite.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-    toWrite.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    toWrite.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    toWrite.image = effectImage->handle();
-    toWrite.subresourceRange = m_effectView->imageSubresources();
+    const auto subresources = m_effectView->imageSubresources();
+    const auto transition = m_effectLayout.plan(
+        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+    VkImageMemoryBarrier2 toWrite =
+        war3::render::MakeWar3OwnedImageBarrier(
+            transition, effectImage->handle(), subresources);
 
     VkDependencyInfo depInfo = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
     depInfo.imageMemoryBarrierCount = 1;
     depInfo.pImageMemoryBarriers = &toWrite;
     ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &depInfo);
+    war3::render::CommitWar3OwnedImageLayout(
+        m_effectLayout, transition, *m_effectImage, subresources);
   }
 
   VkRenderingAttachmentInfo attachment = {
@@ -1695,57 +1814,8 @@ bool War3VolumetricLightPass::drawVolumetricLight(
       input.settings->shadows.enabled
           ? clampFinite(input.settings->shadows.strength, 0.0f, 1.0f, 1.0f)
           : 0.0f;
-  // Adaptive quality is subordinate to the hard ray-segment budget below.
-  // Raising an external setting can never restore the old TDR-prone loop.
-  int effectiveSamples = std::clamp(
-      settings.sampleCount, kVolumetricMinSamples, kVolumetricMaxSamples);
-  if (settings.adaptiveSampleCount) {
-    const float intensity01 = std::clamp(pc.params0.x / 0.35f, 0.55f, 1.0f);
-    const float source01 = sunIntensity > 1e-6f
-        ? std::clamp(sunIntensity, 0.45f, 1.0f)
-        : (lightUbo.count > 0u ? 1.0f : 0.55f);
-    // Shadow strength controls radiometric contrast, not geometric sampling
-    // frequency. Scaling samples by it made a perfectly valid .60 shadow
-    // setting turn a requested 16-step unit silhouette into only ~12 probes.
-    // The independent ray-segment budget below remains the hard TDR backstop.
-    const float quality = std::min(intensity01, source01);
-    const int adaptive =
-        static_cast<int>(std::lround(float(effectiveSamples) * quality));
-    const int adaptiveFloor = std::min(12, effectiveSamples);
-    effectiveSamples =
-        std::clamp(adaptive, adaptiveFloor, effectiveSamples);
-  }
-  // Only scissored fragments are submitted. Charging the complete backing
-  // image would force a small half-resolution local ROI down to four samples
-  // even though the watchdog work outside the ROI does not exist.
-  const uint64_t effectPixelCount =
-      uint64_t(effectScissor.extent.width) *
-      uint64_t(effectScissor.extent.height);
-  const uint64_t budgetedSamples = effectPixelCount != 0u
-      ? kVolumetricRaySegmentBudget / effectPixelCount
-      : uint64_t(kVolumetricMinSamples);
-  effectiveSamples = std::min(
-      effectiveSamples,
-      std::clamp<int>(
-          static_cast<int>(std::min<uint64_t>(
-              budgetedSamples, uint64_t(kVolumetricMaxSamples))),
-          kVolumetricMinSamples, kVolumetricMaxSamples));
-  if (fogVolumeUbo.count > 0u && effectPixelCount > 0u) {
-    const uint64_t fogInteractionMultiplier =
-        1u + uint64_t(lightUbo.count);
-    const uint64_t denominator =
-        effectPixelCount * uint64_t(fogVolumeUbo.count) *
-        fogInteractionMultiplier;
-    const uint64_t fogBudgetedSamples = denominator > 0u
-        ? kVolumetricFogSegmentTestBudget / denominator
-        : uint64_t(kVolumetricMinSamples);
-    effectiveSamples = std::min(
-        effectiveSamples,
-        std::clamp<int>(
-            static_cast<int>(std::min<uint64_t>(
-                fogBudgetedSamples, uint64_t(kVolumetricMaxSamples))),
-            kVolumetricMinSamples, kVolumetricMaxSamples));
-  }
+  effectiveSamples = std::clamp(
+      effectiveSamples, kVolumetricMinSamples, kVolumetricMaxSamples);
   pc.params2 =
       Vector4(float(effectiveSamples),
               clampFinite(settings.sunDistance, 100.0f, 6000.0f, 1200.0f),
@@ -2083,20 +2153,21 @@ bool War3VolumetricLightPass::drawVolumetricLight(
   ctx->cmdEndRendering();
 
   {
-    VkImageMemoryBarrier2 toRead = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
-    toRead.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    toRead.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-    toRead.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-    toRead.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-    toRead.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    toRead.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    toRead.image = effectImage->handle();
-    toRead.subresourceRange = m_effectView->imageSubresources();
+    const auto subresources = m_effectView->imageSubresources();
+    const auto transition = m_effectLayout.plan(
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+        VK_ACCESS_2_SHADER_READ_BIT);
+    VkImageMemoryBarrier2 toRead =
+        war3::render::MakeWar3OwnedImageBarrier(
+            transition, effectImage->handle(), subresources);
 
     VkDependencyInfo depInfo = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
     depInfo.imageMemoryBarrierCount = 1;
     depInfo.pImageMemoryBarriers = &toRead;
     ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &depInfo);
+    war3::render::CommitWar3OwnedImageLayout(
+        m_effectLayout, transition, *m_effectImage, subresources);
   }
 
   ctx->track(m_effectImage, DxvkAccess::Write);
@@ -2410,7 +2481,6 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
             1u, (uint64_t(extent.height) + divisor - 1u) / divisor)),
         1u};
   };
-
   if (froxelAdmitted) {
     const uint64_t maxTraversalSteps =
         settings.quality == War3VolumetricQuality::FroxelHigh
@@ -2426,14 +2496,23 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
     }
   }
   VkExtent3D effectExtent = {};
-  const auto minimumRaySegments = [](const VkExtent3D& value) {
-    return uint64_t(value.width) * uint64_t(value.height) *
-        uint64_t(kVolumetricMinSamples);
+  const auto minimumRaySegments = [](const VkExtent3D& value,
+                                     uint64_t& out) noexcept {
+    uint64_t pixels = 0u;
+    return war3::render::War3VolumetricCheckedMultiply(
+               value.width, value.height, pixels) &&
+        war3::render::War3VolumetricCheckedMultiply(
+               pixels, kVolumetricMinSamples, out);
   };
-  const auto minimumFogSegmentTests = [&](const VkExtent3D& value) {
-    return uint64_t(value.width) * uint64_t(value.height) *
-        uint64_t(kVolumetricMinSamples) * uint64_t(fogVolumes.count) *
-        (1u + uint64_t(pointSelection.count));
+  const auto minimumFogSegmentTests = [&](const VkExtent3D& value,
+                                          uint64_t& out) noexcept {
+    uint64_t segments = 0u;
+    uint64_t fogSegments = 0u;
+    return minimumRaySegments(value, segments) &&
+        war3::render::War3VolumetricCheckedMultiply(
+            segments, fogVolumes.count, fogSegments) &&
+        war3::render::War3VolumetricCheckedMultiply(
+            fogSegments, 1u + pointSelection.count, out);
   };
   VkRect2D effectScissor = {};
   VkRect2D compositeScissor = FullRect(extent);
@@ -2457,17 +2536,25 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
     if (localRegion.empty())
       return;
 
-    const uint64_t roiPixels =
-        uint64_t(localRegion.width) * uint64_t(localRegion.height);
+    uint64_t roiPixels = 0u;
     const uint64_t requestedSamples = uint64_t(std::clamp(
         settings.sampleCount, kVolumetricMinSamples, kVolumetricMaxSamples));
-    const uint64_t fogInteractionScale =
-        requestedSamples * uint64_t(fogVolumes.count) *
-        (1u + uint64_t(pointSelection.count));
-    const bool rayBudgetFits = requestedSamples > 0u &&
-        roiPixels <= kVolumetricRaySegmentBudget / requestedSamples;
-    const bool fogBudgetFits = fogInteractionScale == 0u ||
-        roiPixels <= kVolumetricFogSegmentTestBudget / fogInteractionScale;
+    uint64_t requestedRaySegments = 0u;
+    uint64_t requestedFogTests = 0u;
+    const bool roiWorkValid =
+        war3::render::War3VolumetricCheckedMultiply(
+            localRegion.width, localRegion.height, roiPixels) &&
+        war3::render::War3VolumetricCheckedMultiply(
+            roiPixels, requestedSamples, requestedRaySegments) &&
+        war3::render::War3VolumetricCheckedMultiply(
+            requestedRaySegments, fogVolumes.count, requestedFogTests) &&
+        war3::render::War3VolumetricCheckedMultiply(
+            requestedFogTests, 1u + pointSelection.count,
+            requestedFogTests);
+    const bool rayBudgetFits = roiWorkValid &&
+        requestedRaySegments <= kVolumetricRaySegmentBudget;
+    const bool fogBudgetFits = roiWorkValid &&
+        requestedFogTests <= kVolumetricFogSegmentTestBudget;
     if (rayBudgetFits && fogBudgetFits) {
       useLocalHalfResRoi = true;
       resolutionDivisor = kVolumetricLocalRoiResolutionDivisor;
@@ -2526,20 +2613,120 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
     effectScissor = FullRect(effectExtent);
   } else if (!useLocalHalfResRoi) {
     effectExtent = effectExtentForDivisor(resolutionDivisor);
-    while ((minimumRaySegments(effectExtent) > kVolumetricRaySegmentBudget ||
-            minimumFogSegmentTests(effectExtent) >
-                kVolumetricFogSegmentTestBudget) &&
+    uint64_t minimumSegments = 0u;
+    uint64_t minimumFogTests = 0u;
+    bool minimumWorkValid =
+        minimumRaySegments(effectExtent, minimumSegments) &&
+        minimumFogSegmentTests(effectExtent, minimumFogTests);
+    while ((!minimumWorkValid ||
+            minimumSegments > kVolumetricRaySegmentBudget ||
+            minimumFogTests > kVolumetricFogSegmentTestBudget) &&
            resolutionDivisor < kVolumetricMaxResolutionDivisor) {
       effectExtent = effectExtentForDivisor(++resolutionDivisor);
+      minimumWorkValid =
+          minimumRaySegments(effectExtent, minimumSegments) &&
+          minimumFogSegmentTests(effectExtent, minimumFogTests);
     }
     // The fragment shader deliberately keeps a four-sample quality floor. If
     // even divisor=8 cannot honor the watchdog budget, skip this optional pass
     // instead of silently exceeding the advertised hard limit.
-    if (minimumRaySegments(effectExtent) > kVolumetricRaySegmentBudget ||
-        minimumFogSegmentTests(effectExtent) >
-            kVolumetricFogSegmentTestBudget)
+    if (!minimumWorkValid ||
+        minimumSegments > kVolumetricRaySegmentBudget ||
+        minimumFogTests > kVolumetricFogSegmentTestBudget)
       return;
     effectScissor = FullRect(effectExtent);
+  }
+
+  uint64_t effectPixelCount = 0u;
+  if (!war3::render::War3VolumetricCheckedMultiply(
+          effectScissor.extent.width, effectScissor.extent.height,
+          effectPixelCount))
+    return;
+  int effectiveSamples = ComputeVolumetricEffectiveSamples(
+      settings, sunIntensity, hasSunVolume, hasPointVolume,
+      effectPixelCount);
+  if (fogVolumes.count > 0u && effectPixelCount > 0u) {
+    uint64_t fogInteractionsPerSample = 0u;
+    const bool denominatorValid =
+        war3::render::War3VolumetricCheckedMultiply(
+            effectPixelCount, fogVolumes.count,
+            fogInteractionsPerSample) &&
+        war3::render::War3VolumetricCheckedMultiply(
+            fogInteractionsPerSample, 1u + pointSelection.count,
+            fogInteractionsPerSample);
+    if (!denominatorValid || fogInteractionsPerSample == 0u)
+      return;
+    const uint64_t fogBudgetedSamples =
+        kVolumetricFogSegmentTestBudget / fogInteractionsPerSample;
+    if (fogBudgetedSamples < uint64_t(kVolumetricMinSamples))
+      return;
+    effectiveSamples = std::min(
+        effectiveSamples,
+        static_cast<int>(std::min<uint64_t>(
+            fogBudgetedSamples, uint64_t(kVolumetricMaxSamples))));
+  }
+
+  // This is a conservative, source-proven upper bound evaluated before any
+  // volume resource allocation, color/depth copy, UBO update or draw command.
+  // It deliberately assumes the maximum shader branch allowed by the current
+  // settings: eight probes, two directional layers, and either the volume-sun
+  // 3x3 kernel or the camera-CSM 2x2 kernel. A missing snapshot can only make
+  // the executed work smaller than this admission request.
+  war3::render::War3VolumetricShaderWorkRequest workRequest = {};
+  workRequest.rayWidth = effectScissor.extent.width;
+  workRequest.rayHeight = effectScissor.extent.height;
+  workRequest.sampleCount = static_cast<uint32_t>(effectiveSamples);
+  const bool directionalShadowRequested =
+      hasSunVolume && input.settings->shadows.enabled &&
+      clampFinite(input.settings->shadows.strength, 0.0f, 1.0f, 0.0f) >
+          1.0e-6f;
+  if (directionalShadowRequested) {
+    workRequest.directionalProbeCount =
+        kVolumetricDirectionalProbesPerSegment;
+    workRequest.directionalCascadeSamples =
+        kVolumetricDirectionalCascadeSamples;
+    workRequest.directionalTapsPerCascade =
+        settings.volumeSunShadowEnabled
+            ? kVolumetricVolumeSunTapsPerCascade
+            : kVolumetricCsmTapsPerCascade;
+  }
+  const bool pointShadowRequested =
+      hasPointVolume && input.settings->shadows.pointLightsEnabled &&
+      input.settings->shadows.pointShadowEnabled;
+  if (pointShadowRequested) {
+    workRequest.shadowedPointLightCount = std::min<uint32_t>(
+        pointSelection.count, kVolumetricMaxPointLights);
+    workRequest.pointProbesPerLight = kVolumetricPointProbesPerLight;
+  }
+  workRequest.compositeWidth = compositeScissor.extent.width;
+  workRequest.compositeHeight = compositeScissor.extent.height;
+  workRequest.compositeTextureReadsPerPixel =
+      kVolumetricCompositeTextureReadsPerPixel;
+
+  const auto workEstimate =
+      war3::render::EvaluateWar3VolumetricShaderWork(workRequest);
+  PublishVolumetricShaderWorkDiagnostics(input.frameSerial, workEstimate);
+  if (!workEstimate.accepted) {
+    static uint32_t s_workRejectLogs = 0u;
+    const uint32_t rejectLog = s_workRejectLogs++;
+    if (rejectLog < 16u || (rejectLog % 240u) == 0u) {
+      WAR3_RENDER_LOG(
+          "DXVK War3Volumetric: shader-work admission rejected frame=%llu "
+          "reason=%u segments=%llu directionalD32=%llu pointCube=%llu "
+          "compositeTexture=%llu total=%llu budget=%llu\n",
+          static_cast<unsigned long long>(input.frameSerial),
+          static_cast<unsigned>(workEstimate.rejectReason),
+          static_cast<unsigned long long>(workEstimate.raySegments),
+          static_cast<unsigned long long>(
+              workEstimate.directionalD32Reads),
+          static_cast<unsigned long long>(workEstimate.pointCubeReads),
+          static_cast<unsigned long long>(
+              workEstimate.compositeTextureReads),
+          static_cast<unsigned long long>(workEstimate.totalWork),
+          static_cast<unsigned long long>(
+              workEstimate.limits.maxTotalWork));
+    }
+    return;
   }
 
   ensureResources(extent, colorInfo.format, depthInfo.format,
@@ -2551,7 +2738,8 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
   const bool effectSubmitted = drawVolumetricLight(
       ctx, input, pointLights, fogVolumes, pointSelection.sourceIndices,
       pointSelection.count, cameraPos, farClearRaw, rawDepthQuantum,
-      farIsOne, effectScissor, pointShadowedLightCount);
+      farIsOne, effectScissor, effectiveSamples,
+      pointShadowedLightCount);
   if (effectSubmitted &&
       compositeVolumetricLight(ctx, input, compositeScissor)) {
     // Exact execution evidence: this is emitted only after both the low-res

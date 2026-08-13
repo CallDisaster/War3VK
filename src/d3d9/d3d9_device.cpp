@@ -19,19 +19,33 @@
 #include "war3/render/war3_render_state.h"
 #include "war3/render/war3_renderer.h"
 #include "war3/render/war3_shadow_capture_frontend.h"
+#include "war3/render/war3_shadow_drawtime_cache_policy.h"
+#include "war3/render/war3_shadow_fallback_breakdown.h"
 #include "war3/render/war3_shadow_lifecycle.h"
 #include "war3/render/war3_shadow_object_registry.h"
+#include "war3/render/war3_shadow_observer_build_policy.h"
+#include "war3/render/war3_shadow_pinned_upload_policy.h"
 #include "war3/render/war3_shadow_producer_policy.h"
+#include "war3/render/war3_shadow_stage11_allocation_observer.h"
 #include "war3/render/war3_shadow_runtime_bridge.h"
+#include "war3/render/war3_terrain_bounds_provenance.h"
 #include "war3/render/war3_upper_layer_shadow.h"
 #include "war3/render/war3_visible_renderables.h"
+#include "war3/render/war3_visible_instance_projection.h"
 #include "war3/render/war3_canonical_draw.h"
 #include "war3/render/war3_current_draw_contract.h"
+#include "war3/render/war3_immutable_group_slot_binding.h"
+#include "war3/render/war3_current_draw_group_slot_summary.h"
+#include "war3/render/war3_direct_packet_scratch.h"
 #include "war3/render/war3_lightning_runtime.h"
 #include "war3/handle/war3_handle_resolver.h"
 #include "war3/hooks/war3_hook_widget_identity.h"
 #include "war3/hooks/war3_hook_perf.h"
 #include "war3/memory/war3_cpu_readable_buffer_span.h"
+#include "war3/memory/war3_coherent_up_index_trim_contract.h"
+#include "war3/memory/war3_coherent_real_index_trim_contract.h"
+#include "war3/memory/war3_current_up_shadow_replay_contract.h"
+#include "war3/memory/war3_exact_index_domain_observer_cache.h"
 #include "war3/memory/war3_shadow_arena.h"
 #include "war3/memory/war3_storm_hook.h"
 #include "war3/model/war3_model_hook.h"
@@ -96,9 +110,11 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <shared_mutex>
 #include <type_traits>
@@ -436,7 +452,8 @@ War3DrawTimeVBCacheKey War3MakeDrawTimeVBCacheKey(
   key.mapEpoch = mapEpoch;
   key.renderablePart = renderablePart;
   key.layerIndex = layerIndex;
-  if (contract != nullptr && contract->known &&
+  if (contract != nullptr &&
+      war3::render::CurrentDrawContractHasCanonicalIdentity(*contract) &&
       contract->renderablePart == renderablePart &&
       contract->layerIndex == layerIndex) {
     key.instanceIdentity = War3CurrentDrawInstanceIdentity(*contract);
@@ -452,7 +469,8 @@ bool War3CurrentDrawContractNamesExactSlice(
     void* renderablePart,
     uint32_t layerIndex,
     const war3::render::CurrentDrawContractRecord& contract) {
-  return contract.known && contract.renderablePart == renderablePart &&
+  return war3::render::CurrentDrawContractHasCanonicalIdentity(contract) &&
+         contract.renderablePart == renderablePart &&
          contract.layerIndex == layerIndex &&
          contract.meshPayloadPtr != nullptr &&
          (War3CurrentDrawInstanceIdentity(contract) != nullptr ||
@@ -1254,11 +1272,9 @@ inline bool War3SemanticFastAppendStatsReuseVerifierRuntime() {
 }
 
 inline bool War3SemanticPaletteInPlaceAppendRuntime() {
-  // War3ShadowMatrixPalette owns a fixed 256-matrix array. Building a local
-  // value and then moving it into vector still copies the full array. The
-  // in-place route default-constructs the identical zero-filled value directly
-  // in the destination slot and then fills the live prefix. Keep a runtime A/B
-  // gate so isolated tests can compare the two byte-equivalent paths.
+  // Construct the compact live palette directly in its scene slot. Keep a
+  // runtime A/B gate so isolated tests can compare the two byte-equivalent
+  // paths without changing the fixed 256-matrix shader upload layout.
   static const bool s_enabled =
       War3GetEnvU32("DXVK_WAR3_SEMANTIC_PALETTE_IN_PLACE_APPEND", 1u) != 0u;
   return s_enabled;
@@ -2352,14 +2368,16 @@ enum class War3CompactWorkTableMode : uint8_t {
 War3CompactWorkTableMode War3SemanticCompactWorkTableModeRuntime() {
   // The table is a correctness-neutral control-plane optimization. Keep the
   // release default disabled until Observe has proved parity and its measured
-  // overhead stays below the 0.15 ms/frame admission gate.
-  if constexpr (dxvk::war3::internal::
-                    kReleaseFreezeExperimentalShadowRoutes)
+  // overhead stays below the 0.15 ms/frame admission gate.  A dedicated
+  // observer build may request mode 1; mode 2 can never reach Consume here.
+  if constexpr (!dxvk::war3::render::kDevelopmentShadowObserversEnabled)
     return War3CompactWorkTableMode::Off;
-  static const auto s_mode = static_cast<War3CompactWorkTableMode>(
-      std::min<uint32_t>(
-          2u, War3GetEnvU32("DXVK_WAR3_SEMANTIC_COMPACT_WORK_TABLE", 0u)));
-  return s_mode;
+  static const auto s_mode =
+      dxvk::war3::render::ParseShadowObserverBuildMode(War3GetEnvU32(
+          "DXVK_WAR3_SEMANTIC_COMPACT_WORK_TABLE", 0u));
+  return s_mode == dxvk::war3::render::War3ShadowObserverBuildMode::Observe
+      ? War3CompactWorkTableMode::Observe
+      : War3CompactWorkTableMode::Off;
 }
 
 dxvk::war3::gpu_skin::War3PersistentGpuPackageStage11ObserveAdapter::Mode
@@ -2544,6 +2562,16 @@ inline bool War3SemanticDynamicEvidenceStatsRuntime() {
   return s_enabled;
 }
 
+inline bool War3SemanticPaletteDiagnosticsRuntime() {
+  // These historical motion/churn probes do not participate in palette
+  // selection, replay validation, or publication. Keep their large lookup
+  // tables out of the release hot path unless a targeted capture requests
+  // them explicitly.
+  static const bool s_enabled =
+      War3GetEnvU32("DXVK_WAR3_SEMANTIC_PALETTE_DIAGNOSTICS", 0u) != 0u;
+  return s_enabled;
+}
+
 bool War3SemanticDrawTimePrebuildBypassRuntime() {
   // This producer feeds only the unsafe fast append contract. It must not
   // manufacture a Skinned eligible record when fast append is production-off.
@@ -2723,7 +2751,12 @@ uint64_t War3SemanticDirectSelectionKey(
 }
 
 uint64_t War3SemanticDirectRecordSelectionKey(
-    const dxvk::war3::render::CurrentDrawContractRecord& record) {
+    const dxvk::war3::render::CurrentDrawContractRecord& record,
+    const dxvk::war3::render::VisibleRenderableRecord** outVisibleHint = nullptr,
+    dxvk::war3::render::VisibleRenderablePartLayerQueryCache*
+        visibleQueryCache = nullptr) {
+  if (outVisibleHint != nullptr)
+    *outVisibleHint = nullptr;
   auto ptrValue = [](const void* ptr) -> uint64_t {
     return uint64_t(reinterpret_cast<uintptr_t>(ptr));
   };
@@ -2741,20 +2774,33 @@ uint64_t War3SemanticDirectRecordSelectionKey(
   // churns every frame under cap pressure. Resolve only the current renderable
   // record here; this is bounded by the direct scan cap, not every draw hook.
   if (record.renderablePart != nullptr) {
-    dxvk::war3::render::VisibleRenderableRecord visible = {};
-    if (dxvk::war3::render::VisibleRenderableRegistry::instance()
-            .queryByRenderablePartAndLayer(record.renderablePart,
-                                           record.layerIndex, visible)) {
-      if (visible.identity.jHandle != 0u)
-        return makeKey(2u, visible.identity.jHandle);
-      if (visible.identity.handleId != 0u)
-        return makeKey(2u, visible.identity.handleId | 0x100000u);
-      if (visible.identity.unitPtr != nullptr)
-        return makeKey(1u, ptrValue(visible.identity.unitPtr));
-      if (visible.identity.worldObjectEntry != nullptr)
-        return makeKey(4u, ptrValue(visible.identity.worldObjectEntry));
-      if (visible.sceneNode != nullptr)
-        return makeKey(5u, ptrValue(visible.sceneNode));
+    const auto& registry =
+        dxvk::war3::render::VisibleRenderableRegistry::instance();
+    dxvk::war3::render::VisibleRenderableRecord visibleStorage = {};
+    const dxvk::war3::render::VisibleRenderableRecord* visible = nullptr;
+    if (visibleQueryCache != nullptr) {
+      visible = visibleQueryCache->queryPtr(
+          registry, record.renderablePart, record.layerIndex);
+    } else if (registry.queryByRenderablePartAndLayer(
+                   record.renderablePart, record.layerIndex,
+                   visibleStorage)) {
+      visible = &visibleStorage;
+    }
+    if (visible != nullptr) {
+      // A pointer can be handed off only when the caller supplied the
+      // Populate-local cache owner. It must be copied before the next query.
+      if (outVisibleHint != nullptr && visibleQueryCache != nullptr)
+        *outVisibleHint = visible;
+      if (visible->identity.jHandle != 0u)
+        return makeKey(2u, visible->identity.jHandle);
+      if (visible->identity.handleId != 0u)
+        return makeKey(2u, visible->identity.handleId | 0x100000u);
+      if (visible->identity.unitPtr != nullptr)
+        return makeKey(1u, ptrValue(visible->identity.unitPtr));
+      if (visible->identity.worldObjectEntry != nullptr)
+        return makeKey(4u, ptrValue(visible->identity.worldObjectEntry));
+      if (visible->sceneNode != nullptr)
+        return makeKey(5u, ptrValue(visible->sceneNode));
     }
   }
 
@@ -3100,8 +3146,11 @@ inline bool War3ShadowCapturePostBreakdownRuntime() {
   // frame flush, so the tree remains closed. Each leaf subtracts the measured
   // QPC lower bound; nested probes can still add a small observer tax to the
   // exact parent while this explicit diagnostic mode is enabled.
-  if constexpr (dxvk::war3::internal::
-                    kReleaseFreezeExperimentalShadowRoutes)
+  // The recursive timer is an observer, not a rendering route. Keep it
+  // unreachable in the default Release build, but allow the separately
+  // configured observer DLL to attribute PostGate without enabling Consume.
+  if constexpr (!dxvk::war3::render::
+                     kDevelopmentShadowObserversEnabled)
     return false;
   static const bool s_enabled =
       War3GetEnvU32("DXVK_WAR3_SHADOW_CAPTURE_BREAKDOWN", 0u) != 0u;
@@ -3110,24 +3159,116 @@ inline bool War3ShadowCapturePostBreakdownRuntime() {
 
 inline dxvk::war3::render::War3TerrainBoundsCullMode
 War3TerrainBoundsCullModeRuntime() {
-  if constexpr (dxvk::war3::internal::
-                    kReleaseFreezeExperimentalShadowRoutes)
+  if constexpr (!dxvk::war3::render::kDevelopmentShadowObserversEnabled)
     return dxvk::war3::render::War3TerrainBoundsCullMode::Off;
-  static const auto s_mode = [] {
-    const char* mode = std::getenv("DXVK_WAR3_CSM_TERRAIN_BOUNDS_MODE");
-    if (mode != nullptr && mode[0] != '\0') {
-      return static_cast<dxvk::war3::render::War3TerrainBoundsCullMode>(
-          std::min<uint32_t>(War3GetEnvU32(
-                                 "DXVK_WAR3_CSM_TERRAIN_BOUNDS_MODE", 0u),
-                             2u));
-    }
-    // Compatibility: the old boolean explicitly requested the historical
-    // direct-consume experiment.
-    return War3GetEnvU32("DXVK_WAR3_CSM_TERRAIN_BOUNDS_CULL", 0u) != 0u
-        ? dxvk::war3::render::War3TerrainBoundsCullMode::Consume
-        : dxvk::war3::render::War3TerrainBoundsCullMode::Off;
-  }();
+  static const auto mode =
+      dxvk::war3::render::ParseShadowObserverBuildMode(War3GetEnvU32(
+          "DXVK_WAR3_CSM_TERRAIN_BOUNDS_MODE", 0u));
+  return mode == dxvk::war3::render::War3ShadowObserverBuildMode::Observe
+      ? dxvk::war3::render::War3TerrainBoundsCullMode::Observe
+      : dxvk::war3::render::War3TerrainBoundsCullMode::Off;
+}
+
+inline bool War3Stage11AllocationObserverRuntime() {
+  if constexpr (!dxvk::war3::render::kDevelopmentShadowObserversEnabled)
+    return false;
+  static const bool s_enabled =
+      War3GetEnvU32("DXVK_WAR3_STAGE11_ALLOC_OBSERVER", 0u) == 1u;
+  return s_enabled;
+}
+
+inline bool War3Stage11DirectStaticSourceRuntime() {
+  // Generation stamps prove that an allocation belongs to the same D3D9
+  // resource, but they do not prove that a building/tree child is immutable
+  // while Warcraft reuses the parent model buffer. Direct binding therefore
+  // remains a development-only A/B route. Release keeps the exact ordered copy
+  // into WarVK-owned snapshot pages so later native writes cannot tear replay.
+  if constexpr (!dxvk::war3::render::kDevelopmentShadowObserversEnabled)
+    return false;
+  static const bool s_enabled =
+      War3GetEnvU32("DXVK_WAR3_STAGE11_DIRECT_STATIC_SOURCE_MODE", 0u) == 1u;
+  return s_enabled;
+}
+
+dxvk::war3::memory::War3CoherentUpIndexTrimMode
+War3CoherentUpIndexTrimModeRuntime() {
+  using namespace dxvk::war3::memory;
+  if constexpr (!kCoherentUpIndexTrimDevelopmentEnabled)
+    return War3CoherentUpIndexTrimMode::Off;
+  static const auto s_mode = ParseWar3CoherentUpIndexTrimMode(
+      War3GetEnvU32("DXVK_WAR3_COHERENT_UP_INDEX_TRIM_MODE", 0u));
   return s_mode;
+}
+
+dxvk::war3::memory::War3CurrentUpShadowReplayMode
+War3CurrentUpShadowReplayModeRuntime() {
+  using namespace dxvk::war3::memory;
+  if constexpr (!kCurrentUpShadowReplayDevelopmentEnabled)
+    return War3CurrentUpShadowReplayMode::Off;
+  static const auto s_mode = ParseWar3CurrentUpShadowReplayMode(
+      War3GetEnvU32("DXVK_WAR3_CURRENT_UP_SHADOW_REPLAY_MODE", 0u));
+  return s_mode;
+}
+
+dxvk::war3::memory::War3CoherentRealIndexTrimMode
+War3CoherentRealIndexTrimModeRuntime() {
+  using namespace dxvk::war3::memory;
+  if constexpr (!kCoherentRealIndexTrimDevelopmentEnabled)
+    return War3CoherentRealIndexTrimMode::Off;
+  static const auto s_mode = ParseWar3CoherentRealIndexTrimMode(
+      War3GetEnvU32(
+          "DXVK_WAR3_COHERENT_REAL_INDEX_TRIM_MODE",
+          DefaultWar3CoherentRealIndexTrimConfiguredMode()));
+  return s_mode;
+}
+
+inline bool War3CoherentRealDomainCacheRuntime() {
+  if constexpr (!dxvk::war3::memory::
+                    kCoherentRealIndexTrimDevelopmentEnabled)
+    return false;
+  static const bool s_enabled =
+      War3GetEnvU32("DXVK_WAR3_COHERENT_REAL_DOMAIN_CACHE", 1u) == 1u;
+  return s_enabled;
+}
+
+inline bool War3CoherentRealHintDomainRuntime() {
+  if constexpr (!dxvk::war3::memory::
+                    kCoherentRealIndexTrimDevelopmentEnabled)
+    return false;
+  static const bool s_enabled =
+      War3GetEnvU32(
+          "DXVK_WAR3_COHERENT_REAL_HINT_DOMAIN",
+          dxvk::war3::memory::DefaultWar3CoherentRealHintDomainEnabled()
+              ? 1u : 0u) == 1u;
+  return s_enabled;
+}
+
+inline bool War3Stage11DirectUploadSourceRuntime() {
+  if constexpr (!dxvk::war3::render::kDevelopmentShadowObserversEnabled)
+    return false;
+  static const bool s_enabled =
+      War3GetEnvU32("DXVK_WAR3_STAGE11_DIRECT_UPLOAD_SOURCE_MODE", 0u) == 1u;
+  return s_enabled;
+}
+
+inline DxvkResourceBufferInfo War3PinnedAllocationSliceInfo(
+    const Rc<DxvkResourceAllocation>& allocation,
+    VkDeviceSize localOffset, VkDeviceSize requestedBytes) {
+  if (allocation == nullptr)
+    return {};
+  const DxvkResourceBufferInfo whole = allocation->getBufferInfo();
+  const auto range = dxvk::war3::render::MakeWar3PinnedUploadRange(
+      uint64_t(whole.size), uint64_t(localOffset), uint64_t(requestedBytes));
+  if (!range.valid || whole.buffer == VK_NULL_HANDLE)
+    return {};
+  DxvkResourceBufferInfo result = whole;
+  result.offset += VkDeviceSize(range.offset);
+  result.size = VkDeviceSize(range.length);
+  if (result.mapPtr != nullptr)
+    result.mapPtr = reinterpret_cast<uint8_t*>(result.mapPtr) + range.offset;
+  if (result.gpuAddress != 0u)
+    result.gpuAddress += VkDeviceAddress(range.offset);
+  return result;
 }
 
 enum class War3ProducerClaimObserveMode : uint8_t {
@@ -3137,17 +3278,17 @@ enum class War3ProducerClaimObserveMode : uint8_t {
 };
 
 War3ProducerClaimObserveMode War3ProducerClaimObserveModeRuntime() {
-  // Consume is parsed for experiment compatibility but deliberately behaves
-  // as Observe below. The reduced pre-build identity has not yet proved
-  // collision-free parity with the post-build exact-owner key.
-  if constexpr (dxvk::war3::internal::
-                    kReleaseFreezeExperimentalShadowRoutes)
+  // The reduced pre-build identity has not yet proved collision-free parity
+  // with the post-build exact-owner key.  Release is always Off; a dedicated
+  // observer build accepts only mode 1 and mode 2 remains unreachable.
+  if constexpr (!dxvk::war3::render::kDevelopmentShadowObserversEnabled)
     return War3ProducerClaimObserveMode::Off;
-  static const auto s_mode = static_cast<War3ProducerClaimObserveMode>(
-      std::min<uint32_t>(
-          2u,
-          War3GetEnvU32("DXVK_WAR3_SEMANTIC_PRODUCER_CLAIM_LEDGER", 0u)));
-  return s_mode;
+  static const auto s_mode =
+      dxvk::war3::render::ParseShadowObserverBuildMode(War3GetEnvU32(
+          "DXVK_WAR3_SEMANTIC_PRODUCER_CLAIM_LEDGER", 0u));
+  return s_mode == dxvk::war3::render::War3ShadowObserverBuildMode::Observe
+      ? War3ProducerClaimObserveMode::Observe
+      : War3ProducerClaimObserveMode::Off;
 }
 
 inline bool War3LegacyPerDrawSemanticScopesRuntime() {
@@ -3960,11 +4101,15 @@ static thread_local War3CaptureCpuTlsAccum g_war3CaptureCpuTls;
 static thread_local uint32_t g_war3ShadowMetadataTimingOrdinal = 0u;
 
 struct War3CaptureCpuSample {
-  int64_t start = dxvk::high_resolution_clock::get_counter();
+  explicit War3CaptureCpuSample(bool active = true)
+      : start(active ? dxvk::high_resolution_clock::get_counter() : 0) {
+  }
+
+  int64_t start = 0;
   uint64_t* bucketTicks = nullptr;
   uint32_t* bucketCalls = nullptr;
   void stop() {
-    if (bucketTicks == nullptr || bucketCalls == nullptr)
+    if (start == 0 || bucketTicks == nullptr || bucketCalls == nullptr)
       return;
     const int64_t end = dxvk::high_resolution_clock::get_counter();
     if (end > start)
@@ -4516,22 +4661,12 @@ uint32_t War3NormalizeShadowHandle(uint32_t handle) {
 }
 
 void War3RecomputeFallbackBreakdown(War3FrameScene& scene) {
-  scene.shadowStats.fallbackDrawCount =
-      static_cast<uint32_t>(scene.shadowFallbacks.size());
-  scene.shadowStats.fallbackDrawCountTerrain = 0u;
-  scene.shadowStats.fallbackDrawCountWorldObject = 0u;
-  scene.shadowStats.fallbackDrawCountUnitObject = 0u;
+  war3::render::War3ResetShadowFallbackBreakdown(
+      scene.shadowStats, scene.shadowFallbacks.size());
   for (const auto& fallback : scene.shadowFallbacks) {
-    if (fallback.snapshot.category == War3RenderState::StageCategory::Terrain)
-      scene.shadowStats.fallbackDrawCountTerrain++;
-    if (fallback.snapshot.category == War3RenderState::StageCategory::WorldObject ||
-        fallback.snapshot.category == War3RenderState::StageCategory::Effect) {
-      scene.shadowStats.fallbackDrawCountWorldObject++;
-    }
-    if (fallback.snapshot.objectKind ==
-        static_cast<uint8_t>(dxvk::war3::render::ObjectKind::Unit)) {
-      scene.shadowStats.fallbackDrawCountUnitObject++;
-    }
+    war3::render::War3AccumulateShadowFallbackClassification(
+        scene.shadowStats, fallback.snapshot.category,
+        fallback.snapshot.objectKind);
   }
 }
 
@@ -4777,8 +4912,9 @@ void War3NoteDirectMainWorldBackingStatus(
   }
 }
 
-bool War3SemanticDirectPacketHasMainWorldVisibleBacking(
+bool War3SemanticDirectPacketMatchesMainWorldVisibleRecord(
     const dxvk::war3::shadow::ShadowDrawPacket& packet,
+    const dxvk::war3::render::VisibleRenderableRecord& visible,
     War3SemanticDirectMainWorldBackingStatus* outStatus = nullptr) {
   auto setStatus = [&](War3SemanticDirectMainWorldBackingStatus status) {
     if (outStatus != nullptr)
@@ -4787,14 +4923,6 @@ bool War3SemanticDirectPacketHasMainWorldVisibleBacking(
   const auto& renderable = packet.renderable;
   if (renderable.renderablePart == nullptr) {
     setStatus(War3SemanticDirectMainWorldBackingStatus::NoRenderablePart);
-    return false;
-  }
-
-  dxvk::war3::render::VisibleRenderableRecord visible = {};
-  if (!dxvk::war3::render::VisibleRenderableRegistry::instance()
-           .queryByRenderablePartAndLayer(renderable.renderablePart,
-                                          renderable.layerIndex, visible)) {
-    setStatus(War3SemanticDirectMainWorldBackingStatus::LookupMiss);
     return false;
   }
 
@@ -4842,6 +4970,31 @@ bool War3SemanticDirectPacketHasMainWorldVisibleBacking(
 
   setStatus(War3SemanticDirectMainWorldBackingStatus::Pass);
   return true;
+}
+
+bool War3SemanticDirectPacketHasMainWorldVisibleBacking(
+    const dxvk::war3::shadow::ShadowDrawPacket& packet,
+    War3SemanticDirectMainWorldBackingStatus* outStatus = nullptr) {
+  const auto& renderable = packet.renderable;
+  if (renderable.renderablePart == nullptr) {
+    if (outStatus != nullptr) {
+      *outStatus =
+          War3SemanticDirectMainWorldBackingStatus::NoRenderablePart;
+    }
+    return false;
+  }
+
+  dxvk::war3::render::VisibleRenderableRecord visible = {};
+  if (!dxvk::war3::render::VisibleRenderableRegistry::instance()
+           .queryByRenderablePartAndLayer(renderable.renderablePart,
+                                          renderable.layerIndex, visible)) {
+    if (outStatus != nullptr)
+      *outStatus = War3SemanticDirectMainWorldBackingStatus::LookupMiss;
+    return false;
+  }
+
+  return War3SemanticDirectPacketMatchesMainWorldVisibleRecord(
+      packet, visible, outStatus);
 }
 
 bool War3HasSemanticDynamicUnitEvidence(
@@ -4931,6 +5084,38 @@ using War3DirectPacketGeosetRecord =
 using War3DirectPacketGeosetCache =
     std::unordered_map<void*,
                        std::shared_ptr<const War3DirectPacketGeosetRecord>>;
+
+bool War3PacketResourceHasImmutableCurrentDrawGroupSlots(
+    const dxvk::war3::shadow::ShadowPacketResource& resource) {
+  if (!resource.currentDrawGroupSlotsBackedByResourceKeepAlive ||
+      resource.resourceKeepAlive == nullptr ||
+      resource.vertexGroupIndices == nullptr) {
+    return false;
+  }
+
+  const auto* owner = static_cast<const War3DirectPacketGeosetRecord*>(
+      resource.resourceKeepAlive.get());
+  if (owner == nullptr)
+    return false;
+
+  const dxvk::war3::render::ImmutableGroupSlotBindingProof proof = {
+      resource.currentDrawGroupSlotsBackedByResourceKeepAlive,
+      owner->readyForShadowConsumer(),
+      resource.resourceKeepAlive.get(),
+      owner,
+      resource.vertexGroupIndices,
+      &owner->vertexGroupIndices,
+      resource.mapEpoch,
+      owner->mapEpoch,
+      resource.immutableModelGeneration,
+      owner->immutableModelGeneration,
+      resource.geosetIndex,
+      owner->geosetIndex,
+      resource.vertexCount,
+      owner->vertexGroupIndices.size(),
+  };
+  return dxvk::war3::render::ValidateImmutableGroupSlotBinding(proof);
+}
 
 // Phase 7.76：从 std::mutex 切到 shared_mutex 让 Find 走 shared_lock，
 // 同帧 BuildPacket 的并发 lookup 不再相互排队。Get 的 read-only 命中分支也
@@ -5043,7 +5228,8 @@ bool War3LegacyMaterialSignatureScopeRuntime() {
 
 dxvk::war3::shadow::ShadowMaterialSignature
 War3BuildShadowMaterialSignatureCached(
-    const dxvk::war3::shadow::ShadowRenderableRecord& renderable) {
+    const dxvk::war3::shadow::ShadowRenderableRecord& renderable,
+    uint64_t provenMapEpoch = 0u) {
   // Phase 7.74：把 material signature 计算的 CPU 时间显式归类为
   // Shadow/DrawTime/MaterialSig，避免它继续藏在 OutsideMainLoop/Tracked。
   auto& perfMonitor = war3::War3PerfMonitor::instance();
@@ -5069,7 +5255,6 @@ War3BuildShadowMaterialSignatureCached(
     // 在当前 canonical layer contract 路径下只是 draw-local 输入，可能随帧
     // 抖动，因此不再作为命中硬条件。
     void* sceneNode = nullptr;
-    void* meshData = nullptr;
     void* layerState = nullptr;
     void* modelResourcePtr = nullptr;
     uint64_t modelKey = 0u;
@@ -5083,7 +5268,9 @@ War3BuildShadowMaterialSignatureCached(
   };
 
   const uint64_t mapEpoch =
-      dxvk::war3::model::ShadowModelResourceCache::instance().mapEpoch();
+      provenMapEpoch != 0u
+          ? provenMapEpoch
+          : dxvk::war3::model::ShadowModelResourceCache::instance().mapEpoch();
   uint64_t hash = bit::fnv1a_init();
   hash = bit::fnv1a_iter(hash, mapEpoch);
   hash = bit::fnv1a_iter(hash, reinterpret_cast<uintptr_t>(renderable.sceneNode));
@@ -5095,7 +5282,6 @@ War3BuildShadowMaterialSignatureCached(
   hash = bit::fnv1a_iter(hash, renderable.meshIndex);
   hash = bit::fnv1a_iter(hash, renderable.layerIndex);
   hash = bit::fnv1a_iter(hash, renderable.flags);
-  hash = bit::fnv1a_iter(hash, reinterpret_cast<uintptr_t>(renderable.layerState));
   hash = bit::fnv1a_iter(hash, renderable.transparentType);
   hash = bit::fnv1a_iter(hash, renderable.transparentSortKey);
   hash = bit::fnv1a_iter(hash, uint32_t(renderable.queueKind));
@@ -5104,7 +5290,12 @@ War3BuildShadowMaterialSignatureCached(
   auto& entry = s_cache[size_t(hash) & (s_cache.size() - 1u)];
   if (entry.valid && entry.mapEpoch == mapEpoch &&
       entry.sceneNode == renderable.sceneNode &&
-      entry.layerState == renderable.layerState &&
+      // A resolved signature comes from the canonical sceneNode mesh/layer
+      // records; renderable.layerState is only a draw-local diagnostic view
+      // and is not read by that resolver. Keep exact pointer matching for the
+      // unresolved fallback, which hashes the layerState prefix directly.
+      (entry.signature.layerContractResolved ||
+       entry.layerState == renderable.layerState) &&
       entry.modelResourcePtr == renderable.modelResourcePtr &&
       entry.modelKey == renderable.modelKey &&
       entry.flags == renderable.flags &&
@@ -5121,7 +5312,6 @@ War3BuildShadowMaterialSignatureCached(
   entry.valid = true;
   entry.mapEpoch = mapEpoch;
   entry.sceneNode = renderable.sceneNode;
-  entry.meshData = renderable.meshData;
   entry.layerState = renderable.layerState;
   entry.modelResourcePtr = renderable.modelResourcePtr;
   entry.modelKey = renderable.modelKey;
@@ -5392,9 +5582,7 @@ War3MapCurrentDrawPrimitiveTypeToTopology(uint32_t primitiveType) {
   }
 }
 
-uint64_t War3ComputeCurrentDrawVisibleIndexSliceHash(
-    const dxvk::war3::render::CurrentDrawContractRecord& record,
-    const dxvk::war3::shadow::ShadowRenderableRecord& renderable,
+uint64_t War3ComputeCurrentDrawVisibleIndexSliceContentHash(
     const dxvk::war3::model::ShadowGeosetResourceRecord& geoset,
     uint32_t primitiveIndex, uint32_t baseIndex, uint32_t indexCount,
     dxvk::war3::shadow::ShadowPrimitiveTopology topology,
@@ -5402,11 +5590,6 @@ uint64_t War3ComputeCurrentDrawVisibleIndexSliceHash(
   uint64_t hash = bit::fnv1a_init();
   hash = bit::fnv1a_iter(hash, geoset.contentHash);
   hash = bit::fnv1a_iter(hash, uint64_t(geoset.geosetIndex));
-  hash = bit::fnv1a_iter(hash, renderable.layerIndex);
-  hash = bit::fnv1a_iter(hash, renderable.subIndex);
-  hash = bit::fnv1a_iter(hash, record.layerIndex);
-  hash = bit::fnv1a_iter(hash, record.payloadWord108);
-  hash = bit::fnv1a_iter(hash, record.payloadWord11C);
   hash = bit::fnv1a_iter(hash, primitiveIndex);
   hash = bit::fnv1a_iter(hash, baseIndex);
   hash = bit::fnv1a_iter(hash, indexCount);
@@ -5422,6 +5605,20 @@ uint64_t War3ComputeCurrentDrawVisibleIndexSliceHash(
   return hash;
 }
 
+uint64_t War3ComputeCurrentDrawVisibleIndexSliceHash(
+    const dxvk::war3::render::CurrentDrawContractRecord& record,
+    const dxvk::war3::shadow::ShadowRenderableRecord& renderable,
+    uint64_t immutableSliceContentHash) {
+  uint64_t hash = bit::fnv1a_init();
+  hash = bit::fnv1a_iter(hash, renderable.layerIndex);
+  hash = bit::fnv1a_iter(hash, renderable.subIndex);
+  hash = bit::fnv1a_iter(hash, record.layerIndex);
+  hash = bit::fnv1a_iter(hash, record.payloadWord108);
+  hash = bit::fnv1a_iter(hash, record.payloadWord11C);
+  hash = bit::fnv1a_iter(hash, immutableSliceContentHash);
+  return hash;
+}
+
 class War3CurrentDrawVisibleIndexSliceCache final {
 public:
   War3CurrentDrawVisibleIndexSliceCache(bool enabled,
@@ -5434,10 +5631,10 @@ public:
 
   bool find(const dxvk::war3::model::ShadowGeosetResourceRecord* geoset,
             uint32_t primitiveIndex,
-            std::shared_ptr<const std::vector<uint16_t>>& outIndices,
             uint32_t& outBaseIndex,
             uint32_t& outIndexCount,
-            dxvk::war3::shadow::ShadowPrimitiveTopology& outTopology) {
+            dxvk::war3::shadow::ShadowPrimitiveTopology& outTopology,
+            uint64_t& outContentHash) {
     if (!m_enabled) {
       ++m_bypassCount;
       return false;
@@ -5454,10 +5651,10 @@ public:
             frameEntry.primitiveIndex != primitiveIndex) {
           continue;
         }
-        outIndices = frameEntry.indices;
         outBaseIndex = frameEntry.baseIndex;
         outIndexCount = frameEntry.indexCount;
         outTopology = frameEntry.topology;
+        outContentHash = frameEntry.contentHash;
         ++m_hitCount;
         return true;
       }
@@ -5468,11 +5665,11 @@ public:
     if (entry.geoset == geoset &&
         entry.mapEpoch == geoset->mapEpoch &&
         entry.immutableModelGeneration == geoset->immutableModelGeneration &&
-        entry.primitiveIndex == primitiveIndex && entry.indices != nullptr) {
-      outIndices = entry.indices;
+        entry.primitiveIndex == primitiveIndex) {
       outBaseIndex = entry.baseIndex;
       outIndexCount = entry.indexCount;
       outTopology = entry.topology;
+      outContentHash = entry.contentHash;
       ++m_hitCount;
       return true;
     }
@@ -5482,18 +5679,20 @@ public:
 
   void store(const dxvk::war3::model::ShadowGeosetResourceRecord* geoset,
              uint32_t primitiveIndex,
-             std::shared_ptr<const std::vector<uint16_t>> indices,
              uint32_t baseIndex,
              uint32_t indexCount,
-             dxvk::war3::shadow::ShadowPrimitiveTopology topology) {
+             dxvk::war3::shadow::ShadowPrimitiveTopology topology,
+             uint64_t contentHash) {
     if (!m_enabled || geoset == nullptr || !geoset->readyForShadowConsumer() ||
         geoset->mapEpoch == 0u || geoset->immutableModelGeneration == 0u ||
-        indices == nullptr || indices->empty()) {
+        indexCount == 0u || indexCount > geoset->indices.size() ||
+        baseIndex > geoset->indices.size() - indexCount) {
       return;
     }
     const Entry stored = {
         geoset, geoset->mapEpoch, geoset->immutableModelGeneration,
-        primitiveIndex, std::move(indices), baseIndex, indexCount, topology};
+        primitiveIndex, baseIndex, indexCount, topology,
+        contentHash};
     if (m_generationReuseEnabled) {
       generationEntries()[slotFor(geoset, primitiveIndex)] = stored;
       return;
@@ -5515,17 +5714,17 @@ private:
     uint64_t mapEpoch = 0u;
     uint64_t immutableModelGeneration = 0u;
     uint32_t primitiveIndex = 0u;
-    std::shared_ptr<const std::vector<uint16_t>> indices;
     uint32_t baseIndex = 0u;
     uint32_t indexCount = 0u;
     dxvk::war3::shadow::ShadowPrimitiveTopology topology =
         dxvk::war3::shadow::ShadowPrimitiveTopology::TriangleList;
+    uint64_t contentHash = 0u;
   };
 
   static constexpr size_t kEntryCount = 256u;
 
   static std::array<Entry, kEntryCount>& generationEntries() {
-    // The sub-vector owns its CPU bytes. Reuse is admitted only when the
+    // The immutable geoset owns the CPU bytes. Reuse is admitted only when the
     // process-monotonic immutable model generation and map epoch both match;
     // a recycled Warcraft pointer or a same-address replacement therefore
     // cannot revive an old slice. This is not a content-hash/fingerprint
@@ -5560,6 +5759,348 @@ private:
   uint32_t m_hitCount = 0u;
   uint32_t m_missCount = 0u;
   uint32_t m_bypassCount = 0u;
+};
+
+// One Populate call can contain hundreds of instances which all refer to the
+// same immutable geoset. The process-wide cache remains the generation owner,
+// but taking its shared mutex and probing its hash table for every instance is
+// unnecessary. Keep a small direct-mapped view for this scene build only.
+class War3CurrentDrawGeosetSnapshotCache final {
+public:
+  explicit War3CurrentDrawGeosetSnapshotCache(uint64_t mapEpoch)
+      : m_mapEpoch(mapEpoch) {}
+
+  std::shared_ptr<const dxvk::war3::model::ShadowGeosetResourceRecord>
+  find(void* meshPayloadPtr) {
+    if (meshPayloadPtr == nullptr || m_mapEpoch == 0u) {
+      ++m_missCount;
+      return nullptr;
+    }
+
+    const auto& entry = m_entries[slotFor(meshPayloadPtr)];
+    if (entry.meshPayloadPtr != meshPayloadPtr || entry.snapshot == nullptr ||
+        entry.snapshot->mapEpoch != m_mapEpoch ||
+        entry.snapshot->immutableModelGeneration == 0u ||
+        !entry.snapshot->readyForShadowConsumer()) {
+      ++m_missCount;
+      return nullptr;
+    }
+
+    ++m_hitCount;
+    return entry.snapshot;
+  }
+
+  void store(
+      void* meshPayloadPtr,
+      std::shared_ptr<const dxvk::war3::model::ShadowGeosetResourceRecord>
+          snapshot) {
+    if (meshPayloadPtr == nullptr || snapshot == nullptr ||
+        m_mapEpoch == 0u || snapshot->mapEpoch != m_mapEpoch ||
+        snapshot->immutableModelGeneration == 0u ||
+        !snapshot->readyForShadowConsumer()) {
+      return;
+    }
+    m_entries[slotFor(meshPayloadPtr)] =
+        Entry{meshPayloadPtr, std::move(snapshot)};
+  }
+
+  uint32_t hitCount() const { return m_hitCount; }
+  uint32_t missCount() const { return m_missCount; }
+
+private:
+  struct Entry {
+    void* meshPayloadPtr = nullptr;
+    std::shared_ptr<const dxvk::war3::model::ShadowGeosetResourceRecord>
+        snapshot;
+  };
+
+  static constexpr size_t kEntryCount = 128u;
+
+  static size_t slotFor(void* meshPayloadPtr) {
+    const uintptr_t value = reinterpret_cast<uintptr_t>(meshPayloadPtr);
+    return size_t((value >> 4u) ^ (value >> 13u)) & (kEntryCount - 1u);
+  }
+
+  uint64_t m_mapEpoch = 0u;
+  std::array<Entry, kEntryCount> m_entries = {};
+  uint32_t m_hitCount = 0u;
+  uint32_t m_missCount = 0u;
+};
+
+// A scene build commonly visits every geoset of the same instance in
+// succession. Avoid reacquiring ModelInstanceRegistry's shared mutex for each
+// part, but invalidate the POD projection on every registry write generation.
+// The cache is stack-owned by one Populate call and never grants cross-frame
+// identity lifetime.
+class War3CurrentDrawInstanceSnapshotCache final {
+public:
+  void reset() noexcept {
+    ++m_populationGeneration;
+    if (m_populationGeneration == 0u) {
+      m_entries = {};
+      ++m_populationGeneration;
+    }
+    m_hitCount = 0u;
+    m_missCount = 0u;
+  }
+
+  bool find(
+      const dxvk::war3::model::ModelInstanceRegistry& registry,
+      void* sceneNode, void* unitPtr, void* worldObjectEntry,
+      void* runtimeModelPtr,
+      dxvk::war3::model::ModelInstanceDirectPacketView& out) {
+    const uint64_t currentGeneration = registry.mutationGeneration();
+    const size_t slot = slotFor(sceneNode, unitPtr, worldObjectEntry,
+                                runtimeModelPtr);
+    const auto& entry = m_entries[slot];
+    if ((currentGeneration & 1u) == 0u &&
+        entry.populationGeneration == m_populationGeneration &&
+        entry.registryGeneration == currentGeneration &&
+        entry.sceneNode == sceneNode && entry.unitPtr == unitPtr &&
+        entry.worldObjectEntry == worldObjectEntry &&
+        entry.runtimeModelPtr == runtimeModelPtr) {
+      if (registry.mutationGeneration() == currentGeneration) {
+        // The Populate-local cache is single-thread owned. Registry writers
+        // can invalidate its generation but cannot mutate this entry, so copy
+        // the POD projection only after the second generation check.
+        out = entry.value;
+        ++m_hitCount;
+        return entry.found;
+      }
+    }
+
+    uint64_t observedGeneration = 0u;
+    out = {};
+    const bool found = registry.findFirstForDirectPacketView(
+        sceneNode, unitPtr, worldObjectEntry, runtimeModelPtr, out,
+        &observedGeneration);
+    const uint64_t publishedGeneration = registry.mutationGeneration();
+    if ((observedGeneration & 1u) == 0u &&
+        observedGeneration == publishedGeneration) {
+      m_entries[slot] = Entry{sceneNode, unitPtr, worldObjectEntry,
+                              runtimeModelPtr, m_populationGeneration,
+                              observedGeneration, out, found};
+    }
+    ++m_missCount;
+    return found;
+  }
+
+  uint32_t hitCount() const { return m_hitCount; }
+  uint32_t missCount() const { return m_missCount; }
+
+private:
+  struct Entry {
+    void* sceneNode = nullptr;
+    void* unitPtr = nullptr;
+    void* worldObjectEntry = nullptr;
+    void* runtimeModelPtr = nullptr;
+    uint64_t populationGeneration = 0u;
+    uint64_t registryGeneration = ~uint64_t(0u);
+    dxvk::war3::model::ModelInstanceDirectPacketView value = {};
+    bool found = false;
+  };
+
+  static constexpr size_t kEntryCount = 128u;
+
+  static size_t slotFor(void* sceneNode, void* unitPtr,
+                        void* worldObjectEntry, void* runtimeModelPtr) {
+    uint64_t hash = bit::fnv1a_init();
+    hash = bit::fnv1a_iter(
+        hash, uint64_t(reinterpret_cast<uintptr_t>(sceneNode)));
+    hash = bit::fnv1a_iter(
+        hash, uint64_t(reinterpret_cast<uintptr_t>(unitPtr)));
+    hash = bit::fnv1a_iter(
+        hash, uint64_t(reinterpret_cast<uintptr_t>(worldObjectEntry)));
+    hash = bit::fnv1a_iter(
+        hash, uint64_t(reinterpret_cast<uintptr_t>(runtimeModelPtr)));
+    return size_t(hash) & (kEntryCount - 1u);
+  }
+
+  std::array<Entry, kEntryCount> m_entries = {};
+  uint64_t m_populationGeneration = 0u;
+  uint32_t m_hitCount = 0u;
+  uint32_t m_missCount = 0u;
+};
+
+// PoseAugmentView is the allocation-free subset used by the authoritative
+// CurrentDraw route. Adjacent geosets normally resolve the same pose, so keep
+// a Populate-local copy and authorize hits with PoseRegistry's mutation
+// generation. Full matrix-palette fallback records are deliberately excluded.
+class War3CurrentDrawPoseAugmentSnapshotCache final {
+public:
+  void reset() noexcept {
+    ++m_populationGeneration;
+    if (m_populationGeneration == 0u) {
+      m_entries = {};
+      ++m_populationGeneration;
+    }
+    m_hitCount = 0u;
+    m_missCount = 0u;
+  }
+
+  bool find(
+      const dxvk::war3::model::PoseRegistry& registry,
+      void* runtimeModelPtr, void* sceneNode, void* unitPtr,
+      dxvk::war3::model::PoseAugmentView& out) {
+    const uint64_t currentGeneration = registry.mutationGeneration();
+    const size_t slot = slotFor(runtimeModelPtr, sceneNode, unitPtr);
+    const auto& entry = m_entries[slot];
+    if ((currentGeneration & 1u) == 0u &&
+        entry.populationGeneration == m_populationGeneration &&
+        entry.registryGeneration == currentGeneration &&
+        entry.runtimeModelPtr == runtimeModelPtr &&
+        entry.sceneNode == sceneNode && entry.unitPtr == unitPtr) {
+      if (registry.mutationGeneration() == currentGeneration) {
+        out = entry.value;
+        ++m_hitCount;
+        return entry.found;
+      }
+    }
+
+    uint64_t observedGeneration = 0u;
+    out = {};
+    const bool found = registry.findFirstForDirectPacketAugment(
+        runtimeModelPtr, sceneNode, unitPtr, out, &observedGeneration);
+    const uint64_t publishedGeneration = registry.mutationGeneration();
+    if ((observedGeneration & 1u) == 0u &&
+        observedGeneration == publishedGeneration) {
+      m_entries[slot] = Entry{runtimeModelPtr, sceneNode, unitPtr,
+                              m_populationGeneration, observedGeneration,
+                              out, found};
+    }
+    ++m_missCount;
+    return found;
+  }
+
+  uint32_t hitCount() const { return m_hitCount; }
+  uint32_t missCount() const { return m_missCount; }
+
+private:
+  struct Entry {
+    void* runtimeModelPtr = nullptr;
+    void* sceneNode = nullptr;
+    void* unitPtr = nullptr;
+    uint64_t populationGeneration = 0u;
+    uint64_t registryGeneration = ~uint64_t(0u);
+    dxvk::war3::model::PoseAugmentView value = {};
+    bool found = false;
+  };
+
+  static constexpr size_t kEntryCount = 128u;
+
+  static size_t slotFor(void* runtimeModelPtr, void* sceneNode,
+                        void* unitPtr) {
+    uint64_t hash = bit::fnv1a_init();
+    hash = bit::fnv1a_iter(
+        hash, uint64_t(reinterpret_cast<uintptr_t>(runtimeModelPtr)));
+    hash = bit::fnv1a_iter(
+        hash, uint64_t(reinterpret_cast<uintptr_t>(sceneNode)));
+    hash = bit::fnv1a_iter(
+        hash, uint64_t(reinterpret_cast<uintptr_t>(unitPtr)));
+    return size_t(hash) & (kEntryCount - 1u);
+  }
+
+  std::array<Entry, kEntryCount> m_entries = {};
+  uint64_t m_populationGeneration = 0u;
+  uint32_t m_hitCount = 0u;
+  uint32_t m_missCount = 0u;
+};
+
+// ShadowObject identity/pose metadata is shared by every geoset of one object.
+// Cache only the registry's value projection for this Populate call and use its
+// seqlock-style mutation generation as the authority for every hit.
+class War3CurrentDrawShadowObjectSnapshotCache final {
+public:
+  void reset() noexcept {
+    ++m_populationGeneration;
+    if (m_populationGeneration == 0u) {
+      m_entries = {};
+      ++m_populationGeneration;
+    }
+    m_hitCount = 0u;
+    m_missCount = 0u;
+  }
+
+  bool find(
+      const dxvk::war3::render::ShadowObjectRegistry& registry,
+      void* worldObjectEntry, void* sceneNode, uint32_t jHandle,
+      void* primaryRuntimeModelPtr, void* secondaryRuntimeModelPtr,
+      dxvk::war3::render::ShadowObjectAugmentView& out) {
+    const uint64_t currentGeneration = registry.mutationGeneration();
+    const size_t slot = slotFor(worldObjectEntry, sceneNode, jHandle,
+                                primaryRuntimeModelPtr,
+                                secondaryRuntimeModelPtr);
+    const auto& entry = m_entries[slot];
+    if ((currentGeneration & 1u) == 0u &&
+        entry.populationGeneration == m_populationGeneration &&
+        entry.registryGeneration == currentGeneration &&
+        entry.worldObjectEntry == worldObjectEntry &&
+        entry.sceneNode == sceneNode && entry.jHandle == jHandle &&
+        entry.primaryRuntimeModelPtr == primaryRuntimeModelPtr &&
+        entry.secondaryRuntimeModelPtr == secondaryRuntimeModelPtr) {
+      if (registry.mutationGeneration() == currentGeneration) {
+        out = entry.value;
+        ++m_hitCount;
+        return entry.found;
+      }
+    }
+
+    uint64_t observedGeneration = 0u;
+    out = {};
+    const bool found = registry.findFirstForDirectPacketView(
+        worldObjectEntry, sceneNode, jHandle, primaryRuntimeModelPtr,
+        secondaryRuntimeModelPtr, out, &observedGeneration);
+    const uint64_t publishedGeneration = registry.mutationGeneration();
+    if ((observedGeneration & 1u) == 0u &&
+        observedGeneration == publishedGeneration) {
+      m_entries[slot] = Entry{worldObjectEntry, sceneNode, jHandle,
+                              primaryRuntimeModelPtr,
+                              secondaryRuntimeModelPtr,
+                              m_populationGeneration, observedGeneration, out,
+                              found};
+    }
+    ++m_missCount;
+    return found;
+  }
+
+  uint32_t hitCount() const { return m_hitCount; }
+  uint32_t missCount() const { return m_missCount; }
+
+private:
+  struct Entry {
+    void* worldObjectEntry = nullptr;
+    void* sceneNode = nullptr;
+    uint32_t jHandle = 0u;
+    void* primaryRuntimeModelPtr = nullptr;
+    void* secondaryRuntimeModelPtr = nullptr;
+    uint64_t populationGeneration = 0u;
+    uint64_t registryGeneration = ~uint64_t(0u);
+    dxvk::war3::render::ShadowObjectAugmentView value = {};
+    bool found = false;
+  };
+
+  static constexpr size_t kEntryCount = 128u;
+
+  static size_t slotFor(void* worldObjectEntry, void* sceneNode,
+                        uint32_t jHandle, void* primaryRuntimeModelPtr,
+                        void* secondaryRuntimeModelPtr) {
+    uint64_t hash = bit::fnv1a_init();
+    hash = bit::fnv1a_iter(
+        hash, uint64_t(reinterpret_cast<uintptr_t>(worldObjectEntry)));
+    hash = bit::fnv1a_iter(
+        hash, uint64_t(reinterpret_cast<uintptr_t>(sceneNode)));
+    hash = bit::fnv1a_iter(hash, jHandle);
+    hash = bit::fnv1a_iter(
+        hash, uint64_t(reinterpret_cast<uintptr_t>(primaryRuntimeModelPtr)));
+    hash = bit::fnv1a_iter(
+        hash, uint64_t(reinterpret_cast<uintptr_t>(secondaryRuntimeModelPtr)));
+    return size_t(hash) & (kEntryCount - 1u);
+  }
+
+  std::array<Entry, kEntryCount> m_entries = {};
+  uint64_t m_populationGeneration = 0u;
+  uint32_t m_hitCount = 0u;
+  uint32_t m_missCount = 0u;
 };
 
 bool War3TryAttachCurrentDrawVisibleIndexSlice(
@@ -5605,13 +6146,13 @@ bool War3TryAttachCurrentDrawVisibleIndexSlice(
     uint32_t count = 0u;
     dxvk::war3::shadow::ShadowPrimitiveTopology topology =
         dxvk::war3::shadow::ShadowPrimitiveTopology::TriangleList;
-    std::shared_ptr<const std::vector<uint16_t>> owned;
+    uint64_t immutableSliceContentHash = 0u;
     if (packetBuildTiming != nullptr)
       packetBuildTiming->enterIndexSlice(War3IndexSlicePhase::CacheLookup);
     const bool cacheHit =
         sliceCache != nullptr &&
-        sliceCache->find(&geoset, primitiveIndex, owned, baseIndex, count,
-                         topology);
+        sliceCache->find(&geoset, primitiveIndex, baseIndex, count,
+                         topology, immutableSliceContentHash);
     if (!cacheHit) {
       if (packetBuildTiming != nullptr)
         packetBuildTiming->enterIndexSlice(War3IndexSlicePhase::PrefixScan);
@@ -5632,19 +6173,15 @@ bool War3TryAttachCurrentDrawVisibleIndexSlice(
         return false;
       }
 
-      if (packetBuildTiming != nullptr)
-        packetBuildTiming->enterIndexSlice(War3IndexSlicePhase::AllocateCopy);
-      auto mutableOwned = std::make_shared<std::vector<uint16_t>>(
-          geoset.indices.begin() + baseIndex,
-          geoset.indices.begin() + baseIndex + count);
-      if (mutableOwned->empty())
-        return false;
-      owned = std::move(mutableOwned);
       topology = War3MapCurrentDrawPrimitiveTypeToTopology(
           primitive.primitiveTypeOrMaterialSlot);
+      immutableSliceContentHash =
+          War3ComputeCurrentDrawVisibleIndexSliceContentHash(
+              geoset, primitiveIndex, baseIndex, count, topology,
+              geoset.indices.data() + baseIndex);
       if (sliceCache != nullptr) {
-        sliceCache->store(&geoset, primitiveIndex, owned, baseIndex, count,
-                          topology);
+        sliceCache->store(&geoset, primitiveIndex, baseIndex, count,
+                          topology, immutableSliceContentHash);
       }
     }
 
@@ -5652,13 +6189,12 @@ bool War3TryAttachCurrentDrawVisibleIndexSlice(
       packetBuildTiming->enterIndexSlice(War3IndexSlicePhase::Hash);
     const uint64_t dynamicIndexHash =
         War3ComputeCurrentDrawVisibleIndexSliceHash(
-            record, renderable, geoset, primitiveIndex, baseIndex, count,
-            topology, owned->data());
+            record, renderable, immutableSliceContentHash);
     if (packetBuildTiming != nullptr)
       packetBuildTiming->enterIndexSlice(War3IndexSlicePhase::ResourceWrite);
-    resource.ownedDynamicIndices = owned;
-    resource.dynamicIndexStream = owned->data();
-    resource.dynamicIndexCount = uint32_t(owned->size());
+    resource.ownedDynamicIndices.reset();
+    resource.dynamicIndexStream = geoset.indices.data() + baseIndex;
+    resource.dynamicIndexCount = count;
     resource.dynamicPrimitiveBaseIndex = baseIndex;
     resource.dynamicIndexHash = dynamicIndexHash;
     if (preparedHash != 0u)
@@ -5666,6 +6202,7 @@ bool War3TryAttachCurrentDrawVisibleIndexSlice(
           bit::fnv1a_iter(resource.dynamicIndexHash, preparedHash);
     resource.topology = topology;
     resource.dynamicIndexSource = source;
+    resource.dynamicIndexBackedByResourceKeepAlive = true;
     return true;
   };
 
@@ -6126,7 +6663,8 @@ bool War3TryBuildLiveRuntimeGroupPalette(
     uint32_t* outPaletteSlotIndex,
     uint32_t* outPaletteMinFrameTag,
     uint32_t* outPaletteMaxFrameTag,
-    War3LivePaletteBuildTiming* outTiming);
+    War3LivePaletteBuildTiming* outTiming,
+    uint32_t provenMaxVertexGroupSlot);
 
 bool War3TryBuildShadowPacketFromCurrentDrawRecord(
     const dxvk::war3::render::CurrentDrawContractRecord& record,
@@ -6137,7 +6675,22 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
     War3PacketBuildRawTiming* packetBuildTiming = nullptr,
     const dxvk::war3::render::CurrentDrawRangeValidator*
         groupRangeValidator = nullptr,
-    War3CurrentDrawVisibleIndexSliceCache* visibleIndexSliceCache = nullptr) {
+    War3CurrentDrawVisibleIndexSliceCache* visibleIndexSliceCache = nullptr,
+    War3CurrentDrawGeosetSnapshotCache* geosetSnapshotCache = nullptr,
+    War3CurrentDrawInstanceSnapshotCache* instanceSnapshotCache = nullptr,
+    War3CurrentDrawShadowObjectSnapshotCache*
+        shadowObjectSnapshotCache = nullptr,
+    War3CurrentDrawPoseAugmentSnapshotCache*
+        poseAugmentSnapshotCache = nullptr,
+    const dxvk::war3::render::VisibleRenderableRecord*
+        preselectedVisibleRecord = nullptr,
+    War3SemanticDirectMainWorldBackingStatus*
+        outPrevalidatedMainWorldBackingStatus = nullptr,
+    bool producerPolicyPrevalidated = false) {
+  if (outPrevalidatedMainWorldBackingStatus != nullptr) {
+    *outPrevalidatedMainWorldBackingStatus =
+        War3SemanticDirectMainWorldBackingStatus::NotChecked;
+  }
   const dxvk::war3::render::ShadowProducerPolicyContext producerContext = {
       record.stage,
       record.batchTag,
@@ -6145,7 +6698,8 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
       War3BatchTag::Unknown,
       false,
   };
-  if (!dxvk::war3::render::ShadowProducerPolicyAllows(
+  if (!producerPolicyPrevalidated &&
+      !dxvk::war3::render::ShadowProducerPolicyAllows(
           dxvk::war3::render::ShadowProducerKind::SemanticDirectGrouped,
           producerContext)) {
     return false;
@@ -6155,11 +6709,31 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
     packetBuildTiming->enter(War3PacketBuildPhase::GateReset);
   auto directBuildScope =
       War3SemanticSubmitScope("War3SemanticScene/Direct/BuildPacket");
-  out = {};
-  if (outDirectCurrentDrawSample != nullptr)
-    *outDirectCurrentDrawSample = {};
+  // A recycled packet contributes capacity only. Clear every identity,
+  // pointer, owner and generation before current-frame validation; the reset
+  // helper retains empty buffers inside the packet until the authoritative
+  // decoder actually needs them, so early geoset/owner rejects do not discard
+  // warmed capacity.
+  dxvk::war3::render::ResetShadowDrawPacketPreserveScratch(out);
+  if (outDirectCurrentDrawSample != nullptr) {
+    dxvk::war3::render::
+        ResetCurrentDrawAuthoritativeSamplePreserveScratch(
+            *outDirectCurrentDrawSample);
+  }
   if (record.renderablePart == nullptr || record.meshPayloadPtr == nullptr)
     return false;
+
+  // Object-grouped preselection resolves this exact part/layer from the
+  // immutable current-frame visible snapshot. Keep the value copy alive for
+  // both instance projection and the later visible-record setup.
+  dxvk::war3::render::VisibleRenderableRecord visibleRecordStorage = {};
+  const bool preselectedVisibleMatches =
+      record.renderablePart != nullptr && preselectedVisibleRecord != nullptr &&
+      preselectedVisibleRecord->renderablePart == record.renderablePart &&
+      preselectedVisibleRecord->layerIndex == record.layerIndex;
+  bool visibleHit = preselectedVisibleMatches;
+  const dxvk::war3::render::VisibleRenderableRecord* visibleRecord =
+      visibleHit ? preselectedVisibleRecord : nullptr;
 
   if (packetBuildTiming != nullptr)
     packetBuildTiming->enter(War3PacketBuildPhase::GeosetLookup);
@@ -6169,10 +6743,16 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
       sharedGeoset;
   const dxvk::war3::model::ShadowGeosetResourceRecord* geoset = nullptr;
   bool geosetHit = false;
+  bool geosetSnapshotCacheHit = false;
   {
     auto geosetLookupScope =
         War3SemanticSubmitScope("War3SemanticScene/Direct/GeosetLookup");
-    sharedGeoset = War3FindDirectPacketGeosetResource(record.meshPayloadPtr);
+    if (geosetSnapshotCache != nullptr) {
+      sharedGeoset = geosetSnapshotCache->find(record.meshPayloadPtr);
+      geosetSnapshotCacheHit = sharedGeoset != nullptr;
+    }
+    if (sharedGeoset == nullptr)
+      sharedGeoset = War3FindDirectPacketGeosetResource(record.meshPayloadPtr);
     geoset = sharedGeoset.get();
     geosetHit = geoset != nullptr;
     if (!geosetHit) {
@@ -6185,53 +6765,123 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
   }
   if (packetBuildTiming != nullptr)
     packetBuildTiming->enter(War3PacketBuildPhase::OwnerInstanceLookup);
-  if (packetBuildTiming != nullptr)
-    packetBuildTiming->enterNested(War3PacketBuildNestedPhase::OwnerLookup);
-  dxvk::war3::model::ShadowModelResourceRecord ownerRecord = {};
+  dxvk::war3::model::ShadowRuntimeModelOwnerBinding ownerBinding = {};
   bool ownerHit = false;
-  {
-    auto ownerLookupScope =
-        War3SemanticSubmitScope("War3SemanticScene/Direct/OwnerLookup");
-    if (geosetHit) {
-      ownerHit = resourceCache.findRuntimeModelOwnerIndexed(
-          geoset->geosetPtr, geoset->geosetDataPtr, ownerRecord);
-      if (!ownerHit && War3SemanticDirectOwnerScanRuntime()) {
-        ownerHit =
-            resourceCache.findRuntimeModelOwner(geoset->geosetPtr,
-                                                geoset->geosetDataPtr,
-                                                geoset->geosetIndex,
-                                                geoset->modelResourcePtr,
-                                                ownerRecord);
-      }
-    }
-    if (!ownerHit) {
-      ownerHit = resourceCache.findRuntimeModelOwnerIndexed(
-          nullptr, record.meshPayloadPtr, ownerRecord);
-      if (!ownerHit && War3SemanticDirectOwnerScanRuntime()) {
-        ownerHit = resourceCache.findRuntimeModelOwner(
-            nullptr, record.meshPayloadPtr,
-            dxvk::war3::model::kInvalidShadowGeosetIndex, nullptr,
-            ownerRecord);
-      }
-    }
-  }
-  dxvk::war3::model::ModelInstanceRecord instanceRecord = {};
+  dxvk::war3::model::ModelInstanceDirectPacketView instanceRecord = {};
   auto& instanceRegistry = dxvk::war3::model::ModelInstanceRegistry::instance();
-  bool instanceHit = false;
+  // An exact visible record is already the current-frame value projection of
+  // this part/layer. Reuse its model owner when CurrentDraw carries at least
+  // one strong instance alias and every alias it does carry agrees. Shared
+  // model parts without instance proof retain the generation-checked lookup.
+  const dxvk::war3::render::War3VisibleInstanceProjectionFacts
+      visibleInstanceFacts = {
+          record.worldObjectEntry,
+          record.sceneNode,
+          record.unitPtr,
+          record.jHandle,
+          record.rawcode,
+          visibleHit ? visibleRecord->identity.worldObjectEntry : nullptr,
+          visibleHit ? visibleRecord->sceneNode : nullptr,
+          visibleHit ? visibleRecord->identity.sceneNode : nullptr,
+          visibleHit ? visibleRecord->identity.unitPtr : nullptr,
+          visibleHit ? visibleRecord->identity.jHandle : 0u,
+          visibleHit ? visibleRecord->identity.rawcode : 0u,
+          visibleHit ? visibleRecord->runtimeModelPtr : nullptr,
+          visibleHit ? visibleRecord->modelResourcePtr : nullptr,
+          visibleHit ? visibleRecord->modelKey : 0u,
+      };
+  const bool visibleProvesInstance =
+      visibleHit && dxvk::war3::render::War3CanProjectVisibleInstance(
+                        visibleInstanceFacts);
+  bool instanceHit = visibleProvesInstance;
+  if (visibleProvesInstance) {
+    instanceRecord.worldObjectEntry =
+        visibleRecord->identity.worldObjectEntry != nullptr
+            ? visibleRecord->identity.worldObjectEntry
+            : record.worldObjectEntry;
+    instanceRecord.sceneNode = visibleRecord->sceneNode != nullptr
+        ? visibleRecord->sceneNode : record.sceneNode;
+    instanceRecord.unitPtr = visibleRecord->identity.unitPtr != nullptr
+        ? visibleRecord->identity.unitPtr : record.unitPtr;
+    instanceRecord.runtimeModelPtr = visibleRecord->runtimeModelPtr;
+    instanceRecord.modelResourcePtr = visibleRecord->modelResourcePtr;
+    instanceRecord.jHandle = visibleRecord->identity.jHandle != 0u
+        ? visibleRecord->identity.jHandle : record.jHandle;
+    instanceRecord.rawcode = visibleRecord->identity.rawcode != 0u
+        ? visibleRecord->identity.rawcode : record.rawcode;
+    instanceRecord.modelKey = visibleRecord->modelKey;
+  }
   if (packetBuildTiming != nullptr)
     packetBuildTiming->enterNested(War3PacketBuildNestedPhase::InstanceLookup);
-  {
+  if (!instanceHit) {
     auto instanceLookupScope =
         War3SemanticSubmitScope("War3SemanticScene/Direct/InstanceLookup");
-    if (record.sceneNode != nullptr)
-      instanceHit = instanceRegistry.findBySceneNode(record.sceneNode, instanceRecord);
-    if (!instanceHit && record.unitPtr != nullptr)
-      instanceHit = instanceRegistry.findByUnitPtr(record.unitPtr, instanceRecord);
-    if (!instanceHit && record.worldObjectEntry != nullptr)
-      instanceHit = instanceRegistry.findByWorldObjectEntry(record.worldObjectEntry, instanceRecord);
-    if (!instanceHit && ownerHit && ownerRecord.runtimeModelPtr != nullptr)
-      instanceHit = instanceRegistry.findByRuntimeModel(ownerRecord.runtimeModelPtr,
-                                                        instanceRecord);
+    if (instanceSnapshotCache != nullptr) {
+      instanceHit = instanceSnapshotCache->find(
+          instanceRegistry, record.sceneNode, record.unitPtr,
+          record.worldObjectEntry, nullptr, instanceRecord);
+    } else {
+      instanceHit = instanceRegistry.findFirstForDirectPacketView(
+          record.sceneNode, record.unitPtr, record.worldObjectEntry, nullptr,
+          instanceRecord);
+    }
+  }
+
+  // The exact instance aliases are published from the same runtime model as
+  // its immutable geoset. If both independent generations agree on model
+  // resource and key, an owner-index probe cannot contribute any scalar used
+  // by this packet. Attachments and incomplete identities retain the owner
+  // lookup and its runtime-model fallback below.
+  const auto instanceProvesGeosetOwner = [&]() {
+    return geosetHit && geoset != nullptr && instanceHit &&
+        instanceRecord.runtimeModelPtr != nullptr &&
+        geoset->modelResourcePtr != nullptr &&
+        instanceRecord.modelResourcePtr == geoset->modelResourcePtr &&
+        geoset->modelKey != 0u && instanceRecord.modelKey == geoset->modelKey;
+  };
+  bool ownerSatisfiedByInstance = instanceProvesGeosetOwner();
+  if (!ownerSatisfiedByInstance) {
+    if (packetBuildTiming != nullptr)
+      packetBuildTiming->enterNested(War3PacketBuildNestedPhase::OwnerLookup);
+    {
+      auto ownerLookupScope =
+          War3SemanticSubmitScope("War3SemanticScene/Direct/OwnerLookup");
+      if (geosetHit) {
+        ownerHit = resourceCache.findRuntimeModelOwnerBindingIndexed(
+            geoset->geosetPtr, geoset->geosetDataPtr, ownerBinding);
+        if (!ownerHit && War3SemanticDirectOwnerScanRuntime()) {
+          ownerHit = resourceCache.findRuntimeModelOwnerBinding(
+              geoset->geosetPtr, geoset->geosetDataPtr, geoset->geosetIndex,
+              geoset->modelResourcePtr, ownerBinding);
+        }
+      }
+      if (!ownerHit) {
+        ownerHit = resourceCache.findRuntimeModelOwnerBindingIndexed(
+            nullptr, record.meshPayloadPtr, ownerBinding);
+        if (!ownerHit && War3SemanticDirectOwnerScanRuntime()) {
+          ownerHit = resourceCache.findRuntimeModelOwnerBinding(
+              nullptr, record.meshPayloadPtr,
+              dxvk::war3::model::kInvalidShadowGeosetIndex, nullptr,
+              ownerBinding);
+        }
+      }
+    }
+    if (!instanceHit && ownerHit && ownerBinding.runtimeModelPtr != nullptr) {
+      if (packetBuildTiming != nullptr)
+        packetBuildTiming->enterNested(
+            War3PacketBuildNestedPhase::InstanceLookup);
+      auto instancePostOwnerLookupScope = War3SemanticSubmitScope(
+          "War3SemanticScene/Direct/InstancePostOwnerLookup");
+      if (instanceSnapshotCache != nullptr) {
+        instanceHit = instanceSnapshotCache->find(
+            instanceRegistry, nullptr, nullptr, nullptr,
+            ownerBinding.runtimeModelPtr, instanceRecord);
+      } else {
+        instanceHit = instanceRegistry.findFirstForDirectPacketView(
+            nullptr, nullptr, nullptr, ownerBinding.runtimeModelPtr,
+            instanceRecord);
+      }
+    }
   }
 
   if (packetBuildTiming != nullptr)
@@ -6255,15 +6905,19 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
   if (!geosetHit) {
     auto ownerScanFallbackScope =
         War3SemanticSubmitScope("War3SemanticScene/Direct/OwnerGeosetScan");
-    if (ownerHit && ownerRecord.runtimeModelPtr != nullptr) {
-      for (uint32_t i = 0u; i < ownerRecord.geosetCount; ++i) {
-        if (i < ownerRecord.geosetDataPtrs.size() &&
-            ownerRecord.geosetDataPtrs[i] == record.meshPayloadPtr &&
-            resourceCache.findRuntimeModelGeoset(ownerRecord.runtimeModelPtr, i,
-                                                 geosetLocal)) {
-          geosetHit = true;
-          geoset = &geosetLocal;
-          break;
+    if (ownerHit && ownerBinding.runtimeModelPtr != nullptr) {
+      dxvk::war3::model::ShadowModelResourceRecord ownerRecord = {};
+      if (resourceCache.findRuntimeModelResource(ownerBinding.runtimeModelPtr,
+                                                 ownerRecord)) {
+        for (uint32_t i = 0u; i < ownerRecord.geosetCount; ++i) {
+          if (i < ownerRecord.geosetDataPtrs.size() &&
+              ownerRecord.geosetDataPtrs[i] == record.meshPayloadPtr &&
+              resourceCache.findRuntimeModelGeoset(ownerBinding.runtimeModelPtr,
+                                                   i, geosetLocal)) {
+            geosetHit = true;
+            geoset = &geosetLocal;
+            break;
+          }
         }
       }
     }
@@ -6304,117 +6958,122 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
   if (!geosetHit || geoset == nullptr || !geoset->readyForShadowConsumer())
     return false;
 
-  if (!ownerHit) {
+  ownerSatisfiedByInstance =
+      ownerSatisfiedByInstance || instanceProvesGeosetOwner();
+  if (!ownerHit && !ownerSatisfiedByInstance) {
     auto ownerPostLookupScope =
         War3SemanticSubmitScope("War3SemanticScene/Direct/OwnerPostLookup");
-    ownerHit = resourceCache.findRuntimeModelOwnerIndexed(
-        geoset->geosetPtr, geoset->geosetDataPtr, ownerRecord);
+    ownerHit = resourceCache.findRuntimeModelOwnerBindingIndexed(
+        geoset->geosetPtr, geoset->geosetDataPtr, ownerBinding);
     if (!ownerHit && War3SemanticDirectOwnerScanRuntime()) {
-      ownerHit =
-          resourceCache.findRuntimeModelOwner(geoset->geosetPtr,
-                                              geoset->geosetDataPtr,
-                                              geoset->geosetIndex,
-                                              geoset->modelResourcePtr,
-                                              ownerRecord);
+      ownerHit = resourceCache.findRuntimeModelOwnerBinding(
+          geoset->geosetPtr, geoset->geosetDataPtr, geoset->geosetIndex,
+          geoset->modelResourcePtr, ownerBinding);
     }
   }
-  if (!instanceHit && ownerHit && ownerRecord.runtimeModelPtr != nullptr) {
+  if (!instanceHit && ownerHit && ownerBinding.runtimeModelPtr != nullptr) {
     auto instancePostLookupScope =
         War3SemanticSubmitScope("War3SemanticScene/Direct/InstancePostLookup");
-    instanceHit = instanceRegistry.findByRuntimeModel(ownerRecord.runtimeModelPtr,
-                                                      instanceRecord);
+    if (instanceSnapshotCache != nullptr) {
+      instanceHit = instanceSnapshotCache->find(
+          instanceRegistry, nullptr, nullptr, nullptr,
+          ownerBinding.runtimeModelPtr, instanceRecord);
+    } else {
+      instanceHit = instanceRegistry.findFirstForDirectPacketView(
+          nullptr, nullptr, nullptr, ownerBinding.runtimeModelPtr,
+          instanceRecord);
+    }
   }
 
   if (packetBuildTiming != nullptr)
     packetBuildTiming->enter(War3PacketBuildPhase::RegistryLookups);
+
+  if (packetBuildTiming != nullptr)
+    packetBuildTiming->enterNested(War3PacketBuildNestedPhase::VisibleLookup);
+  if (!visibleHit) {
+    auto visibleLookupScope =
+        War3SemanticSubmitScope("War3SemanticScene/Direct/VisibleLookup");
+    // The grouped preselector has already queried this exact part/layer from
+    // the immutable current-frame Visible snapshot in order to derive its
+    // stable selection key. Reuse that value copy instead of performing the
+    // same indexed lookup again during packet construction. The uncapped
+    // path, compact-table Consume without a canonical lookup, and any
+    // mismatching hint retain the canonical fallback below.
+    auto& visibleRegistry =
+        dxvk::war3::render::VisibleRenderableRegistry::instance();
+    visibleHit = visibleRegistry.queryFirstForDirectPacket(
+        record, visibleRecordStorage);
+    if (visibleHit)
+      visibleRecord = &visibleRecordStorage;
+  }
+
+  // CurrentDraw is already backfilled from the exact visible part at publish
+  // time. When all object aliases are present and that exact visible lookup
+  // supplies both the render group and unit flags, RenderObjectRegistry cannot
+  // add any field used by this packet. Keep the registry fallback for
+  // incomplete identities, destructibles/effects and unusual queue parts.
+  const bool currentDrawHasUnitKind =
+      record.objectKind == dxvk::war3::render::ObjectKind::Unit ||
+      record.objectKind == dxvk::war3::render::ObjectKind::Building;
+  const bool currentDrawObjectIdentityComplete =
+      record.worldObjectEntry != nullptr && record.sceneNode != nullptr &&
+      record.unitPtr != nullptr && record.jHandle != 0u &&
+      record.rawcode != 0u && currentDrawHasUnitKind && visibleHit &&
+      visibleRecord->identity.groupIdx >= 0 &&
+      visibleRecord->identity.flags5C != 0u;
   if (packetBuildTiming != nullptr)
     packetBuildTiming->enterNested(
         War3PacketBuildNestedPhase::RenderObjectLookup);
   const dxvk::war3::render::RenderObjectInfo* renderObject = nullptr;
-  {
+  if (!currentDrawObjectIdentityComplete) {
     auto renderObjectLookupScope =
         War3SemanticSubmitScope("War3SemanticScene/Direct/RenderObjectLookup");
     auto& renderRegistry = dxvk::war3::render::RenderObjectRegistry::instance();
-    if (record.worldObjectEntry != nullptr)
-      renderObject = renderRegistry.findByEntry(record.worldObjectEntry);
-    if (renderObject == nullptr && record.sceneNode != nullptr)
-      renderObject = renderRegistry.findBySceneNode(record.sceneNode);
-    if (renderObject == nullptr && record.jHandle != 0u)
-      renderObject = renderRegistry.findByHandle(record.jHandle);
+    renderObject = renderRegistry.findFirstForDirectPacket(
+        record.worldObjectEntry, record.sceneNode, record.jHandle);
   }
 
-  dxvk::war3::render::ShadowObjectRecord shadowRecord = {};
+  dxvk::war3::render::ShadowObjectAugmentView shadowRecord = {};
   bool shadowHit = false;
-  if (packetBuildTiming != nullptr)
-    packetBuildTiming->enterNested(
-        War3PacketBuildNestedPhase::ShadowObjectLookup);
-  {
+  // A complete CurrentDraw identity plus an independently matched immutable
+  // geoset/instance owner already supplies every ShadowObject scalar consumed
+  // below: runtime model, object aliases, model identity and object kind. Do
+  // not take another registry generation snapshot and alias lookup for that
+  // common path. Attachments, incomplete identities and owner mismatches keep
+  // the canonical fallback intact.
+  const bool currentDrawShadowAugmentComplete =
+      currentDrawObjectIdentityComplete && ownerSatisfiedByInstance;
+  if (!currentDrawShadowAugmentComplete) {
+    if (packetBuildTiming != nullptr)
+      packetBuildTiming->enterNested(
+          War3PacketBuildNestedPhase::ShadowObjectLookup);
     auto shadowObjectLookupScope =
         War3SemanticSubmitScope("War3SemanticScene/Direct/ShadowObjectLookup");
     auto& shadowRegistry = dxvk::war3::render::ShadowObjectRegistry::instance();
-    if (record.worldObjectEntry != nullptr)
-      shadowHit = shadowRegistry.findByWorldObjectEntry(record.worldObjectEntry,
-                                                        shadowRecord);
-    if (!shadowHit && record.sceneNode != nullptr)
-      shadowHit = shadowRegistry.findBySceneNode(record.sceneNode, shadowRecord);
-    if (!shadowHit && record.jHandle != 0u)
-      shadowHit = shadowRegistry.findByHandle(record.jHandle, shadowRecord);
-    if (!shadowHit && ownerHit && ownerRecord.runtimeModelPtr != nullptr)
-      shadowHit =
-          shadowRegistry.findByRuntimeModel(ownerRecord.runtimeModelPtr, shadowRecord);
-    if (!shadowHit && instanceHit && instanceRecord.runtimeModelPtr != nullptr)
-      shadowHit = shadowRegistry.findByRuntimeModel(instanceRecord.runtimeModelPtr,
-                                                    shadowRecord);
+    if (shadowObjectSnapshotCache != nullptr) {
+      shadowHit = shadowObjectSnapshotCache->find(
+          shadowRegistry, record.worldObjectEntry, record.sceneNode,
+          record.jHandle,
+          ownerHit ? ownerBinding.runtimeModelPtr : nullptr,
+          instanceHit ? instanceRecord.runtimeModelPtr : nullptr,
+          shadowRecord);
+    } else {
+      shadowHit = shadowRegistry.findFirstForDirectPacketView(
+          record.worldObjectEntry, record.sceneNode, record.jHandle,
+          ownerHit ? ownerBinding.runtimeModelPtr : nullptr,
+          instanceHit ? instanceRecord.runtimeModelPtr : nullptr,
+          shadowRecord);
+    }
   }
 
-  dxvk::war3::render::VisibleRenderableRecord visibleRecord = {};
-  bool visibleHit = false;
-  if (packetBuildTiming != nullptr)
-    packetBuildTiming->enterNested(War3PacketBuildNestedPhase::VisibleLookup);
-  {
-    auto visibleLookupScope =
-        War3SemanticSubmitScope("War3SemanticScene/Direct/VisibleLookup");
-    auto& visibleRegistry = dxvk::war3::render::VisibleRenderableRegistry::instance();
-    if (record.renderablePart != nullptr)
-      visibleHit = visibleRegistry.queryByRenderablePartAndLayer(
-          record.renderablePart, record.layerIndex, visibleRecord);
-    if (!visibleHit && record.renderablePart != nullptr)
-      visibleHit = visibleRegistry.queryByPayload(record.renderablePart,
-                                                  visibleRecord) &&
-                   War3VisibleRecordMatchesCurrentDrawSlice(record,
-                                                            visibleRecord);
-    if (!visibleHit && record.sceneNode != nullptr)
-      visibleHit = visibleRegistry.queryBySceneNode(record.sceneNode,
-                                                   visibleRecord) &&
-                   War3VisibleRecordMatchesCurrentDrawSlice(record,
-                                                            visibleRecord);
-  }
-
-  dxvk::war3::model::PoseRecord poseRecord = {};
-  bool poseHit = false;
   const void* effectiveRuntimeModelPtr =
       instanceHit && instanceRecord.runtimeModelPtr != nullptr
           ? instanceRecord.runtimeModelPtr
-          : ownerHit && ownerRecord.runtimeModelPtr != nullptr
-                ? ownerRecord.runtimeModelPtr
+          : ownerHit && ownerBinding.runtimeModelPtr != nullptr
+                ? ownerBinding.runtimeModelPtr
                 : shadowHit && shadowRecord.runtimeModelPtr != nullptr
                       ? shadowRecord.runtimeModelPtr
                       : nullptr;
-  if (packetBuildTiming != nullptr)
-    packetBuildTiming->enterNested(War3PacketBuildNestedPhase::PoseLookup);
-  {
-    auto poseLookupScope =
-        War3SemanticSubmitScope("War3SemanticScene/Direct/PoseLookup");
-    auto& poseRegistry = dxvk::war3::model::PoseRegistry::instance();
-    if (effectiveRuntimeModelPtr != nullptr)
-      poseHit = poseRegistry.findByRuntimeModel(const_cast<void*>(effectiveRuntimeModelPtr),
-                                               poseRecord);
-    if (!poseHit && record.sceneNode != nullptr)
-      poseHit = poseRegistry.findBySceneNode(record.sceneNode, poseRecord);
-    if (!poseHit && record.unitPtr != nullptr)
-      poseHit = poseRegistry.findByUnitPtr(record.unitPtr, poseRecord);
-  }
-
   if (packetBuildTiming != nullptr)
     packetBuildTiming->enter(War3PacketBuildPhase::RenderableSetup);
   auto& renderable = out.renderable;
@@ -6459,11 +7118,11 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
     renderable.meshData = record.meshPayloadPtr;
     if (visibleHit) {
       if (renderable.payload == nullptr)
-        renderable.payload = visibleRecord.payload;
-      renderable.layerState = visibleRecord.layerState;
-      renderable.transparentType = visibleRecord.transparentType;
-      renderable.transparentSortKey = visibleRecord.transparentSortKey;
-      renderable.queueKind = visibleRecord.queueKind;
+        renderable.payload = visibleRecord->payload;
+      renderable.layerState = visibleRecord->layerState;
+      renderable.transparentType = visibleRecord->transparentType;
+      renderable.transparentSortKey = visibleRecord->transparentSortKey;
+      renderable.queueKind = visibleRecord->queueKind;
     }
     renderable.runtimeModelPtr = const_cast<void*>(effectiveRuntimeModelPtr);
     renderable.modelResourcePtr =
@@ -6471,7 +7130,7 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
             ? geoset->modelResourcePtr
             : instanceHit && instanceRecord.modelResourcePtr != nullptr
                   ? instanceRecord.modelResourcePtr
-                  : ownerHit ? ownerRecord.modelResourcePtr
+                  : ownerHit ? ownerBinding.modelResourcePtr
                              : shadowHit ? shadowRecord.modelResourcePtr
                                          : nullptr;
     renderable.runtimeGeosetPtr = geoset->geosetPtr;
@@ -6481,8 +7140,8 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
             ? geoset->modelKey
             : instanceHit && instanceRecord.modelKey != 0u
                   ? instanceRecord.modelKey
-                  : ownerHit && ownerRecord.modelKey != 0u
-                        ? ownerRecord.modelKey
+                  : ownerHit && ownerBinding.modelKey != 0u
+                        ? ownerBinding.modelKey
                         : shadowHit ? shadowRecord.modelKey : 0u;
     renderable.flags = 0u;
     renderable.jHandle =
@@ -6507,20 +7166,22 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
                                     : 0u;
     renderable.stage = record.stage;
     renderable.pathBlocker =
-        record.pathBlocker || (visibleHit && visibleRecord.pathBlocker) ||
+        record.pathBlocker || (visibleHit && visibleRecord->pathBlocker) ||
         IsLosBlockerFourCc(renderable.rawcode);
     renderable.unitFlags5C =
-        renderObject != nullptr && renderObject->flags5C != 0u
-            ? renderObject->flags5C
-            : 0u;
+        currentDrawObjectIdentityComplete
+            ? visibleRecord->identity.flags5C
+            : renderObject != nullptr && renderObject->flags5C != 0u
+                  ? renderObject->flags5C
+                  : 0u;
     // In the current-draw contract `payload + 0x108` is the selector used for
     // sceneNode->meshInfoTable. It is not a material layer index. When the
     // visible registry does not provide a layer, default to layer 0; using the
     // selector as a layer made first-layer cutout/alpha records read the wrong
     // material contract and collapse to opaque.
-    renderable.layerIndex = visibleHit ? visibleRecord.layerIndex
+    renderable.layerIndex = visibleHit ? visibleRecord->layerIndex
                                        : record.layerIndex;
-    renderable.subIndex = visibleHit ? visibleRecord.subIndex
+    renderable.subIndex = visibleHit ? visibleRecord->subIndex
                                      : record.layerIndex;
     if (!visibleHit) {
       renderable.transparentType = 0u;
@@ -6534,9 +7195,9 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
             : geoset->geosetIndex;
     renderable.meshIndex =
         visibleHit &&
-                visibleRecord.meshIndex !=
+                visibleRecord->meshIndex !=
                     dxvk::war3::render::kInvalidVisibleMeshIndex
-            ? visibleRecord.meshIndex
+            ? visibleRecord->meshIndex
             : drawMeshSelector;
     renderable.geosetIndex = geoset->geosetIndex;
     renderable.objectKind =
@@ -6547,7 +7208,7 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
                   : shadowHit ? shadowRecord.kind
                               : dxvk::war3::render::ObjectKind::Unknown;
     renderable.groupIdx =
-        visibleHit ? visibleRecord.identity.groupIdx
+        visibleHit ? visibleRecord->identity.groupIdx
                    : renderObject != nullptr ? int8_t(renderObject->groupIdx)
                                              : int8_t(0);
     renderable.frameSerial =
@@ -6558,6 +7219,16 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
                                    renderable.unitFlags5C);
     }
   }
+  // Object-grouped preselection obtained this exact part/layer from the same
+  // immutable current-frame Visible snapshot consumed above. Validate the
+  // finished packet against that value once and carry only the result through
+  // eligibility and the same-call lease update. Fallback builders and restored
+  // leases retain the canonical registry query.
+  if (outPrevalidatedMainWorldBackingStatus != nullptr &&
+      preselectedVisibleMatches) {
+    War3SemanticDirectPacketMatchesMainWorldVisibleRecord(
+        out, *visibleRecord, outPrevalidatedMainWorldBackingStatus);
+  }
 
   if (packetBuildTiming != nullptr)
     packetBuildTiming->enter(War3PacketBuildPhase::ResourceSetup);
@@ -6567,6 +7238,11 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
   if (sharedGeoset == nullptr)
     sharedGeoset =
         War3GetDirectPacketGeosetResource(std::move(geosetLocal));
+  // A cache hit already leaves the same immutable shared owner in its slot.
+  // Re-storing it would hash the key again and perform an otherwise useless
+  // shared_ptr increment/decrement pair for every adjacent instance part.
+  if (geosetSnapshotCache != nullptr && !geosetSnapshotCacheHit)
+    geosetSnapshotCache->store(record.meshPayloadPtr, sharedGeoset);
   const auto& geo = *sharedGeoset;
 
   auto& resource = out.resource;
@@ -6575,7 +7251,11 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
   {
     auto resourceSetupScope = War3SemanticSubmitScope(
         "War3SemanticScene/Direct/ResourceSetup");
-    resource.resourceKeepAlive = sharedGeoset;
+    // The packet is the final owner for this build result. The Populate-local
+    // snapshot cache already took its own reference above, so move the local
+    // owner instead of paying another shared_ptr atomic increment/decrement
+    // for every caster. `geo` remains valid through resourceKeepAlive.
+    resource.resourceKeepAlive = std::move(sharedGeoset);
     resource.modelResourcePtr = renderable.modelResourcePtr;
     resource.modelKey = renderable.modelKey;
     resource.geosetIndex = geo.geosetIndex;
@@ -6602,10 +7282,26 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
   }
   bool directExplicitBlendResolved = false;
   uint32_t directExplicitBlendMaxGroupSlot = 0u;
+  bool directDecodedGroupSlotMaxReady = false;
+  uint32_t directDecodedMaxGroupSlot = 0u;
 
   if (packetBuildTiming != nullptr)
     packetBuildTiming->enter(War3PacketBuildPhase::AuthoritativeSetup);
   dxvk::war3::render::CurrentDrawAuthoritativeSample directCurrentDrawSample = {};
+  directCurrentDrawSample.palette = std::move(out.runtimeGroupPalette);
+  directCurrentDrawSample.groupSlots =
+      std::move(out.resource.ownedVertexGroupIndices);
+  if (outDirectCurrentDrawSample != nullptr) {
+    if (outDirectCurrentDrawSample->palette.capacity() >
+        directCurrentDrawSample.palette.capacity()) {
+      directCurrentDrawSample.palette.swap(outDirectCurrentDrawSample->palette);
+    }
+    if (outDirectCurrentDrawSample->groupSlots.capacity() >
+        directCurrentDrawSample.groupSlots.capacity()) {
+      directCurrentDrawSample.groupSlots.swap(
+          outDirectCurrentDrawSample->groupSlots);
+    }
+  }
   dxvk::war3::render::CurrentDrawResolveStatus directResolveStatus;
   {
     auto directResolveScope = War3SemanticSubmitScope(
@@ -6643,15 +7339,25 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
       };
     }
     directResolveStatus =
-        dxvk::war3::render::ResolveCurrentDrawAuthoritativeSampleFromRecord(
-            record,
-            resource.vertexCount != 0u
-                ? resource.vertexCount
-                : uint32_t(resource.positionVec().size() / 3u),
-            renderable.frameSerial,
-            directCurrentDrawSample,
-            packetBuildTiming != nullptr ? &resolveTrace : nullptr,
-            groupRangeValidator);
+        [&]() {
+          const dxvk::war3::render::CurrentDrawImmutableGroupSlotHint
+              immutableGroupSlotHint = {
+                  geo.vertexGroupIndices.data(),
+                  geo.vertexGroupIndices.size(),
+                  geo.vertexGroupSlotWordHash,
+                  geo.maxVertexGroupSlot,
+                  geo.immutableModelGeneration,
+              };
+          return dxvk::war3::render::
+              ResolveCurrentDrawAuthoritativeSampleFromRecord(
+                  record,
+                  resource.vertexCount != 0u
+                      ? resource.vertexCount
+                      : uint32_t(resource.positionVec().size() / 3u),
+                  renderable.frameSerial, directCurrentDrawSample,
+                  packetBuildTiming != nullptr ? &resolveTrace : nullptr,
+                  groupRangeValidator, &immutableGroupSlotHint);
+        }();
   }
   if (packetBuildTiming != nullptr)
     packetBuildTiming->enter(War3PacketBuildPhase::SkinningDecision);
@@ -6708,6 +7414,10 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
     // Resolve 失败（InvalidPaletteSlot / MissingPalette 等）时尝试 live rebuild。
     // 注意 allowCModelFallbackForCall 保持 false，避免 1.27a 上 CModel 直读拿到
     // 错对象的已知 bug。
+    // The failed authoritative decode no longer needs its palette payload.
+    // Reuse that allocation for the live fallback of the same candidate.
+    liveRebuiltPalette = std::move(directCurrentDrawSample.palette);
+    liveRebuiltPalette.clear();
     dxvk::war3::render::NoteSubmitLiveRebuildAttempt();
     liveRebuildUsed = War3TryBuildLiveRuntimeGroupPalette(
         resource,
@@ -6724,10 +7434,14 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
         &liveRebuiltSlotIndex,
         &liveRebuiltMinFrameTag,
         &liveRebuiltMaxFrameTag,
-        nullptr);
+        nullptr,
+        0xFFFFFFFFu);
     if (!liveRebuildUsed || liveRebuiltPalette.empty()) {
       // live rebuild 也失败：这是真正的"没数据"，只能 skip 这帧。
       dxvk::war3::render::NoteSubmitLiveRebuildMiss();
+      out.runtimeGroupPalette = std::move(liveRebuiltPalette);
+      out.resource.ownedVertexGroupIndices =
+          std::move(directCurrentDrawSample.groupSlots);
       return false;
     }
     dxvk::war3::render::NoteSubmitLiveRebuildHit();
@@ -6742,19 +7456,31 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
         directCurrentDrawSample.paletteReady()) {
       const bool directGroupSlotsReady =
           directCurrentDrawSample.groupSlotsReady();
+      directDecodedGroupSlotMaxReady = directGroupSlotsReady;
+      directDecodedMaxGroupSlot = directCurrentDrawSample.maxGroupSlot;
       if (outDirectCurrentDrawSample != nullptr) {
-        *outDirectCurrentDrawSample = {};
+        dxvk::war3::render::
+            ResetCurrentDrawAuthoritativeSamplePreserveScratch(
+                *outDirectCurrentDrawSample);
         outDirectCurrentDrawSample->contract = directCurrentDrawSample.contract;
         outDirectCurrentDrawSample->paletteCount =
             directCurrentDrawSample.paletteCount;
         outDirectCurrentDrawSample->paletteHash =
             directCurrentDrawSample.paletteHash;
-        outDirectCurrentDrawSample->palette = directCurrentDrawSample.palette;
-        outDirectCurrentDrawSample->groupSlots =
-            directCurrentDrawSample.groupSlots;
-        outDirectCurrentDrawSample->groupHash = directCurrentDrawSample.groupHash;
+        outDirectCurrentDrawSample->paletteProvenance =
+            directCurrentDrawSample.paletteProvenance;
+        // The packet owns the decoded palette and either owns group bytes or
+        // retains their exact immutable geoset owner. Callers only need the
+        // sample's immutable contract, provenance and hashes once that packet
+        // authority is proven.
+        outDirectCurrentDrawSample->groupHash =
+            directCurrentDrawSample.groupHash;
         outDirectCurrentDrawSample->stableGroupHash =
             directCurrentDrawSample.stableGroupHash;
+        outDirectCurrentDrawSample->maxGroupSlot =
+            directCurrentDrawSample.maxGroupSlot;
+        outDirectCurrentDrawSample->groupSlotsBorrowedFromImmutableHint =
+            directCurrentDrawSample.groupSlotsBorrowedFromImmutableHint;
         outDirectCurrentDrawSample->status = directCurrentDrawSample.status;
       }
       out.runtimeGroupPalette = std::move(directCurrentDrawSample.palette);
@@ -6767,9 +7493,22 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
           directCurrentDrawSample.contract.frameTag;
       out.hasRuntimeGroupPalette = true;
       if (directGroupSlotsReady) {
-        resource.ownedVertexGroupIndices =
-            std::move(directCurrentDrawSample.groupSlots);
-        resource.vertexGroupIndices = &resource.ownedVertexGroupIndices;
+        if (directCurrentDrawSample.groupSlotsBorrowedFromImmutableHint) {
+          resource.currentDrawGroupSlotsBackedByResourceKeepAlive = true;
+          // Keep the historical owned representation if any packet field does
+          // not prove the exact retained owner. The immutable match avoided a
+          // decode copy, so materialize only on this rare proof failure.
+          if (!War3PacketResourceHasImmutableCurrentDrawGroupSlots(resource)) {
+            resource.currentDrawGroupSlotsBackedByResourceKeepAlive = false;
+            resource.ownedVertexGroupIndices.assign(
+                geo.vertexGroupIndices.begin(), geo.vertexGroupIndices.end());
+            resource.vertexGroupIndices = &resource.ownedVertexGroupIndices;
+          }
+        } else {
+          resource.ownedVertexGroupIndices =
+              std::move(directCurrentDrawSample.groupSlots);
+          resource.vertexGroupIndices = &resource.ownedVertexGroupIndices;
+        }
       }
     } else if (liveRebuildUsed && !liveRebuiltPalette.empty()) {
       // Phase 7.50：Resolve 不 Ready 但 live rebuild 成功，用 fresh palette 组装。
@@ -6786,17 +7525,56 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
       if (outDirectCurrentDrawSample != nullptr) {
         // 用 stale directCurrentDrawSample 的 contract + rebuild 后的 palette
         // 构造一个 "fresh-palette sample" 给调用方，保留 contract/identity 信息。
-        *outDirectCurrentDrawSample = {};
+        dxvk::war3::render::
+            ResetCurrentDrawAuthoritativeSamplePreserveScratch(
+                *outDirectCurrentDrawSample);
         outDirectCurrentDrawSample->contract = directCurrentDrawSample.contract;
         outDirectCurrentDrawSample->paletteCount =
             uint32_t(out.runtimeGroupPalette.size());
         outDirectCurrentDrawSample->paletteHash = liveRebuiltHash;
-        outDirectCurrentDrawSample->palette = out.runtimeGroupPalette;
         outDirectCurrentDrawSample->status =
             dxvk::war3::render::CurrentDrawResolveStatus::Ready;
       }
     } else if (outDirectCurrentDrawSample != nullptr) {
       *outDirectCurrentDrawSample = std::move(directCurrentDrawSample);
+    }
+    // A failed group decode may leave an unused temporary allocation. Keep
+    // its capacity with the packet scratch, but never let partial group bytes
+    // become the packet's active vertex-group source.
+    if (resource.ownedVertexGroupIndices.empty()) {
+      directCurrentDrawSample.groupSlots.clear();
+      resource.ownedVertexGroupIndices =
+          std::move(directCurrentDrawSample.groupSlots);
+    }
+  }
+
+  // The authoritative CurrentDraw path already owns the palette used by the
+  // packet. Query only the fixed-size pose projection in that common case;
+  // copying PoseRegistry::matrixPalette (up to 256 matrices) is reserved for
+  // the non-authoritative fallback that actually consumes it.
+  dxvk::war3::model::PoseRecord poseRecord = {};
+  dxvk::war3::model::PoseAugmentView poseAugment = {};
+  bool poseHit = false;
+  const bool needPoseMatrixPayload =
+      !out.hasRuntimeGroupPalette && !authoritativeSkinnedRequired;
+  if (packetBuildTiming != nullptr)
+    packetBuildTiming->enterNested(War3PacketBuildNestedPhase::PoseLookup);
+  {
+    auto poseLookupScope =
+        War3SemanticSubmitScope("War3SemanticScene/Direct/PoseLookup");
+    auto& poseRegistry = dxvk::war3::model::PoseRegistry::instance();
+    if (needPoseMatrixPayload) {
+      poseHit = poseRegistry.findFirstForDirectPacket(
+          const_cast<void*>(effectiveRuntimeModelPtr), record.sceneNode,
+          record.unitPtr, poseRecord);
+    } else if (poseAugmentSnapshotCache != nullptr) {
+      poseHit = poseAugmentSnapshotCache->find(
+          poseRegistry, const_cast<void*>(effectiveRuntimeModelPtr),
+          record.sceneNode, record.unitPtr, poseAugment);
+    } else {
+      poseHit = poseRegistry.findFirstForDirectPacketAugment(
+          const_cast<void*>(effectiveRuntimeModelPtr), record.sceneNode,
+          record.unitPtr, poseAugment);
     }
   }
 
@@ -6806,7 +7584,7 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
   {
     auto poseInstallScope =
         War3SemanticSubmitScope("War3SemanticScene/Direct/PoseInstall");
-    if (poseHit) {
+    if (poseHit && needPoseMatrixPayload) {
       pose.runtimeModelPtr =
           poseRecord.runtimeModelPtr != nullptr
               ? poseRecord.runtimeModelPtr
@@ -6820,6 +7598,19 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
       if (poseRecord.hasWorldTransform)
         pose.worldTransform = poseRecord.worldTransform;
       pose.frameSerial = renderable.frameSerial;
+    } else if (poseHit) {
+      pose.runtimeModelPtr =
+          poseAugment.runtimeModelPtr != nullptr
+              ? poseAugment.runtimeModelPtr
+              : const_cast<void*>(effectiveRuntimeModelPtr);
+      pose.sceneNode = poseAugment.sceneNode;
+      pose.unitPtr = poseAugment.unitPtr;
+      pose.matrixCount = poseAugment.matrixCount;
+      pose.matrixHash = poseAugment.matrixHash;
+      pose.hasWorldTransform = poseAugment.hasWorldTransform;
+      if (poseAugment.hasWorldTransform)
+        pose.worldTransform = poseAugment.worldTransform;
+      pose.frameSerial = renderable.frameSerial;
     }
   }
 
@@ -6832,34 +7623,32 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
         directResolveStatus ==
             dxvk::war3::render::CurrentDrawResolveStatus::Ready &&
         out.hasRuntimeGroupPalette && !out.runtimeGroupPalette.empty()) {
-      dxvk::war3::shadow::ShadowPoseRecord explicitPose = pose;
-      explicitPose.matrixPalette = out.runtimeGroupPalette;
-      explicitPose.matrixCount = uint32_t(out.runtimeGroupPalette.size());
-      explicitPose.matrixHash = out.runtimeGroupPaletteHash;
-      explicitPose.runtimeModelPtr =
-          renderable.runtimeModelPtr != nullptr ? renderable.runtimeModelPtr
-                                                : pose.runtimeModelPtr;
-      explicitPose.sceneNode =
-          renderable.sceneNode != nullptr ? renderable.sceneNode : pose.sceneNode;
-      explicitPose.unitPtr =
-          renderable.unitPtr != nullptr ? renderable.unitPtr : pose.unitPtr;
-      explicitPose.frameSerial = renderable.frameSerial;
+      // The explicit-blend decoder is synchronous and reads only the current
+      // authoritative palette. Pass a bounded view so BuildEligible does not
+      // clone up to 256 matrices into a temporary ShadowPoseRecord before the
+      // resolver copies the final maxGroupSlot prefix into its result.
+      const dxvk::war3::shadow::ShadowMatrixPaletteView explicitPalette = {
+          out.runtimeGroupPalette.data(),
+          uint32_t(out.runtimeGroupPalette.size())};
 
-      uint32_t maxExpectedGroupSize = 0u;
-      for (uint32_t groupSize : geo.matrixGroupSizes)
-        maxExpectedGroupSize = std::max(maxExpectedGroupSize, groupSize);
+      const uint32_t maxExpectedGroupSize = geo.maxMatrixGroupSize;
 
       dxvk::war3::shadow::ShadowExplicitBlendSkinningResult explicitBlend = {};
+      explicitBlend.weights =
+          std::move(resource.ownedVertexBlendWeights);
+      explicitBlend.indices =
+          std::move(resource.ownedVertexBlendIndices);
       const uint32_t explicitVertexCount =
           resource.vertexCount != 0u
               ? resource.vertexCount
               : uint32_t(resource.positionVec().size() / 3u);
       const uint32_t explicitPaletteLimit =
-          std::min<uint32_t>(uint32_t(explicitPose.matrixPalette.size()), 256u);
+          std::min<uint32_t>(explicitPalette.size, 256u);
       if (explicitVertexCount != 0u && explicitPaletteLimit != 0u &&
           dxvk::war3::shadow::TryResolveExplicitBlendSkinningForRenderable(
               renderable, explicitVertexCount, explicitPaletteLimit,
-              maxExpectedGroupSize, explicitPose, explicitBlend, nullptr)) {
+              maxExpectedGroupSize, explicitPalette,
+              false, explicitBlend, nullptr)) {
         resource.ownedVertexBlendWeights = std::move(explicitBlend.weights);
         resource.vertexBlendWeights = &resource.ownedVertexBlendWeights;
         resource.ownedVertexBlendIndices = std::move(explicitBlend.indices);
@@ -6867,14 +7656,23 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
         resource.explicitBlendCount = explicitBlend.blendCount;
         resource.contentHash =
             bit::fnv1a_iter(resource.contentHash, explicitBlend.dynamicHash);
-        if (!explicitBlend.runtimeGroupPalette.empty()) {
-          out.runtimeGroupPalette = std::move(explicitBlend.runtimeGroupPalette);
-          out.runtimeGroupPaletteHash = War3SemanticHashMatrixPalette(
-              out.runtimeGroupPalette.data(),
-              uint32_t(out.runtimeGroupPalette.size()));
-        }
+        // The direct packet already owns the exact input palette. The
+        // resolver selected a prefix of that same sequence, so trim in place
+        // instead of allocating and copying an identical result vector.
+        out.runtimeGroupPalette.resize(
+            size_t(explicitBlend.maxGroupSlot) + 1u);
+        out.runtimeGroupPaletteHash = War3SemanticHashMatrixPalette(
+            out.runtimeGroupPalette.data(),
+            uint32_t(out.runtimeGroupPalette.size()));
         directExplicitBlendResolved = true;
         directExplicitBlendMaxGroupSlot = explicitBlend.maxGroupSlot;
+      } else {
+        explicitBlend.weights.clear();
+        explicitBlend.indices.clear();
+        resource.ownedVertexBlendWeights =
+            std::move(explicitBlend.weights);
+        resource.ownedVertexBlendIndices =
+            std::move(explicitBlend.indices);
       }
     }
   }
@@ -6884,7 +7682,11 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
   {
     auto materialScope =
         War3SemanticSubmitScope("War3SemanticScene/Direct/MaterialSignature");
-    out.material = War3BuildShadowMaterialSignatureCached(renderable);
+    // The immutable geoset owner was admitted against the current map epoch
+    // above. Reuse that proof instead of acquiring the global epoch again for
+    // every packet's material-cache lookup.
+    out.material = War3BuildShadowMaterialSignatureCached(
+        renderable, resource.mapEpoch);
   }
 
   if (packetBuildTiming != nullptr)
@@ -6908,13 +7710,9 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
   {
     auto maxSlotScope =
         War3SemanticSubmitScope("War3SemanticScene/Direct/MaxGroupSlotScan");
-    uint32_t maxSlot = 0u;
-    const auto& effectiveGroupSlots =
-        !resource.ownedVertexGroupIndices.empty()
-            ? resource.ownedVertexGroupIndices
-            : geo.vertexGroupIndices;
-    for (uint8_t slot : effectiveGroupSlots)
-      maxSlot = std::max(maxSlot, uint32_t(slot));
+    uint32_t maxSlot = directDecodedGroupSlotMaxReady
+        ? directDecodedMaxGroupSlot
+        : geo.maxVertexGroupSlot;
     if (directExplicitBlendResolved)
       maxSlot = std::max(maxSlot, directExplicitBlendMaxGroupSlot);
     out.maxVertexGroupSlot = maxSlot;
@@ -6991,6 +7789,8 @@ bool War3LooksSubmitEligibleForDirectCurrentDrawFast(
     bool unitsOnly,
     const dxvk::war3::render::CurrentDrawAuthoritativeSample*
         directCurrentDrawSample,
+    War3SemanticDirectMainWorldBackingStatus
+        prevalidatedMainWorldBackingStatus,
     War3SemanticDirectMainWorldBackingStatus* outMainWorldBackingStatus =
         nullptr) {
   if (outMainWorldBackingStatus != nullptr) {
@@ -7014,7 +7814,8 @@ bool War3LooksSubmitEligibleForDirectCurrentDrawFast(
           : uint32_t(packet.resource.positionVec().size() / 3u);
   if (vertexCount == 0u || !packet.hasRuntimeGroupPalette ||
       packet.runtimeGroupPalette.empty() ||
-      packet.resource.ownedVertexGroupIndices.size() < size_t(vertexCount)) {
+      (packet.resource.ownedVertexGroupIndices.size() < size_t(vertexCount) &&
+       !War3PacketResourceHasImmutableCurrentDrawGroupSlots(packet.resource))) {
     return false;
   }
   if (renderable.groupIdx > 0)
@@ -7025,9 +7826,15 @@ bool War3LooksSubmitEligibleForDirectCurrentDrawFast(
       War3SemanticRequireDirectUnitVisibleBackingRuntime();
   if (outMainWorldBackingStatus != nullptr ||
       requireMainWorldVisibleBacking) {
+    War3SemanticDirectMainWorldBackingStatus backingStatus =
+        prevalidatedMainWorldBackingStatus;
     const bool hasMainWorldVisibleBacking =
-        War3SemanticDirectPacketHasMainWorldVisibleBacking(
-            packet, outMainWorldBackingStatus);
+        backingStatus != War3SemanticDirectMainWorldBackingStatus::NotChecked
+        ? backingStatus == War3SemanticDirectMainWorldBackingStatus::Pass
+        : War3SemanticDirectPacketHasMainWorldVisibleBacking(
+              packet, &backingStatus);
+    if (outMainWorldBackingStatus != nullptr)
+      *outMainWorldBackingStatus = backingStatus;
     if (requireMainWorldVisibleBacking && !hasMainWorldVisibleBacking)
       return false;
   }
@@ -7689,7 +8496,8 @@ bool War3TryBuildLiveRuntimeGroupPalette(
     uint32_t* outPaletteSlotIndex = nullptr,
     uint32_t* outPaletteMinFrameTag = nullptr,
     uint32_t* outPaletteMaxFrameTag = nullptr,
-    War3LivePaletteBuildTiming* outTiming = nullptr) {
+    War3LivePaletteBuildTiming* outTiming = nullptr,
+    uint32_t provenMaxVertexGroupSlot = 0xFFFFFFFFu) {
   War3LivePaletteBuildRawTiming buildTiming(outTiming);
   auto markSource = [&](War3SemanticPaletteSource source) {
     if (outPaletteSource != nullptr)
@@ -7717,10 +8525,18 @@ bool War3TryBuildLiveRuntimeGroupPalette(
   if (vertexGroups.empty())
     return false;
 
-  buildTiming.enter(War3LivePaletteBuildPhase::GroupScan);
-  for (const uint8_t groupSlot : vertexGroups)
-    outMaxVertexGroupSlot =
-        std::max(outMaxVertexGroupSlot, uint32_t(groupSlot));
+  if (provenMaxVertexGroupSlot < 256u) {
+    // The caller may reuse the immutable group-domain maximum that was sealed
+    // with this packet. Palette bytes can change every frame, but the vertex
+    // group stream and its maximum do not. Unknown callers retain the exact
+    // byte scan below.
+    outMaxVertexGroupSlot = provenMaxVertexGroupSlot;
+  } else {
+    buildTiming.enter(War3LivePaletteBuildPhase::GroupScan);
+    for (const uint8_t groupSlot : vertexGroups)
+      outMaxVertexGroupSlot =
+          std::max(outMaxVertexGroupSlot, uint32_t(groupSlot));
+  }
   const uint32_t requiredPaletteCount = outMaxVertexGroupSlot + 1u;
   if (requiredPaletteCount == 0u || requiredPaletteCount > 256u)
     return false;
@@ -7736,7 +8552,14 @@ bool War3TryBuildLiveRuntimeGroupPalette(
       uint64_t lastSeenFrameSerial = 0u;
     };
 
+    struct PaletteSlotCacheLookupEntry {
+      void* renderablePart = nullptr;
+      uint64_t mapEpoch = 0u;
+      uint32_t cacheIndex = 0xFFFFFFFFu;
+    };
+
     static constexpr size_t kMaxPaletteSlotCacheEntries = 4096u;
+    static constexpr size_t kPaletteSlotCacheLookupEntries = 8192u;
     uint32_t currentSlotIndex = 0xFFFFFFFFu;
     dxvk::war3::SafeReadU32Fast(
         partPtr, dxvk::war3::RenderablePartFieldOffsets::StagePresetSpanBaseIndex,
@@ -7757,13 +8580,19 @@ bool War3TryBuildLiveRuntimeGroupPalette(
     static thread_local std::array<PaletteSlotCacheEntry,
                                    kMaxPaletteSlotCacheEntries>
         s_paletteSlotCache = {};
+    // The authoritative cache historically performed a 4096-entry linear
+    // walk for every skinned caster. Keep that walk as the exact collision
+    // fallback, but remember the most recent index in a fixed direct-mapped
+    // accelerator. A collision can only cost a fallback scan; identity and
+    // epoch are revalidated against the original entry before use.
+    static thread_local std::array<PaletteSlotCacheLookupEntry,
+                                   kPaletteSlotCacheLookupEntries>
+        s_paletteSlotCacheLookup = {};
     static thread_local size_t s_paletteSlotCacheCursor = 0u;
     const uint64_t mapEpoch =
         dxvk::war3::model::ShadowModelResourceCache::instance().mapEpoch();
 
-    for (auto& entry : s_paletteSlotCache) {
-      if (entry.renderablePart != partPtr || entry.mapEpoch != mapEpoch)
-        continue;
+    auto useCachedEntry = [&](PaletteSlotCacheEntry& entry) -> uint32_t {
       entry.lastSeenFrameSerial = frameSerial;
       if (currentSlotIndex != 0xFFFFFFFFu && currentSlotIndex < 0x3A98u) {
         entry.paletteSlotIndex = currentSlotIndex;
@@ -7775,6 +8604,27 @@ bool War3TryBuildLiveRuntimeGroupPalette(
         return producerSlotIndex;
       }
       return entry.paletteSlotIndex;
+    };
+
+    const uintptr_t partValue = reinterpret_cast<uintptr_t>(partPtr);
+    const size_t lookupSlot =
+        ((partValue >> 4u) ^ size_t(mapEpoch)) &
+        (kPaletteSlotCacheLookupEntries - 1u);
+    auto& lookup = s_paletteSlotCacheLookup[lookupSlot];
+    if (lookup.renderablePart == partPtr && lookup.mapEpoch == mapEpoch &&
+        lookup.cacheIndex < s_paletteSlotCache.size()) {
+      auto& cached = s_paletteSlotCache[lookup.cacheIndex];
+      if (cached.renderablePart == partPtr && cached.mapEpoch == mapEpoch)
+        return useCachedEntry(cached);
+    }
+
+    for (size_t cacheIndex = 0u; cacheIndex < s_paletteSlotCache.size();
+         ++cacheIndex) {
+      auto& entry = s_paletteSlotCache[cacheIndex];
+      if (entry.renderablePart != partPtr || entry.mapEpoch != mapEpoch)
+        continue;
+      lookup = {partPtr, mapEpoch, uint32_t(cacheIndex)};
+      return useCachedEntry(entry);
     }
 
     if (currentSlotIndex == 0xFFFFFFFFu || currentSlotIndex >= 0x3A98u) {
@@ -7784,13 +8634,14 @@ bool War3TryBuildLiveRuntimeGroupPalette(
       currentSlotIndex = producerSlotIndex;
     }
 
-    auto& entry =
-        s_paletteSlotCache[s_paletteSlotCacheCursor++ %
-                           kMaxPaletteSlotCacheEntries];
+    const size_t cacheIndex =
+        s_paletteSlotCacheCursor++ % kMaxPaletteSlotCacheEntries;
+    auto& entry = s_paletteSlotCache[cacheIndex];
     entry.renderablePart = partPtr;
     entry.mapEpoch = mapEpoch;
     entry.paletteSlotIndex = currentSlotIndex;
     entry.lastSeenFrameSerial = frameSerial;
+    lookup = {partPtr, mapEpoch, uint32_t(cacheIndex)};
     return currentSlotIndex;
   };
 
@@ -7804,12 +8655,20 @@ bool War3TryBuildLiveRuntimeGroupPalette(
       uint32_t slotMinFrameTag = 0u;
       uint32_t slotMaxFrameTag = 0u;
       uint32_t slotMissingCount = 0u;
-      buildTiming.enter(War3LivePaletteBuildPhase::FrameTagQuery);
-      const bool slotFrameTagReady =
-          dxvk::war3::model::QueryBlendedPaletteFrameTagRange(
-              slotIndex, requiredPaletteCount, slotMinFrameTag,
-              slotMaxFrameTag, slotMissingCount);
+      bool slotFrameTagQueried = false;
+      bool slotFrameTagReady = false;
+      auto ensureSlotFrameTags = [&]() {
+        if (slotFrameTagQueried)
+          return;
+        slotFrameTagQueried = true;
+        buildTiming.enter(War3LivePaletteBuildPhase::FrameTagQuery);
+        slotFrameTagReady =
+            dxvk::war3::model::QueryBlendedPaletteFrameTagRange(
+                slotIndex, requiredPaletteCount, slotMinFrameTag,
+                slotMaxFrameTag, slotMissingCount);
+      };
       auto publishSlotFrameTags = [&]() {
+        ensureSlotFrameTags();
         if (!slotFrameTagReady)
           return;
         if (outPaletteMinFrameTag != nullptr)
@@ -8199,6 +9058,8 @@ void War3NoteLivePaletteMotion(War3ShadowCaptureStats& stats,
                                uint64_t frameSerial,
                                uint64_t rawHash,
                                uint64_t groupHash) {
+  if (!War3SemanticPaletteDiagnosticsRuntime())
+    return;
   if (runtimeModelPtr == nullptr || rawHash == 0u || groupHash == 0u)
     return;
 
@@ -8267,6 +9128,8 @@ void War3NoteDrawTimePoseMotion(War3ShadowCaptureStats& stats,
                                 void* runtimeModelPtr,
                                 uint64_t frameSerial,
                                 uint64_t hash) {
+  if (!War3SemanticPaletteDiagnosticsRuntime())
+    return;
   if (runtimeModelPtr == nullptr || hash == 0u)
     return;
 
@@ -8314,6 +9177,8 @@ void War3NoteSubmittedPaletteMotion(War3ShadowCaptureStats& stats,
                                     void* runtimeModelPtr,
                                     uint64_t frameSerial,
                                     uint64_t hash) {
+  if (!War3SemanticPaletteDiagnosticsRuntime())
+    return;
   if (runtimeModelPtr == nullptr || hash == 0u)
     return;
 
@@ -9061,6 +9926,46 @@ inline uint64_t War3ComputeTerrainBoundsContentKey(
   return hash != 0u ? hash : 1u;
 }
 
+inline void War3RecordTerrainBoundsProducerSpan(
+    War3ShadowCaptureStats& stats,
+    const dxvk::war3::memory::War3CpuReadableBufferSpan& span,
+    bool buildAttempted) {
+  if (!buildAttempted) {
+    ++stats.semanticSceneTerrainBoundsProducerNoSourceCount;
+    return;
+  }
+  if (span) {
+    ++stats.semanticSceneTerrainBoundsProducerSpanAcceptedCount;
+    return;
+  }
+
+  ++stats.semanticSceneTerrainBoundsProducerSpanRejectedCount;
+  using Reject = dxvk::war3::memory::War3CpuReadableSpanRejectReason;
+  switch (span.rejectReason) {
+    case Reject::NullBase:
+      ++stats.semanticSceneTerrainBoundsProducerSpanNullBaseRejectCount;
+      break;
+    case Reject::NotCpuReadable:
+      ++stats.semanticSceneTerrainBoundsProducerSpanNotCpuReadableRejectCount;
+      break;
+    case Reject::MissingOwner:
+      ++stats.semanticSceneTerrainBoundsProducerSpanMissingOwnerRejectCount;
+      break;
+    case Reject::MissingGeneration:
+      ++stats.semanticSceneTerrainBoundsProducerSpanMissingGenerationRejectCount;
+      break;
+    case Reject::OffsetOutsideAllocation:
+    case Reject::LengthOutsideAllocation:
+      ++stats.semanticSceneTerrainBoundsProducerSpanRangeRejectCount;
+      break;
+    case Reject::AddressOverflow:
+      ++stats.semanticSceneTerrainBoundsProducerSpanAddressOverflowRejectCount;
+      break;
+    case Reject::None:
+      break;
+  }
+}
+
 inline bool War3ComputeCachedMappedTerrainBoundsFromSpan(
     const dxvk::war3::memory::War3CpuReadableBufferSpan& positionSpan,
     uint32_t positionStride,
@@ -9076,11 +9981,15 @@ inline bool War3ComputeCachedMappedTerrainBoundsFromSpan(
     uint64_t stableSourceSequence = 0u) {
   struct TerrainBoundsCacheEntry {
     bool valid = false;
+    bool stableSourceKey = false;
     uint64_t mapEpoch = 0u;
     const void* keyIdentity = nullptr;
     uint64_t keyOffset = 0u;
     uint64_t keyLength = 0u;
-    uint64_t keySequence = 0u;
+    uint64_t keyStableSourceSequence = 0u;
+    uint64_t keyIdentityGeneration = 0u;
+    uint64_t keyAllocationGeneration = 0u;
+    uint64_t keyContentGeneration = 0u;
     uint32_t keyElementCount = 0u;
     uint32_t keyElementStride = 0u;
     uint32_t keyElementSize = 0u;
@@ -9190,12 +10099,14 @@ inline bool War3ComputeCachedMappedTerrainBoundsFromSpan(
   const uint64_t keyLength = useStableSourceKey
                                  ? stableSourceLength
                                  : positionSpan.length;
-  const uint64_t keySequence =
-      useStableSourceKey
-          ? stableSourceSequence
-          : positionSpan.identityGeneration ^
-                (positionSpan.allocationGeneration << 1u) ^
-                (positionSpan.contentGeneration << 2u);
+  const uint64_t keyStableSourceSequence =
+      useStableSourceKey ? stableSourceSequence : 0u;
+  const uint64_t keyIdentityGeneration =
+      useStableSourceKey ? 0u : positionSpan.identityGeneration;
+  const uint64_t keyAllocationGeneration =
+      useStableSourceKey ? 0u : positionSpan.allocationGeneration;
+  const uint64_t keyContentGeneration =
+      useStableSourceKey ? 0u : positionSpan.contentGeneration;
   const uint32_t keyElementCount =
       useStableSourceKey ? stableSourceElementCount : 0u;
   const uint32_t keyElementStride =
@@ -9218,7 +10129,11 @@ inline bool War3ComputeCachedMappedTerrainBoundsFromSpan(
   hash = fold(hash, reinterpret_cast<uintptr_t>(keyIdentity));
   hash = fold(hash, keyOffset);
   hash = fold(hash, keyLength);
-  hash = fold(hash, keySequence);
+  hash = fold(hash, uint64_t(useStableSourceKey));
+  hash = fold(hash, keyStableSourceSequence);
+  hash = fold(hash, keyIdentityGeneration);
+  hash = fold(hash, keyAllocationGeneration);
+  hash = fold(hash, keyContentGeneration);
   hash = fold(hash, uint64_t(keyElementCount) |
                         (uint64_t(keyElementStride) << 32));
   hash = fold(hash, uint64_t(keyElementSize));
@@ -9232,10 +10147,14 @@ inline bool War3ComputeCachedMappedTerrainBoundsFromSpan(
       {};
   TerrainBoundsCacheEntry& entry = s_cache[hash & (kCacheSize - 1u)];
 
-  if (entry.valid && entry.mapEpoch == mapEpoch &&
+  if (entry.valid && entry.stableSourceKey == useStableSourceKey &&
+      entry.mapEpoch == mapEpoch &&
       entry.keyIdentity == keyIdentity &&
       entry.keyOffset == keyOffset && entry.keyLength == keyLength &&
-      entry.keySequence == keySequence &&
+      entry.keyStableSourceSequence == keyStableSourceSequence &&
+      entry.keyIdentityGeneration == keyIdentityGeneration &&
+      entry.keyAllocationGeneration == keyAllocationGeneration &&
+      entry.keyContentGeneration == keyContentGeneration &&
       entry.keyElementCount == keyElementCount &&
       entry.keyElementStride == keyElementStride &&
       entry.keyElementSize == keyElementSize &&
@@ -9270,11 +10189,15 @@ inline bool War3ComputeCachedMappedTerrainBoundsFromSpan(
   }
 
   entry.valid = true;
+  entry.stableSourceKey = useStableSourceKey;
   entry.mapEpoch = mapEpoch;
   entry.keyIdentity = keyIdentity;
   entry.keyOffset = keyOffset;
   entry.keyLength = keyLength;
-  entry.keySequence = keySequence;
+  entry.keyStableSourceSequence = keyStableSourceSequence;
+  entry.keyIdentityGeneration = keyIdentityGeneration;
+  entry.keyAllocationGeneration = keyAllocationGeneration;
+  entry.keyContentGeneration = keyContentGeneration;
   entry.keyElementCount = keyElementCount;
   entry.keyElementStride = keyElementStride;
   entry.keyElementSize = keyElementSize;
@@ -10266,6 +11189,8 @@ D3D9DeviceEx::~D3D9DeviceEx() {
   // that recording finished; the GPU may still be executing those pipelines.
   // Drain the device before destroying any pass owner.
   m_dxvkDevice->waitForIdle(); // Sync Device
+
+  dxvk::war3::memory::ShadowArena_Shutdown(m_dxvkDevice.ptr());
 
   if (m_war3PersistentPackageD3D9ObserveOwner != nullptr) {
     m_war3PersistentPackageD3D9ObserveOwner->pollProducerCompletions();
@@ -14671,7 +15596,7 @@ void D3D9DeviceEx::War3RequestShadowDeviceEpochTransition(
 
 void D3D9DeviceEx::War3QuarantineShadowSessionAtPresent(
     uint64_t retireSerial) {
-  if (dxvk::war3::memory::ShadowArena_IsInitialized())
+  if (dxvk::war3::memory::ShadowArena_IsOwnedBy(m_dxvkDevice.ptr()))
     dxvk::war3::memory::ShadowArena_QuarantineCurrentGeneration(retireSerial);
 
   // This signal is ordered after every command emitted by the old epoch and
@@ -15161,8 +16086,54 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::QueryInterface(REFIID riid,
   return E_NOINTERFACE;
 }
 
+bool D3D9DeviceEx::CheckVulkanDeviceLostFailStop(const char* origin) {
+  if (!IsVulkanDeviceLostFailStop())
+    return false;
+
+  bool expected = false;
+  const bool firstFailStop = m_vkDeviceLostFailStop.compare_exchange_strong(
+      expected, true, std::memory_order_acq_rel,
+      std::memory_order_acquire);
+  const Rc<DxvkDevice> device = m_dxvkDevice;
+
+  if (firstFailStop) {
+    const DxvkDeviceFaultSnapshot deviceFaultBeforeCapture = device != nullptr
+      ? device->getDeviceFaultSnapshot()
+      : DxvkDeviceFaultSnapshot{};
+    m_war3ShadowSessionReady.store(false, std::memory_order_release);
+    Logger::err(str::format(
+        "D3D9DeviceEx: Vulkan device lost; entering irreversible fail-stop at ",
+        origin != nullptr ? origin : "unknown"));
+    // Persist a useful terminal record before asking the driver for optional
+    // diagnostics. vkGetDeviceFaultInfoEXT has no finite-return contract.
+    dxvk::war3::tools::NotifyGpuDeviceLostFailStop(
+        origin, deviceFaultBeforeCapture);
+    m_vkDeviceLostBaseIncidentReady.store(true, std::memory_order_release);
+  } else if (!m_vkDeviceLostBaseIncidentReady.load(
+                 std::memory_order_acquire)) {
+    // A concurrent first observer is still writing the base record. Do not
+    // wait or seize its origin; a later D3D entrypoint may enrich it.
+    return true;
+  }
+
+  // A direct-driver eligibility bit is required, so synthetic command-stream
+  // terminal states remain publish-only. The capture itself is one-shot.
+  if (device != nullptr) {
+    device->captureDeviceFaultIfDriverLossObserved();
+    const DxvkDeviceFaultSnapshot deviceFaultAfterCapture =
+        device->getDeviceFaultSnapshot();
+    dxvk::war3::tools::NotifyGpuDeviceLostFailStop(
+        origin, deviceFaultAfterCapture);
+  }
+
+  return true;
+}
+
 HRESULT STDMETHODCALLTYPE D3D9DeviceEx::TestCooperativeLevel() {
   D3D9DeviceLock lock = LockDevice();
+
+  if (CheckVulkanDeviceLostFailStop("D3D9Device.TestCooperativeLevel"))
+    return D3DERR_DEVICEREMOVED;
 
   // Equivelant of D3D11/DXGI present tests. We can always present.
   if (likely(m_deviceLostState == D3D9DeviceLostState::Ok)) {
@@ -15395,6 +16366,11 @@ HRESULT STDMETHODCALLTYPE
 D3D9DeviceEx::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
   D3D9DeviceLock lock = LockDevice();
 
+  // A Vulkan logical device cannot be recovered by a D3D9 Reset. Do not
+  // reopen producers or rebuild GPU resources after the queue reported loss.
+  if (CheckVulkanDeviceLostFailStop("D3D9Device.Reset"))
+    return D3DERR_DEVICEREMOVED;
+
   // [War3] FPS 解锁时强制禁用 VSync
   War3ForceImmediatePresent(pPresentationParameters);
 
@@ -15510,6 +16486,9 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::Present(const RECT *pSourceRect,
                                                 const RECT *pDestRect,
                                                 HWND hDestWindowOverride,
                                                 const RGNDATA *pDirtyRegion) {
+  if (CheckVulkanDeviceLostFailStop("D3D9Device.Present"))
+    return D3DERR_DEVICEREMOVED;
+
   War3MaybeInsertBeforeUi(true);
   War3ResetShadowAllocator();
 
@@ -15563,6 +16542,9 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CreateTexture(
     UINT Width, UINT Height, UINT Levels, DWORD Usage, D3DFORMAT Format,
     D3DPOOL Pool, IDirect3DTexture9 **ppTexture, HANDLE *pSharedHandle) {
   InitReturnPtr(ppTexture);
+
+  if (CheckVulkanDeviceLostFailStop("D3D9Device.CreateTexture"))
+    return D3DERR_DEVICEREMOVED;
 
   if (unlikely(ppTexture == nullptr))
     return D3DERR_INVALIDCALL;
@@ -15636,6 +16618,9 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CreateVolumeTexture(
     HANDLE *pSharedHandle) {
   InitReturnPtr(ppVolumeTexture);
 
+  if (CheckVulkanDeviceLostFailStop("D3D9Device.CreateVolumeTexture"))
+    return D3DERR_DEVICEREMOVED;
+
   if (unlikely(ppVolumeTexture == nullptr))
     return D3DERR_INVALIDCALL;
 
@@ -15695,6 +16680,9 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CreateCubeTexture(
     UINT EdgeLength, UINT Levels, DWORD Usage, D3DFORMAT Format, D3DPOOL Pool,
     IDirect3DCubeTexture9 **ppCubeTexture, HANDLE *pSharedHandle) {
   InitReturnPtr(ppCubeTexture);
+
+  if (CheckVulkanDeviceLostFailStop("D3D9Device.CreateCubeTexture"))
+    return D3DERR_DEVICEREMOVED;
 
   if (unlikely(ppCubeTexture == nullptr))
     return D3DERR_INVALIDCALL;
@@ -15757,6 +16745,9 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CreateVertexBuffer(
     IDirect3DVertexBuffer9 **ppVertexBuffer, HANDLE *pSharedHandle) {
   InitReturnPtr(ppVertexBuffer);
 
+  if (CheckVulkanDeviceLostFailStop("D3D9Device.CreateVertexBuffer"))
+    return D3DERR_DEVICEREMOVED;
+
   if (unlikely(ppVertexBuffer == nullptr))
     return D3DERR_INVALIDCALL;
 
@@ -15802,6 +16793,9 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CreateIndexBuffer(
     UINT Length, DWORD Usage, D3DFORMAT Format, D3DPOOL Pool,
     IDirect3DIndexBuffer9 **ppIndexBuffer, HANDLE *pSharedHandle) {
   InitReturnPtr(ppIndexBuffer);
+
+  if (CheckVulkanDeviceLostFailStop("D3D9Device.CreateIndexBuffer"))
+    return D3DERR_DEVICEREMOVED;
 
   if (unlikely(ppIndexBuffer == nullptr))
     return D3DERR_INVALIDCALL;
@@ -16756,6 +17750,9 @@ D3D9DeviceEx::GetDepthStencilSurface(IDirect3DSurface9 **ppZStencilSurface) {
 HRESULT STDMETHODCALLTYPE D3D9DeviceEx::BeginScene() {
   D3D9DeviceLock lock = LockDevice();
 
+  if (CheckVulkanDeviceLostFailStop("D3D9Device.BeginScene"))
+    return D3DERR_DEVICEREMOVED;
+
   if (unlikely(m_inScene))
     return D3DERR_INVALIDCALL;
 
@@ -16766,6 +17763,9 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::BeginScene() {
 
 HRESULT STDMETHODCALLTYPE D3D9DeviceEx::EndScene() {
   D3D9DeviceLock lock = LockDevice();
+
+  if (CheckVulkanDeviceLostFailStop("D3D9Device.EndScene"))
+    return D3DERR_DEVICEREMOVED;
 
   if (unlikely(!m_inScene))
     return D3DERR_INVALIDCALL;
@@ -18077,6 +19077,9 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::DrawPrimitive(
       war3::hooks::War3HotHookId::D3D9DrawPrimitive, 4u);
   D3D9DeviceLock lock = LockDevice();
 
+  if (CheckVulkanDeviceLostFailStop("D3D9Device.DrawPrimitive"))
+    return D3DERR_DEVICEREMOVED;
+
   if (unlikely(m_state.vertexDecl == nullptr))
     return D3DERR_INVALIDCALL;
 
@@ -18173,6 +19176,9 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::DrawPrimitive(
 }
 
 void D3D9DeviceEx::War3MaybeInsertBeforeUi(bool forceFrameEnd) {
+  if (CheckVulkanDeviceLostFailStop("War3.BeforeUi"))
+    return;
+
   if (!m_war3Pipeline)
     return;
 
@@ -19007,6 +20013,12 @@ void D3D9DeviceEx::War3MaybeInsertBeforeUi(bool forceFrameEnd) {
         categoryHistogram[categoryBin]++;
     }
   }
+  // The pre-receiver runtime publication and the later move into
+  // War3PipelineInput must carry the same producer stamp.  An unsealed scene
+  // is deliberately not interpreted as a complete empty caster set.
+  War3SealShadowProducerCompleteness(
+      m_war3Scene, m_war3ShadowPersistentFrameSerial + 1u,
+      m_war3GpuSkinMapEpoch, m_war3GpuSkinDeviceEpoch);
   dxvk::war3::render::NoteShadowSceneStats(m_war3Scene.shadowStats);
 
   static uint32_t s_casterDiag = 0;
@@ -19070,6 +20082,9 @@ void D3D9DeviceEx::War3MaybeInsertBeforeUi(bool forceFrameEnd) {
   }
   if (m_shadowPaletteReserveHint > 0) {
     m_war3Scene.shadowPalettes.reserve(m_shadowPaletteReserveHint);
+    m_war3ShadowPaletteHashIndex.reserve(m_shadowPaletteReserveHint);
+    m_war3SemanticPaletteCache.reserve(m_shadowPaletteReserveHint);
+    m_war3SemanticPaletteCacheHashIndex.reserve(m_shadowPaletteReserveHint);
   }
   War3ResetShadowAllocator();
   const uint64_t pipelineFrameSerial =
@@ -19095,6 +20110,8 @@ void D3D9DeviceEx::War3MaybeInsertBeforeUi(bool forceFrameEnd) {
   input.frameSerial = pipelineFrameSerial;
   input.mapEpoch = m_war3GpuSkinMapEpoch;
   input.deviceEpoch = m_war3GpuSkinDeviceEpoch;
+  War3SealShadowProducerCompleteness(input.scene, input.frameSerial,
+                                     input.mapEpoch, input.deviceEpoch);
 
   EmitCs([this, cInput = std::move(input)](DxvkContext *ctx) mutable {
     Rc<DxvkCommandList> cmd;
@@ -19128,6 +20145,9 @@ void D3D9DeviceEx::War3MaybeInsertBeforeUi(bool forceFrameEnd) {
             rec.terrainBoundsProofAcceptedCount;
         cInput.scene.shadowStats.semanticSceneTerrainBoundsFailVisibleCount =
             rec.terrainBoundsFailVisibleCount;
+        cInput.scene.shadowStats
+            .semanticSceneTerrainBoundsRejectReasonHistogram =
+            rec.terrainBoundsRejectReasonHistogram;
         cInput.scene.shadowStats.semanticSceneTerrainBoundsWouldCullCount =
             rec.terrainBoundsWouldCullCount;
         cInput.scene.shadowStats.semanticSceneTerrainBoundsAppliedCullCount =
@@ -19146,6 +20166,9 @@ void D3D9DeviceEx::War3MaybeInsertBeforeUi(bool forceFrameEnd) {
             rec.objectBoundsProofAcceptedCount;
         cInput.scene.shadowStats.semanticSceneObjectBoundsFailVisibleCount =
             rec.objectBoundsFailVisibleCount;
+        cInput.scene.shadowStats
+            .semanticSceneObjectBoundsRejectReasonHistogram =
+            rec.objectBoundsRejectReasonHistogram;
         cInput.scene.shadowStats.semanticSceneObjectBoundsWouldCullCount =
             rec.objectBoundsWouldCullCount;
         cInput.scene.shadowStats.semanticSceneObjectBoundsAppliedCullCount =
@@ -19552,30 +20575,37 @@ uint32_t D3D9DeviceEx::War3GetOrCreateShadowMatrixPalette() {
     m_war3ShadowPaletteHashIndex.clear();
 
   const size_t bytes = sizeof(Matrix4) * 256;
-  const auto range = m_war3ShadowPaletteHashIndex.equal_range(h);
-  for (auto it = range.first; it != range.second; ++it) {
-    const uint32_t idx = it->second;
+  uint32_t matchingIndex =
+      dxvk::war3::render::War3FrameHashIndex::InvalidNode;
+  m_war3ShadowPaletteHashIndex.forEach(h, [&](uint32_t idx) {
     if (idx >= m_war3Scene.shadowPalettes.size())
-      continue;
+      return true;
 
     auto& p = m_war3Scene.shadowPalettes[idx];
-    if (std::memcmp(
+    if (p.worldMatrices.size() == 256u &&
+        std::memcmp(
             p.worldMatrices.data(),
             &m_state.transforms[GetTransformIndex(D3DTS_WORLDMATRIX(0))],
             bytes) == 0) {
-      return idx;
+      matchingIndex = idx;
+      return false;
     }
-  }
+    return true;
+  });
+  if (matchingIndex !=
+      dxvk::war3::render::War3FrameHashIndex::InvalidNode)
+    return matchingIndex;
 
   War3ShadowMatrixPalette palette = {};
   palette.hash = h;
+  palette.worldMatrices.resize(256u);
   for (uint32_t i = 0; i < 256; i++) {
     palette.worldMatrices[i] =
         m_state.transforms[GetTransformIndex(D3DTS_WORLDMATRIX(i))];
   }
   m_war3Scene.shadowPalettes.emplace_back(std::move(palette));
   const uint32_t newIndex = uint32_t(m_war3Scene.shadowPalettes.size() - 1);
-  m_war3ShadowPaletteHashIndex.emplace(h, newIndex);
+  m_war3ShadowPaletteHashIndex.insert(h, newIndex);
   return newIndex;
 }
 
@@ -19606,16 +20636,23 @@ uint32_t D3D9DeviceEx::War3GetOrCreateShadowMatrixPaletteFromData(
     m_war3ShadowPaletteHashIndex.clear();
 
   const size_t bytes = sizeof(Matrix4) * boundedCount;
-  const auto range = m_war3ShadowPaletteHashIndex.equal_range(h);
-  for (auto it = range.first; it != range.second; ++it) {
-    const uint32_t idx = it->second;
+  uint32_t matchingIndex =
+      dxvk::war3::render::War3FrameHashIndex::InvalidNode;
+  m_war3ShadowPaletteHashIndex.forEach(h, [&](uint32_t idx) {
     if (idx >= m_war3Scene.shadowPalettes.size())
-      continue;
+      return true;
 
     auto& existing = m_war3Scene.shadowPalettes[idx];
-    if (std::memcmp(existing.worldMatrices.data(), matrices, bytes) == 0)
-      return idx;
-  }
+    if (existing.worldMatrices.size() == boundedCount &&
+        std::memcmp(existing.worldMatrices.data(), matrices, bytes) == 0) {
+      matchingIndex = idx;
+      return false;
+    }
+    return true;
+  });
+  if (matchingIndex !=
+      dxvk::war3::render::War3FrameHashIndex::InvalidNode)
+    return matchingIndex;
 
   uint32_t newIndex = 0u;
   if (War3SemanticPaletteInPlaceAppendRuntime()) {
@@ -19628,6 +20665,7 @@ uint32_t D3D9DeviceEx::War3GetOrCreateShadowMatrixPaletteFromData(
         War3FallbackAppendPhase::PaletteStorageInitCopy);
     auto& palette = m_war3Scene.shadowPalettes[newIndex];
     palette.hash = h;
+    palette.worldMatrices.resize(boundedCount);
     for (uint32_t i = 0; i < boundedCount; ++i)
       palette.worldMatrices[i] = matrices[i];
   } else {
@@ -19635,6 +20673,7 @@ uint32_t D3D9DeviceEx::War3GetOrCreateShadowMatrixPaletteFromData(
         War3FallbackAppendPhase::PaletteStorageInitCopy);
     War3ShadowMatrixPalette palette = {};
     palette.hash = h;
+    palette.worldMatrices.resize(boundedCount);
     for (uint32_t i = 0; i < boundedCount; ++i)
       palette.worldMatrices[i] = matrices[i];
 
@@ -19645,7 +20684,7 @@ uint32_t D3D9DeviceEx::War3GetOrCreateShadowMatrixPaletteFromData(
   }
   War3EnterFallbackAppendPhase(
       War3FallbackAppendPhase::PaletteStorageIndexPublish);
-  m_war3ShadowPaletteHashIndex.emplace(h, newIndex);
+  m_war3ShadowPaletteHashIndex.insert(h, newIndex);
   return newIndex;
 }
 
@@ -19677,16 +20716,21 @@ uint32_t D3D9DeviceEx::War3GetOrCreateSemanticShadowPalette(
       War3SemanticPacketUsesDirectGeosetData(packet) &&
       War3IsSemanticUnitObject(resolvedObjectKind);
   if (directGeosetUnitPalette && packet.pose.hasWorldTransform) {
-    const bool looksModelLocal = War3SemanticPaletteLooksModelLocal(
-        sourceMatrices, matrixCount, packet.pose.worldTransform,
-        static_cast<uint8_t>(resolvedObjectKind), false);
     if (hasOverridePalette) {
       m_war3Scene.shadowStats.semanticScenePaletteOverrideNoComposeCount++;
-      if (looksModelLocal) {
+      // A current-draw override already carries the authoritative palette used
+      // by the game for this draw. Composing it would be incorrect, so the
+      // model-local heuristic is only useful for optional diagnostics.
+      if (War3SemanticPaletteDiagnosticsRuntime() &&
+          War3SemanticPaletteLooksModelLocal(
+              sourceMatrices, matrixCount, packet.pose.worldTransform,
+              static_cast<uint8_t>(resolvedObjectKind), false)) {
         m_war3Scene.shadowStats
             .semanticScenePaletteOverrideWouldComposeCount++;
       }
-    } else if (looksModelLocal) {
+    } else if (War3SemanticPaletteLooksModelLocal(
+                   sourceMatrices, matrixCount, packet.pose.worldTransform,
+                   static_cast<uint8_t>(resolvedObjectKind), false)) {
       composeWorldPalette = true;
       worldHash = War3SemanticHashMatrix4(packet.pose.worldTransform);
       m_war3Scene.shadowStats.semanticScenePalettePacketWorldComposeCount++;
@@ -19703,22 +20747,31 @@ uint32_t D3D9DeviceEx::War3GetOrCreateSemanticShadowPalette(
   if (directGeosetUnitPalette && worldHash != 0u)
     matrixHash = bit::fnv1a_iter(matrixHash, worldHash);
 
-  // Phase 7.121：通过 m_war3SemanticPaletteCacheHashIndex 做 O(1) 查找，
-  // 替代原本的 O(N) 线性扫描。同 matrixHash 多个 entry 时（极少发生）
-  // 仍然走完整字段比较，确保命中语义和原线性扫描一致。
+  // Retained frame-local hash nodes keep O(1) candidate lookup without
+  // allocating one unordered-map node for every packet on every frame.
+  // Complete semantic comparison remains authoritative for collisions.
   War3EnterFallbackAppendPhase(War3FallbackAppendPhase::PaletteCacheLookup);
-  auto hashRange = m_war3SemanticPaletteCacheHashIndex.equal_range(matrixHash);
-  for (auto it = hashRange.first; it != hashRange.second; ++it) {
-    const auto& entry = m_war3SemanticPaletteCache[it->second];
+  uint32_t matchingPaletteIndex =
+      dxvk::war3::render::War3FrameHashIndex::InvalidNode;
+  m_war3SemanticPaletteCacheHashIndex.forEach(
+      matrixHash, [&](uint32_t cacheIndex) {
+    if (cacheIndex >= m_war3SemanticPaletteCache.size())
+      return true;
+    const auto& entry = m_war3SemanticPaletteCache[cacheIndex];
     if (entry.runtimeModelPtr == packet.renderable.runtimeModelPtr &&
         entry.matrixHash == matrixHash &&
         entry.worldHash == worldHash &&
         entry.matrixCount == matrixCount &&
         entry.objectKind == static_cast<uint8_t>(resolvedObjectKind) &&
         entry.composedWorldPalette == composeWorldPalette) {
-      return entry.paletteIndex;
+      matchingPaletteIndex = entry.paletteIndex;
+      return false;
     }
-  }
+    return true;
+  });
+  if (matchingPaletteIndex !=
+      dxvk::war3::render::War3FrameHashIndex::InvalidNode)
+    return matchingPaletteIndex;
 
   War3EnterFallbackAppendPhase(War3FallbackAppendPhase::PaletteMissBuild);
   War3SemanticPaletteCacheEntry entry = {};
@@ -19748,11 +20801,11 @@ uint32_t D3D9DeviceEx::War3GetOrCreateSemanticShadowPalette(
       War3GetOrCreateShadowMatrixPaletteFromData(effectiveMatrices, matrixCount,
                                                  uploadMatrixHash);
   const uint32_t paletteIndex = entry.paletteIndex;
-  // Phase 7.121：写入向量同时更新 hash index，保证下一次命中走 O(1)。
+  // Publish into the retained frame-local index for subsequent O(1) probes.
   War3EnterFallbackAppendPhase(War3FallbackAppendPhase::PaletteCachePublish);
   const uint32_t cacheIndex = uint32_t(m_war3SemanticPaletteCache.size());
   m_war3SemanticPaletteCache.emplace_back(std::move(entry));
-  m_war3SemanticPaletteCacheHashIndex.emplace(matrixHash, cacheIndex);
+  m_war3SemanticPaletteCacheHashIndex.insert(matrixHash, cacheIndex);
   return paletteIndex;
 }
 
@@ -19812,8 +20865,19 @@ Rc<DxvkBuffer> D3D9DeviceEx::War3AllocFreezeBuffer(VkDeviceSize size,
   outOffset = 0u;
 
   if (!hostVisible && dxvk::war3::render::IsShadowArenaCaptureEnabled()) {
-    if (!dxvk::war3::memory::ShadowArena_IsInitialized() &&
-        dxvk::war3::memory::ShadowArena_Init()) {
+    bool arenaInitializedNow = false;
+    if (!dxvk::war3::memory::ShadowArena_IsOwnedBy(m_dxvkDevice.ptr()) &&
+        !dxvk::war3::memory::ShadowArena_Init(m_dxvkDevice.ptr())) {
+      return nullptr;
+    }
+    if (!dxvk::war3::memory::ShadowArena_IsOwnedBy(m_dxvkDevice.ptr()))
+      return nullptr;
+    // Init may have just created the warm generations before the Present
+    // boundary has selected one. Detect that state by zero capacity rather
+    // than rewinding a valid but empty current generation.
+    arenaInitializedNow =
+        dxvk::war3::memory::ShadowArena_CapacityBytes() == 0u;
+    if (arenaInitializedNow) {
       const uint64_t completedSerial =
           m_war3ShadowArenaFence != nullptr
               ? m_war3ShadowArenaFence->value()
@@ -20447,6 +21511,29 @@ void D3D9DeviceEx::War3GcS1TerrainEarlyCache() {
   }
 }
 
+void D3D9DeviceEx::War3GcS1GenerationProofObservations() {
+  if constexpr (!dxvk::war3::render::kDevelopmentShadowObserversEnabled)
+    return;
+
+  const uint64_t currentFrame = m_war3ShadowPersistentFrameSerial;
+  if (currentFrame < m_war3S1GenerationProofLastGcFrame ||
+      currentFrame - m_war3S1GenerationProofLastGcFrame < 120u) {
+    return;
+  }
+
+  m_war3S1GenerationProofLastGcFrame = currentFrame;
+  const uint64_t maxAge = War3GetShadowPersistentMaxAgeFrames();
+  for (auto it = m_war3S1GenerationProofObservations.begin();
+       it != m_war3S1GenerationProofObservations.end();) {
+    if (currentFrame > it->second.lastSeenFrame &&
+        currentFrame - it->second.lastSeenFrame > maxAge) {
+      it = m_war3S1GenerationProofObservations.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
 bool D3D9DeviceEx::War3CreateShadowPersistentBuffer(
     const War3ShadowPersistentUpload &upload, Rc<DxvkBuffer> &outStorage,
     DxvkResourceBufferInfo &outInfo) {
@@ -20698,10 +21785,22 @@ bool D3D9DeviceEx::War3CreateShadowPersistentGeometryAfterMiss(
     }
   }
 
+  const uint32_t geometryId = m_war3NextShadowGeometryId++;
   War3ShadowPersistentGeometry stored = candidate;
   stored.key = key;
   stored.totalBytes = bytesNeeded;
   stored.lastSeenFrame = m_war3ShadowPersistentFrameSerial;
+  if (stored.localBoundsIdentityProven &&
+      stored.localBoundsRadius > 0.0f &&
+      std::isfinite(stored.localBoundsRadius)) {
+    // The persistent allocation is immutable after insertion. Its registry
+    // generation, not the transient upload/ring generation, owns the cached
+    // local-bounds proof used by later S1 cache hits.
+    stored.localBoundsSourceGeneration = uint64_t(geometryId);
+  } else {
+    stored.localBoundsSourceGeneration = 0u;
+    stored.localBoundsIdentityProven = false;
+  }
 
   if (uploads[0].bytes > 0) {
     if (!War3CreateShadowPersistentBuffer(uploads[0], stored.positionStorage,
@@ -20729,7 +21828,34 @@ bool D3D9DeviceEx::War3CreateShadowPersistentGeometryAfterMiss(
     }
   }
 
-  const uint32_t geometryId = m_war3NextShadowGeometryId++;
+  // Capture the package's logical slices after all backing buffers have been
+  // finalized. Future cache hits copy these value bindings so command replay
+  // can follow a relocatable DxvkBuffer from backing A to backing B without
+  // retaining A's raw VkBuffer/offset.
+  const uint64_t replaySourceGeneration = uint64_t(geometryId);
+  stored.positionReplayBinding.capture(
+      stored.positionStorage, nullptr, stored.positionInfo,
+      m_war3GpuSkinMapEpoch, m_war3GpuSkinDeviceEpoch,
+      replaySourceGeneration, War3ShadowReplayStreamType::Position);
+  if (stored.indexed) {
+    stored.indexReplayBinding.capture(
+        stored.indexStorage, nullptr, stored.indexInfo,
+        m_war3GpuSkinMapEpoch, m_war3GpuSkinDeviceEpoch,
+        replaySourceGeneration, War3ShadowReplayStreamType::Index);
+  }
+  if (stored.blendBinding == 1u) {
+    stored.blendReplayBinding.capture(
+        stored.blendStorage, nullptr, stored.blendInfo,
+        m_war3GpuSkinMapEpoch, m_war3GpuSkinDeviceEpoch,
+        replaySourceGeneration, War3ShadowReplayStreamType::Blend);
+  }
+  if (stored.alphaTestEnabled && stored.uvBinding == 2u) {
+    stored.uvReplayBinding.capture(
+        stored.uvStorage, nullptr, stored.uvInfo,
+        m_war3GpuSkinMapEpoch, m_war3GpuSkinDeviceEpoch,
+        replaySourceGeneration, War3ShadowReplayStreamType::Uv);
+  }
+
   War3ShadowPersistentGeometryEntry entry = {};
   entry.key = key;
   entry.geometry = std::move(stored);
@@ -20773,6 +21899,47 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
     const dxvk::war3::render::CurrentDrawAuthoritativeSample*
         directCurrentDrawSample,
     bool fromStalePoseRestore) {
+  return War3TryAppendSemanticShadowPacket(
+      packet, directCurrentDrawSample, fromStalePoseRestore, false);
+}
+
+bool War3PacketResourceHasImmutableDynamicIndexSlice(
+    const dxvk::war3::shadow::ShadowPacketResource& resource) {
+  if (!resource.dynamicIndexBackedByResourceKeepAlive ||
+      resource.resourceKeepAlive == nullptr || resource.mapEpoch == 0u ||
+      resource.immutableModelGeneration == 0u ||
+      resource.dynamicIndexStream == nullptr ||
+      resource.dynamicIndexCount == 0u) {
+    return false;
+  }
+
+  const auto* owner = static_cast<
+      const dxvk::war3::model::ShadowGeosetResourceRecord*>(
+          resource.resourceKeepAlive.get());
+  if (owner == nullptr || !owner->readyForShadowConsumer() ||
+      owner->mapEpoch != resource.mapEpoch ||
+      owner->immutableModelGeneration != resource.immutableModelGeneration ||
+      owner->geosetIndex != resource.geosetIndex ||
+      owner->modelKey != resource.modelKey ||
+      owner->contentHash != resource.contentHash || owner->indices.empty()) {
+    return false;
+  }
+
+  const size_t baseIndex = size_t(resource.dynamicPrimitiveBaseIndex);
+  const size_t indexCount = size_t(resource.dynamicIndexCount);
+  if (baseIndex > owner->indices.size() ||
+      indexCount > owner->indices.size() - baseIndex) {
+    return false;
+  }
+  return resource.dynamicIndexStream == owner->indices.data() + baseIndex;
+}
+
+bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
+    const dxvk::war3::shadow::ShadowDrawPacket& packet,
+    const dxvk::war3::render::CurrentDrawAuthoritativeSample*
+        directCurrentDrawSample,
+    bool fromStalePoseRestore,
+    bool currentFrameExactOwnerPrefiltered) {
   if (!m_war3ShadowSessionReady.load(std::memory_order_acquire) ||
       m_war3ShadowMapResetRequestedSerial.load(std::memory_order_acquire) !=
           m_war3ShadowMapResetAppliedSerial ||
@@ -20800,7 +21967,8 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
   // remove exact-owned Stage11 records earlier, but a restored/alternate
   // caller must not append a generic representation for the same logical
   // slice after the current-frame producer has claimed it.
-  if (War3DrawTimeCurrentFrameGeometryRuntime() &&
+  if (!currentFrameExactOwnerPrefiltered &&
+      War3DrawTimeCurrentFrameGeometryRuntime() &&
       directCurrentDrawSample != nullptr) {
     const auto& contract = directCurrentDrawSample->contract;
     const int16_t effectiveProducerStage =
@@ -20983,13 +22151,17 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
   const auto ownedDynamicIndices = packet.resource.ownedDynamicIndices;
   const bool hasOwnedDynamicIndexStream =
       ownedDynamicIndices != nullptr && !ownedDynamicIndices->empty();
+  const bool hasImmutableDynamicIndexStream =
+      War3PacketResourceHasImmutableDynamicIndexSlice(packet.resource);
+  const bool hasImmutableCurrentDrawGroupSlots =
+      War3PacketResourceHasImmutableCurrentDrawGroupSlots(packet.resource);
   const bool hasDynamicPositionStream =
       packet.usesDynamicMeshPositions &&
       packet.resource.dynamicPositionStream != nullptr &&
       packet.resource.dynamicPositionStride >= 12u &&
       packet.resource.vertexCount != 0u;
   const bool hasDynamicIndexStream =
-      hasOwnedDynamicIndexStream ||
+      hasOwnedDynamicIndexStream || hasImmutableDynamicIndexStream ||
       (packet.resource.dynamicIndexStream != nullptr &&
        packet.resource.dynamicIndexCount != 0u);
   const uint32_t positionVertexCount =
@@ -21044,7 +22216,8 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
         directAuthoritativeCurrentDrawReady &&
         War3SemanticPacketUsesDirectGeosetData(packet) &&
         packet.hasRuntimeGroupPalette &&
-        packet.resource.ownedVertexGroupIndices.size() >= size_t(vertexCount);
+        (packet.resource.ownedVertexGroupIndices.size() >= size_t(vertexCount) ||
+         hasImmutableCurrentDrawGroupSlots);
     if (skinned && hasLiveVisibleMeshContext && !hasDynamicIndexStream &&
         !packetIndices.empty() &&
         War3SemanticRequireVisibleIndexSliceForSkinnedRuntime() &&
@@ -21086,6 +22259,7 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
     return false;
   }
   if (hasDynamicIndexStream && !hasOwnedDynamicIndexStream &&
+      !hasImmutableDynamicIndexStream &&
       !dxvk::war3::IsReadableRange(effectiveIndexData,
                                    size_t(effectiveIndexCount) *
                                        sizeof(uint16_t))) {
@@ -21140,7 +22314,8 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
   void* liveRuntimePoseModelPtr = nullptr;
   const bool packetAuthoritativeSkinnedContractReady =
       skinned && packet.hasRuntimeGroupPalette &&
-      packet.resource.ownedVertexGroupIndices.size() >= size_t(vertexCount);
+      (packet.resource.ownedVertexGroupIndices.size() >= size_t(vertexCount) ||
+       hasImmutableCurrentDrawGroupSlots);
   dxvk::war3::render::CurrentDrawAuthoritativeSample currentDrawSampleStorage =
       {};
   const dxvk::war3::render::CurrentDrawAuthoritativeSample*
@@ -21204,6 +22379,10 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
           ? packet.runtimeGroupPaletteMaxFrameTag
           : currentDrawSample != nullptr ? currentDrawSample->contract.frameTag
                                          : 0u;
+  const auto drawTimeCapturedPaletteProvenance =
+      currentDrawSample != nullptr
+          ? currentDrawSample->paletteProvenance
+          : dxvk::war3::render::PaletteProvenance::Unknown;
   // Phase 7.35 路径 2：submit 端 live palette rebuild。
   // 背景：Phase 7.35 诊断 counter 证实 50.2% 的 submit 在用 >=1 帧旧的 palette
   // （Lag>=1），其中 Lag>=3 占 38.2%，视觉上对应"Pose 停一下再追帧"。
@@ -21266,13 +22445,24 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
           dxvk::war3::state::RenderState::instance().getFrameIndex());
       const uint64_t recordFrame =
           uint64_t(currentDrawSample->contract.renderFrameIndex);
+      uint32_t currentPaletteFrameTag = 0u;
+      const bool capturedPaletteCurrentFrameProven =
+          drawTimeCapturedPaletteProvenance ==
+              dxvk::war3::render::PaletteProvenance::TrustedBlendedWriter &&
+          drawTimeCapturedPaletteMinFrameTag != 0u &&
+          drawTimeCapturedPaletteMinFrameTag ==
+              drawTimeCapturedPaletteMaxFrameTag &&
+          dxvk::war3::model::QueryCurrentPaletteFrameTag(
+              currentPaletteFrameTag) &&
+          currentPaletteFrameTag == drawTimeCapturedPaletteMinFrameTag;
       // Phase 7.51：改为 (EveryFrame OR LagExceedsThreshold)。
       // EveryFrame=1（默认）时即使 lag=0 也尝试 rebuild，用 hash 对比决定是否覆盖。
       const bool shouldAttempt =
-          kSubmitLiveRebuildEveryFrame ||
-          (currentFrame > recordFrame &&
-           (currentFrame - recordFrame) >=
-               uint64_t(kSubmitLiveRebuildLagThreshold));
+          !capturedPaletteCurrentFrameProven &&
+          (kSubmitLiveRebuildEveryFrame ||
+           (currentFrame > recordFrame &&
+            (currentFrame - recordFrame) >=
+                uint64_t(kSubmitLiveRebuildLagThreshold)));
       if (shouldAttempt) {
         dxvk::war3::render::NoteSubmitLiveRebuildAttempt();
         submitLiveRebuildScratchTls.clear();
@@ -21293,7 +22483,10 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
             &rebuildRawHash, &rebuildRuntimeModelPtr,
             /*allowCModelFallbackForCall=*/false,
             &rebuildSource, &rebuildSlotIndex, &rebuildMinFrameTag,
-            &rebuildMaxFrameTag);
+            &rebuildMaxFrameTag, nullptr,
+            packet.maxVertexGroupSlot < drawTimeCapturedPaletteCount
+                ? packet.maxVertexGroupSlot
+                : 0xFFFFFFFFu);
         if (rebuildOk && !submitLiveRebuildScratchTls.empty()) {
           dxvk::war3::render::NoteSubmitLiveRebuildHit();
           // 覆盖 drawTimeCapturedPalette 指针 + 计数 + hash + ready。
@@ -21322,14 +22515,26 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
       War3FallbackAppendPhase::InputGroupContract);
   const std::vector<uint8_t>* authoritativeGroupSlots =
       packetAuthoritativeSkinnedContractReady
-          ? &packet.resource.ownedVertexGroupIndices
+          ? packet.resource.vertexGroupIndices
           : currentDrawSample != nullptr ? &currentDrawSample->groupSlots
                                          : nullptr;
+  // BuildPacket and Append receive the same authoritative sample as one
+  // transaction. DecodeCurrentDrawGroupSlots already validated and hashed the
+  // group stream while producing ownedVertexGroupIndices, so do not scan the
+  // per-vertex bytes a second time here. Callers without that sealed sample
+  // retain the exact byte-hash fallback.
+  const uint64_t sealedCurrentDrawGroupHash =
+      currentDrawSample != nullptr && currentDrawSample->groupHash != 0u
+          ? currentDrawSample->groupHash
+          : 0u;
   const uint64_t authoritativeGroupHash =
       packetAuthoritativeSkinnedContractReady
-          ? bit::fnv1a_hash(packet.resource.ownedVertexGroupIndices.data(),
-                            packet.resource.ownedVertexGroupIndices.size())
-          : currentDrawSample != nullptr ? currentDrawSample->groupHash : 0u;
+          ? sealedCurrentDrawGroupHash != 0u
+              ? sealedCurrentDrawGroupHash
+              : bit::fnv1a_hash(
+                    authoritativeGroupSlots->data(),
+                    authoritativeGroupSlots->size())
+          : sealedCurrentDrawGroupHash;
   // Phase 7.2: stable group hash（不含 stream1Ptr），用于 geometry key 稳定身份
   const uint64_t authoritativeStableGroupHash =
       currentDrawSample != nullptr && currentDrawSample->stableGroupHash != 0u
@@ -21537,8 +22742,48 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
   bool cachedPersistentGeometry = false;
 
   fallbackAppendTiming.enter(War3FallbackAppendPhase::WorldTransform);
+  // A ready CurrentDraw palette is already expressed in world space and the
+  // canonical builder deliberately selects identity for it. Avoid resolving
+  // two world transforms that cannot affect the resulting draw. For every
+  // other route, preserve the canonical priority by reading the scene-node
+  // matrix first and consulting PoseRegistry only as its fallback.
+  const bool currentDrawPaletteOwnsWorldTransform =
+      skinned && currentDrawSample != nullptr &&
+      currentDrawSample->status ==
+          dxvk::war3::render::CurrentDrawResolveStatus::Ready &&
+      authoritativeGroupSlotsReady && drawTimeCapturedPaletteReady &&
+      drawTimeCapturedPalette != nullptr &&
+      !drawTimeCapturedPalette->empty() &&
+      drawTimeCapturedPaletteHash != 0u;
+  Matrix4 sceneNodeWorldMatrix = Matrix4();
+  const bool hasSceneNodeWorldMatrix = [&]() {
+    if (currentDrawPaletteOwnsWorldTransform)
+      return false;
+    auto worldMatrixScope = War3SemanticSubmitScope(
+        "War3SemanticScene/SubmitFrame/SceneNodeWorldMatrix");
+    if (packet.renderable.sceneNode == nullptr)
+      return false;
+
+    float raw[12] = {};
+    const auto* matrixBase =
+        reinterpret_cast<const uint8_t*>(packet.renderable.sceneNode) +
+        dxvk::war3::SceneNodeOffsets::WorldMatrix;
+    if (!dxvk::war3::IsReadableRange(matrixBase, sizeof(raw)))
+      return false;
+
+    std::memcpy(raw, matrixBase, sizeof(raw));
+    sceneNodeWorldMatrix =
+        Matrix4(Vector4(raw[0], raw[1], raw[2], 0.0f),
+                Vector4(raw[3], raw[4], raw[5], 0.0f),
+                Vector4(raw[6], raw[7], raw[8], 0.0f),
+                Vector4(raw[9], raw[10], raw[11], 1.0f));
+    return true;
+  }();
+
   dxvk::war3::model::PoseAugmentView livePoseRecord = {};
   const bool hasLivePoseWorldTransform = [&]() {
+    if (currentDrawPaletteOwnsWorldTransform || hasSceneNodeWorldMatrix)
+      return false;
     auto& poseRegistry = dxvk::war3::model::PoseRegistry::instance();
     if (packet.renderable.runtimeModelPtr != nullptr &&
         poseRegistry.findByRuntimeModelAugment(
@@ -21567,33 +22812,19 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
                  : &livePoseRecord.worldTransform)
           : nullptr;
 
-  Matrix4 sceneNodeWorldMatrix = Matrix4();
-  const bool hasSceneNodeWorldMatrix = [&]() {
-    auto worldMatrixScope = War3SemanticSubmitScope(
-        "War3SemanticScene/SubmitFrame/SceneNodeWorldMatrix");
-    if (packet.renderable.sceneNode == nullptr)
-      return false;
-
-    float raw[12] = {};
-    const auto* matrixBase =
-        reinterpret_cast<const uint8_t*>(packet.renderable.sceneNode) +
-        dxvk::war3::SceneNodeOffsets::WorldMatrix;
-    if (!dxvk::war3::IsReadableRange(matrixBase, sizeof(raw)))
-      return false;
-
-    std::memcpy(raw, matrixBase, sizeof(raw));
-    sceneNodeWorldMatrix =
-        Matrix4(Vector4(raw[0], raw[1], raw[2], 0.0f),
-                Vector4(raw[3], raw[4], raw[5], 0.0f),
-                Vector4(raw[6], raw[7], raw[8], 0.0f),
-                Vector4(raw[9], raw[10], raw[11], 1.0f));
-    return true;
-  }();
-
   fallbackAppendTiming.enter(War3FallbackAppendPhase::LivePalette);
   uint32_t paletteIndex = 0u;
-  std::vector<std::array<uint8_t, 4>> blendIndices;
-  std::vector<std::array<float, 3>> blendWeights;
+  struct SemanticBlendVertex {
+    float weights[3];
+    uint8_t indices[4];
+  };
+  // Persistent-buffer creation copies hostData into mapped staging before it
+  // returns, so this scratch never escapes the current append. Reuse its CPU
+  // allocation across packets while dropping pathological oversized capacity.
+  thread_local std::vector<SemanticBlendVertex> blendVertices;
+  dxvk::war3::render::ClearBoundedDirectPacketScratch(
+      blendVertices,
+      dxvk::war3::render::kDirectPacketScratchMaxVertexEntries);
   uint64_t submittedRuntimeGroupPaletteHash = 0u;
   bool liveRuntimeGroupPaletteReady = false;
   // Phase 7.28：本次 submit 对应的 palette 来源 + slotIndex 记录。
@@ -21866,7 +23097,8 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
     std::vector<Matrix4> trimmedCanonicalPalette;
     const auto& canonicalPaletteVec = canonicalSkin.paletteVec();
     const auto& canonicalGroupSlots = canonicalSkin.groupSlotsVec();
-    if (!usesExplicitBlendContract &&
+    if (War3SemanticPaletteDiagnosticsRuntime() &&
+        !usesExplicitBlendContract &&
         canonicalGroupSlots.size() >= size_t(vertexCount)) {
       std::array<bool, 256> seenGroupSlots = {};
       for (uint32_t i = 0u; i < vertexCount; ++i) {
@@ -21922,7 +23154,7 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
     // "part 稳定但 palette 内容每帧抖动"。
     // 仅在该 submit 真实归属于某个 stable part 时做采样；每个 thread 保持
     // 一份独立表，避免多线程交叉污染。
-    if (skinned) {
+    if (skinned && War3SemanticPaletteDiagnosticsRuntime()) {
       auto& stats = m_war3Scene.shadowStats;
       // palette source 分桶。
       switch (paletteSourceThisSubmit) {
@@ -22327,28 +23559,34 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
         return false;
       }
       if (!cachedPersistentGeometry) {
-        blendIndices.resize(vertexCount);
-        blendWeights.resize(vertexCount);
+        blendVertices.resize(vertexCount);
         for (uint32_t i = 0; i < vertexCount; ++i) {
-          blendWeights[i] = canonicalSkin.explicitBlendWeights[i];
-          blendIndices[i] = canonicalSkin.explicitBlendIndices[i];
+          const auto& sourceWeights = canonicalSkin.explicitBlendWeights[i];
+          const auto& sourceIndices = canonicalSkin.explicitBlendIndices[i];
           const uint32_t maxInfluence =
               uint32_t(canonicalSkin.explicitBlendCount) + 1u;
           for (uint32_t influence = 0u; influence < maxInfluence; ++influence) {
-          const uint32_t groupSlot = blendIndices[i][influence];
-          if (groupSlot >= effectiveCanonicalPaletteCount ||
-              groupSlot >= 256u) {
-            m_war3Scene.shadowStats.semanticSceneRejectedSkinnedContract++;
-            notePhase5SkinnedContractReject();
-            return false;
+            const uint32_t groupSlot = sourceIndices[influence];
+            if (groupSlot >= effectiveCanonicalPaletteCount ||
+                groupSlot >= 256u) {
+              m_war3Scene.shadowStats.semanticSceneRejectedSkinnedContract++;
+              notePhase5SkinnedContractReject();
+              return false;
             }
           }
+          blendVertices[i].weights[0] = sourceWeights[0];
+          blendVertices[i].weights[1] = sourceWeights[1];
+          blendVertices[i].weights[2] = sourceWeights[2];
+          blendVertices[i].indices[0] = sourceIndices[0];
+          blendVertices[i].indices[1] = sourceIndices[1];
+          blendVertices[i].indices[2] = sourceIndices[2];
+          blendVertices[i].indices[3] = sourceIndices[3];
         }
       }
     } else if (!cachedPersistentGeometry) {
       auto blendScope = War3SemanticSubmitScope(
           "War3SemanticScene/SubmitFrame/BlendContract");
-      blendIndices.resize(vertexCount);
+      blendVertices.resize(vertexCount);
       for (uint32_t i = 0; i < vertexCount; ++i) {
         const uint32_t groupSlot = uint32_t(canonicalGroupSlots[i]);
         if (groupSlot >= effectiveCanonicalPaletteCount ||
@@ -22357,7 +23595,13 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
           notePhase5SkinnedContractReject();
           return false;
         }
-        blendIndices[i] = {uint8_t(groupSlot), 0u, 0u, 0u};
+        blendVertices[i].weights[0] = 0.0f;
+        blendVertices[i].weights[1] = 0.0f;
+        blendVertices[i].weights[2] = 0.0f;
+        blendVertices[i].indices[0] = uint8_t(groupSlot);
+        blendVertices[i].indices[1] = 0u;
+        blendVertices[i].indices[2] = 0u;
+        blendVertices[i].indices[3] = 0u;
       }
     }
   }
@@ -22501,28 +23745,7 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
     uploads[1].usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
     uploads[1].debugName = "War3SemanticShadowIdx";
   }
-  struct SemanticBlendVertex {
-    float weights[3];
-    uint8_t indices[4];
-  };
-  std::vector<SemanticBlendVertex> blendVertices;
-  if (skinned && !blendIndices.empty()) {
-    blendVertices.resize(vertexCount);
-    for (uint32_t i = 0u; i < vertexCount; ++i) {
-      if (usesExplicitBlendContract) {
-        blendVertices[i].weights[0] = blendWeights[i][0];
-        blendVertices[i].weights[1] = blendWeights[i][1];
-        blendVertices[i].weights[2] = blendWeights[i][2];
-      } else {
-        blendVertices[i].weights[0] = 0.0f;
-        blendVertices[i].weights[1] = 0.0f;
-        blendVertices[i].weights[2] = 0.0f;
-      }
-      blendVertices[i].indices[0] = blendIndices[i][0];
-      blendVertices[i].indices[1] = blendIndices[i][1];
-      blendVertices[i].indices[2] = blendIndices[i][2];
-      blendVertices[i].indices[3] = blendIndices[i][3];
-    }
+  if (skinned && !blendVertices.empty()) {
     uploads[2].hostData = blendVertices.data();
     uploads[2].bytes =
         VkDeviceSize(blendVertices.size() * sizeof(blendVertices[0]));
@@ -22663,6 +23886,7 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
   draw.indexed = geometry->indexed;
   draw.positionStorage = geometry->positionStorage;
   draw.positionInfo = geometry->positionInfo;
+  War3CopyPersistentReplayBindings(draw, *geometry);
   draw.positionStride = geometry->positionStride;
   draw.positionOffset = geometry->positionOffset;
   draw.positionFormat = geometry->positionFormat;
@@ -22733,6 +23957,7 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
         drawTimeVBEntry = &entry;
         // 用 capture 时拷的 device-local buffer
         draw.positionStorage = entry.positionBuffer;
+        draw.positionPinnedAllocation = entry.positionPinnedAllocation;
         draw.positionInfo = entry.positionInfo;
         draw.positionStride = entry.positionStride;
         draw.positionOffset = entry.positionOffset;
@@ -22762,6 +23987,7 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
             entry.indexInfo.buffer != VK_NULL_HANDLE) {
           draw.indexed = true;
           draw.indexStorage = entry.indexBuffer;
+          draw.indexPinnedAllocation = entry.indexPinnedAllocation;
           draw.indexInfo = entry.indexInfo;
           draw.indexType = entry.indexType;
           draw.indexCount = entry.indexCount;
@@ -22785,6 +24011,7 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
             entry.uvBuffer != nullptr &&
             entry.uvInfo.buffer != VK_NULL_HANDLE) {
           draw.uvStorage = entry.uvBuffer;
+          draw.uvPinnedAllocation = entry.uvPinnedAllocation;
           draw.uvInfo = entry.uvInfo;
           draw.uvStride = entry.uvStride;
           draw.uvOffset = entry.uvOffset;
@@ -23214,7 +24441,8 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
       reinterpret_cast<uint64_t>(packet.renderable.renderablePart);
   m_war3Scene.shadowStats.semanticSceneLastAppendedMeshData =
       reinterpret_cast<uint64_t>(packet.renderable.meshData);
-  if (stableAuthoritativeSkinnedGeometryKey && currentDrawSample != nullptr) {
+  if (War3SemanticPaletteDiagnosticsRuntime() &&
+      stableAuthoritativeSkinnedGeometryKey && currentDrawSample != nullptr) {
     auto& st = m_war3Scene.shadowStats;
     const uint64_t contractIdentityKey =
         War3SemanticDirectSelectionKey(packet, *currentDrawSample);
@@ -23289,10 +24517,10 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
         }
       }
       const bool hasCurrentPalette0 =
-          currentDrawSample->paletteReady() &&
-          !currentDrawSample->palette.empty();
+          drawTimeCapturedPaletteReady && drawTimeCapturedPalette != nullptr &&
+          !drawTimeCapturedPalette->empty();
       const Matrix4 currentPalette0 =
-          hasCurrentPalette0 ? currentDrawSample->palette[0] : Matrix4();
+          hasCurrentPalette0 ? (*drawTimeCapturedPalette)[0] : Matrix4();
 
       auto updateChurn = [](uint64_t& previous, uint64_t current,
                             uint32_t& churnCounter) {
@@ -23415,28 +24643,29 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
         vbIt->second.MatchesKey(cacheKey))
       vbIt->second.submittedFrameSerial = m_war3ShadowPersistentFrameSerial;
   }
-  // Phase 7.35 Pose-lag 诊断：在 submit 成功处记录一次时间滞后。
-  // 只要 directCurrentDrawSample 存在就用它的 contract.renderFrameIndex
-  // 作为 record publish 帧号；没有 sample（fallback 路径）按 0 处理即 Lag0。
-  if (directCurrentDrawSample != nullptr &&
-      directCurrentDrawSample->contract.known) {
-    dxvk::war3::render::NoteSubmitPaletteFrameLag(
-        directCurrentDrawSample->contract.renderFrameIndex);
-  } else {
-    dxvk::war3::render::NoteSubmitPaletteFrameLag(0u);
-  }
-  if (skinned) {
-    uint32_t currentPaletteFrameTag = 0u;
-    const uint32_t paletteContentFrameTag =
-        paletteMinFrameTagThisSubmit != 0u ? paletteMinFrameTagThisSubmit
-                                           : paletteMaxFrameTagThisSubmit;
-    if (paletteContentFrameTag != 0u &&
-        dxvk::war3::model::QueryCurrentPaletteFrameTag(
-            currentPaletteFrameTag)) {
-      dxvk::war3::render::NoteSubmitPaletteContentAge(
-          paletteContentFrameTag, currentPaletteFrameTag);
+  if (War3SemanticPaletteDiagnosticsRuntime()) {
+    // Phase 7.35 Pose-lag diagnostics. These counters and the global palette
+    // frame-tag query are attribution-only and stay out of normal submission.
+    if (directCurrentDrawSample != nullptr &&
+        directCurrentDrawSample->contract.known) {
+      dxvk::war3::render::NoteSubmitPaletteFrameLag(
+          directCurrentDrawSample->contract.renderFrameIndex);
     } else {
-      dxvk::war3::render::NoteSubmitPaletteContentAgeUnknown();
+      dxvk::war3::render::NoteSubmitPaletteFrameLag(0u);
+    }
+    if (skinned) {
+      uint32_t currentPaletteFrameTag = 0u;
+      const uint32_t paletteContentFrameTag =
+          paletteMinFrameTagThisSubmit != 0u ? paletteMinFrameTagThisSubmit
+                                             : paletteMaxFrameTagThisSubmit;
+      if (paletteContentFrameTag != 0u &&
+          dxvk::war3::model::QueryCurrentPaletteFrameTag(
+              currentPaletteFrameTag)) {
+        dxvk::war3::render::NoteSubmitPaletteContentAge(
+            paletteContentFrameTag, currentPaletteFrameTag);
+      } else {
+        dxvk::war3::render::NoteSubmitPaletteContentAgeUnknown();
+      }
     }
   }
   if (resolvedObjectKind == dxvk::war3::render::ObjectKind::Building)
@@ -23551,6 +24780,103 @@ void D3D9DeviceEx::War3MarkDrawTimeExactRejectedCurrentFrame(
         m_war3ShadowPersistentFrameSerial;
   }
   m_war3DrawTimeExactRejectedKeys.insert(key);
+}
+
+void D3D9DeviceEx::War3RecordRequiredCasterOmission(
+    const War3DrawTimeVBCacheKey& key,
+    War3RequiredCasterOmissionReason reason) {
+  if (m_war3RequiredCasterOmissionFrameSerial !=
+      m_war3ShadowPersistentFrameSerial) {
+    m_war3RequiredCasterOmissionKeys.clear();
+    m_war3RequiredCasterOmissionFrameSerial =
+        m_war3ShadowPersistentFrameSerial;
+  }
+  const bool uniqueCaster =
+      m_war3RequiredCasterOmissionKeys.insert(key).second;
+  auto& completeness = m_war3Scene.producerCompleteness;
+  completeness.note(reason, uniqueCaster);
+  if (reason == War3RequiredCasterOmissionReason::PositionAllocBudget ||
+      reason == War3RequiredCasterOmissionReason::UvAllocBudget ||
+      reason == War3RequiredCasterOmissionReason::IndexAllocBudget) {
+    if (uniqueCaster)
+      completeness.noteExactBudgetDeferredUniqueCaster();
+  }
+  auto& stats = m_war3Scene.shadowStats;
+  stats.producerRequiredCasterOmissionCount =
+      completeness.requiredCasterOmissionCount;
+  stats.producerExactBudgetDeferredUniqueCasterCount =
+      completeness.exactBudgetDeferredUniqueCasterCount;
+  stats.producerPositionAllocBudgetCount = completeness.positionAllocBudgetCount;
+  stats.producerUvAllocBudgetCount = completeness.uvAllocBudgetCount;
+  stats.producerIndexAllocBudgetCount = completeness.indexAllocBudgetCount;
+  stats.producerAllocationFailureCount = completeness.allocationFailureCount;
+  stats.producerFallbackByteBudgetCount = completeness.fallbackByteBudgetCount;
+  stats.producerArenaAdmissionCount = completeness.arenaAdmissionCount;
+  stats.producerFreezeFailureCount = completeness.freezeFailureCount;
+  stats.producerSoftPriorityBudgetCount = completeness.softPriorityBudgetCount;
+  stats.producerCompletenessReasonMask = completeness.reasonMask;
+  stats.producerCompletenessCounterOverflow =
+      completeness.counterOverflow ? 1u : 0u;
+}
+
+void D3D9DeviceEx::War3RecordRequiredCasterOmission(
+    War3RequiredCasterOmissionReason reason) {
+  auto& completeness = m_war3Scene.producerCompleteness;
+  completeness.note(reason, true);
+  auto& stats = m_war3Scene.shadowStats;
+  stats.producerRequiredCasterOmissionCount =
+      completeness.requiredCasterOmissionCount;
+  stats.producerExactBudgetDeferredUniqueCasterCount =
+      completeness.exactBudgetDeferredUniqueCasterCount;
+  stats.producerPositionAllocBudgetCount = completeness.positionAllocBudgetCount;
+  stats.producerUvAllocBudgetCount = completeness.uvAllocBudgetCount;
+  stats.producerIndexAllocBudgetCount = completeness.indexAllocBudgetCount;
+  stats.producerAllocationFailureCount = completeness.allocationFailureCount;
+  stats.producerFallbackByteBudgetCount = completeness.fallbackByteBudgetCount;
+  stats.producerArenaAdmissionCount = completeness.arenaAdmissionCount;
+  stats.producerFreezeFailureCount = completeness.freezeFailureCount;
+  stats.producerSoftPriorityBudgetCount = completeness.softPriorityBudgetCount;
+  stats.producerCompletenessReasonMask = completeness.reasonMask;
+  stats.producerCompletenessCounterOverflow =
+      completeness.counterOverflow ? 1u : 0u;
+}
+
+void D3D9DeviceEx::War3SealShadowProducerCompleteness(
+    War3FrameScene& scene, uint64_t frameSerial, uint64_t mapEpoch,
+    uint64_t deviceEpoch) const {
+  // Capture logical buffer ranges while the producer's physical snapshot and
+  // virtual owner still describe the same backing. Consumers resolve these
+  // bindings on the CS thread after any queued DXVK defrag relocation.
+  for (auto& draw : scene.shadowCasters) {
+    War3CaptureShadowReplayBindings(
+        draw, frameSerial, mapEpoch, deviceEpoch);
+  }
+  for (auto& fallback : scene.shadowFallbacks) {
+    War3CaptureShadowReplayBindings(
+        fallback.snapshot, frameSerial, mapEpoch, deviceEpoch);
+  }
+  scene.producerCompleteness.seal(frameSerial, mapEpoch, deviceEpoch);
+  auto& stats = scene.shadowStats;
+  const auto& completeness = scene.producerCompleteness;
+  stats.producerCompletenessSealed = 1u;
+  stats.producerSealFrameSerial = completeness.sealFrameSerial;
+  stats.producerSealMapEpoch = completeness.mapEpoch;
+  stats.producerSealDeviceEpoch = completeness.deviceEpoch;
+  stats.producerCompletenessCounterOverflow =
+      completeness.counterOverflow ? 1u : 0u;
+  stats.producerCompletenessReasonMask = completeness.reasonMask;
+  stats.producerRequiredCasterOmissionCount =
+      completeness.requiredCasterOmissionCount;
+  stats.producerExactBudgetDeferredUniqueCasterCount =
+      completeness.exactBudgetDeferredUniqueCasterCount;
+  stats.producerPositionAllocBudgetCount = completeness.positionAllocBudgetCount;
+  stats.producerUvAllocBudgetCount = completeness.uvAllocBudgetCount;
+  stats.producerIndexAllocBudgetCount = completeness.indexAllocBudgetCount;
+  stats.producerAllocationFailureCount = completeness.allocationFailureCount;
+  stats.producerFallbackByteBudgetCount = completeness.fallbackByteBudgetCount;
+  stats.producerArenaAdmissionCount = completeness.arenaAdmissionCount;
+  stats.producerFreezeFailureCount = completeness.freezeFailureCount;
+  stats.producerSoftPriorityBudgetCount = completeness.softPriorityBudgetCount;
 }
 
 bool D3D9DeviceEx::War3DrawTimeExactRejectedCurrentFrame(
@@ -23939,11 +25265,76 @@ void D3D9DeviceEx::War3ObservePersistentPackageStage11Evidence(
   }
 }
 
-uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer() {
+void D3D9DeviceEx::War3ActivateDrawTimeCacheEntry(
+    const War3DrawTimeVBCacheKey& key, War3DrawTimeVBEntry& entry) {
+  m_war3DrawTimeActiveLedger.activate(
+      m_war3ShadowPersistentFrameSerial, key, entry.activeLedgerStamp);
+}
+
+uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer(
+    std::vector<dxvk::war3::render::CurrentDrawContractRecord>&
+        exactSubmittedManifestRecords) {
   auto& visibleRegistry =
       dxvk::war3::render::VisibleRenderableRegistry::instance();
+  exactSubmittedManifestRecords.clear();
   if (m_war3DrawTimeVBCache.empty())
     return 0u;
+
+  const auto& activeDrawTimeRecords =
+      m_war3DrawTimeActiveLedger.records();
+  const bool useActiveDrawTimeLedger =
+      m_war3DrawTimeActiveLedger.usableForFrame(
+          m_war3ShadowPersistentFrameSerial);
+  exactSubmittedManifestRecords.reserve(
+      useActiveDrawTimeLedger ? activeDrawTimeRecords.size()
+                              : m_war3DrawTimeVBCache.size());
+  const uint64_t manifestFrame = visibleRegistry.getFrameNumber();
+  const uint32_t currentRenderFrameIndex =
+      dxvk::war3::state::RenderState::instance().getFrameIndex();
+  const auto appendExactSubmittedManifestRecord = [&]
+      (const War3DrawTimeVBEntry& entry) {
+    dxvk::war3::render::CurrentDrawContractRecord exactRecord = {};
+    exactRecord.known = true;
+    exactRecord.sceneNode = entry.sceneNode;
+    exactRecord.renderablePart = entry.renderablePart;
+    exactRecord.meshPayloadPtr = entry.meshPayloadPtr;
+    exactRecord.worldObjectEntry = entry.worldObjectEntry;
+    exactRecord.unitPtr = entry.unitPtr;
+    exactRecord.jHandle =
+        entry.jHandle != 0u ? entry.jHandle : entry.contractJHandle;
+    exactRecord.rawcode = entry.rawcode;
+    // Preserve the historical manifest identity exactly.  The actual caster
+    // may use current visible-record enrichment, but that evidence never
+    // authorized the old grouped manifest scan to promote an Unknown entry.
+    exactRecord.objectKind = entry.objectKind;
+    if (War3SemanticRawcodeLooksStaticWorldCaster(exactRecord.rawcode)) {
+      exactRecord.objectKind =
+          dxvk::war3::render::ObjectKind::Destructible;
+    }
+    exactRecord.layerIndex = entry.layerIndex;
+    exactRecord.payloadWord108 = entry.payloadWord108;
+    exactRecord.payloadWord11C = entry.payloadWord11C;
+    exactRecord.stage =
+        entry.producerStage >= 0 ? entry.producerStage : int16_t(11);
+    exactRecord.visibleFrameSerial = manifestFrame;
+    exactRecord.renderFrameIndex = currentRenderFrameIndex;
+    exactRecord.batchTag = War3BatchTag::WorldObjects;
+    exactRecord.producerStage = exactRecord.stage;
+    exactRecord.producerGroup = War3BatchTag::WorldObjects;
+    exactRecord.sourceKind =
+        dxvk::war3::render::ShadowProducerKind::DrawTimeGeometry;
+    exactRecord.producerFreshThisFrame = true;
+    exactRecord.stagePolicyRevision =
+        dxvk::war3::render::CurrentShadowStagePolicyRevision();
+    exactRecord.fromGrace = false;
+    exactRecord.graceAge = 0u;
+    exactRecord.pathBlocker =
+        entry.pathBlocker || entry.pathBlockerGeometryMarker ||
+        IsLosBlockerFourCc(exactRecord.rawcode);
+    exactRecord.alphaPayloadComplete =
+        !entry.alphaTestEnabled || entry.HasCompleteAlphaPayload();
+    exactSubmittedManifestRecords.push_back(std::move(exactRecord));
+  };
 
   uint32_t submitted = 0u;
   if (!War3DrawTimeCurrentFrameGeometryRuntime() &&
@@ -23951,7 +25342,38 @@ uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer() {
     return 0u;
   const auto packageStage11EvidenceMode =
       War3PersistentPackageStage11EvidenceModeRuntime();
-  for (auto& [cacheKey, entry] : m_war3DrawTimeVBCache) {
+  auto activeRecordIt = activeDrawTimeRecords.begin();
+  auto cacheIt = m_war3DrawTimeVBCache.begin();
+  auto nextDrawTimeEntry = [&](const War3DrawTimeVBCacheKey*& outKey,
+                               War3DrawTimeVBEntry*& outEntry) {
+    if (useActiveDrawTimeLedger) {
+      while (activeRecordIt != activeDrawTimeRecords.end()) {
+        const auto& activeRecord = *activeRecordIt++;
+        auto found = m_war3DrawTimeVBCache.find(activeRecord.key);
+        if (found == m_war3DrawTimeVBCache.end() ||
+            !War3DrawTimeActiveLedger::matches(
+                activeRecord, found->second.activeLedgerStamp)) {
+          continue;
+        }
+        outKey = &found->first;
+        outEntry = &found->second;
+        return true;
+      }
+      return false;
+    }
+    if (cacheIt == m_war3DrawTimeVBCache.end())
+      return false;
+    auto current = cacheIt++;
+    outKey = &current->first;
+    outEntry = &current->second;
+    return true;
+  };
+
+  const War3DrawTimeVBCacheKey* cacheKeyPtr = nullptr;
+  War3DrawTimeVBEntry* entryPtr = nullptr;
+  while (nextDrawTimeEntry(cacheKeyPtr, entryPtr)) {
+    const auto& cacheKey = *cacheKeyPtr;
+    auto& entry = *entryPtr;
     void* const renderablePart = cacheKey.renderablePart;
     if (renderablePart == nullptr)
       continue;
@@ -24028,6 +25450,10 @@ uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer() {
 
     m_war3Scene.shadowStats.drawTimeSemanticProducerVisibleCandidateCount++;
     if (entry.exactOwnerFrameSerial == m_war3ShadowPersistentFrameSerial) {
+      if (entry.exactSubmittedFrameSerial ==
+          m_war3ShadowPersistentFrameSerial) {
+        appendExactSubmittedManifestRecord(entry);
+      }
       continue;
     }
 
@@ -24135,6 +25561,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer() {
     War3CopyDrawTimeReplayDomain(draw, entry);
     draw.indexed = entry.indexed;
     draw.positionStorage = entry.positionBuffer;
+    draw.positionPinnedAllocation = entry.positionPinnedAllocation;
     draw.positionInfo = entry.positionInfo;
     draw.positionStride = entry.positionStride;
     draw.positionOffset = entry.positionOffset;
@@ -24173,6 +25600,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer() {
         draw.uvInfo = entry.positionInfo;
       } else {
         draw.uvStorage = entry.uvBuffer;
+        draw.uvPinnedAllocation = entry.uvPinnedAllocation;
         draw.uvInfo = entry.uvInfo;
       }
     }
@@ -24201,6 +25629,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer() {
 
     if (entry.indexed) {
       draw.indexStorage = entry.indexBuffer;
+      draw.indexPinnedAllocation = entry.indexPinnedAllocation;
       draw.indexInfo = entry.indexInfo;
       draw.indexType = entry.indexType;
       draw.indexCount = entry.indexCount;
@@ -24303,6 +25732,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer() {
       m_war3Scene.shadowStats.semanticSceneSubmittedAlphaBlend++;
     m_war3Scene.shadowStats.drawTimeSemanticProducerSubmittedCount++;
     entry.exactSubmittedFrameSerial = m_war3ShadowPersistentFrameSerial;
+    appendExactSubmittedManifestRecord(entry);
     entry.packageLastSubmittedCaptureOrdinal = entry.packageCaptureOrdinal;
     if (packageStage11EvidenceMode != dxvk::war3::gpu_skin::
             War3PersistentGpuPackageStage11ObserveAdapter::Mode::Off) {
@@ -24377,6 +25807,136 @@ void D3D9DeviceEx::War3RefreshRetiredShadowSessionDiagnostics() {
       oldestRetireSerial, std::memory_order_release);
 }
 
+D3D9DeviceEx::War3Stage11SnapshotAllocationResult
+D3D9DeviceEx::War3AllocateStage11Snapshot(
+    VkDeviceSize requiredBytes,
+    std::shared_ptr<War3Stage11SnapshotPage>& outPage,
+    VkDeviceSize& outOffset, VkDeviceSize& outCapacity) {
+  using namespace dxvk::war3::render;
+  outPage.reset();
+  outOffset = 0u;
+  outCapacity = 0u;
+
+  uint64_t alignedBytes = 0u;
+  if (!War3TryAlignStage11SnapshotBytes(
+          uint64_t(requiredBytes), alignedBytes)) {
+    return War3Stage11SnapshotAllocationResult::InvalidRange;
+  }
+
+  const auto tryExistingPage = [&]() -> bool {
+    for (auto it = m_war3Stage11SnapshotPages.rbegin();
+         it != m_war3Stage11SnapshotPages.rend(); ++it) {
+      const auto plan = War3PlanStage11SnapshotSuballocation(
+          uint64_t((*it)->used), uint64_t((*it)->capacity), alignedBytes);
+      if (!plan.valid)
+        continue;
+      (*it)->used = VkDeviceSize(plan.nextUsed);
+      outPage = *it;
+      outOffset = VkDeviceSize(plan.offset);
+      outCapacity = VkDeviceSize(plan.capacity);
+      return true;
+    }
+    return false;
+  };
+
+  if (!tryExistingPage()) {
+    War3CollectUnusedStage11SnapshotPages();
+    if (!tryExistingPage()) {
+      const uint64_t pageBytes =
+          War3Stage11SnapshotPageCapacity(alignedBytes);
+      if (pageBytes == 0u || !War3Stage11SnapshotCanAddPage(
+              m_war3Stage11SnapshotResidentBytes, pageBytes)) {
+        ++m_war3Scene.shadowStats
+              .drawTimeSnapshotPageCapacityRejectCount;
+        return War3Stage11SnapshotAllocationResult::ResidentCapacity;
+      }
+      if (dxvk::war3::internal::
+              kShadowDrawTimeVBCacheAllocBudgetEnabled &&
+          m_war3DrawTimeVBCacheAllocBudgetThisFrame >=
+              dxvk::war3::internal::
+                  kShadowDrawTimeVBCacheAllocBudgetPerFrame) {
+        return War3Stage11SnapshotAllocationResult::PageCreateBudget;
+      }
+
+      DxvkBufferCreateInfo info = {};
+      info.size = VkDeviceSize(pageBytes);
+      info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                   VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                   VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+      info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT |
+                    VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
+      info.access = VK_ACCESS_TRANSFER_WRITE_BIT |
+                    VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT |
+                    VK_ACCESS_INDEX_READ_BIT;
+      info.debugName = "War3Stage11SnapshotPage";
+      auto buffer = m_dxvkDevice->createBuffer(
+          info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+      if (buffer == nullptr) {
+        ++m_war3Scene.shadowStats
+              .drawTimeSnapshotPageAllocationFailureCount;
+        return War3Stage11SnapshotAllocationResult::AllocationFailure;
+      }
+
+      auto page = std::make_shared<War3Stage11SnapshotPage>();
+      if (m_war3Stage11SnapshotNextPageId == 0u)
+        m_war3Stage11SnapshotNextPageId = 1u;
+      page->id = m_war3Stage11SnapshotNextPageId++;
+      page->buffer = std::move(buffer);
+      page->capacity = info.size;
+      m_war3Stage11SnapshotResidentBytes += pageBytes;
+      m_war3Stage11SnapshotPages.emplace_back(std::move(page));
+      ++m_war3DrawTimeVBCacheAllocBudgetThisFrame;
+      ++m_war3Scene.shadowStats.drawTimeSnapshotPageCreateCount;
+
+      if (!tryExistingPage())
+        return War3Stage11SnapshotAllocationResult::InvalidRange;
+    }
+  }
+
+  ++m_war3Scene.shadowStats.drawTimeSnapshotSuballocationCount;
+  m_war3Scene.shadowStats.drawTimeSnapshotSuballocationBytes += alignedBytes;
+  m_war3Scene.shadowStats.drawTimeSnapshotPageResidentBytes =
+      m_war3Stage11SnapshotResidentBytes;
+  uint64_t usedBytes = 0u;
+  for (const auto& page : m_war3Stage11SnapshotPages) {
+    usedBytes = page->used > std::numeric_limits<uint64_t>::max() - usedBytes
+        ? std::numeric_limits<uint64_t>::max()
+        : usedBytes + uint64_t(page->used);
+  }
+  m_war3Scene.shadowStats.drawTimeSnapshotPageUsedBytes = usedBytes;
+  return War3Stage11SnapshotAllocationResult::Success;
+}
+
+void D3D9DeviceEx::War3CollectUnusedStage11SnapshotPages() {
+  for (auto it = m_war3Stage11SnapshotPages.begin();
+       it != m_war3Stage11SnapshotPages.end();) {
+    if (it->use_count() != 1u) {
+      ++it;
+      continue;
+    }
+    const uint64_t capacity = uint64_t((*it)->capacity);
+    m_war3Stage11SnapshotResidentBytes =
+        capacity > m_war3Stage11SnapshotResidentBytes
+            ? 0u : m_war3Stage11SnapshotResidentBytes - capacity;
+    ++m_war3Stage11SnapshotReclaimedPages;
+    it = m_war3Stage11SnapshotPages.erase(it);
+  }
+  m_war3Scene.shadowStats.drawTimeSnapshotPageResidentBytes =
+      m_war3Stage11SnapshotResidentBytes;
+  m_war3Scene.shadowStats.drawTimeSnapshotPageReclaimedCount =
+      m_war3Stage11SnapshotReclaimedPages;
+}
+
+void D3D9DeviceEx::War3ResetStage11SnapshotPages() {
+  // Cache entries already moved to the fence-owned retired session keep
+  // their page references. Clearing this lookup cannot destroy an in-flight
+  // buffer and guarantees that the new map/device epoch never suballocates
+  // from an old page.
+  m_war3Stage11SnapshotPages.clear();
+  m_war3Stage11SnapshotResidentBytes = 0u;
+}
+
 void D3D9DeviceEx::War3ResetShadowSessionState(uint64_t retireSerial) {
   using namespace dxvk::war3::render;
 
@@ -24399,6 +25959,8 @@ void D3D9DeviceEx::War3ResetShadowSessionState(uint64_t retireSerial) {
   retired.persistentExpiryQueue =
       std::move(m_war3ShadowPersistentExpiryQueue);
   retired.drawTimeVbCache = std::move(m_war3DrawTimeVBCache);
+  m_war3DrawTimeActiveLedger.resetSession();
+  War3ResetStage11SnapshotPages();
   retired.s1TerrainCasterStash = std::move(m_war3S1TerrainCasterStash);
   retired.s1TerrainEarlyCache = std::move(m_war3S1TerrainEarlyCache);
 
@@ -24472,8 +26034,14 @@ void D3D9DeviceEx::War3ResetShadowSessionState(uint64_t retireSerial) {
   m_war3Stage13RetainedCasters = {};
   m_war3ShadowPersistentExpiryQueue = {};
   m_war3DrawTimeVBCache = {};
+#if defined(WARVK_ENABLE_SHADOW_OBSERVERS_DEV) && \
+    WARVK_ENABLE_SHADOW_OBSERVERS_DEV
+  m_war3Stage11AllocationObserverProofs.clear();
+  m_war3Stage11AllocationObserverFrameSerial = 0u;
+#endif
   m_war3S1TerrainCasterStash = {};
   m_war3S1TerrainEarlyCache = {};
+  m_war3S1GenerationProofObservations.clear();
 
   // The GPU-owned containers remain in the retired session above. This only
   // drops CPU lookup aliases so a recycled map-B address cannot inherit a
@@ -24494,11 +26062,16 @@ void D3D9DeviceEx::War3ResetShadowSessionState(uint64_t retireSerial) {
   m_war3DrawTimeExactRejectedKeys.clear();
   m_war3DrawTimeExactRejectedFrameSerial =
       m_war3ShadowPersistentFrameSerial;
+  m_war3RequiredCasterOmissionKeys.clear();
+  m_war3RequiredCasterOmissionFrameSerial =
+      m_war3ShadowPersistentFrameSerial;
   m_war3DrawTimeAnonymousMarkerRejectedSlices.clear();
   m_war3S1TerrainEarlyKeysByPersistentGeometryId.clear();
   m_war3S1TerrainEarlyPersistentBackedCount = 0u;
   m_war3S1TerrainEarlyFallbackBackedCount = 0u;
   m_war3S1TerrainEarlyLogicalReferencedBytes = 0u;
+  m_war3S1GenerationProofObservationClock = {};
+  m_war3S1GenerationProofLastGcFrame = 0u;
   m_war3S1TerrainStashBuiltFrameSerial = 0u;
   m_war3S1TerrainStashCaptureFrameSerial = 0u;
   m_war3FrameFreezeCatalogSerial = 0u;
@@ -24832,7 +26405,9 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     bool readyOnly,
     bool unitsOnly,
     uint64_t currentVisibleFrameSerial,
-    uint64_t currentDrawMinVisibleFrameSerial) {
+    uint64_t currentDrawMinVisibleFrameSerial,
+    const std::vector<dxvk::war3::render::CurrentDrawContractRecord>&
+        exactSubmittedManifestRecords) {
   auto directGroupedScope =
       war3::War3PerfMonitor::instance().cpuScope("DirectGrouped");
   std::optional<war3::War3PerfMonitor::ScopedCpuScope> directPhaseScope;
@@ -24889,7 +26464,12 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       m_war3SemanticDirectPrevSubmittedObjectIdentityKeys;
   const std::vector<uint64_t>& previousSubmittedPartIdentityKeys =
       m_war3SemanticDirectPrevSubmittedPartIdentityKeys;
-  std::vector<uint64_t> leasedSelectionKeys;
+  static thread_local std::vector<uint64_t> s_leasedSelectionKeys;
+  static thread_local std::vector<uint64_t> s_preferredSelectionKeys;
+  auto& leasedSelectionKeys = s_leasedSelectionKeys;
+  auto& preferredSelectionKeysScratch = s_preferredSelectionKeys;
+  leasedSelectionKeys.clear();
+  preferredSelectionKeysScratch.clear();
   if (stickySelectionLease) {
     const uint64_t currentFrame = m_war3ShadowPersistentFrameSerial;
     const uint64_t leaseFrames = War3SemanticStickySelectionLeaseFramesRuntime();
@@ -24907,21 +26487,33 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       }
     }
   }
-  std::vector<uint64_t> preferredSelectionKeys =
-      previousSubmittedSelectionKeys;
-  if (stickySelectionLease &&
-      (preferredSelectionKeys.empty() ||
-       War3SemanticStickySelectionBroadLeasePreferenceRuntime())) {
-    preferredSelectionKeys.insert(preferredSelectionKeys.end(),
-                                  leasedSelectionKeys.begin(),
-                                  leasedSelectionKeys.end());
+  // Previous-submitted keys are published sorted/unique below, and tombstone
+  // erasure preserves that order. Borrow that immutable vector in the common
+  // path instead of copying and revalidating it every frame. Only broad lease
+  // preference changes the set, so only that path materializes and normalizes
+  // the TLS merge scratch.
+  const bool mergeLeasedSelectionKeys =
+      stickySelectionLease && !leasedSelectionKeys.empty() &&
+      (previousSubmittedSelectionKeys.empty() ||
+       War3SemanticStickySelectionBroadLeasePreferenceRuntime());
+  const std::vector<uint64_t>* preferredSelectionKeysView =
+      &previousSubmittedSelectionKeys;
+  if (mergeLeasedSelectionKeys) {
+    preferredSelectionKeysScratch.assign(
+        previousSubmittedSelectionKeys.begin(),
+        previousSubmittedSelectionKeys.end());
+    preferredSelectionKeysScratch.insert(
+        preferredSelectionKeysScratch.end(), leasedSelectionKeys.begin(),
+        leasedSelectionKeys.end());
+    std::sort(preferredSelectionKeysScratch.begin(),
+              preferredSelectionKeysScratch.end());
+    preferredSelectionKeysScratch.erase(
+        std::unique(preferredSelectionKeysScratch.begin(),
+                    preferredSelectionKeysScratch.end()),
+        preferredSelectionKeysScratch.end());
+    preferredSelectionKeysView = &preferredSelectionKeysScratch;
   }
-  if (!preferredSelectionKeys.empty()) {
-    std::sort(preferredSelectionKeys.begin(), preferredSelectionKeys.end());
-    preferredSelectionKeys.erase(
-        std::unique(preferredSelectionKeys.begin(), preferredSelectionKeys.end()),
-        preferredSelectionKeys.end());
-  }
+  const auto& preferredSelectionKeys = *preferredSelectionKeysView;
   // The preferred key list is already sorted/unique and remains immutable for
   // this populate.  Reuse it directly for both preselection and submit-group
   // membership instead of building and destroying two node-based hash sets
@@ -24931,6 +26523,37 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
            std::binary_search(preferredSelectionKeys.begin(),
                               preferredSelectionKeys.end(), selectionKey);
   };
+  const auto currentFrameDrawTimeProducerOwnsRecord =
+      [&](const dxvk::war3::render::CurrentDrawContractRecord& record) noexcept {
+        const int16_t effectiveProducerStage =
+            record.producerStage >= 0 ? record.producerStage : record.stage;
+        if (!War3DrawTimeCurrentFrameGeometryRuntime() ||
+            effectiveProducerStage != 11 || record.renderablePart == nullptr)
+          return false;
+        if (War3DrawTimeAnonymousMarkerRejectionActive(
+                record.renderablePart, record.meshPayloadPtr,
+                record.layerIndex))
+          return true;
+        if (!War3CurrentDrawContractNamesExactSlice(
+                record.renderablePart, record.layerIndex, record))
+          return false;
+
+        // Exact rejection and exact ownership use the same immutable key.
+        // Probe them together so SnapshotPreselect does not rebuild/hash the
+        // key and look up the current-frame cache twice for every Stage11
+        // record.
+        const War3DrawTimeVBCacheKey cacheKey = War3MakeDrawTimeVBCacheKey(
+            record.renderablePart, record.layerIndex, &record,
+            m_war3GpuSkinMapEpoch);
+        if (War3DrawTimeExactRejectedCurrentFrame(cacheKey))
+          return true;
+        const auto vbIt = m_war3DrawTimeVBCache.find(cacheKey);
+        return vbIt != m_war3DrawTimeVBCache.end() &&
+            vbIt->second.MatchesKey(cacheKey) &&
+            vbIt->second.frameSerial == m_war3ShadowPersistentFrameSerial &&
+            vbIt->second.exactOwnerFrameSerial ==
+                m_war3ShadowPersistentFrameSerial;
+      };
   m_war3Scene.shadowStats.semanticSceneDirectSelectionLeaseActiveKeyCount =
       stickySelectionLease ? uint32_t(leasedSelectionKeys.size()) : 0u;
 
@@ -24942,17 +26565,69 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
   snapshotOptions.readyOnly = readyOnly;
   snapshotOptions.maxRecords = useObjectFirstSnapshot ? 0u : directScanCap;
   snapshotOptions.unitsOnly = unitsOnly;
-  snapshotOptions.preferredSelectionKeys = preferredSelectionKeys;
-  std::vector<dxvk::war3::render::CurrentDrawContractRecord> directRecords;
+  snapshotOptions.preferredSelectionKeysView = preferredSelectionKeysView;
+  snapshotOptions.preferredSelectionKeysViewSortedUnique = true;
+  static thread_local dxvk::war3::render::
+      VisibleRenderablePartLayerQueryCache s_visiblePartLayerQueryCache;
+  auto& visiblePartLayerQueryCache = s_visiblePartLayerQueryCache;
+  visiblePartLayerQueryCache.reset();
+  snapshotOptions.visiblePartLayerQueryCache =
+      &visiblePartLayerQueryCache;
+  dxvk::war3::render::CurrentDrawContractSnapshotOptions::SnapshotSummary
+      snapshotSummary = {};
+  snapshotOptions.summary = &snapshotSummary;
+  // Release DirectGrouped can discard an exact-owned canonical winner before
+  // copying its large value record. Observer builds and full pose traces keep
+  // the historical complete snapshot. The snapshot implementation applies the
+  // callback only after exact dedupe and bounded ordering, so this cannot
+  // revive a weaker duplicate or backfill across the original cap.
+  if constexpr (!dxvk::war3::render::kDevelopmentShadowObserversEnabled) {
+    if (useObjectGrouped && directRecordCap != 0u &&
+        snapshotOptions.maxRecords != 0u &&
+        !dxvk::war3::render::
+             ShadowPoseFullTraceFastEnabledForRenderThread()) {
+      using ExactOwnerPredicate =
+          decltype(currentFrameDrawTimeProducerOwnsRecord);
+      snapshotOptions.canonicalWinnerFilter.context =
+          &currentFrameDrawTimeProducerOwnsRecord;
+      snapshotOptions.canonicalWinnerFilter.keep =
+          [](const void* context,
+             const dxvk::war3::render::CurrentDrawContractRecord& record)
+                 noexcept {
+            const auto& exactOwner =
+                *static_cast<const ExactOwnerPredicate*>(context);
+            return !exactOwner(record);
+          };
+    }
+  }
+  // Contract records are non-owning scalar values. Reuse only the vector
+  // allocation on this render thread; the snapshot routine clears every
+  // logical element and rebuilds all visibility/generation evidence before
+  // this function can inspect it.
+  static thread_local std::vector<
+      dxvk::war3::render::CurrentDrawContractRecord> s_directRecords;
+  auto& directRecords = s_directRecords;
+  struct DirectRecordScratchReset {
+    std::vector<dxvk::war3::render::CurrentDrawContractRecord>& records;
+
+    ~DirectRecordScratchReset() {
+      records.clear();
+    }
+  };
+  const DirectRecordScratchReset directRecordScratchReset { directRecords };
   {
     auto snapshotScope =
         War3SemanticSubmitScope("War3SemanticScene/Direct/Snapshot");
-    directRecords =
-        dxvk::war3::render::SnapshotPublishedCurrentDrawContracts(
-            snapshotOptions);
+    dxvk::war3::render::SnapshotPublishedCurrentDrawContracts(
+        snapshotOptions, directRecords);
   }
-  dxvk::war3::render::NoteCurrentDrawSnapshotFrame(
-      directRecords, m_war3ShadowPersistentFrameSerial);
+  // A trace can be armed concurrently after the lock-free pre-snapshot probe.
+  // Never label a filtered vector as the complete upstream CurrentDraw set;
+  // skip that racing frame and the next frame will take the unfiltered route.
+  if (!snapshotSummary.canonicalWinnerFilterApplied) {
+    dxvk::war3::render::NoteCurrentDrawSnapshotFrame(
+        directRecords, m_war3ShadowPersistentFrameSerial);
+  }
   enterDirectDetailPhase("SnapshotDiagnostics");
   auto& visibleRegistry =
       dxvk::war3::render::VisibleRenderableRegistry::instance();
@@ -24961,9 +26636,11 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
                                       : visibleRegistry.getFrameNumber();
   auto publishShadowManifestSummary =
       [&](const std::vector<dxvk::war3::render::CurrentDrawContractRecord>&
-              manifestRecords) {
-    visibleRegistry.refreshShadowManifestFromCurrentDraw(manifestRecords,
-                                                         manifestFrame);
+              firstManifestRecords,
+          const std::vector<dxvk::war3::render::CurrentDrawContractRecord>&
+              secondManifestRecords) {
+    visibleRegistry.refreshShadowManifestFromCurrentDraw(
+        firstManifestRecords, secondManifestRecords, manifestFrame);
     const auto manifestSummary =
         visibleRegistry.queryShadowManifestSummary();
     auto& stats = m_war3Scene.shadowStats;
@@ -25015,7 +26692,14 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     stats.semanticSceneVisibleLookupMissCount =
         uint32_t(manifestSummary.visibleLookupMissCount);
   };
-  const uint32_t rawRecordCount = uint32_t(directRecords.size());
+  const uint32_t rawRecordCount = snapshotSummary.canonicalWinnerFilterApplied
+      ? snapshotSummary.canonicalWinnerCount
+      : uint32_t(directRecords.size());
+  if (snapshotSummary.canonicalWinnerFilterApplied) {
+    m_war3Scene.shadowStats
+        .drawTimeSemanticProducerOwnedDirectGroupedSkipCount +=
+        snapshotSummary.filteredCanonicalWinnerCount;
+  }
   // 诊断: raw 层
   m_war3Scene.shadowStats.semanticSceneDirectLastRawRecordCount = rawRecordCount;
   m_war3Scene.shadowStats.semanticSceneDirectCurrentDrawRecordCount +=
@@ -25028,60 +26712,15 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     m_war3Scene.shadowStats.semanticSceneDirectScanCapHitCount++;
   }
 
-  for (const auto& record : directRecords) {
-    if (record.layerIndex != 0u)
-      m_war3Scene.shadowStats
-          .semanticSceneDirectCurrentDrawLayerIndexNonZeroCount++;
-  }
-
-  const auto currentFrameDrawTimeProducerEntry =
-      [&](const dxvk::war3::render::CurrentDrawContractRecord& record)
-          -> const War3DrawTimeVBEntry* {
-        const int16_t effectiveProducerStage =
-            record.producerStage >= 0 ? record.producerStage : record.stage;
-        if (!War3DrawTimeCurrentFrameGeometryRuntime() ||
-            effectiveProducerStage != 11 || record.renderablePart == nullptr ||
-            !War3CurrentDrawContractNamesExactSlice(
-                record.renderablePart, record.layerIndex, record)) {
-          return nullptr;
-        }
-        const War3DrawTimeVBCacheKey cacheKey = War3MakeDrawTimeVBCacheKey(
-            record.renderablePart, record.layerIndex, &record,
-            m_war3GpuSkinMapEpoch);
-        const auto vbIt = m_war3DrawTimeVBCache.find(cacheKey);
-        if (vbIt == m_war3DrawTimeVBCache.end() ||
-            !vbIt->second.MatchesKey(cacheKey) ||
-            vbIt->second.frameSerial != m_war3ShadowPersistentFrameSerial ||
-            vbIt->second.exactOwnerFrameSerial !=
-                m_war3ShadowPersistentFrameSerial) {
-          return nullptr;
-        }
-        return &vbIt->second;
-      };
-  const auto currentFrameDrawTimeProducerOwnsRecord =
-      [&](const dxvk::war3::render::CurrentDrawContractRecord& record) {
-        const int16_t effectiveProducerStage =
-            record.producerStage >= 0 ? record.producerStage : record.stage;
-        if (War3DrawTimeCurrentFrameGeometryRuntime() &&
-            effectiveProducerStage == 11 &&
-            record.renderablePart != nullptr) {
-          const War3DrawTimeVBCacheKey cacheKey =
-              War3MakeDrawTimeVBCacheKey(
-                  record.renderablePart, record.layerIndex, &record,
-                  m_war3GpuSkinMapEpoch);
-          if (War3DrawTimeAnonymousMarkerRejectionActive(
-                  record.renderablePart, record.meshPayloadPtr,
-                  record.layerIndex)) {
-            return true;
-          }
-          if (War3CurrentDrawContractNamesExactSlice(
-                  record.renderablePart, record.layerIndex, record) &&
-              War3DrawTimeExactRejectedCurrentFrame(cacheKey)) {
-            return true;
-          }
-        }
-        return currentFrameDrawTimeProducerEntry(record) != nullptr;
-      };
+  m_war3Scene.shadowStats
+      .semanticSceneDirectCurrentDrawLayerIndexNonZeroCount +=
+      snapshotSummary.canonicalWinnerFilterApplied
+      ? snapshotSummary.canonicalLayerNonZeroCount
+      : uint32_t(std::count_if(
+            directRecords.begin(), directRecords.end(),
+            [](const dxvk::war3::render::CurrentDrawContractRecord& record) {
+              return record.layerIndex != 0u;
+            }));
 
   struct DirectObjectCompletenessBucket {
     uint32_t observedParts = 0u;
@@ -25155,10 +26794,31 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     hash = bit::fnv1a_iter(hash, record.payloadWord108);
     return hash;
   };
-  for (const auto& record : directRecords)
-    completenessBucketForRecord(record).observedParts++;
+  if (trackCompletenessBuckets) {
+    for (const auto& record : directRecords)
+      completenessBucketForRecord(record).observedParts++;
+  }
 
-  std::vector<dxvk::war3::render::CurrentDrawContractRecord> recordsForBuild;
+  // Keep the immutable snapshot as the only owner of CurrentDraw records.
+  // The grouped selector used to copy every record into PreselectedRecord,
+  // move those large values repeatedly during stable_sort, and then copy the
+  // selected records once more into recordsForBuild.  Carry snapshot indices
+  // instead: all policy/order keys and the eventual packet builder still read
+  // the exact same record, while the hot path moves only a uint32_t.
+  struct DirectRecordBuildRef {
+    uint64_t selectionKey = 0u;
+    uint32_t recordIndex = 0u;
+    uint32_t visibleHintIndex = UINT32_MAX;
+  };
+  static_assert(sizeof(DirectRecordBuildRef) == 16u);
+  static thread_local std::vector<DirectRecordBuildRef> s_recordBuildRefs;
+  static thread_local std::vector<
+      dxvk::war3::render::VisibleRenderableRecord>
+      s_preselectedVisibleHints;
+  auto& recordBuildRefs = s_recordBuildRefs;
+  auto& preselectedVisibleHints = s_preselectedVisibleHints;
+  recordBuildRefs.clear();
+  preselectedVisibleHints.clear();
   const War3CompactWorkTableMode compactWorkTableMode =
       War3SemanticCompactWorkTableModeRuntime();
   const bool observeCompactWorkTable =
@@ -25271,12 +26931,23 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
           evidence.flags |= uint8_t(War3CompactWorkPreviouslySelected);
         return evidence;
       };
-  bool recordsForBuildAlphaPrefiltered = false;
+  // The grouped preselector has already run the canonical exact-owner,
+  // static-world, producer-policy, blocker and alpha gates for every record it
+  // publishes to BuildEligible. Nothing between these two loops mutates those
+  // render-thread contracts, so repeating the same registry/cache probes would
+  // only charge the selected subset twice.
+  bool recordsForBuildCanonicalPrefiltered = false;
   if (useObjectGrouped && directRecordCap != 0u) {
     enterDirectDetailPhase("PreselectScan");
+    // Store only successful value snapshots. The old sparse array
+    // default-initialized one full VisibleRenderableRecord per raw record,
+    // including records rejected before BuildEligible. A compact index follows
+    // the candidate through sorting and final selection instead.
+    preselectedVisibleHints.reserve(rawRecordCount);
+    recordBuildRefs.reserve(directStickyRecordBudget);
     struct PreselectedRecord {
-      dxvk::war3::render::CurrentDrawContractRecord record = {};
-      War3CompactWorkItem work = {};
+      uint32_t recordIndex = 0u;
+      uint32_t visibleHintIndex = UINT32_MAX;
       uint64_t selectionKey = 0u;
       uint32_t priorityScore = 0u;
       bool previouslySelected = false;
@@ -25289,14 +26960,29 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       bool previouslySelected = false;
     };
 
-    std::vector<PreselectedRecord> preselectedRecords;
+    static thread_local std::vector<PreselectedRecord> s_preselectedRecords;
+    static thread_local std::vector<PreselectedGroup> s_preselectedGroups;
+    static thread_local std::vector<War3CompactWorkItem>
+        s_preselectedWorkByRecordIndex;
+    auto& preselectedRecords = s_preselectedRecords;
+    auto& preselectedGroups = s_preselectedGroups;
+    auto& preselectedWorkByRecordIndex = s_preselectedWorkByRecordIndex;
+    preselectedRecords.clear();
+    preselectedGroups.clear();
+    preselectedWorkByRecordIndex.clear();
     preselectedRecords.reserve(rawRecordCount);
+    if (compactWorkTableMode != War3CompactWorkTableMode::Off)
+      preselectedWorkByRecordIndex.resize(directRecords.size());
     auto preselectScope = War3SemanticSubmitScope(
         "War3SemanticScene/Direct/Preselect");
-    for (const auto& record : directRecords) {
+    for (uint32_t recordIndex = 0u;
+         recordIndex < uint32_t(directRecords.size()); ++recordIndex) {
+      const auto& record = directRecords[recordIndex];
       War3CompactWorkItem work = {};
-      if (compactWorkTableMode != War3CompactWorkTableMode::Off)
+      if (compactWorkTableMode != War3CompactWorkTableMode::Off) {
         work = buildCompactWorkEvidence(record);
+        preselectedWorkByRecordIndex[recordIndex] = work;
+      }
       const bool workSealed =
           War3CompactWorkHasFlag(work, War3CompactWorkSealed);
       const bool useSealedWork = consumeCompactWorkTable && workSealed;
@@ -25352,7 +27038,9 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       if (!producerAllowed) {
         continue;
       }
-      auto& bucket = completenessBucketForRecord(record);
+      DirectObjectCompletenessBucket* bucket = trackCompletenessBuckets
+          ? &completenessBucketForRecord(record)
+          : nullptr;
       const bool canonicalPathBlocker = !useSealedWork || observeCompactWorkTable
           ? (dxvk::war3::internal::kPathBlockerHideEnabled &&
              War3ShadowIsLosBlocker(record))
@@ -25376,14 +27064,25 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       if (War3RejectCurrentDrawRecordByUnsafeAlphaVisualPolicy(
               record, m_war3ShadowPersistentFrameSerial,
               m_war3Scene.shadowStats)) {
-        bucket.alphaRejectedParts++;
+        if (bucket != nullptr)
+          bucket->alphaRejectedParts++;
         continue;
       }
-      bucket.shadowEligibleParts++;
+      if (bucket != nullptr)
+        bucket->shadowEligibleParts++;
 
+      const dxvk::war3::render::VisibleRenderableRecord* visibleHint = nullptr;
       const uint64_t selectionKey = useSealedWork
           ? work.selectionKey
-          : War3SemanticDirectRecordSelectionKey(record);
+          : War3SemanticDirectRecordSelectionKey(
+                record, &visibleHint, &visiblePartLayerQueryCache);
+      uint32_t visibleHintIndex = UINT32_MAX;
+      if (!useSealedWork && visibleHint != nullptr &&
+          visibleHint->renderablePart == record.renderablePart) {
+        visibleHintIndex = uint32_t(preselectedVisibleHints.size());
+        // Consume the cache-owned pointer before the next selection query.
+        preselectedVisibleHints.push_back(*visibleHint);
+      }
       const uint32_t priorityScore = useSealedWork
           ? work.priorityScore
           : War3SemanticDirectRecordPriorityScore(record);
@@ -25400,29 +27099,37 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
         m_war3Scene.shadowStats.semanticSceneCompactWorkTableMismatchCount++;
       }
       preselectedRecords.push_back(
-          {record,
-           work,
+          {recordIndex,
+           visibleHintIndex,
            selectionKey,
            priorityScore,
            previouslySelected});
     }
 
     enterDirectDetailPhase("PreselectRecordSort");
-    std::stable_sort(
+    // recordIndex is the source ordinal because the preselect scan appends in
+    // directRecords order.  Use it as the final key so std::sort produces the
+    // exact stable-sort order for otherwise equal records without allocating
+    // a merge buffer every frame.
+    std::sort(
         preselectedRecords.begin(), preselectedRecords.end(),
-        [](const PreselectedRecord& a, const PreselectedRecord& b) {
+        [&directRecords](const PreselectedRecord& a,
+                         const PreselectedRecord& b) {
+          const auto& aRecord = directRecords[a.recordIndex];
+          const auto& bRecord = directRecords[b.recordIndex];
           if (a.selectionKey != b.selectionKey)
             return a.selectionKey < b.selectionKey;
-          if (a.record.layerIndex != b.record.layerIndex)
-            return a.record.layerIndex < b.record.layerIndex;
-          if (a.record.payloadWord108 != b.record.payloadWord108)
-            return a.record.payloadWord108 < b.record.payloadWord108;
-          return uintptr_t(a.record.renderablePart) <
-                 uintptr_t(b.record.renderablePart);
+          if (aRecord.layerIndex != bRecord.layerIndex)
+            return aRecord.layerIndex < bRecord.layerIndex;
+          if (aRecord.payloadWord108 != bRecord.payloadWord108)
+            return aRecord.payloadWord108 < bRecord.payloadWord108;
+          if (aRecord.renderablePart != bRecord.renderablePart)
+            return uintptr_t(aRecord.renderablePart) <
+                   uintptr_t(bRecord.renderablePart);
+          return a.recordIndex < b.recordIndex;
         });
 
     enterDirectDetailPhase("PreselectGroupBuild");
-    std::vector<PreselectedGroup> preselectedGroups;
     preselectedGroups.reserve(preselectedRecords.size());
     for (uint32_t i = 0u; i < uint32_t(preselectedRecords.size());) {
       const uint64_t selectionKey = preselectedRecords[i].selectionKey;
@@ -25453,7 +27160,6 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
               });
 
     enterDirectDetailPhase("PreselectSelection");
-    recordsForBuild.reserve(directStickyRecordBudget);
     const bool stickyLease =
         War3SemanticStickySelectionLeaseRuntime() &&
         !preferredSelectionKeys.empty();
@@ -25463,7 +27169,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
 
     auto tryAppendPreselectedGroup = [&](const PreselectedGroup& group,
                                          size_t groupBudget) {
-      if (recordsForBuild.size() + group.count > groupBudget) {
+      if (recordBuildRefs.size() + group.count > groupBudget) {
         m_war3Scene.shadowStats.semanticSceneDirectObjectGroupedSkipCount++;
         m_war3Scene.shadowStats.semanticSceneDirectRecordCapTruncatedRecordCount +=
             group.count;
@@ -25472,28 +27178,38 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
               group.count;
         return false;
       }
-      const size_t beforeSize = recordsForBuild.size();
+      const size_t beforeSize = recordBuildRefs.size();
       for (uint32_t i = group.startIdx; i < group.startIdx + group.count; ++i) {
-        recordsForBuild.push_back(preselectedRecords[i].record);
-        if (compactWorkTableMode != War3CompactWorkTableMode::Off)
-          m_war3CompactWorkTable.append(preselectedRecords[i].work);
+        recordBuildRefs.push_back(
+            {preselectedRecords[i].selectionKey,
+             preselectedRecords[i].recordIndex,
+             preselectedRecords[i].visibleHintIndex});
+        if (compactWorkTableMode != War3CompactWorkTableMode::Off) {
+          const uint32_t sourceRecordIndex =
+              preselectedRecords[i].recordIndex;
+          if (sourceRecordIndex < preselectedWorkByRecordIndex.size())
+            m_war3CompactWorkTable.append(
+                preselectedWorkByRecordIndex[sourceRecordIndex]);
+          else
+            m_war3CompactWorkTable.appendInvalid(1u);
+        }
       }
       if (stickySelectionFill && group.previouslySelected &&
-          recordsForBuild.size() > size_t(directRecordCap)) {
+          recordBuildRefs.size() > size_t(directRecordCap)) {
         const size_t extraBefore =
             beforeSize > size_t(directRecordCap)
                 ? beforeSize - size_t(directRecordCap)
                 : 0u;
         const size_t extraAfter =
-            recordsForBuild.size() - size_t(directRecordCap);
+            recordBuildRefs.size() - size_t(directRecordCap);
         m_war3Scene.shadowStats.semanticSceneDirectStickyFillAppendedCount +=
             uint32_t(extraAfter - extraBefore);
       }
       if (beforeSize < size_t(directRecordCap) &&
-          recordsForBuild.size() >= size_t(directRecordCap)) {
+          recordBuildRefs.size() >= size_t(directRecordCap)) {
         m_war3Scene.shadowStats.semanticSceneDirectRecordCapHitCount++;
       }
-      return recordsForBuild.size() < groupBudget;
+      return recordBuildRefs.size() < groupBudget;
     };
 
     if (stickyLease) {
@@ -25508,7 +27224,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       }
     }
 
-    if (!stickyLease || recordsForBuild.size() < stickyMinRecords) {
+    if (!stickyLease || recordBuildRefs.size() < stickyMinRecords) {
       for (const auto& group : preselectedGroups) {
         if (stickyLease && group.previouslySelected)
           continue;
@@ -25516,10 +27232,15 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
           break;
       }
     }
-    recordsForBuildAlphaPrefiltered = true;
+    recordsForBuildCanonicalPrefiltered = true;
   } else {
     enterDirectDetailPhase("SnapshotFallbackCopy");
-    recordsForBuild = directRecords;
+    recordBuildRefs.resize(directRecords.size());
+    // Zero selection and UINT32_MAX hint mean the uncapped fallback did not
+    // run the grouped preselector; BuildEligible retains its historical
+    // on-demand identity and visible-record resolution.
+    for (uint32_t i = 0u; i < uint32_t(recordBuildRefs.size()); ++i)
+      recordBuildRefs[i].recordIndex = i;
   }
 
   // --- Step 2: build eligible record list (per-record filtering) ---
@@ -25573,6 +27294,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     uint64_t selectionKey = 0u;
     uint64_t submittedPartIdentityKey = 0u;
     uint64_t manifestPartLeaseKey = 0u;
+    War3SemanticDirectMainWorldBackingStatus mainWorldBackingStatus =
+        War3SemanticDirectMainWorldBackingStatus::NotChecked;
     bool previouslySubmittedPart = false;
     // Phase 7.25 part lease 路径恢复出来的 packet 标记。
     bool fromPartPacketLease = false;
@@ -25584,6 +27307,12 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     // BuildPacket 的 bind-pose/palette 数据层构建。该 packet 只供 fast append
     // 消费，不允许写入跨帧 part lease。
     bool fromDrawTimePrebuildBypass = false;
+    // The grouped preselector already queried the current-frame exact Stage11
+    // ownership contract for this record. Nothing between preselection and
+    // append mutates that render-thread-owned table, so the final append gate
+    // need not rebuild the key and repeat the same negative cache lookup.
+    // Restored leases and sealed development work never receive this proof.
+    bool currentFrameExactOwnerPrefiltered = false;
     // The units-only direct eligibility gate duplicates the complete dynamic
     // unit evidence contract (apart from the explicit transparent-queue
     // predicate recorded below). Carry that already-proved diagnostic fact
@@ -25629,7 +27358,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     }
   }
   auto packetSafeForDirectPartLease = [this](
-      const EligibleRecord& eligible,
+      EligibleRecord& eligible,
       bool forLiveLeaseUpdate) {
     auto& stats = m_war3Scene.shadowStats;
     if (eligible.fromDrawTimePrebuildBypass)
@@ -25667,99 +27396,69 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     if (packet.resource.dynamicIndexStream != nullptr &&
         packet.resource.dynamicIndexCount != 0u &&
         (packet.resource.ownedDynamicIndices == nullptr ||
-         packet.resource.ownedDynamicIndices->empty())) {
+         packet.resource.ownedDynamicIndices->empty()) &&
+        !War3PacketResourceHasImmutableDynamicIndexSlice(packet.resource)) {
       stats.semanticSceneDirectPartLeaseRejectedNotSelfContainedCount++;
       stats.semanticSceneShadowManifestPartLeaseRejectedNotSelfContainedCount++;
       return false;
     }
     if (!packet.hasRuntimeGroupPalette || packet.runtimeGroupPalette.empty() ||
-        packet.resource.ownedVertexGroupIndices.empty()) {
+        (packet.resource.ownedVertexGroupIndices.empty() &&
+         !War3PacketResourceHasImmutableCurrentDrawGroupSlots(
+             packet.resource))) {
       stats.semanticSceneDirectPartLeaseRejectedNotSelfContainedCount++;
       stats.semanticSceneShadowManifestPartLeaseRejectedNotSelfContainedCount++;
       return false;
     }
     War3SemanticDirectMainWorldBackingStatus backingStatus =
-        War3SemanticDirectMainWorldBackingStatus::NotChecked;
-    if (!War3SemanticDirectPacketHasMainWorldVisibleBacking(packet,
-                                                           &backingStatus)) {
+        eligible.mainWorldBackingStatus;
+    const bool hasMainWorldVisibleBacking =
+        backingStatus != War3SemanticDirectMainWorldBackingStatus::NotChecked
+        ? backingStatus == War3SemanticDirectMainWorldBackingStatus::Pass
+        : War3SemanticDirectPacketHasMainWorldVisibleBacking(
+              packet, &backingStatus);
+    eligible.mainWorldBackingStatus = backingStatus;
+    if (!hasMainWorldVisibleBacking) {
       stats.semanticSceneDirectPartLeaseRejectedUnsafeBackingCount++;
       stats.semanticSceneShadowManifestPartLeaseRejectedUnsafeBackingCount++;
       return false;
     }
     return true;
   };
-  std::vector<EligibleRecord> submittedPartPacketLeaseRecords;
+  // Both lists are bounded by the direct-record budget and are consumed
+  // entirely inside this render-thread call. Successful lease candidates only
+  // need an address into eligibleRecords until SubmitLeaseUpdate below. Both
+  // submission layouts finish every resize/move before an address is recorded,
+  // and do not mutate eligibleRecords afterwards. Keep non-owning pointers here
+  // so packet/palette vectors are copied exactly once, into the persistent
+  // lease, instead of once into an intermediate list and again into the lease.
+  // This is strictly an intra-call handoff and grants no cross-frame lifetime.
+  static thread_local std::vector<const EligibleRecord*>
+      s_submittedPartPacketLeaseRecords;
+  static thread_local std::vector<EligibleRecord> s_eligibleRecords;
+  static thread_local std::vector<EligibleRecord> s_recycledEligibleRecords;
+  static thread_local std::vector<
+      dxvk::war3::render::CurrentDrawContractRecord>
+      s_shadowEligibleManifestRecords;
+  auto& submittedPartPacketLeaseRecords =
+      s_submittedPartPacketLeaseRecords;
+  auto& eligibleRecords = s_eligibleRecords;
+  auto& recycledEligibleRecords = s_recycledEligibleRecords;
+  auto& shadowEligibleManifestRecords = s_shadowEligibleManifestRecords;
+  submittedPartPacketLeaseRecords.clear();
+  dxvk::war3::render::RecycleScratchElements(
+      eligibleRecords, recycledEligibleRecords);
+  shadowEligibleManifestRecords.clear();
   // 使用固定大小预分配避免多次 realloc
-  std::vector<EligibleRecord> eligibleRecords;
   eligibleRecords.reserve(std::min<uint32_t>(
-      uint32_t(recordsForBuild.size()),
+      uint32_t(recordBuildRefs.size()),
       directRecordCap != 0u ? directRecordCap * 2u
-                            : uint32_t(recordsForBuild.size())));
-  std::vector<dxvk::war3::render::CurrentDrawContractRecord>
-      shadowEligibleManifestRecords;
-  std::vector<dxvk::war3::render::CurrentDrawContractRecord>
-      exactSubmittedManifestRecords;
-  exactSubmittedManifestRecords.reserve(m_war3DrawTimeVBCache.size());
-  const uint32_t currentRenderFrameIndex =
-      dxvk::war3::state::RenderState::instance().getFrameIndex();
-  for (const auto& [cacheKey, entry] : m_war3DrawTimeVBCache) {
-    if (entry.frameSerial != m_war3ShadowPersistentFrameSerial ||
-        entry.exactOwnerFrameSerial != m_war3ShadowPersistentFrameSerial ||
-        entry.exactSubmittedFrameSerial !=
-            m_war3ShadowPersistentFrameSerial ||
-        !entry.MatchesKey(cacheKey) || !entry.HasCompleteBacking()) {
-      continue;
-    }
-
-    dxvk::war3::render::CurrentDrawContractRecord exactRecord = {};
-    exactRecord.known = true;
-    exactRecord.sceneNode = entry.sceneNode;
-    exactRecord.renderablePart = entry.renderablePart;
-    exactRecord.meshPayloadPtr = entry.meshPayloadPtr;
-    exactRecord.worldObjectEntry = entry.worldObjectEntry;
-    exactRecord.unitPtr = entry.unitPtr;
-    exactRecord.jHandle =
-        entry.jHandle != 0u ? entry.jHandle : entry.contractJHandle;
-    exactRecord.rawcode = entry.rawcode;
-    // Preserve Unknown.  A cache/part identity is not proof that this draw is
-    // a Unit; promoting it here allowed anonymous path markers to enter the
-    // Unit-only final-caster exemption.
-    exactRecord.objectKind = entry.objectKind;
-    exactRecord.layerIndex = entry.layerIndex;
-    if (War3SemanticRawcodeLooksStaticWorldCaster(exactRecord.rawcode)) {
-      exactRecord.objectKind =
-          dxvk::war3::render::ObjectKind::Destructible;
-    }
-    exactRecord.payloadWord108 = entry.payloadWord108;
-    exactRecord.payloadWord11C = entry.payloadWord11C;
-    exactRecord.stage = entry.producerStage >= 0
-                            ? entry.producerStage
-                            : int16_t(11);
-    exactRecord.visibleFrameSerial = manifestFrame;
-    exactRecord.renderFrameIndex = currentRenderFrameIndex;
-    exactRecord.batchTag = War3BatchTag::WorldObjects;
-    exactRecord.producerStage = exactRecord.stage;
-    exactRecord.producerGroup = War3BatchTag::WorldObjects;
-    exactRecord.sourceKind =
-        dxvk::war3::render::ShadowProducerKind::DrawTimeGeometry;
-    exactRecord.producerFreshThisFrame = true;
-    exactRecord.stagePolicyRevision =
-        dxvk::war3::render::CurrentShadowStagePolicyRevision();
-    exactRecord.fromGrace = false;
-    exactRecord.graceAge = 0u;
-    exactRecord.pathBlocker =
-        entry.pathBlocker || entry.pathBlockerGeometryMarker ||
-        IsLosBlockerFourCc(exactRecord.rawcode);
-    exactRecord.alphaPayloadComplete =
-        !entry.alphaTestEnabled || entry.HasCompleteAlphaPayload();
-    exactSubmittedManifestRecords.push_back(std::move(exactRecord));
-  }
-  shadowEligibleManifestRecords.reserve(recordsForBuild.size() +
-                                        exactSubmittedManifestRecords.size());
-  shadowEligibleManifestRecords.insert(
-      shadowEligibleManifestRecords.end(),
-      exactSubmittedManifestRecords.begin(),
-      exactSubmittedManifestRecords.end());
+                            : uint32_t(recordBuildRefs.size())));
+  // Exact Stage11 records already live in their caller-owned immutable range.
+  // Keep only DirectGrouped records here; manifest refresh consumes both
+  // ranges in the historical exact-then-direct order without cloning exact
+  // CurrentDrawContractRecord values into this scratch vector every frame.
+  shadowEligibleManifestRecords.reserve(recordBuildRefs.size());
   std::vector<uint64_t> producerClaimStrictKeys;
   std::vector<uint64_t> producerClaimLogicalKeys;
   if (observeProducerClaims) {
@@ -25857,12 +27556,14 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
         return manifestRecord;
       };
 
+  const bool drawTimePrebuildBypassEnabled =
+      War3DrawTimeVBCacheRuntime() &&
+      War3SemanticDrawTimePrebuildBypassRuntime() &&
+      War3SemanticDrawTimeFastAppendRuntime();
   auto tryBuildDrawTimePrebuildBypassEligible =
       [&](const dxvk::war3::render::CurrentDrawContractRecord& record,
           EligibleRecord& eligible) {
-    if (!War3DrawTimeVBCacheRuntime() ||
-        !War3SemanticDrawTimePrebuildBypassRuntime() ||
-        !War3SemanticDrawTimeFastAppendRuntime()) {
+    if (!drawTimePrebuildBypassEnabled) {
       return false;
     }
 
@@ -26015,14 +27716,67 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
   War3CurrentDrawVisibleIndexSliceCache currentDrawVisibleIndexSliceCache(
       War3CurrentDrawVisibleIndexSliceCacheRuntime(),
       War3CurrentDrawGenerationIndexSliceCacheRuntime());
+  War3CurrentDrawGeosetSnapshotCache currentDrawGeosetSnapshotCache(
+      dxvk::war3::model::ShadowModelResourceCache::instance().mapEpoch());
+  static thread_local War3CurrentDrawInstanceSnapshotCache
+      currentDrawInstanceSnapshotCache;
+  static thread_local War3CurrentDrawShadowObjectSnapshotCache
+      currentDrawShadowObjectSnapshotCache;
+  static thread_local War3CurrentDrawPoseAugmentSnapshotCache
+      currentDrawPoseAugmentSnapshotCache;
+  // Retain the fixed entry storage across frames, but advance an independent
+  // Populate generation so no registry result can ever be reused cross-frame.
+  currentDrawInstanceSnapshotCache.reset();
+  currentDrawShadowObjectSnapshotCache.reset();
+  currentDrawPoseAugmentSnapshotCache.reset();
+
+  const auto acquireEligibleRecord = [&]() {
+    EligibleRecord eligible = dxvk::war3::render::AcquireScratchElement(
+        recycledEligibleRecords);
+    // The canonical packet builder owns the authoritative reset immediately
+    // before it validates this record. Resetting the same packet/sample here
+    // would move their scratch vectors and clear both large objects twice for
+    // every caster. The optional prebuild path replaces both objects with
+    // complete current-frame values before it can report success.
+    eligible.sceneNode = nullptr;
+    eligible.completenessKey = 0u;
+    eligible.recordSelectionKey = 0u;
+    eligible.selectionKey = 0u;
+    eligible.submittedPartIdentityKey = 0u;
+    eligible.manifestPartLeaseKey = 0u;
+    eligible.mainWorldBackingStatus =
+        War3SemanticDirectMainWorldBackingStatus::NotChecked;
+    eligible.previouslySubmittedPart = false;
+    eligible.fromPartPacketLease = false;
+    eligible.fromStalePoseRestore = false;
+    eligible.fromDrawTimePrebuildBypass = false;
+    eligible.currentFrameExactOwnerPrefiltered = false;
+    eligible.statsDynamicUnitEvidenceKnown = false;
+    eligible.statsDynamicUnitEvidence = false;
+    return eligible;
+  };
+  const auto recycleRejectedEligibleRecord = [&](EligibleRecord&& eligible) {
+    recycledEligibleRecords.push_back(std::move(eligible));
+  };
 
   enterBuildEligiblePhase("RecordLoop");
-  for (size_t recordIndex = 0u; recordIndex < recordsForBuild.size();
-       ++recordIndex) {
-    const auto& record = recordsForBuild[recordIndex];
+  for (size_t buildIndex = 0u;
+       buildIndex < recordBuildRefs.size(); ++buildIndex) {
+    const DirectRecordBuildRef& buildRef = recordBuildRefs[buildIndex];
+    const uint32_t recordIndex = buildRef.recordIndex;
+    if (recordIndex >= directRecords.size())
+      continue;
+    const auto& record = directRecords[recordIndex];
+    const uint32_t preselectedVisibleHintIndex = buildRef.visibleHintIndex;
+    const dxvk::war3::render::VisibleRenderableRecord*
+        preselectedVisibleRecord =
+            preselectedVisibleHintIndex < preselectedVisibleHints.size()
+            ? &preselectedVisibleHints[preselectedVisibleHintIndex]
+            : nullptr;
+    const uint64_t preselectedRecordSelectionKey = buildRef.selectionKey;
     War3CompactWorkItem compactWork = {};
-    const bool hasCompactWork =
-        m_war3CompactWorkTable.load(recordIndex, compactWork);
+    const bool hasCompactWork = consumeCompactWorkTable &&
+        m_war3CompactWorkTable.load(buildIndex, compactWork);
     const bool useSealedWork = consumeCompactWorkTable &&
         hasCompactWork &&
         War3CompactWorkHasFlag(compactWork, War3CompactWorkValid) &&
@@ -26036,15 +27790,18 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     // slice under the blocker/alpha fail-closed policy.  In both cases the
     // generic skinned reconstruction must not publish a second, non-equivalent
     // representation for the same part in this frame.
-    if (!useSealedWork && currentFrameDrawTimeProducerOwnsRecord(record)) {
+    const bool rerunCanonicalRecordFilters =
+        !recordsForBuildCanonicalPrefiltered && !useSealedWork;
+    if (rerunCanonicalRecordFilters &&
+        currentFrameDrawTimeProducerOwnsRecord(record)) {
       m_war3Scene.shadowStats
           .drawTimeSemanticProducerOwnedDirectGroupedSkipCount++;
       continue;
     }
-    if (!useSealedWork &&
+    if (rerunCanonicalRecordFilters &&
         War3SemanticRawcodeLooksStaticWorldCaster(record.rawcode))
       continue;
-    if (!useSealedWork) {
+    if (rerunCanonicalRecordFilters) {
       const dxvk::war3::render::ShadowProducerPolicyContext producerContext = {
           record.stage,
           record.batchTag,
@@ -26061,13 +27818,22 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     const bool traceBuildRecord =
         traceBuildEligible &&
         War3SampleSemanticBuildEligibleTrace(buildEligibleTracePeriod);
-    War3BuildEligibleRecordRawTiming buildRecordTiming(
-        traceBuildRecord, buildEligibleTracePeriod,
-        buildEligibleQpcOverheadTicks,
-        buildEligibleRecordPhaseTicks, buildEligibleRecordPhaseCalls);
-    buildRecordTiming.enter(War3BuildEligibleRecordPhase::GateFilter);
-    auto& bucket = completenessBucketForRecord(record);
-    if (!useSealedWork && dxvk::war3::internal::kPathBlockerHideEnabled &&
+    std::optional<War3BuildEligibleRecordRawTiming> buildRecordTiming;
+    if (traceBuildRecord) {
+      buildRecordTiming.emplace(
+          true, buildEligibleTracePeriod, buildEligibleQpcOverheadTicks,
+          buildEligibleRecordPhaseTicks, buildEligibleRecordPhaseCalls);
+    }
+    const auto enterBuildRecordPhase = [&](War3BuildEligibleRecordPhase phase) {
+      if (buildRecordTiming.has_value())
+        buildRecordTiming->enter(phase);
+    };
+    enterBuildRecordPhase(War3BuildEligibleRecordPhase::GateFilter);
+    DirectObjectCompletenessBucket* bucket = trackCompletenessBuckets
+        ? &completenessBucketForRecord(record)
+        : nullptr;
+    if (rerunCanonicalRecordFilters &&
+        dxvk::war3::internal::kPathBlockerHideEnabled &&
         War3ShadowIsLosBlocker(record)) {
       m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
       m_war3Scene.shadowStats
@@ -26077,15 +27843,16 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       m_war3Scene.shadowStats.skippedNotCaster++;
       continue;
     }
-    if (!recordsForBuildAlphaPrefiltered &&
+    if (rerunCanonicalRecordFilters &&
         War3RejectCurrentDrawRecordByUnsafeAlphaVisualPolicy(
             record, m_war3ShadowPersistentFrameSerial,
             m_war3Scene.shadowStats)) {
-      bucket.alphaRejectedParts++;
+      if (bucket != nullptr)
+        bucket->alphaRejectedParts++;
       continue;
     }
-    if (!recordsForBuildAlphaPrefiltered)
-      bucket.shadowEligibleParts++;
+    if (rerunCanonicalRecordFilters && bucket != nullptr)
+      bucket->shadowEligibleParts++;
     uint64_t producerClaimStrictKey = 0u;
     uint64_t producerClaimLogicalKey = 0u;
     bool producerClaimStrictPredicted = false;
@@ -26112,34 +27879,62 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
           stats.semanticSceneProducerClaimLogicalPredictedCount++;
       }
     }
-    EligibleRecord eligible = {};
-    eligible.completenessKey = completenessKeyForRecord(record);
-    buildRecordTiming.enter(War3BuildEligibleRecordPhase::Prebuild);
+    EligibleRecord eligible = acquireEligibleRecord();
+    eligible.currentFrameExactOwnerPrefiltered =
+        recordsForBuildCanonicalPrefiltered && !useSealedWork;
+    // Completeness buckets are development-only diagnostics. The canonical
+    // object key normally requires an exact VisibleRenderable lookup, which
+    // the grouped preselector has already performed. Do not repeat that
+    // lookup in Release where the bucket is disabled; when diagnostics are
+    // enabled, reuse the sealed/preselected key whenever one was carried into
+    // this loop and only resolve the uncapped fallback on demand.
+    const uint64_t carriedRecordSelectionKey = useSealedWork
+        ? compactWork.selectionKey
+        : preselectedRecordSelectionKey;
+    eligible.completenessKey = trackCompletenessBuckets
+        ? (carriedRecordSelectionKey != 0u
+               ? carriedRecordSelectionKey
+               : completenessKeyForRecord(record))
+        : 0u;
+    enterBuildRecordPhase(War3BuildEligibleRecordPhase::Prebuild);
     const bool drawTimePrebuildBypassed =
         tryBuildDrawTimePrebuildBypassEligible(record, eligible);
     if (!drawTimePrebuildBypassed) {
-      buildRecordTiming.enter(War3BuildEligibleRecordPhase::PacketBuild);
+      enterBuildRecordPhase(War3BuildEligibleRecordPhase::PacketBuild);
       auto buildPacketScope =
           War3SemanticSubmitScope("War3SemanticScene/Direct/BuildPacketCall");
-      War3PacketBuildRawTiming packetBuildTiming(
-          traceBuildRecord, buildEligibleTracePeriod,
-          buildEligibleQpcOverheadTicks, buildEligiblePacketPhaseTicks,
-          buildEligiblePacketPhaseCalls, buildEligiblePacketNestedPhaseTicks,
-          buildEligiblePacketNestedPhaseCalls,
-          buildEligibleIndexSlicePhaseTicks,
-          buildEligibleIndexSlicePhaseCalls);
+      std::optional<War3PacketBuildRawTiming> packetBuildTiming;
+      if (traceBuildRecord) {
+        packetBuildTiming.emplace(
+            true, buildEligibleTracePeriod, buildEligibleQpcOverheadTicks,
+            buildEligiblePacketPhaseTicks, buildEligiblePacketPhaseCalls,
+            buildEligiblePacketNestedPhaseTicks,
+            buildEligiblePacketNestedPhaseCalls,
+            buildEligibleIndexSlicePhaseTicks,
+            buildEligibleIndexSlicePhaseCalls);
+      }
       const bool packetBuilt = War3TryBuildShadowPacketFromCurrentDrawRecord(
           record, currentDrawMinVisibleFrameSerial, eligible.packet,
           &eligible.sample,
-          traceBuildRecord ? &packetBuildTiming : nullptr,
+          packetBuildTiming.has_value() ? &*packetBuildTiming : nullptr,
           &currentDrawGroupRangeValidator,
-          &currentDrawVisibleIndexSliceCache);
-      packetBuildTiming.finish();
+          &currentDrawVisibleIndexSliceCache,
+          &currentDrawGeosetSnapshotCache,
+          &currentDrawInstanceSnapshotCache,
+          &currentDrawShadowObjectSnapshotCache,
+          &currentDrawPoseAugmentSnapshotCache,
+          preselectedVisibleRecord,
+          &eligible.mainWorldBackingStatus,
+          recordsForBuildCanonicalPrefiltered && !useSealedWork);
+      if (packetBuildTiming.has_value())
+        packetBuildTiming->finish();
       if (!packetBuilt) {
-        bucket.packetBuildFailParts++;
+        if (bucket != nullptr)
+          bucket->packetBuildFailParts++;
         if (observeProducerClaims)
           m_war3Scene.shadowStats
               .semanticSceneProducerClaimUnresolvedCount++;
+        recycleRejectedEligibleRecord(std::move(eligible));
         continue;
       }
       m_war3Scene.shadowStats.semanticSceneDirectCurrentDrawBuiltPacketCount++;
@@ -26174,16 +27969,18 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     // with unrelated palette/world/UV state.
     if (War3SemanticRawcodeLooksStaticWorldCaster(
             eligible.packet.renderable.rawcode)) {
+      recycleRejectedEligibleRecord(std::move(eligible));
       continue;
     }
-    buildRecordTiming.enter(War3BuildEligibleRecordPhase::Eligibility);
+    enterBuildRecordPhase(War3BuildEligibleRecordPhase::Eligibility);
     // unitsOnly eligibility 过滤
     War3SemanticDirectMainWorldBackingStatus mainWorldBackingStatus =
         War3SemanticDirectMainWorldBackingStatus::NotChecked;
     bool directSubmitEligible = true;
     if (unitsOnly && !drawTimePrebuildBypassed) {
       directSubmitEligible = War3LooksSubmitEligibleForDirectCurrentDrawFast(
-          eligible.packet, true, &eligible.sample, &mainWorldBackingStatus);
+          eligible.packet, true, &eligible.sample,
+          eligible.mainWorldBackingStatus, &mainWorldBackingStatus);
     }
     // Phase 7.26：移除非 unitsOnly 路径下的 skinned 纯诊断 backing 调用。
     // 这里只是为了分类统计而再次做 visible lookup，实际决策路径并不使用，
@@ -26206,6 +28003,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
         m_war3Scene.shadowStats
             .semanticSceneDirectCurrentDrawUnitsFilterRejectNoStableResourceCount++;
       }
+      recycleRejectedEligibleRecord(std::move(eligible));
       continue;
     }
     if (unitsOnly && !drawTimePrebuildBypassed) {
@@ -26218,37 +28016,34 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
           eligible.packet.renderable.queueKind !=
           dxvk::war3::render::VisibleRenderableQueueKind::Transparent;
     }
-    buildRecordTiming.enter(War3BuildEligibleRecordPhase::Manifest);
-    const auto manifestRecord =
+    enterBuildRecordPhase(War3BuildEligibleRecordPhase::Manifest);
+    auto manifestRecord =
         manifestRecordForEligible(record, eligible.packet, eligible.sample);
     eligible.manifestPartLeaseKey =
         dxvk::war3::render::VisibleRenderableRegistry::
             computeShadowManifestPartKey(manifestRecord);
-    // Grace fills a producer hole but must not impersonate fresh visibility.
-    // Preserve the original visibleFrameSerial and part key for one-frame
-    // replay, without refreshing Manifest structure/pose/slice timestamps.
-    if (!eligible.sample.contract.fromGrace)
-      shadowEligibleManifestRecords.push_back(manifestRecord);
-    bucket.eligibleParts++;
-    if (eligible.packet.path == dxvk::war3::shadow::ShadowDrawPath::Skinned) {
+    if (bucket != nullptr)
+      bucket->eligibleParts++;
+    if (bucket != nullptr &&
+        eligible.packet.path == dxvk::war3::shadow::ShadowDrawPath::Skinned) {
       if (eligible.packet.resource.dynamicIndexStream != nullptr &&
           eligible.packet.resource.dynamicIndexCount != 0u) {
         if (eligible.packet.resource.dynamicIndexSource ==
             dxvk::war3::shadow::ShadowDynamicIndexSource::PreparedSlice) {
-          bucket.preparedSliceParts++;
+          bucket->preparedSliceParts++;
         } else {
-          bucket.fallbackSliceParts++;
+          bucket->fallbackSliceParts++;
         }
       } else if (drawTimePrebuildBypassed) {
-        bucket.preparedSliceParts++;
+        bucket->preparedSliceParts++;
       } else {
-        bucket.missingSliceParts++;
+        bucket->missingSliceParts++;
       }
     }
-    buildRecordTiming.enter(War3BuildEligibleRecordPhase::Identity);
+    enterBuildRecordPhase(War3BuildEligibleRecordPhase::Identity);
     eligible.sceneNode = eligible.packet.renderable.sceneNode;
-    eligible.recordSelectionKey = useSealedWork
-        ? compactWork.selectionKey
+    eligible.recordSelectionKey = carriedRecordSelectionKey != 0u
+        ? carriedRecordSelectionKey
         : War3SemanticDirectRecordSelectionKey(record);
     War3SemanticDirectSelectionKeySource selectionKeySource =
         War3SemanticDirectSelectionKeySource::None;
@@ -26268,6 +28063,13 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
                   manifestRecord,
                   dxvk::war3::render::VisibleRenderableRegistry::
                       computeShadowManifestObjectKey(manifestRecord));
+    // Grace fills a producer hole but must not impersonate fresh visibility.
+    // Preserve the original visibleFrameSerial and part key for one-frame
+    // replay, without refreshing Manifest structure/pose/slice timestamps.
+    // All identity consumers above have finished, so transfer the record's
+    // storage into the publication vector instead of copying the full POD.
+    if (!eligible.sample.contract.fromGrace)
+      shadowEligibleManifestRecords.push_back(std::move(manifestRecord));
     if (!m_war3SemanticDirectPrevSubmittedPartIdentityKeys.empty()) {
       eligible.previouslySubmittedPart =
           std::binary_search(
@@ -26303,7 +28105,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     case War3SemanticDirectSelectionKeySource::None:
       break;
     }
-    buildRecordTiming.enter(War3BuildEligibleRecordPhase::Append);
+    enterBuildRecordPhase(War3BuildEligibleRecordPhase::Append);
     eligibleRecords.push_back(std::move(eligible));
     War3RebindEligibleRecordPacket(eligibleRecords.back());
   }
@@ -26417,7 +28219,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
   }
 
   enterBuildEligiblePhase("ManifestPublish");
-  publishShadowManifestSummary(shadowEligibleManifestRecords);
+  publishShadowManifestSummary(exactSubmittedManifestRecords,
+                               shadowEligibleManifestRecords);
 
   enterBuildEligiblePhase("ProvisionalFilter");
   if (War3SemanticShadowManifestDeferProvisionalPartsRuntime() &&
@@ -26515,34 +28318,56 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     }
 
     enterBuildEligibleLeasePhase("LeaseCurrentKeys");
-    std::unordered_set<uint64_t> currentPartKeys;
+    // This set is built once, then queried once for every unique sorted lease
+    // key. Reuse contiguous storage and sort it once instead of allocating one
+    // unordered_set node per current part on every frame.
+    static thread_local std::vector<uint64_t> s_currentPartKeys;
+    auto& currentPartKeys = s_currentPartKeys;
+    currentPartKeys.clear();
     currentPartKeys.reserve(
-        (eligibleRecords.size() + exactSubmittedManifestRecords.size()) * 2u +
-        1u);
+        eligibleRecords.size() + exactSubmittedManifestRecords.size());
     for (const auto& eligible : eligibleRecords) {
       if (eligible.manifestPartLeaseKey != 0u)
-        currentPartKeys.insert(eligible.manifestPartLeaseKey);
+        currentPartKeys.push_back(eligible.manifestPartLeaseKey);
     }
     for (const auto& exactRecord : exactSubmittedManifestRecords) {
       const uint64_t partKey =
           dxvk::war3::render::VisibleRenderableRegistry::
               computeShadowManifestPartKey(exactRecord);
       if (partKey != 0u)
-        currentPartKeys.insert(partKey);
+        currentPartKeys.push_back(partKey);
     }
+    std::sort(currentPartKeys.begin(), currentPartKeys.end());
+    currentPartKeys.erase(
+        std::unique(currentPartKeys.begin(), currentPartKeys.end()),
+        currentPartKeys.end());
 
     enterBuildEligibleLeasePhase("LeaseKeySort");
     const size_t leaseBudget =
         directRecordCap != 0u ? size_t(directStickyRecordBudget)
                               : eligibleRecords.size() + size_t(64u);
-    std::vector<uint64_t> leaseKeys;
+    static thread_local std::vector<uint64_t> s_leaseKeys;
+    auto& leaseKeys = s_leaseKeys;
+    leaseKeys.clear();
     leaseKeys.reserve(directPartPacketLeases.size());
     for (const auto& [key, _] : directPartPacketLeases)
       leaseKeys.push_back(key);
     std::sort(leaseKeys.begin(), leaseKeys.end());
     enterBuildEligibleLeasePhase("LeaseRestoreScan");
-    std::vector<EligibleRecord> restoredLeaseRecords;
+    static thread_local std::vector<EligibleRecord> s_restoredLeaseRecords;
+    static thread_local std::vector<Matrix4> s_leaseLivePaletteScratch;
+    auto& restoredLeaseRecords = s_restoredLeaseRecords;
+    auto& leaseLivePaletteScratch = s_leaseLivePaletteScratch;
+    restoredLeaseRecords.clear();
+    leaseLivePaletteScratch.clear();
     restoredLeaseRecords.reserve(leaseKeys.size());
+    const auto installLeaseLivePalette = [&] (
+        EligibleRecord& leased, std::vector<Matrix4>& livePalette) {
+      auto previousPalette = std::move(leased.packet.runtimeGroupPalette);
+      leased.packet.runtimeGroupPalette = std::move(livePalette);
+      livePalette = std::move(previousPalette);
+      livePalette.clear();
+    };
     auto tryRefreshLeasedPaletteFromProducerFacts =
         [&](EligibleRecord& leased,
             const dxvk::war3::render::VisibleRenderableRegistry::
@@ -26564,7 +28389,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
           leased.packet.renderable.runtimeModelPtr != nullptr
               ? leased.packet.renderable.runtimeModelPtr
               : leaseInfo.runtimeModelPtr;
-      std::vector<Matrix4> liveRuntimeGroupPalette;
+      leaseLivePaletteScratch.clear();
       uint32_t liveMaxVertexGroupSlot = 0u;
       uint64_t liveRuntimeGroupPaletteHash = 0u;
       uint64_t liveRuntimeRawPaletteHash = 0u;
@@ -26577,34 +28402,39 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       const bool rebuilt = War3TryBuildLiveRuntimeGroupPalette(
           leased.packet.resource, runtimeModelPtr,
           leased.packet.renderable.renderablePart,
-          m_war3ShadowPersistentFrameSerial, liveRuntimeGroupPalette,
+          m_war3ShadowPersistentFrameSerial, leaseLivePaletteScratch,
           liveMaxVertexGroupSlot, liveRuntimeGroupPaletteHash,
           &liveRuntimeRawPaletteHash, &liveRuntimePoseModelPtr,
            /*allowCModelFallbackForCall=*/false, &livePaletteSource,
            &livePaletteSlotIndex, &livePaletteMinFrameTag,
            &livePaletteMaxFrameTag,
-           traceBuildEligible ? &buildEligibleLeasePaletteTiming : nullptr);
+           traceBuildEligible ? &buildEligibleLeasePaletteTiming : nullptr,
+           leased.packet.hasRuntimeGroupPalette &&
+                   leased.packet.maxVertexGroupSlot <
+                       leased.packet.runtimeGroupPalette.size()
+               ? leased.packet.maxVertexGroupSlot
+               : 0xFFFFFFFFu);
       const bool producerPaletteSource =
           livePaletteSource == War3SemanticPaletteSource::SubmitTimeGlobalSlot ||
           livePaletteSource ==
               War3SemanticPaletteSource::SubmitTimeBlendedPaletteCache;
       uint32_t currentPaletteFrameTag = 0u;
       const bool producerPaletteCurrentFrameProven =
-          rebuilt && !liveRuntimeGroupPalette.empty() &&
+          rebuilt && !leaseLivePaletteScratch.empty() &&
           producerPaletteSource &&
           dxvk::war3::model::QueryCurrentPaletteFrameTag(
               currentPaletteFrameTag) &&
           currentPaletteFrameTag != 0u && livePaletteMinFrameTag != 0u &&
           livePaletteMinFrameTag == livePaletteMaxFrameTag &&
           livePaletteMinFrameTag == currentPaletteFrameTag;
-      if (!rebuilt || liveRuntimeGroupPalette.empty() ||
+      if (!rebuilt || leaseLivePaletteScratch.empty() ||
           !producerPaletteSource || !producerPaletteCurrentFrameProven) {
         m_war3Scene.shadowStats
             .semanticSceneShadowManifestPartLeasePaletteRefreshMissCount++;
         return false;
       }
 
-      leased.packet.runtimeGroupPalette = std::move(liveRuntimeGroupPalette);
+      installLeaseLivePalette(leased, leaseLivePaletteScratch);
       leased.packet.hasRuntimeGroupPalette = true;
       leased.packet.maxVertexGroupSlot = liveMaxVertexGroupSlot;
       leased.packet.runtimeGroupPaletteHash = liveRuntimeGroupPaletteHash;
@@ -26639,23 +28469,29 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
         return false;
       }
 
-      std::vector<Matrix4> liveRuntimeGroupPalette;
+      leaseLivePaletteScratch.clear();
       uint32_t liveMaxVertexGroupSlot = 0u;
       uint64_t liveRuntimeGroupPaletteHash = 0u;
       uint64_t liveRuntimeRawPaletteHash = 0u;
       void* liveRuntimePoseModelPtr = nullptr;
       if (!War3TryBuildLiveRuntimeGroupPalette(
               leased.packet.resource, leaseInfo.runtimeModelPtr, nullptr,
-              m_war3ShadowPersistentFrameSerial, liveRuntimeGroupPalette,
+              m_war3ShadowPersistentFrameSerial, leaseLivePaletteScratch,
               liveMaxVertexGroupSlot, liveRuntimeGroupPaletteHash,
-              &liveRuntimeRawPaletteHash, &liveRuntimePoseModelPtr, true) ||
-          liveRuntimeGroupPalette.empty()) {
+              &liveRuntimeRawPaletteHash, &liveRuntimePoseModelPtr, true,
+              nullptr, nullptr, nullptr, nullptr, nullptr,
+              leased.packet.hasRuntimeGroupPalette &&
+                      leased.packet.maxVertexGroupSlot <
+                          leased.packet.runtimeGroupPalette.size()
+                  ? leased.packet.maxVertexGroupSlot
+                  : 0xFFFFFFFFu) ||
+          leaseLivePaletteScratch.empty()) {
         m_war3Scene.shadowStats
             .semanticSceneShadowManifestPartLeasePoseCModelRefreshMissCount++;
         return false;
       }
 
-      leased.packet.runtimeGroupPalette = std::move(liveRuntimeGroupPalette);
+      installLeaseLivePalette(leased, leaseLivePaletteScratch);
       leased.packet.hasRuntimeGroupPalette = true;
       leased.packet.maxVertexGroupSlot = liveMaxVertexGroupSlot;
       leased.packet.runtimeGroupPaletteHash = liveRuntimeGroupPaletteHash;
@@ -26690,7 +28526,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
         break;
       }
       const uint64_t key = leaseKeys[leaseIndex];
-      if (currentPartKeys.find(key) != currentPartKeys.end())
+      if (std::binary_search(currentPartKeys.begin(), currentPartKeys.end(),
+                             key))
         continue;
       const auto leaseIt = directPartPacketLeases.find(key);
       if (leaseIt == directPartPacketLeases.end())
@@ -26717,7 +28554,6 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
                 m_war3GpuSkinMapEpoch);
         if (War3DrawTimeAnonymousMarkerRejectionActive(
                 leasedPart, currentContract.meshPayloadPtr, leasedLayer)) {
-          currentPartKeys.insert(key);
           m_war3Scene.shadowStats
               .drawTimeSemanticProducerOwnedDirectGroupedSkipCount++;
           continue;
@@ -26725,7 +28561,6 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
         if (War3CurrentDrawContractNamesExactSlice(
                 leasedPart, leasedLayer, currentContract)) {
           if (War3DrawTimeExactRejectedCurrentFrame(currentKey)) {
-            currentPartKeys.insert(key);
             m_war3Scene.shadowStats
                 .drawTimeSemanticProducerOwnedDirectGroupedSkipCount++;
             continue;
@@ -26737,7 +28572,6 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
                   m_war3ShadowPersistentFrameSerial &&
               currentVbIt->second.exactOwnerFrameSerial ==
                   m_war3ShadowPersistentFrameSerial) {
-            currentPartKeys.insert(key);
             m_war3Scene.shadowStats
                 .drawTimeSemanticProducerOwnedDirectGroupedSkipCount++;
             continue;
@@ -26787,7 +28621,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
         continue;
       }
       leaseScanTiming.enter(War3BuildEligibleLeaseScanPhase::PacketCopy);
-      EligibleRecord leased = {};
+      EligibleRecord leased = acquireEligibleRecord();
       leased.packet = leaseIt->second.packet;
       War3RebindShadowPacketOwnedResourcePointers(leased.packet);
       leased.sample = leaseIt->second.sample;
@@ -26836,6 +28670,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
           (!poseFreshForLease && !allowStalePoseForCore)) {
         m_war3Scene.shadowStats
             .semanticSceneShadowManifestPartLeaseRejectedPoseStaleCount++;
+        recycleRejectedEligibleRecord(std::move(leased));
         continue;
       }
       // Phase 7.30 Step A probe：标记"通过 stale-pose 宽限门通过"。
@@ -26848,31 +28683,41 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       leased.sample.contract.fromGrace = true;
       leased.sample.contract.graceAge = uint32_t(directLeaseAge);
       leased.sample.contract.producerFreshThisFrame = false;
-      if (!packetSafeForDirectPartLease(leased, false))
+      if (!packetSafeForDirectPartLease(leased, false)) {
+        recycleRejectedEligibleRecord(std::move(leased));
         continue;
+      }
       if (!leaseInfo.sliceFresh &&
           leased.packet.resource.dynamicIndexStream != nullptr &&
           leased.packet.resource.dynamicIndexCount != 0u &&
           (leased.packet.resource.ownedDynamicIndices == nullptr ||
-           leased.packet.resource.ownedDynamicIndices->empty())) {
+           leased.packet.resource.ownedDynamicIndices->empty()) &&
+          !War3PacketResourceHasImmutableDynamicIndexSlice(
+              leased.packet.resource)) {
         m_war3Scene.shadowStats
             .semanticSceneShadowManifestPartLeaseRejectedSliceStaleCount++;
+        recycleRejectedEligibleRecord(std::move(leased));
         continue;
       }
-      auto& bucket = completenessBucketForKey(leased.completenessKey);
-      bucket.shadowEligibleParts++;
-      bucket.eligibleParts++;
-      if (leased.packet.path == dxvk::war3::shadow::ShadowDrawPath::Skinned) {
+      DirectObjectCompletenessBucket* bucket = trackCompletenessBuckets
+          ? &completenessBucketForKey(leased.completenessKey)
+          : nullptr;
+      if (bucket != nullptr) {
+        bucket->shadowEligibleParts++;
+        bucket->eligibleParts++;
+      }
+      if (bucket != nullptr &&
+          leased.packet.path == dxvk::war3::shadow::ShadowDrawPath::Skinned) {
         if (leased.packet.resource.dynamicIndexStream != nullptr &&
             leased.packet.resource.dynamicIndexCount != 0u) {
           if (leased.packet.resource.dynamicIndexSource ==
               dxvk::war3::shadow::ShadowDynamicIndexSource::PreparedSlice) {
-            bucket.preparedSliceParts++;
+            bucket->preparedSliceParts++;
           } else {
-            bucket.fallbackSliceParts++;
+            bucket->fallbackSliceParts++;
           }
         } else {
-          bucket.missingSliceParts++;
+          bucket->missingSliceParts++;
         }
       }
       if (leasePaletteRefreshAttempted && !paletteFreshenedFromProducer &&
@@ -26892,7 +28737,6 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
         m_war3Scene.shadowStats
             .semanticSceneShadowManifestPartLeaseRestoredPoseStaleCoreCount++;
       }
-      currentPartKeys.insert(key);
     }
 
     if (traceBuildEligible) {
@@ -26941,18 +28785,19 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
 
     enterBuildEligibleLeasePhase("LeaseMerge");
     if (!restoredLeaseRecords.empty()) {
-      std::vector<EligibleRecord> mergedRecords;
-      mergedRecords.reserve(restoredLeaseRecords.size() +
-                            eligibleRecords.size());
-      for (auto& restored : restoredLeaseRecords) {
-        mergedRecords.push_back(std::move(restored));
-        War3RebindEligibleRecordPacket(mergedRecords.back());
-      }
-      for (auto& live : eligibleRecords) {
-        mergedRecords.push_back(std::move(live));
-        War3RebindEligibleRecordPacket(mergedRecords.back());
-      }
-      eligibleRecords = std::move(mergedRecords);
+      // Preserve the historical [restored, live] ordering directly in the
+      // reusable primary vector. Any reserve/insert move may invalidate packet
+      // self-aliases, so no consumer observes the range before the full rebind.
+      eligibleRecords.reserve(
+          restoredLeaseRecords.size() + eligibleRecords.size());
+      eligibleRecords.insert(
+          eligibleRecords.begin(),
+          std::make_move_iterator(restoredLeaseRecords.begin()),
+          std::make_move_iterator(restoredLeaseRecords.end()));
+      // Release moved-from packet ownership now while retaining allocator
+      // capacity for the next frame. Scratch storage must never extend a
+      // logical resource reference across calls.
+      restoredLeaseRecords.clear();
       War3RebindEligibleRecordPackets(eligibleRecords);
     }
   }
@@ -26981,25 +28826,27 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
               War3SemanticStickyPartSelectionMinRecordsRuntime());
       if (retainedRecordCount >= minStickyPartRecords) {
         // Decide before moving. If the sticky set is below the threshold we
-        // must leave every EligibleRecord intact for the fallback submission;
-        // moving first would empty packet-owned vectors while leaving their
-        // raw aliases behind.
-        std::vector<EligibleRecord> retainedRecords;
-        retainedRecords.reserve(retainedRecordCount);
-        for (auto& eligible : eligibleRecords) {
-          if (eligible.previouslySubmittedPart) {
-            retainedRecords.push_back(std::move(eligible));
-            War3RebindEligibleRecordPacket(retainedRecords.back());
-          }
-        }
+        // must leave every EligibleRecord intact for fallback submission.
+        // Once accepted, stable in-place compaction preserves the old record
+        // order without allocating and moving a second packet vector. Moving
+        // may invalidate packet self-aliases, so rebind the retained range
+        // before any consumer observes it.
+        const uint32_t droppedRecordCount =
+            uint32_t(eligibleRecords.size()) - retainedRecordCount;
+        eligibleRecords.erase(
+            std::remove_if(
+                eligibleRecords.begin(), eligibleRecords.end(),
+                [](const EligibleRecord& eligible) {
+                  return !eligible.previouslySubmittedPart;
+                }),
+            eligibleRecords.end());
+        War3RebindEligibleRecordPackets(eligibleRecords);
         m_war3Scene.shadowStats
             .semanticSceneDirectStickyPartSelectionRetainedCount =
             retainedRecordCount;
         m_war3Scene.shadowStats
             .semanticSceneDirectStickyPartSelectionDroppedCount =
-            uint32_t(eligibleRecords.size() - retainedRecordCount);
-        eligibleRecords = std::move(retainedRecords);
-        War3RebindEligibleRecordPackets(eligibleRecords);
+            droppedRecordCount;
         eligibleRecordCount = uint32_t(eligibleRecords.size());
         m_war3Scene.shadowStats.semanticSceneDirectLastEligibleRecordCount =
             eligibleRecordCount;
@@ -27060,14 +28907,49 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
   static thread_local std::vector<uint64_t> s_submittedIdentityKeys;
   static thread_local std::vector<uint64_t> s_submittedPreferenceKeys;
   static thread_local std::vector<uint64_t> s_submittedPartIdentityKeys;
-  static thread_local std::unordered_map<uint64_t, std::vector<uint64_t>>
+  struct LiveSubmittedCorePartsEntry {
+    uint64_t frameSerial = 0u;
+    std::vector<uint64_t> partKeys;
+  };
+  static thread_local std::unordered_map<
+      uint64_t, LiveSubmittedCorePartsEntry>
       s_liveSubmittedCorePartsByObject;
+  static thread_local std::vector<uint64_t>
+      s_liveSubmittedCorePartObjectKeys;
+  static thread_local uint64_t s_liveSubmittedCorePartsMapEpoch = 0u;
+  static thread_local uint64_t s_liveSubmittedCorePartsFrameSerial = 0u;
   s_submittedIdentityKeys.clear();
   s_submittedPreferenceKeys.clear();
   s_submittedPartIdentityKeys.clear();
-  for (auto& kv : s_liveSubmittedCorePartsByObject)
-    kv.second.clear();
-  s_liveSubmittedCorePartsByObject.clear();
+  if (s_liveSubmittedCorePartsMapEpoch != m_war3GpuSkinMapEpoch) {
+    s_liveSubmittedCorePartsByObject.clear();
+    s_liveSubmittedCorePartObjectKeys.clear();
+    s_liveSubmittedCorePartsMapEpoch = m_war3GpuSkinMapEpoch;
+    s_liveSubmittedCorePartsFrameSerial = directPartPacketLeaseFrame;
+  } else if (s_liveSubmittedCorePartsFrameSerial !=
+             directPartPacketLeaseFrame) {
+    s_liveSubmittedCorePartObjectKeys.clear();
+    s_liveSubmittedCorePartsFrameSerial = directPartPacketLeaseFrame;
+
+    // This table owns CPU scratch capacity only, but a long-running map can
+    // still see many transient object identities. Amortize stale-node cleanup
+    // instead of either freeing every node every frame or growing forever.
+    constexpr uint64_t kCorePartScratchRetireFrames = 256u;
+    if ((directPartPacketLeaseFrame & 0xFFu) == 0u) {
+      for (auto it = s_liveSubmittedCorePartsByObject.begin();
+           it != s_liveSubmittedCorePartsByObject.end();) {
+        const uint64_t lastFrame = it->second.frameSerial;
+        if (lastFrame == 0u ||
+            (directPartPacketLeaseFrame > lastFrame &&
+             directPartPacketLeaseFrame - lastFrame >
+                 kCorePartScratchRetireFrames)) {
+          it = s_liveSubmittedCorePartsByObject.erase(it);
+        } else {
+          ++it;
+        }
+      }
+    }
+  }
   auto& submittedIdentityKeys = s_submittedIdentityKeys;
   auto& submittedPreferenceKeys = s_submittedPreferenceKeys;
   auto& submittedPartIdentityKeys = s_submittedPartIdentityKeys;
@@ -27078,6 +28960,28 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
   submittedPartIdentityKeys.reserve(liveLifecycleRecordCount);
   submittedPartPacketLeaseRecords.reserve(eligibleRecordCount);
   auto& liveSubmittedCorePartsByObject = s_liveSubmittedCorePartsByObject;
+  auto& liveSubmittedCorePartObjectKeys =
+      s_liveSubmittedCorePartObjectKeys;
+  const auto appendLiveSubmittedCorePart = [&] (
+      uint64_t objectKey, uint64_t partKey) {
+    if (objectKey == 0u || partKey == 0u)
+      return;
+    auto& entry = liveSubmittedCorePartsByObject[objectKey];
+    if (entry.frameSerial != directPartPacketLeaseFrame) {
+      entry.frameSerial = directPartPacketLeaseFrame;
+      entry.partKeys.clear();
+      liveSubmittedCorePartObjectKeys.push_back(objectKey);
+    }
+    entry.partKeys.push_back(partKey);
+  };
+  const auto findLiveSubmittedCoreParts = [&] (uint64_t objectKey)
+      -> const std::vector<uint64_t>* {
+    const auto it = liveSubmittedCorePartsByObject.find(objectKey);
+    return it != liveSubmittedCorePartsByObject.end() &&
+            it->second.frameSerial == directPartPacketLeaseFrame
+        ? &it->second.partKeys
+        : nullptr;
+  };
   uint32_t genericStatsObjectKindReuseCount = 0u;
   uint32_t genericStatsObjectKindFallbackCount = 0u;
   uint32_t genericStatsDynamicEvidenceReuseCount = 0u;
@@ -27085,7 +28989,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
   uint32_t genericStatsDynamicEvidenceSkippedCount = 0u;
 
   auto noteSubmittedKeys = [&](
-      const EligibleRecord& eligible,
+      EligibleRecord& eligible,
       War3SubmitAppendNestedRawTiming* nestedTiming,
       bool fastAppended,
       dxvk::war3::render::ObjectKind appendedObjectKind,
@@ -27109,14 +29013,13 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
         packetSafeForDirectPartLease(eligible, true)) {
       if (nestedTiming != nullptr)
         nestedTiming->enter(War3SubmitAppendNestedPhase::BookLeaseCopy);
-      submittedPartPacketLeaseRecords.push_back(eligible);
-      War3RebindEligibleRecordPacket(submittedPartPacketLeaseRecords.back());
+      submittedPartPacketLeaseRecords.push_back(&eligible);
       if (!eligible.fromPartPacketLease && eligible.selectionKey != 0u &&
           eligible.manifestPartLeaseKey != 0u) {
         if (nestedTiming != nullptr)
           nestedTiming->enter(War3SubmitAppendNestedPhase::BookCorePartIndex);
-        liveSubmittedCorePartsByObject[eligible.selectionKey].push_back(
-            eligible.manifestPartLeaseKey);
+        appendLiveSubmittedCorePart(eligible.selectionKey,
+                                    eligible.manifestPartLeaseKey);
       }
     }
     if (nestedTiming != nullptr)
@@ -27285,7 +29188,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     if (submittedPartIdentityKey != 0u)
       submittedPartIdentityKeys.push_back(submittedPartIdentityKey);
     if (selectionKey != 0u && manifestPartKey != 0u) {
-      liveSubmittedCorePartsByObject[selectionKey].push_back(manifestPartKey);
+      appendLiveSubmittedCorePart(selectionKey, manifestPartKey);
     }
     m_war3Scene.shadowStats
         .drawTimeSemanticProducerLifecycleMergedCount++;
@@ -27446,6 +29349,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     draw.deviceEpoch = m_war3GpuSkinDeviceEpoch;
     draw.indexed = entry.indexed;
     draw.positionStorage = entry.positionBuffer;
+    draw.positionPinnedAllocation = entry.positionPinnedAllocation;
     draw.positionInfo = entry.positionInfo;
     draw.positionStride = entry.positionStride;
     draw.positionOffset = entry.positionOffset;
@@ -27489,6 +29393,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
         draw.uvInfo = entry.positionInfo;
       } else {
         draw.uvStorage = entry.uvBuffer;
+        draw.uvPinnedAllocation = entry.uvPinnedAllocation;
         draw.uvInfo = entry.uvInfo;
       }
     }
@@ -27519,6 +29424,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       nestedTiming->enter(War3SubmitAppendNestedPhase::FastGeometryIdentity);
     if (entry.indexed) {
       draw.indexStorage = entry.indexBuffer;
+      draw.indexPinnedAllocation = entry.indexPinnedAllocation;
       draw.indexInfo = entry.indexInfo;
       draw.indexType = entry.indexType;
       draw.indexCount = entry.indexCount;
@@ -27661,7 +29567,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       if (traceSample)
         fallbackAppendTrace.arm(submitAppendTracePeriod);
       appended = War3TryAppendSemanticShadowPacket(
-          eligible.packet, &eligible.sample, eligible.fromStalePoseRestore);
+          eligible.packet, &eligible.sample, eligible.fromStalePoseRestore,
+          eligible.currentFrameExactOwnerPrefiltered);
       if (traceSample)
         fallbackAppendTrace.disarm();
     }
@@ -27679,7 +29586,9 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
         nestedTimingPtr->enter(
             War3SubmitAppendNestedPhase::BookCompleteness);
       }
-      completenessBucketForKey(eligible.completenessKey).submittedParts++;
+      if (trackCompletenessBuckets) {
+        completenessBucketForKey(eligible.completenessKey).submittedParts++;
+      }
       noteSubmittedKeys(eligible, nestedTimingPtr, fastAppended,
                         appendedObjectKind, appendedObjectKindKnown);
     }
@@ -27752,7 +29661,9 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       uint32_t priorityScore;
       bool previouslySelected;
     };
-    std::vector<ObjectGroup> objectGroups;
+    static thread_local std::vector<ObjectGroup> s_objectGroups;
+    auto& objectGroups = s_objectGroups;
+    objectGroups.clear();
     objectGroups.reserve(eligibleRecordCount);
 
     const bool useSubmitPermutationView =
@@ -27927,6 +29838,12 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
           hash = bit::fnv1a_iter(hash, resource.dynamicPrimitiveBaseIndex);
           hash = bit::fnv1a_iter(
               hash, uint32_t(resource.dynamicIndexSource));
+          hash = bit::fnv1a_iter(
+              hash, uint32_t(resource.dynamicIndexBackedByResourceKeepAlive));
+          hash = bit::fnv1a_iter(
+              hash,
+              uint32_t(
+                  resource.currentDrawGroupSlotsBackedByResourceKeepAlive));
           hash = appendSubmitPermutationPointerHash(
               hash, resource.ownedDynamicIndices.get());
           if (resource.ownedDynamicIndices != nullptr) {
@@ -28016,6 +29933,10 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
           hash = bit::fnv1a_iter(hash, eligible.sample.paletteHash);
           hash = appendSubmitPermutationVectorHash(
               hash, eligible.sample.groupSlots);
+          hash = bit::fnv1a_iter(
+              hash,
+              uint32_t(
+                  eligible.sample.groupSlotsBorrowedFromImmutableHint));
           hash = bit::fnv1a_iter(hash, eligible.sample.groupHash);
           hash = bit::fnv1a_iter(hash, eligible.sample.stableGroupHash);
           hash = bit::fnv1a_iter(
@@ -28183,6 +30104,10 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
               ag.dynamicIndexHash == bg.dynamicIndexHash &&
               ag.dynamicPrimitiveBaseIndex == bg.dynamicPrimitiveBaseIndex &&
               ag.dynamicIndexSource == bg.dynamicIndexSource &&
+              ag.dynamicIndexBackedByResourceKeepAlive ==
+                  bg.dynamicIndexBackedByResourceKeepAlive &&
+              ag.currentDrawGroupSlotsBackedByResourceKeepAlive ==
+                  bg.currentDrawGroupSlotsBackedByResourceKeepAlive &&
               bool(ag.ownedDynamicIndices) ==
                   bool(bg.ownedDynamicIndices) &&
               (!ag.ownedDynamicIndices ||
@@ -28266,6 +30191,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
               a.sample.paletteHash == b.sample.paletteHash &&
               submitPermutationVectorsEqual(
                   a.sample.groupSlots, b.sample.groupSlots) &&
+              a.sample.groupSlotsBorrowedFromImmutableHint ==
+                  b.sample.groupSlotsBorrowedFromImmutableHint &&
               a.sample.groupHash == b.sample.groupHash &&
               a.sample.stableGroupHash == b.sample.stableGroupHash &&
               a.sample.status == b.sample.status &&
@@ -28315,7 +30242,14 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
 
     // 先按 stable identity 排序以利于分组（稳定排序保持 record 内部顺序）
     enterSubmitGroupSortDetail("IndexInit");
-    std::vector<uint32_t> originalIndices(eligibleRecordCount);
+    // This permutation contains only bounded scalar indices. Reuse its
+    // allocator storage on the render thread instead of paying for a fresh
+    // allocation on every populated frame; no packet or resource ownership is
+    // retained across calls.
+    static thread_local std::vector<uint32_t> s_originalIndices;
+    auto& originalIndices = s_originalIndices;
+    originalIndices.clear();
+    originalIndices.resize(eligibleRecordCount);
     for (uint32_t i = 0u; i < eligibleRecordCount; ++i)
       originalIndices[i] = i;
     enterSubmitGroupSortDetail("StableSort");
@@ -28533,7 +30467,9 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     // vector 分配与析构。
     constexpr size_t kCoreGateStackBudget = 32u;
     uint64_t coreGateStack[kCoreGateStackBudget];
-    std::vector<uint64_t> coreGateHeap;
+    static thread_local std::vector<uint64_t> s_coreGateHeap;
+    auto& coreGateHeap = s_coreGateHeap;
+    coreGateHeap.clear();
     for (const auto& group : objectGroups) {
       // Committed core is authoritative lifecycle evidence, not an all-or-
       // nothing submission gate. Missing required parts are diagnosed here,
@@ -28547,20 +30483,18 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
           !coreIt->second.committedPartKeys.empty()) {
         uint64_t* groupPartKeys = coreGateStack;
         size_t groupPartKeyCount = 0u;
-        const auto exactCoreIt =
-            liveSubmittedCorePartsByObject.find(group.selectionKey);
+        const auto* exactCoreParts =
+            findLiveSubmittedCoreParts(group.selectionKey);
         const size_t exactCorePartCount =
-            exactCoreIt != liveSubmittedCorePartsByObject.end()
-                ? exactCoreIt->second.size()
-                : 0u;
+            exactCoreParts != nullptr ? exactCoreParts->size() : 0u;
         const size_t worstCase = size_t(group.count) + exactCorePartCount;
         bool useHeap = worstCase > kCoreGateStackBudget;
         if (useHeap) {
           coreGateHeap.clear();
           coreGateHeap.reserve(worstCase);
         }
-        if (exactCoreIt != liveSubmittedCorePartsByObject.end()) {
-          for (uint64_t partKey : exactCoreIt->second) {
+        if (exactCoreParts != nullptr) {
+          for (uint64_t partKey : *exactCoreParts) {
             if (partKey == 0u)
               continue;
             if (useHeap) {
@@ -29117,7 +31051,11 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
 
   enterDirectDetailPhase("SubmitLeaseUpdate");
   if (useDirectPartPacketLease) {
-    for (const auto& eligible : submittedPartPacketLeaseRecords) {
+    for (const EligibleRecord* eligiblePtr :
+         submittedPartPacketLeaseRecords) {
+      if (eligiblePtr == nullptr)
+        continue;
+      const EligibleRecord& eligible = *eligiblePtr;
       if (eligible.manifestPartLeaseKey == 0u ||
           eligible.sample.contract.fromGrace)
         continue;
@@ -29143,8 +31081,13 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
           .semanticSceneShadowManifestPartLeaseUpdatedFromLiveCount++;
     }
 
-    for (auto& [objectKey, partKeys] : liveSubmittedCorePartsByObject) {
-      if (objectKey == 0u || partKeys.empty())
+    for (uint64_t objectKey : liveSubmittedCorePartObjectKeys) {
+      auto liveIt = liveSubmittedCorePartsByObject.find(objectKey);
+      if (liveIt == liveSubmittedCorePartsByObject.end() ||
+          liveIt->second.frameSerial != directPartPacketLeaseFrame)
+        continue;
+      auto& partKeys = liveIt->second.partKeys;
+      if (partKeys.empty())
         continue;
       std::sort(partKeys.begin(), partKeys.end());
       partKeys.erase(std::unique(partKeys.begin(), partKeys.end()),
@@ -29155,7 +31098,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       // Phase 7.25 旧语义回退路径：直接覆盖，保持与 7.24 行为一致，
       // 便于 A/B 和回归排查。
       if (!War3SemanticShadowManifestCoreEpochPlannerRuntime()) {
-        coreSet.committedPartKeys = partKeys;
+        if (coreSet.committedPartKeys != partKeys)
+          coreSet.committedPartKeys = partKeys;
         coreSet.authoritativeAbsenceStreak.clear();
         coreSet.lastCommitFrame = directPartPacketLeaseFrame;
         coreSet.observationPartKeys.clear();
@@ -29207,7 +31151,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
           coreSet.observationStartFrame = directPartPacketLeaseFrame;
         }
       } else if (covers) {
-        coreSet.committedPartKeys = partKeys;
+        if (coreSet.committedPartKeys != partKeys)
+          coreSet.committedPartKeys = partKeys;
         coreSet.authoritativeAbsenceStreak.clear();
         coreSet.lastCommitFrame = directPartPacketLeaseFrame;
         coreSet.observationPartKeys.clear();
@@ -29219,29 +31164,30 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
         // after two consecutive complete authoritative live observations omit
         // it. A reappearing part resets its streak immediately. Tombstones do
         // not wait here and are drained by War3DrainShadowCasterTombstones.
-        std::vector<uint64_t> shrunken;
-        shrunken.reserve(coreSet.committedPartKeys.size());
-        for (uint64_t partKey : coreSet.committedPartKeys) {
-          const bool inLive = std::binary_search(partKeys.begin(),
-                                                 partKeys.end(), partKey);
-          if (inLive) {
-            coreSet.authoritativeAbsenceStreak.erase(partKey);
-            shrunken.push_back(partKey);
-            continue;
-          }
-          uint8_t& streak = coreSet.authoritativeAbsenceStreak[partKey];
-          if (streak < 2u)
-            ++streak;
-          if (streak < 2u) {
-            shrunken.push_back(partKey);
-          } else {
-            coreSet.authoritativeAbsenceStreak.erase(partKey);
-            m_war3Scene.shadowStats
-                .semanticSceneShadowManifestRetiredAfterAuthoritativeAbsenceCount++;
-          }
-        }
-        if (shrunken.size() < coreSet.committedPartKeys.size()) {
-          coreSet.committedPartKeys = std::move(shrunken);
+        const auto retiredBegin = std::remove_if(
+            coreSet.committedPartKeys.begin(),
+            coreSet.committedPartKeys.end(),
+            [&](uint64_t partKey) {
+              const bool inLive = std::binary_search(
+                  partKeys.begin(), partKeys.end(), partKey);
+              if (inLive) {
+                coreSet.authoritativeAbsenceStreak.erase(partKey);
+                return false;
+              }
+              uint8_t& streak =
+                  coreSet.authoritativeAbsenceStreak[partKey];
+              if (streak < 2u)
+                ++streak;
+              if (streak < 2u)
+                return false;
+              coreSet.authoritativeAbsenceStreak.erase(partKey);
+              m_war3Scene.shadowStats
+                  .semanticSceneShadowManifestRetiredAfterAuthoritativeAbsenceCount++;
+              return true;
+            });
+        if (retiredBegin != coreSet.committedPartKeys.end()) {
+          coreSet.committedPartKeys.erase(
+              retiredBegin, coreSet.committedPartKeys.end());
           coreSet.lastCommitFrame = directPartPacketLeaseFrame;
         }
         // Live temporarily does not cover committed; preserve the remaining
@@ -29335,15 +31281,13 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
 
   // identity hash: 基于实际提交的 stable caster identity 集合
   {
-    auto computeJaccardMilli = [](std::vector<uint64_t> previousKeys,
-                                  std::vector<uint64_t> currentKeys)
+    // Both inputs are canonical sorted/unique sets. The old diagnostics copied
+    // and sorted all four vectors again every frame even though publication
+    // below already establishes that invariant.
+    const auto computeSortedJaccardMilli = [](
+                                  const std::vector<uint64_t>& previousKeys,
+                                  const std::vector<uint64_t>& currentKeys)
         -> uint32_t {
-      std::sort(previousKeys.begin(), previousKeys.end());
-      previousKeys.erase(std::unique(previousKeys.begin(), previousKeys.end()),
-                         previousKeys.end());
-      std::sort(currentKeys.begin(), currentKeys.end());
-      currentKeys.erase(std::unique(currentKeys.begin(), currentKeys.end()),
-                        currentKeys.end());
       if (previousKeys.empty() && currentKeys.empty())
         return 1000u;
       size_t previousIndex = 0u;
@@ -29377,20 +31321,21 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     sortUniqueKeys(submittedPartIdentityKeys);
 
     uint64_t identityHash = 0xcbf29ce484222325ull;
-    std::vector<uint64_t> sortedKeys = submittedPartIdentityKeys;
-    if (sortedKeys.empty())
-      sortedKeys = submittedIdentityKeys;
-    for (uint64_t key : sortedKeys) {
+    const std::vector<uint64_t>& currentPartIdentityKeys =
+        !submittedPartIdentityKeys.empty()
+            ? submittedPartIdentityKeys
+            : submittedIdentityKeys;
+    for (uint64_t key : currentPartIdentityKeys) {
       identityHash = bit::fnv1a_iter(identityHash, key);
     }
     m_war3Scene.shadowStats.semanticSceneDirectLastSubmittedIdentityHash = identityHash;
 
-    std::vector<uint64_t> sortedObjectKeys = submittedIdentityKeys;
     m_war3Scene.shadowStats.semanticSceneSubmittedObjectJaccardMilli =
-        computeJaccardMilli(previousSubmittedObjectIdentityKeys,
-                            sortedObjectKeys);
+        computeSortedJaccardMilli(previousSubmittedObjectIdentityKeys,
+                                  submittedIdentityKeys);
     m_war3Scene.shadowStats.semanticSceneSubmittedPartJaccardMilli =
-        computeJaccardMilli(previousSubmittedPartIdentityKeys, sortedKeys);
+        computeSortedJaccardMilli(previousSubmittedPartIdentityKeys,
+                                  currentPartIdentityKeys);
 
     if (m_war3SemanticDirectPrevIdentityHash != 0u &&
         m_war3SemanticDirectPrevIdentityHash != identityHash) {
@@ -29407,12 +31352,20 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
           .semanticSceneDirectSelectionLeaseSubmittedKeyCount +=
           uint32_t(submittedPreferenceKeys.size());
     }
-    std::vector<uint64_t> sortedPreferenceKeys = submittedPreferenceKeys;
-    m_war3SemanticDirectPrevSubmittedIdentityKeys =
-        std::move(sortedPreferenceKeys);
-    m_war3SemanticDirectPrevSubmittedObjectIdentityKeys =
-        std::move(sortedObjectKeys);
-    m_war3SemanticDirectPrevSubmittedPartIdentityKeys = std::move(sortedKeys);
+    // Exchange the current and previous backing allocations instead of
+    // copying. The TLS scratch receives last frame's capacity and will clear
+    // it on the next populate, keeping both sides allocation-stable.
+    m_war3SemanticDirectPrevSubmittedIdentityKeys.swap(
+        submittedPreferenceKeys);
+    m_war3SemanticDirectPrevSubmittedObjectIdentityKeys.swap(
+        submittedIdentityKeys);
+    if (!submittedPartIdentityKeys.empty()) {
+      m_war3SemanticDirectPrevSubmittedPartIdentityKeys.swap(
+          submittedPartIdentityKeys);
+    } else {
+      m_war3SemanticDirectPrevSubmittedPartIdentityKeys =
+          m_war3SemanticDirectPrevSubmittedObjectIdentityKeys;
+    }
   }
 
   // 更新 frame serial
@@ -29654,6 +31607,22 @@ uint32_t D3D9DeviceEx::War3TryPopulateSemanticShadowScene(
                 : uint64_t(1u);
   dxvk::war3::shadow::NativeD3D9BackendRuntime::instance()
       .beginCanonicalFrame(canonicalNativeFrameSerial);
+  // Exact Stage11 manifest records are scalar, non-owning handoff values.
+  // Reuse only their allocator storage on this render thread; clear the
+  // logical range both before and after the Populate call so no Warcraft
+  // identity survives the call and no caster/resource lifetime is extended.
+  static thread_local std::vector<
+      dxvk::war3::render::CurrentDrawContractRecord>
+      s_exactSubmittedManifestRecords;
+  auto& exactSubmittedManifestRecords = s_exactSubmittedManifestRecords;
+  exactSubmittedManifestRecords.clear();
+  struct ExactSubmittedManifestScratchReset {
+    std::vector<dxvk::war3::render::CurrentDrawContractRecord>& records;
+
+    ~ExactSubmittedManifestScratchReset() {
+      records.clear();
+    }
+  } exactSubmittedManifestScratchReset { exactSubmittedManifestRecords };
   if (War3SemanticDirectOnlyRuntime()) {
     // Stage11 has exactly one preferred current-frame representation.  Run
     // the native draw-time owner first; DirectGrouped then supplements only
@@ -29664,7 +31633,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateSemanticShadowScene(
     if (War3SemanticDrawTimeDirectProducerRuntime()) {
       const uint32_t drawTimeClaimedBefore =
           m_war3Scene.shadowStats.drawTimeSemanticProducerClaimedCount;
-      drawTimeSubmitted = War3TryPopulateDrawTimeSemanticProducer();
+      drawTimeSubmitted = War3TryPopulateDrawTimeSemanticProducer(
+          exactSubmittedManifestRecords);
       if (m_war3Scene.shadowStats.drawTimeSemanticProducerClaimedCount ==
           drawTimeClaimedBefore) {
         m_war3Scene.shadowStats
@@ -29674,7 +31644,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateSemanticShadowScene(
     // Phase 7.1: 使用 object-grouped helper 替代原始逐 record 提交
     const uint32_t directSubmitted = War3TryPopulateDirectCurrentDrawGrouped(
         /*readyOnly=*/true, unitsOnly,
-        currentVisibleFrameSerial, currentDrawMinVisibleFrameSerial);
+        currentVisibleFrameSerial, currentDrawMinVisibleFrameSerial,
+        exactSubmittedManifestRecords);
     const uint32_t totalDirectSubmitted =
         directSubmitted + drawTimeSubmitted;
     if (totalDirectSubmitted != 0u) {
@@ -30204,7 +32175,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateSemanticShadowScene(
     // Phase 7.1: 使用 object-grouped helper 替代原始逐 record 提交（fallback 路径，readyOnly=false）
     if (const uint32_t directSubmitted = War3TryPopulateDirectCurrentDrawGrouped(
             /*readyOnly=*/false, unitsOnly,
-            currentVisibleFrameSerial, currentDrawMinVisibleFrameSerial);
+            currentVisibleFrameSerial, currentDrawMinVisibleFrameSerial,
+            exactSubmittedManifestRecords);
         directSubmitted != 0u) {
       bool nativeDirectPrepared = false;
       bool nativeDirectExecuted = false;
@@ -30861,6 +32833,11 @@ bool D3D9DeviceEx::War3ExecuteSemanticShadowSceneForValidation(
   input.frameSerial = pipelineFrameSerial;
   input.mapEpoch = m_war3GpuSkinMapEpoch;
   input.deviceEpoch = m_war3GpuSkinDeviceEpoch;
+  // EndFrame/SemanticValidation moves the same producer scene as BeforeUi.
+  // Seal only after its final input stamp is known; an unsealed zero scene is
+  // not permission for the receiver to publish or reuse a directional map.
+  War3SealShadowProducerCompleteness(input.scene, input.frameSerial,
+                                     input.mapEpoch, input.deviceEpoch);
 
   EmitCs([this, cInput = std::move(input)](DxvkContext *ctx) mutable {
     Rc<DxvkCommandList> cmd;
@@ -30883,6 +32860,8 @@ bool D3D9DeviceEx::War3ExecuteSemanticShadowSceneForValidation(
       cInput.scene.shadowStats.semanticSceneTerrainBoundsCandidateCount = rec.terrainBoundsCandidateCount;
       cInput.scene.shadowStats.semanticSceneTerrainBoundsProofAcceptedCount = rec.terrainBoundsProofAcceptedCount;
       cInput.scene.shadowStats.semanticSceneTerrainBoundsFailVisibleCount = rec.terrainBoundsFailVisibleCount;
+      cInput.scene.shadowStats.semanticSceneTerrainBoundsRejectReasonHistogram =
+          rec.terrainBoundsRejectReasonHistogram;
       cInput.scene.shadowStats.semanticSceneTerrainBoundsWouldCullCount = rec.terrainBoundsWouldCullCount;
       cInput.scene.shadowStats.semanticSceneTerrainBoundsAppliedCullCount = rec.terrainBoundsAppliedCullCount;
       cInput.scene.shadowStats.semanticSceneTerrainBoundsC0WouldCullCount = rec.terrainBoundsC0WouldCullCount;
@@ -30892,6 +32871,8 @@ bool D3D9DeviceEx::War3ExecuteSemanticShadowSceneForValidation(
       cInput.scene.shadowStats.semanticSceneObjectBoundsCandidateCount = rec.objectBoundsCandidateCount;
       cInput.scene.shadowStats.semanticSceneObjectBoundsProofAcceptedCount = rec.objectBoundsProofAcceptedCount;
       cInput.scene.shadowStats.semanticSceneObjectBoundsFailVisibleCount = rec.objectBoundsFailVisibleCount;
+      cInput.scene.shadowStats.semanticSceneObjectBoundsRejectReasonHistogram =
+          rec.objectBoundsRejectReasonHistogram;
       cInput.scene.shadowStats.semanticSceneObjectBoundsWouldCullCount = rec.objectBoundsWouldCullCount;
       cInput.scene.shadowStats.semanticSceneObjectBoundsAppliedCullCount = rec.objectBoundsAppliedCullCount;
       cInput.scene.shadowStats.semanticSceneShadowMapPreparedDrawCount = rec.shadowMapPreparedDrawCount;
@@ -31424,6 +33405,9 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::DrawIndexedPrimitive(
   war3::hooks::War3HotHookCallTiming dxvkDrawTiming(
       war3::hooks::War3HotHookId::D3D9DrawIndexedPrimitive, 4u);
   D3D9DeviceLock lock = LockDevice();
+
+  if (CheckVulkanDeviceLostFailStop("D3D9Device.DrawIndexedPrimitive"))
+    return D3DERR_DEVICEREMOVED;
 
   // [War3] 16位索引溢出防护：拆分过大的批次，避免索引越界导致模型撕裂
   // 说明：
@@ -32210,6 +34194,9 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::DrawPrimitiveUP(
       war3::hooks::War3HotHookId::D3D9DrawPrimitiveUP, 4u);
   D3D9DeviceLock lock = LockDevice();
 
+  if (CheckVulkanDeviceLostFailStop("D3D9Device.DrawPrimitiveUP"))
+    return D3DERR_DEVICEREMOVED;
+
   if (unlikely(!VertexStreamZeroStride))
     return D3DERR_INVALIDCALL;
 
@@ -32309,6 +34296,9 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::DrawIndexedPrimitiveUP(
   war3::hooks::War3HotHookCallTiming dxvkDrawTiming(
       war3::hooks::War3HotHookId::D3D9DrawIndexedPrimitiveUP, 4u);
   D3D9DeviceLock lock = LockDevice();
+
+  if (CheckVulkanDeviceLostFailStop("D3D9Device.DrawIndexedPrimitiveUP"))
+    return D3DERR_DEVICEREMOVED;
 
   if (unlikely(!VertexStreamZeroStride))
     return D3DERR_INVALIDCALL;
@@ -32711,6 +34701,9 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CreateVertexShader(
 
   if (unlikely(ppShader == nullptr))
     return D3DERR_INVALIDCALL;
+
+  if (CheckVulkanDeviceLostFailStop("D3D9Device.CreateVertexShader"))
+    return D3DERR_DEVICEREMOVED;
 
   DxsoModuleInfo moduleInfo;
   moduleInfo.options = m_dxsoOptions;
@@ -33123,6 +35116,9 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CreatePixelShader(
   if (unlikely(ppShader == nullptr))
     return D3DERR_INVALIDCALL;
 
+  if (CheckVulkanDeviceLostFailStop("D3D9Device.CreatePixelShader"))
+    return D3DERR_DEVICEREMOVED;
+
   DxsoModuleInfo moduleInfo;
   moduleInfo.options = m_dxsoOptions;
 
@@ -33479,6 +35475,9 @@ D3D9DeviceEx::GetMaximumFrameLatency(UINT *pMaxLatency) {
 
 HRESULT STDMETHODCALLTYPE
 D3D9DeviceEx::CheckDeviceState(HWND hDestinationWindow) {
+  if (CheckVulkanDeviceLostFailStop("D3D9Device.CheckDeviceState"))
+    return D3DERR_DEVICEREMOVED;
+
   static bool s_errorShown = false;
 
   if (!std::exchange(s_errorShown, true))
@@ -33492,6 +35491,9 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
                                                   HWND hDestWindowOverride,
                                                   const RGNDATA *pDirtyRegion,
                                                   DWORD dwFlags) {
+  if (CheckVulkanDeviceLostFailStop("D3D9Device.PresentEx"))
+    return D3DERR_DEVICEREMOVED;
+
   // War3MaybeInsertBeforeUi moves the completed scene into the pipeline and
   // immediately prepares a reserved, empty scene for the next frame. Preserve
   // that fact across OnFrameStart(), which clears HasInsertedBeforeUi().
@@ -33672,17 +35674,18 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
         War3PresentFrameTransitionScope("ShadowArenaBeginFrame");
     dxvk::war3::render::BeginShadowArenaCaptureFrame();
     if (dxvk::war3::render::IsShadowArenaCaptureEnabled()) {
-      if (!dxvk::war3::memory::ShadowArena_IsInitialized())
-        dxvk::war3::memory::ShadowArena_Init();
+      const bool arenaOwned =
+          dxvk::war3::memory::ShadowArena_IsOwnedBy(m_dxvkDevice.ptr()) ||
+          dxvk::war3::memory::ShadowArena_Init(m_dxvkDevice.ptr());
       // Present is the last command-producing boundary for the current world
       // frame. Retire its Arena generation, enqueue a dedicated completion
       // signal, then acquire a proven-free generation for the next frame.
       const uint64_t retiringFrameSerial =
           m_war3ShadowPersistentFrameSerial + 1u;
       const uint64_t nextFrameSerial = retiringFrameSerial + 1u;
-      if (!war3ArenaRetiredAtEpochTransition)
+      if (arenaOwned && !war3ArenaRetiredAtEpochTransition)
         dxvk::war3::memory::ShadowArena_EndFrame(retiringFrameSerial);
-      if (!war3ArenaRetiredAtEpochTransition &&
+      if (arenaOwned && !war3ArenaRetiredAtEpochTransition &&
           m_war3ShadowArenaFence != nullptr) {
         const Rc<sync::Fence> cShadowArenaFence = m_war3ShadowArenaFence;
         EmitCs([cShadowArenaFence,
@@ -33695,8 +35698,9 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
               ? m_war3ShadowArenaFence->value()
               : 0u;
       War3CollectRetiredShadowSessions(completedSerial);
-      const bool arenaReady = dxvk::war3::memory::ShadowArena_BeginFrame(
-          nextFrameSerial, completedSerial);
+      const bool arenaReady = arenaOwned &&
+          dxvk::war3::memory::ShadowArena_BeginFrame(
+              nextFrameSerial, completedSerial);
       const bool resetFullyApplied =
           m_war3ShadowMapResetRequestedSerial.load(
               std::memory_order_acquire) ==
@@ -33759,6 +35763,8 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
       m_war3SemanticPaletteCacheHashIndex.clear();
     }
     m_war3ShadowPersistentFrameSerial++;
+    m_war3DrawTimeActiveLedger.beginFrame(
+        m_war3ShadowPersistentFrameSerial);
     // 报告元数据：把业务帧主序号登记到 perf monitor，与 frameEpoch 建立对齐点。
     war3::War3PerfMonitor::instance().noteBusinessFrameSerial(
         m_war3ShadowPersistentFrameSerial);
@@ -33770,6 +35776,8 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
     auto phaseScope =
         War3PresentFrameTransitionScope("S1TerrainEarlyCacheGc");
     War3GcS1TerrainEarlyCache();
+    if constexpr (dxvk::war3::render::kDevelopmentShadowObserversEnabled)
+      War3GcS1GenerationProofObservations();
   }
   {
     auto phaseScope =
@@ -33791,6 +35799,12 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
         m_war3S1TerrainEarlyFallbackBackedCount;
     m_war3ShadowPersistentDiagnosticsFrame.s1EarlyLogicalReferencedBytes =
         m_war3S1TerrainEarlyLogicalReferencedBytes;
+    if constexpr (dxvk::war3::render::kDevelopmentShadowObserversEnabled) {
+      m_war3ShadowPersistentDiagnosticsFrame.s1GenerationProofEntryCount =
+          static_cast<uint64_t>(m_war3S1GenerationProofObservations.size());
+    } else {
+      m_war3ShadowPersistentDiagnosticsFrame.s1GenerationProofEntryCount = 0u;
+    }
     const auto completed =
         std::exchange(m_war3ShadowPersistentDiagnosticsFrame, {});
     war3::War3PerfMonitor::PersistentGeometryFrameStats stats = {};
@@ -33841,6 +35855,22 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
         completed.s1EarlyReplayFallbackCount;
     stats.s1EarlySourceMismatchEvictCount =
         completed.s1EarlySourceMismatchEvictCount;
+    stats.s1GenerationProofEntryCount = completed.s1GenerationProofEntryCount;
+    stats.s1GenerationProofEligibleCount =
+        completed.s1GenerationProofEligibleCount;
+    stats.s1GenerationProofFirstCount = completed.s1GenerationProofFirstCount;
+    stats.s1GenerationProofSameFrameCount =
+        completed.s1GenerationProofSameFrameCount;
+    stats.s1GenerationProofAdvancedCount =
+        completed.s1GenerationProofAdvancedCount;
+    stats.s1GenerationProofChangedCount =
+        completed.s1GenerationProofChangedCount;
+    stats.s1GenerationProofStaleRestartCount =
+        completed.s1GenerationProofStaleRestartCount;
+    stats.s1GenerationProofPromotionReadyCount =
+        completed.s1GenerationProofPromotionReadyCount;
+    stats.s1GenerationProofCapacityRejectCount =
+        completed.s1GenerationProofCapacityRejectCount;
     stats.s1EarlyReplayClosureMismatch =
         completed.s1EarlyAcceptedHitCount !=
             completed.s1EarlyReplayPublishedCount ||
@@ -33849,7 +35879,7 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
                 completed.s1EarlyReplayFallbackCount;
     war3::War3PerfMonitor::instance().notePersistentGeometryFrame(stats);
   }
-  // Phase 7.55 v4：每 60 帧清理一次 draw-time VB cache 中的 stale entry。
+  // Phase 7.55 v4：按共享策略周期清理 draw-time VB cache 中的 stale entry。
   // 2026-05-30 问题2：静态几何（桥/斜坡/建筑/装饰物/可破坏物）常驻，
   // 离开视野后不淘汰 GPU buffer，再次进入视野 O(1) 复用；只有动态对象按
   // 16 帧 TTL 淘汰。静态常驻受总字节上限约束做 LRU 回收，防止超大地图无限增长。
@@ -33857,13 +35887,18 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
     auto phaseScope =
         War3PresentFrameTransitionScope("DrawTimeVbCacheGc");
     if (m_war3ShadowPersistentFrameSerial >=
-        m_war3DrawTimeVBCacheLastCleanFrame + 60u) {
+        m_war3DrawTimeVBCacheLastCleanFrame +
+            war3::render::kWar3ShadowDrawTimeVBCacheGcIntervalFrames) {
     m_war3DrawTimeVBCacheLastCleanFrame = m_war3ShadowPersistentFrameSerial;
     const uint64_t dynamicMaxAge =
         dxvk::war3::internal::kShadowDrawTimeVBCacheDynamicMaxAgeFrames;
     const uint64_t staticMaxIdle =
         dxvk::war3::internal::kShadowDrawTimeVBCacheStaticMaxIdleFrames;
     uint64_t staticBytesLive = 0u;
+    uint64_t staticBytesProtected = 0u;
+    uint64_t staticBytesInactive = 0u;
+    uint64_t evictedEntries = 0u;
+    uint64_t evictedBytes = 0u;
     for (auto it = m_war3DrawTimeVBCache.begin();
          it != m_war3DrawTimeVBCache.end();) {
       const auto &e = it->second;
@@ -33874,10 +35909,18 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
                 ? (m_war3ShadowPersistentFrameSerial - e.lastAccessFrameSerial)
                 : 0u;
         if (idleAge > staticMaxIdle) {
+          evictedEntries++;
+          evictedBytes += e.ownedGpuBytes;
           it = m_war3DrawTimeVBCache.erase(it);
           continue;
         }
         staticBytesLive += e.ownedGpuBytes;
+        if (war3::render::IsWar3ShadowDrawTimeStaticWorkingSetProtected(
+                e.lastAccessFrameSerial, m_war3ShadowPersistentFrameSerial)) {
+          staticBytesProtected += e.ownedGpuBytes;
+        } else {
+          staticBytesInactive += e.ownedGpuBytes;
+        }
         ++it;
       } else {
         // 动态对象：保持原 16 帧 TTL 淘汰。
@@ -33889,18 +35932,44 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
       }
     }
 
-    // 静态常驻字节上限 LRU：超过上限时回收最久未访问（lastAccessFrameSerial
-    // 最小）的静态 entry，直到回到上限以下。
+    // The fixed 64 MiB is a target for inactive static residency, not a hard
+    // cap on the current Stage11 working set.  Evict only non-protected
+    // entries so visible trees cannot be cyclically evicted and then delayed
+    // behind the 32-allocation gate on the next camera update.
     const uint64_t staticCap =
         dxvk::war3::internal::kShadowDrawTimeVBCacheStaticPersistMaxBytes;
-    while (staticBytesLive > staticCap) {
+    const auto stableKeyLess = [] (const War3DrawTimeVBCacheKey& a,
+                                   const War3DrawTimeVBCacheKey& b) {
+      const auto pa = reinterpret_cast<uintptr_t>(a.instanceIdentity);
+      const auto pb = reinterpret_cast<uintptr_t>(b.instanceIdentity);
+      if (a.mapEpoch != b.mapEpoch) return a.mapEpoch < b.mapEpoch;
+      if (pa != pb) return pa < pb;
+      const auto ma = reinterpret_cast<uintptr_t>(a.meshPayloadPtr);
+      const auto mb = reinterpret_cast<uintptr_t>(b.meshPayloadPtr);
+      if (ma != mb) return ma < mb;
+      const auto ra = reinterpret_cast<uintptr_t>(a.renderablePart);
+      const auto rb = reinterpret_cast<uintptr_t>(b.renderablePart);
+      if (ra != rb) return ra < rb;
+      if (a.jHandle != b.jHandle) return a.jHandle < b.jHandle;
+      if (a.layerIndex != b.layerIndex) return a.layerIndex < b.layerIndex;
+      if (a.payloadWord108 != b.payloadWord108)
+        return a.payloadWord108 < b.payloadWord108;
+      return a.payloadWord11C < b.payloadWord11C;
+    };
+    while (staticBytesInactive > staticCap) {
       auto victim = m_war3DrawTimeVBCache.end();
       uint64_t oldestAccess = UINT64_MAX;
       for (auto it = m_war3DrawTimeVBCache.begin();
            it != m_war3DrawTimeVBCache.end(); ++it) {
-        if (!it->second.isStaticGeometry)
+        if (!it->second.isStaticGeometry ||
+            war3::render::IsWar3ShadowDrawTimeStaticWorkingSetProtected(
+                it->second.lastAccessFrameSerial,
+                m_war3ShadowPersistentFrameSerial))
           continue;
-        if (it->second.lastAccessFrameSerial < oldestAccess) {
+        if (it->second.lastAccessFrameSerial < oldestAccess ||
+            (it->second.lastAccessFrameSerial == oldestAccess &&
+             (victim == m_war3DrawTimeVBCache.end() ||
+              stableKeyLess(it->first, victim->first)))) {
           oldestAccess = it->second.lastAccessFrameSerial;
           victim = it;
         }
@@ -33908,8 +35977,26 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
       if (victim == m_war3DrawTimeVBCache.end())
         break;
       staticBytesLive -= victim->second.ownedGpuBytes;
+      staticBytesInactive -= victim->second.ownedGpuBytes;
+      evictedEntries++;
+      evictedBytes += victim->second.ownedGpuBytes;
       m_war3DrawTimeVBCache.erase(victim);
     }
+    const uint64_t overCapBytes =
+        war3::render::War3ShadowDrawTimeStaticOverCapBytes(
+            staticBytesLive, staticCap);
+    if (overCapBytes != 0u)
+      ++m_war3DrawTimeVBCacheStaticOverCapFrameCount;
+    m_war3Scene.shadowStats.drawTimeVBCacheStaticLiveBytes = staticBytesLive;
+    m_war3Scene.shadowStats.drawTimeVBCacheStaticProtectedBytes =
+        staticBytesProtected;
+    m_war3Scene.shadowStats.drawTimeVBCacheStaticOverCapBytes = overCapBytes;
+    m_war3Scene.shadowStats.drawTimeVBCacheStaticOverCapFrameCount =
+        m_war3DrawTimeVBCacheStaticOverCapFrameCount;
+    m_war3Scene.shadowStats.drawTimeVBCacheStaticEvictedBytes = evictedBytes;
+    m_war3Scene.shadowStats.drawTimeVBCacheStaticEvictedEntryCount =
+        evictedEntries;
+    War3CollectUnusedStage11SnapshotPages();
     }
   }
   {
@@ -34013,6 +36100,9 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CreateRenderTargetEx(
     HANDLE *pSharedHandle, DWORD Usage) {
   InitReturnPtr(ppSurface);
 
+  if (CheckVulkanDeviceLostFailStop("D3D9Device.CreateRenderTargetEx"))
+    return D3DERR_DEVICEREMOVED;
+
   if (unlikely(ppSurface == nullptr))
     return D3DERR_INVALIDCALL;
 
@@ -34080,6 +36170,10 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CreateOffscreenPlainSurfaceEx(
     UINT Width, UINT Height, D3DFORMAT Format, D3DPOOL Pool,
     IDirect3DSurface9 **ppSurface, HANDLE *pSharedHandle, DWORD Usage) {
   InitReturnPtr(ppSurface);
+
+  if (CheckVulkanDeviceLostFailStop(
+          "D3D9Device.CreateOffscreenPlainSurfaceEx"))
+    return D3DERR_DEVICEREMOVED;
 
   if (unlikely(ppSurface == nullptr))
     return D3DERR_INVALIDCALL;
@@ -34165,6 +36259,10 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CreateDepthStencilSurfaceEx(
     HANDLE *pSharedHandle, DWORD Usage) {
   InitReturnPtr(ppSurface);
 
+  if (CheckVulkanDeviceLostFailStop(
+          "D3D9Device.CreateDepthStencilSurfaceEx"))
+    return D3DERR_DEVICEREMOVED;
+
   if (unlikely(ppSurface == nullptr))
     return D3DERR_INVALIDCALL;
 
@@ -34224,6 +36322,9 @@ D3D9DeviceEx::ResetEx(D3DPRESENT_PARAMETERS *pPresentationParameters,
                       D3DDISPLAYMODEEX *pFullscreenDisplayMode) {
   D3D9DeviceLock lock = LockDevice();
 
+  if (CheckVulkanDeviceLostFailStop("D3D9Device.ResetEx"))
+    return D3DERR_DEVICEREMOVED;
+
   HRESULT hr;
   if (likely(m_deviceType != D3DDEVTYPE_NULLREF)) {
     hr = m_parent->ValidatePresentationParametersEx(pPresentationParameters,
@@ -34259,6 +36360,10 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CreateAdditionalSwapChainEx(
 
   if (ppSwapChain == nullptr || pPresentationParameters == nullptr)
     return D3DERR_INVALIDCALL;
+
+  if (CheckVulkanDeviceLostFailStop(
+          "D3D9Device.CreateAdditionalSwapChainEx"))
+    return D3DERR_DEVICEREMOVED;
 
   // Additional fullscreen swapchains are forbidden.
   if (!pPresentationParameters->Windowed)
@@ -36139,11 +38244,17 @@ void D3D9DeviceEx::UploadPerDrawData(UINT &FirstVertexIndex, UINT NumVertices,
 }
 
 void D3D9DeviceEx::InjectCsChunk(DxvkCsChunkRef &&Chunk, bool Synchronize) {
+  if (unlikely(IsVulkanDeviceLostFailStop()))
+    return;
+
   m_csThread.injectChunk(DxvkCsQueue::HighPriority, std::move(Chunk),
                          Synchronize);
 }
 
 void D3D9DeviceEx::EmitCsChunk(DxvkCsChunkRef &&chunk) {
+  if (unlikely(IsVulkanDeviceLostFailStop()))
+    return;
+
   // Flush init commands so that the CS thread
   // can processe them before the first use.
   m_initializer->FlushCsChunk();
@@ -36161,6 +38272,16 @@ void D3D9DeviceEx::ConsiderFlush(GpuFlushType FlushType) {
 
 void D3D9DeviceEx::SynchronizeCsThread(uint64_t SequenceNumber) {
   D3D9DeviceLock lock = LockDevice();
+
+  // A non-empty, not-yet-dispatched chunk is reported to callers as the
+  // next sequence number. Once the Vulkan device is terminally lost,
+  // FlushCsChunk deliberately drops that chunk instead of dispatching it,
+  // so only wait for a sequence that has actually been submitted.
+  if (unlikely(IsVulkanDeviceLostFailStop())) {
+    FlushCsChunk();
+    m_csThread.synchronize(m_csSeqNum);
+    return;
+  }
 
   // Dispatch current chunk so that all commands
   // recorded prior to this function will be run
@@ -36559,6 +38680,9 @@ template <D3D9RenderStateItem Item> void D3D9DeviceEx::UpdatePushConstant() {
 
 template <bool Synchronize9On12> void D3D9DeviceEx::ExecuteFlush() {
   D3D9DeviceLock lock = LockDevice();
+
+  if (unlikely(CheckVulkanDeviceLostFailStop("D3D9Device.Flush")))
+    return;
 
   if constexpr (Synchronize9On12)
     m_submitStatus.result = VK_NOT_READY;
@@ -40393,17 +42517,27 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   war3::hooks::War3HotHookCallTiming shadowCallbackTiming(
       war3::hooks::War3HotHookId::ShadowCaptureCallback, 4u);
 
+  // The exact per-draw QPC tree is report instrumentation, not part of the
+  // shadow producer contract. Keep it available while Ctrl+F1 recording is
+  // active, but do not charge every ordinary gameplay draw for two clock
+  // reads when no report can consume the sample.
+  const auto& shadowPerfMonitor = war3::War3PerfMonitor::instance();
+  const bool trackShadowCaptureCpu =
+      shadowPerfMonitor.isEnabled() && shadowPerfMonitor.isRecording();
+
   // Gates 分段：从入口到 legacy 采样点（早退 draw 也计入 Gates）。
-  War3CaptureCpuSample shadowCaptureGatesSample;
-  shadowCaptureGatesSample.bucketTicks =
-      &g_war3CaptureCpuTls.shadowCaptureGatesTicks;
-  shadowCaptureGatesSample.bucketCalls =
-      &g_war3CaptureCpuTls.shadowCaptureGatesCalls;
+  War3CaptureCpuSample shadowCaptureGatesSample(trackShadowCaptureCpu);
+  if (trackShadowCaptureCpu) {
+    shadowCaptureGatesSample.bucketTicks =
+        &g_war3CaptureCpuTls.shadowCaptureGatesTicks;
+    shadowCaptureGatesSample.bucketCalls =
+        &g_war3CaptureCpuTls.shadowCaptureGatesCalls;
+  }
 
   const bool traceShadowCaptureGates =
-      War3ShadowCaptureGateBreakdownRuntime();
+      trackShadowCaptureCpu && War3ShadowCaptureGateBreakdownRuntime();
   const bool traceShadowDrawTimeCapture =
-      War3ShadowDrawTimeCaptureBreakdownRuntime();
+      trackShadowCaptureCpu && War3ShadowDrawTimeCaptureBreakdownRuntime();
   const bool traceAnyShadowCaptureGateChild =
       traceShadowCaptureGates || traceShadowDrawTimeCapture;
   const uint32_t shadowCaptureGateTracePeriod =
@@ -41055,24 +43189,30 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       }
 
       // Safe metadata-only capture must run before the Stage11 semantic
-      // early-return below. It restores native alpha/UV/texture and anonymous
-      // blocker classification without touching the fail-closed draw-time
-      // position/index cache. A positive return is an authoritative blocker
-      // rejection for this exact current-frame part/layer.
-      // About six samples per frame in the current pressure scene. This keeps
-      // A/B variance low while adding only a handful of paired QPC reads.
+      // early-return below for non-indexed draws. Indexed alpha UV cannot be
+      // sized from MinVertexIndex/NumVertices and is therefore handled only
+      // by the exact IB-domain path later in this function. The anonymous
+      // indexed blocker probe is diagnostic-only for the same reason and the
+      // exact path performs its authoritative test. Do not pay the contract,
+      // material and declaration walk here for a bridge that must reject.
+      bool metadataRejectedBlocker = false;
       constexpr uint32_t kShadowMetadataTimingSamplePeriod = 16u;
-      ++g_war3CaptureCpuTls.shadowMetadataCaptureCalls;
+      const bool runShadowMetadataBridge = !indexed;
       const bool sampleShadowMetadata =
+          runShadowMetadataBridge && trackShadowCaptureCpu &&
           (++g_war3ShadowMetadataTimingOrdinal %
            kShadowMetadataTimingSamplePeriod) == 0u;
       const int64_t shadowMetadataBegin = sampleShadowMetadata
           ? dxvk::high_resolution_clock::get_counter()
           : 0;
-      const bool metadataRejectedBlocker = War3CaptureShadowDrawMetadata(
-          PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices,
-          StartVal, CountVal, indexed, DynamicSysmemVBOs, semantic,
-          stage, cat, earlyTag);
+      if (runShadowMetadataBridge) {
+        if (trackShadowCaptureCpu)
+          ++g_war3CaptureCpuTls.shadowMetadataCaptureCalls;
+        metadataRejectedBlocker = War3CaptureShadowDrawMetadata(
+            PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices,
+            StartVal, CountVal, indexed, DynamicSysmemVBOs, semantic,
+            stage, cat, earlyTag);
+      }
       if (sampleShadowMetadata) {
         const int64_t shadowMetadataEnd =
             dxvk::high_resolution_clock::get_counter();
@@ -41139,9 +43279,13 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       // Gates 分解在此暂停；该区间由精确 DrawTimeCapture 子节点独占，
       // 防止同一段时间同时落入 SemanticContext 与 DrawTimeCapture。
       shadowCaptureGateTiming.pause();
-      War3CaptureCpuSample captureSample;
-      captureSample.bucketTicks = &g_war3CaptureCpuTls.drawTimeCaptureTicks;
-      captureSample.bucketCalls = &g_war3CaptureCpuTls.drawTimeCaptureCalls;
+      War3CaptureCpuSample captureSample(trackShadowCaptureCpu);
+      if (trackShadowCaptureCpu) {
+        captureSample.bucketTicks =
+            &g_war3CaptureCpuTls.drawTimeCaptureTicks;
+        captureSample.bucketCalls =
+            &g_war3CaptureCpuTls.drawTimeCaptureCalls;
+      }
       War3ShadowDrawTimeCaptureRawTiming drawTimeCaptureTiming(
           traceShadowDrawTimeCapture && traceThisShadowCaptureChild,
           shadowCaptureGateTracePeriod,
@@ -41462,11 +43606,14 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         DxvkBufferSlice posSlice;
         uint32_t posStride = 0u;
         D3D9CommonBuffer* posCommon = nullptr;
+        VkDeviceSize posBindingOffset = 0u;
+        bool posCommonNeedsReadback = false;
         Rc<DxvkResourceAllocation> posMappedAllocation = nullptr;
         dxvk::war3::memory::War3CpuReadableBufferSpan posReadableSpan = {};
         const uint8_t* posCanonicalBytes = nullptr;
         VkDeviceSize posCanonicalLength = 0u;
         bool posCanonicalHostCached = false;
+        bool posReadableSpanResolveAttempted = false;
         if (gpuSkinSemanticBacking) {
           posSlice = gpuSkinResolved->lease.slice;
           posStride = gpuSkinResolved->lease.desc.vertexStride;
@@ -41492,30 +43639,12 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           }
           posSlice = m_war3PerDrawUpload.vbSlices[posStream];
           posStride = m_war3PerDrawUpload.vbStrides[posStream];
-          posReadableSpan =
-              dxvk::war3::memory::BuildWar3CpuReadableBufferSpan({
-                  m_war3PerDrawUpload.vbUploadBytes[posStream],
-                  m_war3PerDrawUpload.vbUploadLength[posStream], 0u,
-                  m_war3PerDrawUpload.vbUploadLength[posStream],
-                  m_war3PerDrawUpload.vbSourceResource[posStream],
-                  m_war3PerDrawUpload.vbSourceIdentityGeneration[posStream],
-                  m_war3PerDrawUpload.vbSourceSequence[posStream],
-                  m_war3PerDrawUpload.vbSourceContentGeneration[posStream],
-                  true});
-          if (posReadableSpan) {
-            posCanonicalBytes = posReadableSpan.data;
-            posCanonicalLength = posReadableSpan.length;
-            posCanonicalHostCached =
-                (m_war3PerDrawUpload.storage->getMemoryProperties() &
-                 VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0u;
-          }
         } else {
           auto *vb = m_state.vertexBuffers[posStream].vertexBuffer.ptr();
           if (vb) {
             posCommon = vb->GetCommonBuffer();
             if (posCommon) {
-              const VkDeviceSize bindingOffset =
-                  m_state.vertexBuffers[posStream].offset;
+              posBindingOffset = m_state.vertexBuffers[posStream].offset;
               // Capture precedes PrepareDraw.  A BUFFER/MANAGED resource with
               // pending CPU writes still has the previous generation in REAL.
               // FlushBuffer first copies those bytes into its own immutable
@@ -41530,39 +43659,9 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
               }
               posSlice = posCommon
                   ->GetBufferSlice<D3D9_COMMON_BUFFER_TYPE_REAL>(
-                      bindingOffset);
+                      posBindingOffset);
               posStride = m_state.vertexBuffers[posStream].stride;
-              if (!posCommon->NeedsReadback()) {
-                posMappedAllocation = posCommon->GetMappedSlice();
-                if (posMappedAllocation != nullptr) {
-                  const auto allocationInfo =
-                      posMappedAllocation->getBufferInfo();
-                  const bool hostVisible =
-                      (posMappedAllocation->getMemoryProperties() &
-                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0u;
-                  const bool hostCached =
-                      (posMappedAllocation->getMemoryProperties() &
-                       VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0u;
-                  const uint64_t requestedBytes =
-                      bindingOffset <= allocationInfo.size
-                      ? uint64_t(allocationInfo.size - bindingOffset)
-                      : 0u;
-                  posReadableSpan =
-                      dxvk::war3::memory::BuildWar3CpuReadableBufferSpan({
-                          posMappedAllocation->mapPtr(),
-                          uint64_t(allocationInfo.size), uint64_t(bindingOffset),
-                          requestedBytes,
-                          reinterpret_cast<uintptr_t>(posCommon),
-                          posCommon->War3IdentityGeneration(),
-                          posCommon->War3MapAllocationGeneration(),
-                          posCommon->War3ContentGeneration(), hostVisible});
-                  if (posReadableSpan) {
-                    posCanonicalBytes = posReadableSpan.data;
-                    posCanonicalLength = posReadableSpan.length;
-                    posCanonicalHostCached = hostCached;
-                  }
-                }
-              }
+              posCommonNeedsReadback = posCommon->NeedsReadback();
             }
           }
         }
@@ -41583,6 +43682,68 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           m_war3Scene.shadowStats.drawTimeVBCacheRejectNoSlice++;
           break;
         }
+        // Most Stage11 casters only need the immutable GPU slice. Resolving a
+        // CPU mapping is useful solely for the narrow blocker-marker bounds
+        // check and the separately compiled Package observer, so defer all
+        // allocation/memory-property work until one of those consumers asks.
+        const auto resolvePositionReadableSpan = [&]() -> bool {
+          if (posReadableSpanResolveAttempted)
+            return static_cast<bool>(posReadableSpan);
+          posReadableSpanResolveAttempted = true;
+
+          if (gpuSkinSemanticBacking || gpuSkinSemanticDirectOnly)
+            return false;
+          if (DynamicSysmemVBOs) {
+            posReadableSpan =
+                dxvk::war3::memory::BuildWar3CpuReadableBufferSpan({
+                    m_war3PerDrawUpload.vbUploadBytes[posStream],
+                    m_war3PerDrawUpload.vbUploadLength[posStream], 0u,
+                    m_war3PerDrawUpload.vbUploadLength[posStream],
+                    m_war3PerDrawUpload.vbSourceResource[posStream],
+                    m_war3PerDrawUpload.vbSourceIdentityGeneration[posStream],
+                    m_war3PerDrawUpload.vbSourceSequence[posStream],
+                    m_war3PerDrawUpload.vbSourceContentGeneration[posStream],
+                    true});
+            if (posReadableSpan) {
+              posCanonicalBytes = posReadableSpan.data;
+              posCanonicalLength = posReadableSpan.length;
+              posCanonicalHostCached =
+                  (m_war3PerDrawUpload.storage->getMemoryProperties() &
+                   VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0u;
+            }
+            return static_cast<bool>(posReadableSpan);
+          }
+
+          if (posCommon == nullptr || posCommonNeedsReadback)
+            return false;
+          posMappedAllocation = posCommon->GetMappedSlice();
+          if (posMappedAllocation == nullptr)
+            return false;
+          const auto allocationInfo = posMappedAllocation->getBufferInfo();
+          const VkMemoryPropertyFlags memoryProperties =
+              posMappedAllocation->getMemoryProperties();
+          const bool hostVisible =
+              (memoryProperties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0u;
+          const uint64_t requestedBytes =
+              posBindingOffset <= allocationInfo.size
+              ? uint64_t(allocationInfo.size - posBindingOffset)
+              : 0u;
+          posReadableSpan =
+              dxvk::war3::memory::BuildWar3CpuReadableBufferSpan({
+                  posMappedAllocation->mapPtr(), uint64_t(allocationInfo.size),
+                  uint64_t(posBindingOffset), requestedBytes,
+                  reinterpret_cast<uintptr_t>(posCommon),
+                  posCommon->War3IdentityGeneration(),
+                  posCommon->War3MapAllocationGeneration(),
+                  posCommon->War3ContentGeneration(), hostVisible});
+          if (posReadableSpan) {
+            posCanonicalBytes = posReadableSpan.data;
+            posCanonicalLength = posReadableSpan.length;
+            posCanonicalHostCached =
+                (memoryProperties & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0u;
+          }
+          return static_cast<bool>(posReadableSpan);
+        };
         // Resolve the exact IB before choosing a vertex copy range.  Warcraft
         // III does not consistently keep MinVertexIndex/NumVertices in sync
         // with the indices emitted by animated model geosets, so those D3D9
@@ -41613,6 +43774,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                 PersistentPackageMode::Observe &&
             War3PersistentPackageStage11EvidenceModeRuntime() ==
                 PersistentPackageMode::Observe;
+        if (persistentPackageObserveEnabled)
+          resolvePositionReadableSpan();
         dxvk::war3::memory::War3CpuReadableBufferSpan
             packageObserveIndexReadableSpan = {};
         const uint8_t* packageObserveIndexBytes = nullptr;
@@ -42130,6 +44293,220 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           m_war3Scene.shadowStats.drawTimeVBCacheRejectInsufficientLength++;
           break;
         }
+        using GenerationBackedStreamProof =
+            dxvk::war3::render::War3ShadowGenerationBackedStreamProof;
+        using ShadowStreamKind = dxvk::war3::render::War3ShadowStreamKind;
+        const bool semanticHasDynamicPose =
+            War3SemanticContextHasDynamicPoseEvidence(semantic);
+        const bool unitKindWithIdentity =
+            semantic.objectKind == dxvk::war3::render::ObjectKind::Unit &&
+            War3SemanticContextHasDynamicUnitObjectEvidence(semantic);
+        const bool unitKindWithoutIdentity =
+            semantic.objectKind == dxvk::war3::render::ObjectKind::Unit &&
+            !unitKindWithIdentity && !semanticHasDynamicPose;
+        const bool treatUnitlessRigidAsStatic =
+            dxvk::war3::internal::
+                kShadowDrawTimeVBCacheUnitlessRigidStaticPersistEnabled &&
+            unitKindWithoutIdentity;
+        const bool isDynamicUnit =
+            semanticHasDynamicPose ||
+            (semantic.objectKind == dxvk::war3::render::ObjectKind::Unit &&
+             !treatUnitlessRigidAsStatic);
+        const bool generationBackedStaticCandidate =
+            dxvk::war3::internal::kShadowDrawTimeVBCacheStaticPersistEnabled &&
+            !isDynamicUnit && !gpuSkinSemanticBacking &&
+            !gpuSkinSemanticDirectOnly;
+
+        const auto makeDirectStreamProof =
+            [&](D3D9CommonBuffer* source, uint64_t sourceOffset,
+                uint64_t sourceLength, uint32_t elementStride,
+                uint32_t elementSize,
+                ShadowStreamKind streamKind) -> GenerationBackedStreamProof {
+          GenerationBackedStreamProof proof = {};
+          if (source == nullptr || source->NeedsReadback())
+            return proof;
+          proof.ownerIdentity = reinterpret_cast<uintptr_t>(source);
+          proof.identityGeneration = source->War3IdentityGeneration();
+          proof.allocationGeneration = source->War3MapAllocationGeneration();
+          proof.contentGeneration = source->War3ContentGeneration();
+          proof.sourceOffset = sourceOffset;
+          proof.sourceLength = sourceLength;
+          proof.elementStride = elementStride;
+          proof.elementSize = elementSize;
+          proof.mapEpoch = m_war3GpuSkinMapEpoch;
+          proof.deviceEpoch = m_war3GpuSkinDeviceEpoch;
+          proof.streamKind = streamKind;
+          return proof.valid() ? proof : GenerationBackedStreamProof{};
+        };
+        const auto makeUploadVertexStreamProof =
+            [&](uint32_t stream, uint64_t localByteOffset,
+                uint64_t capturedBytes,
+                ShadowStreamKind streamKind) -> GenerationBackedStreamProof {
+          GenerationBackedStreamProof proof = {};
+          if (stream >= caps::MaxStreams ||
+              !m_war3PerDrawUpload.vbSourceValid[stream] ||
+              m_war3PerDrawUpload.vbSourceResource[stream] == 0u ||
+              m_war3PerDrawUpload.vbSourceIdentityGeneration[stream] == 0u ||
+              m_war3PerDrawUpload.vbSourceSequence[stream] == 0u ||
+              m_war3PerDrawUpload.vbSourceContentGeneration[stream] == 0u)
+            return proof;
+          const uint32_t sourceStride =
+              m_war3PerDrawUpload.vbSourceElementStride[stream];
+          const uint32_t capturedStride =
+              m_war3PerDrawUpload.vbSourceElementSize[stream];
+          if (sourceStride == 0u || capturedStride == 0u ||
+              capturedStride > sourceStride ||
+              localByteOffset % capturedStride != 0u ||
+              capturedBytes % capturedStride != 0u)
+            return proof;
+          const uint64_t firstElement = localByteOffset / capturedStride;
+          const uint64_t elementCount = capturedBytes / capturedStride;
+          if (elementCount == 0u ||
+              firstElement > (UINT64_MAX -
+                  m_war3PerDrawUpload.vbSourceOffset[stream]) / sourceStride ||
+              elementCount - 1u >
+                  (UINT64_MAX - capturedStride) / sourceStride)
+            return proof;
+          proof.ownerIdentity =
+              m_war3PerDrawUpload.vbSourceResource[stream];
+          proof.identityGeneration =
+              m_war3PerDrawUpload.vbSourceIdentityGeneration[stream];
+          proof.allocationGeneration =
+              m_war3PerDrawUpload.vbSourceSequence[stream];
+          proof.contentGeneration =
+              m_war3PerDrawUpload.vbSourceContentGeneration[stream];
+          proof.sourceOffset =
+              uint64_t(m_war3PerDrawUpload.vbSourceOffset[stream]) +
+              firstElement * uint64_t(sourceStride);
+          proof.sourceLength =
+              (elementCount - 1u) * uint64_t(sourceStride) + capturedStride;
+          proof.elementStride = sourceStride;
+          proof.elementSize = capturedStride;
+          proof.mapEpoch = m_war3GpuSkinMapEpoch;
+          proof.deviceEpoch = m_war3GpuSkinDeviceEpoch;
+          proof.streamKind = streamKind;
+          return proof.valid() ? proof : GenerationBackedStreamProof{};
+        };
+
+        const GenerationBackedStreamProof currentPositionSourceProof =
+            DynamicSysmemVBOs
+                ? makeUploadVertexStreamProof(
+                      posStream, uint64_t(vRangeStart) * uint64_t(posStride),
+                      uint64_t(posBytes), ShadowStreamKind::Position)
+                : makeDirectStreamProof(
+                      posCommon, uint64_t(posSrcOffset), uint64_t(posBytes),
+                      posStride, posStride, ShadowStreamKind::Position);
+        const Rc<DxvkResourceAllocation> directStaticPositionAllocation =
+            War3Stage11DirectStaticSourceRuntime() &&
+            generationBackedStaticCandidate && !DynamicSysmemVBOs &&
+            currentPositionSourceProof.valid() &&
+            posSlice.buffer() != nullptr
+                ? posSlice.buffer()->storage() : nullptr;
+        const DxvkResourceBufferInfo directStaticPositionInfo =
+            War3PinnedAllocationSliceInfo(
+                directStaticPositionAllocation, posSrcOffset, posBytes);
+        const bool directStaticPositionSource =
+            directStaticPositionInfo.buffer != VK_NULL_HANDLE;
+        const Rc<DxvkResourceAllocation> directUploadPositionAllocation =
+            War3Stage11DirectUploadSourceRuntime() && DynamicSysmemVBOs &&
+            currentPositionSourceProof.valid() &&
+            m_war3PerDrawUpload.storage != nullptr
+                ? m_war3PerDrawUpload.storage : nullptr;
+        const DxvkResourceBufferInfo directUploadPositionInfo =
+            War3PinnedAllocationSliceInfo(
+                directUploadPositionAllocation, posSrcOffset, posBytes);
+        const bool directUploadPositionSource =
+            directUploadPositionInfo.buffer != VK_NULL_HANDLE;
+#if defined(WARVK_ENABLE_SHADOW_OBSERVERS_DEV) && \
+    WARVK_ENABLE_SHADOW_OBSERVERS_DEV
+        if (War3Stage11AllocationObserverRuntime() && DynamicSysmemVBOs) {
+          auto& observerStats = m_war3Scene.shadowStats;
+          ++observerStats.drawTimeDirectUploadCandidateCount;
+          if (!currentPositionSourceProof.valid())
+            ++observerStats.drawTimeDirectUploadRejectNoProofCount;
+          else if (m_war3PerDrawUpload.storage == nullptr)
+            ++observerStats.drawTimeDirectUploadRejectNoStorageCount;
+          else if (!directUploadPositionSource)
+            ++observerStats.drawTimeDirectUploadRejectRangeCount;
+        }
+#endif
+        GenerationBackedStreamProof currentIndexSourceProof = {};
+        if (indexed) {
+          if (DynamicSysmemIBO &&
+              m_war3PerDrawUpload.ibSourceValid &&
+              m_war3PerDrawUpload.ibSourceResource != 0u &&
+              m_war3PerDrawUpload.ibSourceIdentityGeneration != 0u &&
+              m_war3PerDrawUpload.ibSourceSequence != 0u &&
+              m_war3PerDrawUpload.ibSourceContentGeneration != 0u &&
+              uint64_t(m_war3PerDrawUpload.ibSourceOffset) <=
+                  UINT64_MAX - uint64_t(drawTimeIndexRangeOffset)) {
+            currentIndexSourceProof.ownerIdentity =
+                m_war3PerDrawUpload.ibSourceResource;
+            currentIndexSourceProof.identityGeneration =
+                m_war3PerDrawUpload.ibSourceIdentityGeneration;
+            currentIndexSourceProof.allocationGeneration =
+                m_war3PerDrawUpload.ibSourceSequence;
+            currentIndexSourceProof.contentGeneration =
+                m_war3PerDrawUpload.ibSourceContentGeneration;
+            currentIndexSourceProof.sourceOffset =
+                uint64_t(m_war3PerDrawUpload.ibSourceOffset) +
+                uint64_t(drawTimeIndexRangeOffset);
+            currentIndexSourceProof.sourceLength =
+                uint64_t(drawTimeIndexRangeBytes);
+            currentIndexSourceProof.elementStride =
+                uint32_t(drawTimeIndexStride);
+            currentIndexSourceProof.elementSize =
+                uint32_t(drawTimeIndexStride);
+            currentIndexSourceProof.mapEpoch = m_war3GpuSkinMapEpoch;
+            currentIndexSourceProof.deviceEpoch = m_war3GpuSkinDeviceEpoch;
+            currentIndexSourceProof.streamKind = ShadowStreamKind::Index;
+            if (!currentIndexSourceProof.valid())
+              currentIndexSourceProof = {};
+          } else {
+            currentIndexSourceProof = makeDirectStreamProof(
+                drawTimeIndexCommon,
+                uint64_t(drawTimeIndexSlice.offset()) +
+                    uint64_t(drawTimeIndexRangeOffset),
+                uint64_t(drawTimeIndexRangeBytes),
+                uint32_t(drawTimeIndexStride),
+                uint32_t(drawTimeIndexStride), ShadowStreamKind::Index);
+          }
+        }
+#if defined(WARVK_ENABLE_SHADOW_OBSERVERS_DEV) && \
+    WARVK_ENABLE_SHADOW_OBSERVERS_DEV
+        if (War3Stage11AllocationObserverRuntime() &&
+            generationBackedStaticCandidate) {
+          auto& observerStats = m_war3Scene.shadowStats;
+          observerStats.drawTimeAllocObserverEnabled = 1u;
+          if (m_war3Stage11AllocationObserverFrameSerial !=
+              m_war3ShadowPersistentFrameSerial) {
+            m_war3Stage11AllocationObserverFrameSerial =
+                m_war3ShadowPersistentFrameSerial;
+            m_war3Stage11AllocationObserverProofs.clear();
+          }
+          if (!currentPositionSourceProof.valid()) {
+            ++observerStats.drawTimePositionProofInvalidCount;
+          } else {
+            const auto duplicate =
+                m_war3Stage11AllocationObserverProofs.find(
+                    currentPositionSourceProof);
+            if (duplicate != m_war3Stage11AllocationObserverProofs.end()) {
+              ++observerStats.drawTimePositionProofDuplicateCount;
+              observerStats.drawTimePositionProofDuplicateBytes +=
+                  uint64_t(posBytes);
+            } else if (m_war3Stage11AllocationObserverProofs.size() <
+                       kWar3Stage11AllocationObserverMaxProofs) {
+              m_war3Stage11AllocationObserverProofs.insert(
+                  currentPositionSourceProof);
+              ++observerStats.drawTimePositionProofUniqueCount;
+              observerStats.drawTimePositionProofUniqueBytes +=
+                  uint64_t(posBytes);
+            } else {
+              ++observerStats.drawTimePositionProofSetOverflowCount;
+            }
+          }
+        }
+#endif
         const VkPrimitiveTopology captureTopology = [&]() {
           switch (PrimitiveType) {
           case D3DPT_TRIANGLESTRIP:
@@ -42181,6 +44558,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           if (War3LegacyDrawIsPathBlockerGeometryMarkerCandidate(markerProbe,
                                                                  semantic)) {
             bool boundsReadable = false;
+            resolvePositionReadableSpan();
             if (War3ComputeMappedLocalBoundsFromBytes(
                     posCanonicalBytes, posCanonicalLength, posStride,
                     capturePositionOffset,
@@ -42310,60 +44688,61 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
 
         drawTimeCaptureTiming.enter(
             War3ShadowDrawTimeCapturePhase::FingerprintAndDedup);
-        // Phase 7.70：同帧去重指纹（仅源数据相关字段）。
-        //
-        // 这里我们已经知道 position 源的 buffer/offset/range。一帧里同一个
-        // renderablePart 常被反复 draw（多 layer / sub-mesh），如果源数据没变，
-        // 之前那次 capture 就把同样的 bytes 拷进了我们自有 buffer。第二次进来
-        // 重新 EmitCs(copyBuffer) 是纯浪费。指纹越严越保守：
-        //   - position 源 buffer 指针、offset、本次 range start/count、stride
-        //   - indexed 标志 + StartVal + CountVal（间接表达 IB 源 range）
-        // 我们在拿到 IB 源 buffer 指针之后，再把 IB 指针折进去做最终指纹比较。
-        const auto fold = [](uint64_t h, uint64_t v) -> uint64_t {
-          // 标准 64-bit splittable mix
-          h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
-          h *= 0x100000001b3ull;
-          return h;
-        };
-        uint64_t captureFingerprint = 0xcbf29ce484222325ull;
-        captureFingerprint = fold(captureFingerprint,
-            reinterpret_cast<uintptr_t>(posSlice.buffer().ptr()));
-        captureFingerprint = fold(captureFingerprint,
-            uint64_t(posSlice.offset()));
-        captureFingerprint = fold(captureFingerprint,
-            uint64_t(posSlice.length()));
-        captureFingerprint = fold(captureFingerprint,
-            uint64_t(uint32_t(vRangeStart)) | (uint64_t(vRangeCount) << 32));
-        captureFingerprint = fold(captureFingerprint,
-            uint64_t(posStride) | (uint64_t(capturePositionOffset) << 32));
-        captureFingerprint = fold(captureFingerprint,
-            indexed ? (uint64_t(StartVal) | (uint64_t(CountVal) << 32))
-                    : (uint64_t(StartVal) | (uint64_t(CountVal) << 32)
-                       | (1ull << 63)));
-        if (indexed) {
-          captureFingerprint = fold(
-              captureFingerprint,
-              reinterpret_cast<uintptr_t>(drawTimeIndexSlice.buffer().ptr()));
-          captureFingerprint = fold(
-              captureFingerprint, uint64_t(drawTimeIndexSlice.offset()) ^
-                  (uint64_t(drawTimeIndexRangeOffset) << 1u));
-          captureFingerprint = fold(
-              captureFingerprint,
-              uint64_t(actualIndexMin) | (uint64_t(actualIndexMax) << 32u));
-          captureFingerprint = fold(
-              captureFingerprint, actualIndexContentHash);
-          captureFingerprint = fold(
-              captureFingerprint,
-              uint64_t(actualIndexDomainKnown ? 1u : 0u) |
-                  (uint64_t(fullVertexDomainFallback ? 1u : 0u) << 1u));
+        // The historical source fingerprint is not a complete position / IB /
+        // UV / topology generation proof. Release therefore compiles both its
+        // arithmetic and its backing-reuse branch out instead of calculating a
+        // value that can only be written to an otherwise unread field. Keep the
+        // source rollback behind the same compile-time correctness freeze; an
+        // observer build must never make this mutating route reachable.
+        uint64_t captureFingerprint = 0u;
+        if constexpr (!dxvk::war3::internal::
+                          kReleaseFreezeExperimentalShadowRoutes) {
+          const auto fold = [](uint64_t h, uint64_t v) -> uint64_t {
+            h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+            h *= 0x100000001b3ull;
+            return h;
+          };
+          captureFingerprint = 0xcbf29ce484222325ull;
+          captureFingerprint = fold(captureFingerprint,
+              reinterpret_cast<uintptr_t>(posSlice.buffer().ptr()));
+          captureFingerprint = fold(captureFingerprint,
+              uint64_t(posSlice.offset()));
+          captureFingerprint = fold(captureFingerprint,
+              uint64_t(posSlice.length()));
+          captureFingerprint = fold(captureFingerprint,
+              uint64_t(uint32_t(vRangeStart)) |
+                  (uint64_t(vRangeCount) << 32));
+          captureFingerprint = fold(captureFingerprint,
+              uint64_t(posStride) |
+                  (uint64_t(capturePositionOffset) << 32));
+          captureFingerprint = fold(captureFingerprint,
+              indexed ? (uint64_t(StartVal) | (uint64_t(CountVal) << 32))
+                      : (uint64_t(StartVal) | (uint64_t(CountVal) << 32)
+                         | (1ull << 63)));
+          if (indexed) {
+            captureFingerprint = fold(
+                captureFingerprint,
+                reinterpret_cast<uintptr_t>(
+                    drawTimeIndexSlice.buffer().ptr()));
+            captureFingerprint = fold(
+                captureFingerprint, uint64_t(drawTimeIndexSlice.offset()) ^
+                    (uint64_t(drawTimeIndexRangeOffset) << 1u));
+            captureFingerprint = fold(
+                captureFingerprint,
+                uint64_t(actualIndexMin) |
+                    (uint64_t(actualIndexMax) << 32u));
+            captureFingerprint = fold(
+                captureFingerprint, actualIndexContentHash);
+            captureFingerprint = fold(
+                captureFingerprint,
+                uint64_t(actualIndexDomainKnown ? 1u : 0u) |
+                    (uint64_t(fullVertexDomainFallback ? 1u : 0u) << 1u));
+          }
         }
-        // Phase 7.70：fast path — 同帧、同源数据指纹命中时只刷新易变状态。
-        //
-        // 易变状态指 capture 时 D3D state 中可能在同一 renderablePart 不同
-        // sub-draw 里发生变化的字段：alphaTestEnabled、alphaBlendEnabled、
-        // alphaRef、diffuseTexture（stage0 SRV）、capturedWorldMatrix。这些
-        // 全部不涉及 GPU copy，开销可忽略。下游消费时谁后写谁生效，符合
-        // 既有“最后一次 draw 决定 caster 状态”的语义。
+
+        // FingerprintAndDedup still owns the single cache lookup used by
+        // CacheRecordSetup. Release preserves its historical same-frame repeat
+        // counter even though the unsafe reuse itself is compiled out.
         auto drawTimeCacheIt = m_war3DrawTimeVBCache.end();
         if (!gpuSkinSemanticBacking) {
           drawTimeCacheIt = m_war3DrawTimeVBCache.find(vbCacheKey);
@@ -42371,101 +44750,102 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
             auto& cached = drawTimeCacheIt->second;
             const bool sameFrame =
                 cached.frameSerial == m_war3ShadowPersistentFrameSerial;
-            const bool fingerprintMatch =
-                cached.lastCaptureFingerprint == captureFingerprint;
-            const bool buffersIntact =
-                !cached.gpuSkinLeaseBacked &&
-                cached.HasCompleteBacking() &&
-                cached.vertexCount == vRangeCount &&
-                cached.positionStride == posStride;
-            // Phase C：静态几何允许跨帧 fingerprint 命中跳过 GPU copy。
-            // 动态单位仍只允许同帧 dedup（姿态可能每帧变，但 ring 源指纹相同
-            // 时不能误复用旧 bytes）。
-            const bool staticCrossFrameReuse =
-                !sameFrame && fingerprintMatch && buffersIntact &&
-                cached.isStaticGeometry &&
-                dxvk::war3::internal::
-                    kShadowDrawTimeVBCacheStaticPersistEnabled;
-            if (War3DrawTimeSourceFingerprintReuseRuntime() &&
-                ((sameFrame && fingerprintMatch && buffersIntact) ||
-                 staticCrossFrameReuse)) {
-              // 刷新一份新的 D3D 状态快照，避免拿陈旧 alpha/纹理。
-              const bool atState =
-                  m_state.renderStates[D3DRS_ALPHATESTENABLE] != FALSE;
-              const bool atFunc =
-                  m_state.renderStates[D3DRS_ALPHAFUNC] != D3DCMP_ALWAYS;
-              cached.alphaTestEnabled = atState && atFunc;
-              cached.alphaBlendEnabled =
-                  m_state.renderStates[D3DRS_ALPHABLENDENABLE] != FALSE;
-              const DWORD alphaRefDword =
-                  cached.alphaTestEnabled
-                      ? m_state.renderStates[D3DRS_ALPHAREF]
-                      : DWORD(128);
-              cached.alphaRef = float(alphaRefDword & 0xFFu) / 255.0f;
-              cached.diffuseTexture = nullptr;
-              if (m_state.textures[0] != nullptr) {
-                auto* commonTex = GetCommonTexture(m_state.textures[0]);
-                if (commonTex)
-                  cached.diffuseTexture = commonTex->GetSampleView(false);
+            if constexpr (!dxvk::war3::internal::
+                              kReleaseFreezeExperimentalShadowRoutes) {
+              const bool fingerprintMatch =
+                  cached.lastCaptureFingerprint == captureFingerprint;
+              const bool buffersIntact =
+                  !cached.gpuSkinLeaseBacked &&
+                  cached.HasCompleteBacking() &&
+                  cached.vertexCount == vRangeCount &&
+                  cached.positionStride == posStride;
+              const bool staticCrossFrameReuse =
+                  !sameFrame && fingerprintMatch && buffersIntact &&
+                  cached.isStaticGeometry &&
+                  dxvk::war3::internal::
+                      kShadowDrawTimeVBCacheStaticPersistEnabled;
+              if (War3DrawTimeSourceFingerprintReuseRuntime() &&
+                  ((sameFrame && fingerprintMatch && buffersIntact) ||
+                   staticCrossFrameReuse)) {
+                // Refresh only inexpensive draw state. This rollback remains
+                // unreachable while the Release correctness freeze is active.
+                const bool atState =
+                    m_state.renderStates[D3DRS_ALPHATESTENABLE] != FALSE;
+                const bool atFunc =
+                    m_state.renderStates[D3DRS_ALPHAFUNC] != D3DCMP_ALWAYS;
+                cached.alphaTestEnabled = atState && atFunc;
+                cached.alphaBlendEnabled =
+                    m_state.renderStates[D3DRS_ALPHABLENDENABLE] != FALSE;
+                const DWORD alphaRefDword =
+                    cached.alphaTestEnabled
+                        ? m_state.renderStates[D3DRS_ALPHAREF]
+                        : DWORD(128);
+                cached.alphaRef = float(alphaRefDword & 0xFFu) / 255.0f;
+                cached.diffuseTexture = nullptr;
+                if (m_state.textures[0] != nullptr) {
+                  auto* commonTex = GetCommonTexture(m_state.textures[0]);
+                  if (commonTex)
+                    cached.diffuseTexture = commonTex->GetSampleView(false);
+                }
+                cached.capturedWorldMatrix =
+                    m_state.transforms[GetTransformIndex(D3DTS_WORLD)];
+                cached.sceneNode = vbCacheContract.sceneNode != nullptr
+                                       ? vbCacheContract.sceneNode
+                                       : semantic.sceneNode;
+                cached.unitPtr = vbCacheContract.unitPtr != nullptr
+                                     ? vbCacheContract.unitPtr
+                                     : semanticUnitPtr;
+                cached.worldObjectEntry =
+                    vbCacheContract.worldObjectEntry != nullptr
+                        ? vbCacheContract.worldObjectEntry
+                        : semantic.worldObjectEntry;
+                cached.producerStage = vbCacheContract.producerStage >= 0
+                                           ? vbCacheContract.producerStage
+                                           : static_cast<int16_t>(stage);
+                if (pathBlockerRawcode != 0u)
+                  cached.rawcode = pathBlockerRawcode;
+                cached.jHandle = vbCacheContract.jHandle != 0u
+                                     ? vbCacheContract.jHandle
+                                     : semanticJHandle;
+                if (vbCacheContract.objectKind !=
+                    dxvk::war3::render::ObjectKind::Unknown) {
+                  cached.objectKind = vbCacheContract.objectKind;
+                } else if (semantic.objectKind !=
+                           dxvk::war3::render::ObjectKind::Unknown) {
+                  cached.objectKind = semantic.objectKind;
+                }
+                cached.pathBlockerGeometryMarker =
+                    cached.pathBlockerGeometryMarker ||
+                    drawTimePathBlockerGeometryMarker;
+                cached.pathBlocker =
+                    cached.pathBlocker || vbCacheContract.pathBlocker ||
+                    semantic.pathBlocker ||
+                    cached.pathBlockerGeometryMarker ||
+                    IsLosBlockerFourCc(cached.rawcode);
+                cached.unitIdentityProven =
+                    exactUnitIdentityProven && !cached.pathBlocker;
+                cached.actualIndexMin = actualIndexMin;
+                cached.actualIndexMax = actualIndexMax;
+                cached.actualIndexDomainKnown = actualIndexDomainKnown;
+                cached.fullVertexDomainFallback = fullVertexDomainFallback;
+                cached.indexHintMismatch = indexHintMismatch;
+                // This incomplete rollback proof never refreshes Package
+                // would-use evidence.
+                cached.persistentPackageCurrentDrawProof = {};
+                cached.frameSerial = m_war3ShadowPersistentFrameSerial;
+                War3ActivateDrawTimeCacheEntry(vbCacheKey, cached);
+                cached.lastAccessFrameSerial =
+                    m_war3ShadowPersistentFrameSerial;
+                if (sameFrame) {
+                  m_war3Scene.shadowStats.drawTimeVBCacheSameFrameDedupHit++;
+                  m_war3Scene.shadowStats
+                      .drawTimeVBCacheSameFrameStateRefresh++;
+                } else {
+                  m_war3Scene.shadowStats
+                      .drawTimeVBCacheSameFrameStateRefresh++;
+                }
+                break;
               }
-              cached.capturedWorldMatrix =
-                  m_state.transforms[GetTransformIndex(D3DTS_WORLD)];
-              cached.sceneNode = vbCacheContract.sceneNode != nullptr
-                                     ? vbCacheContract.sceneNode
-                                     : semantic.sceneNode;
-              cached.unitPtr = vbCacheContract.unitPtr != nullptr
-                                   ? vbCacheContract.unitPtr
-                                   : semanticUnitPtr;
-              cached.worldObjectEntry =
-                  vbCacheContract.worldObjectEntry != nullptr
-                      ? vbCacheContract.worldObjectEntry
-                      : semantic.worldObjectEntry;
-              cached.producerStage = vbCacheContract.producerStage >= 0
-                                         ? vbCacheContract.producerStage
-                                         : static_cast<int16_t>(stage);
-              if (pathBlockerRawcode != 0u)
-                cached.rawcode = pathBlockerRawcode;
-              cached.jHandle = vbCacheContract.jHandle != 0u
-                                   ? vbCacheContract.jHandle
-                                   : semanticJHandle;
-              if (vbCacheContract.objectKind !=
-                  dxvk::war3::render::ObjectKind::Unknown) {
-                cached.objectKind = vbCacheContract.objectKind;
-              } else if (semantic.objectKind !=
-                         dxvk::war3::render::ObjectKind::Unknown) {
-                cached.objectKind = semantic.objectKind;
-              }
-              cached.pathBlockerGeometryMarker =
-                  cached.pathBlockerGeometryMarker ||
-                  drawTimePathBlockerGeometryMarker;
-              cached.pathBlocker =
-                  cached.pathBlocker || vbCacheContract.pathBlocker ||
-                  semantic.pathBlocker ||
-                  cached.pathBlockerGeometryMarker ||
-                  IsLosBlockerFourCc(cached.rawcode);
-              cached.unitIdentityProven =
-                  exactUnitIdentityProven && !cached.pathBlocker;
-              cached.actualIndexMin = actualIndexMin;
-              cached.actualIndexMax = actualIndexMax;
-              cached.actualIndexDomainKnown = actualIndexDomainKnown;
-              cached.fullVertexDomainFallback = fullVertexDomainFallback;
-              cached.indexHintMismatch = indexHintMismatch;
-              // The historical fingerprint rollback is not a complete source
-              // generation proof. Even when explicitly enabled it must never
-              // refresh Package would-use evidence.
-              cached.persistentPackageCurrentDrawProof = {};
-              // 跨帧复用时必须把 frameSerial 刷到本帧，否则 consume/producer
-              // 会因 entryFresh 失败而漏提交。
-              cached.frameSerial = m_war3ShadowPersistentFrameSerial;
-              cached.lastAccessFrameSerial = m_war3ShadowPersistentFrameSerial;
-              if (sameFrame) {
-                m_war3Scene.shadowStats.drawTimeVBCacheSameFrameDedupHit++;
-                m_war3Scene.shadowStats.drawTimeVBCacheSameFrameStateRefresh++;
-              } else {
-                // 复用 cross-frame 统计槽：StateRefresh 语义兼容“只刷状态不 copy”。
-                m_war3Scene.shadowStats.drawTimeVBCacheSameFrameStateRefresh++;
-              }
-              break;
             }
             if (sameFrame) {
               // 同帧但数据指纹不一致：必须重做 GPU copy。记账以便观察是否
@@ -42476,6 +44856,20 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         }
         drawTimeCaptureTiming.enter(
             War3ShadowDrawTimeCapturePhase::CacheRecordSetup);
+#if defined(WARVK_ENABLE_SHADOW_OBSERVERS_DEV) && \
+    WARVK_ENABLE_SHADOW_OBSERVERS_DEV
+        const bool observerEntryExisted =
+            drawTimeCacheIt != m_war3DrawTimeVBCache.end();
+        const bool observerHadPositionBuffer =
+            observerEntryExisted &&
+            drawTimeCacheIt->second.positionBuffer != nullptr;
+        const uint64_t observerPreviousPositionCapacity =
+            observerEntryExisted
+                ? uint64_t(drawTimeCacheIt->second.positionCapacity)
+                : 0u;
+        const bool observerReplacingGpuSkinLease =
+            observerEntryExisted && drawTimeCacheIt->second.gpuSkinLeaseBacked;
+#endif
         auto& entry = [&]() -> decltype(m_war3DrawTimeVBCache)::mapped_type& {
           if (War3DrawTimeCacheIteratorReuseRuntime() &&
               drawTimeCacheIt != m_war3DrawTimeVBCache.end()) {
@@ -42483,6 +44877,20 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           }
           return m_war3DrawTimeVBCache[vbCacheKey];
         }();
+        const bool generationBackedPositionReuse =
+            generationBackedStaticCandidate && entry.isStaticGeometry &&
+            entry.positionSourceProof.matches(currentPositionSourceProof) &&
+            entry.positionBuffer != nullptr &&
+            entry.positionCapacity >= posBytes &&
+            entry.vertexCount == vRangeCount &&
+            entry.positionStride == posStride;
+        const bool generationBackedIndexReuse =
+            generationBackedStaticCandidate && indexed &&
+            entry.isStaticGeometry &&
+            entry.indexSourceProof.matches(currentIndexSourceProof) &&
+            entry.indexBuffer != nullptr &&
+            entry.indexCapacity >= drawTimeIndexRangeBytes &&
+            entry.indexType == drawTimeIndexType;
         if (War3DrawTimeCacheIteratorReuseVerifyRuntime()) {
           auto& legacyEntry = m_war3DrawTimeVBCache[vbCacheKey];
           if (&legacyEntry != &entry)
@@ -42538,6 +44946,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
             exactUnitIdentityProven && !entry.pathBlocker;
         entry.vertexCount = vRangeCount;
         entry.frameSerial = m_war3ShadowPersistentFrameSerial;
+        War3ActivateDrawTimeCacheEntry(vbCacheKey, entry);
         entry.packageCaptureOrdinal = packageCurrentCaptureOrdinal;
         entry.positionStride = posStride;
         entry.positionOffset = capturePositionOffset;
@@ -42561,6 +44970,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         const bool replacingGpuSkinLease = entry.gpuSkinLeaseBacked;
         entry.gpuSkinLeaseBacked = false;
         entry.gpuSkinInput = {};
+        entry.positionPinnedAllocation = nullptr;
         if (!gpuSkinSemanticBacking && replacingGpuSkinLease) {
           entry.positionBuffer = nullptr;
           entry.positionInfo = {};
@@ -42610,6 +45020,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           entry.vertexCount = lease.desc.vertexCount;
           entry.consumeVertexOffset = 0;
           entry.positionCapacity = 0u;
+          entry.positionSnapshotPage.reset();
+          entry.positionSnapshotOffset = 0u;
           entry.gpuSkinLeaseBacked = true;
           if (gpuSkinSemanticInputExact)
             entry.gpuSkinInput = gpuSkinSemanticInput;
@@ -42626,8 +45038,30 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           entry.vertexCount = gpuSkinSemanticInput.desc.vertexCount;
           entry.consumeVertexOffset = 0;
           entry.positionCapacity = 0u;
+          entry.positionSnapshotPage.reset();
+          entry.positionSnapshotOffset = 0u;
           entry.gpuSkinLeaseBacked = true;
           entry.gpuSkinInput = gpuSkinSemanticInput;
+        } else if (directStaticPositionSource) {
+          entry.positionBuffer = posSlice.buffer();
+          entry.positionPinnedAllocation = directStaticPositionAllocation;
+          entry.positionInfo = directStaticPositionInfo;
+          entry.positionCapacity = 0u;
+          entry.positionSnapshotPage.reset();
+          entry.positionSnapshotOffset = 0u;
+          m_war3Scene.shadowStats.drawTimeDirectStaticPositionBindCount++;
+          m_war3Scene.shadowStats.drawTimeDirectStaticPositionBytes +=
+              uint64_t(posBytes);
+        } else if (directUploadPositionSource) {
+          entry.positionBuffer = posSlice.buffer();
+          entry.positionPinnedAllocation = directUploadPositionAllocation;
+          entry.positionInfo = directUploadPositionInfo;
+          entry.positionCapacity = 0u;
+          entry.positionSnapshotPage.reset();
+          entry.positionSnapshotOffset = 0u;
+          m_war3Scene.shadowStats.drawTimeDirectUploadPositionBindCount++;
+          m_war3Scene.shadowStats.drawTimeDirectUploadPositionBytes +=
+              uint64_t(posBytes);
         }
 
         drawTimeCaptureTiming.enter(
@@ -42651,57 +45085,122 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         // 同步阻塞。已存在足够 capacity 的 entry 直接走，不消耗预算。
         const bool needsNewPositionBuffer =
             !gpuSkinSemanticBacking && !gpuSkinSemanticDirectOnly &&
+            !directStaticPositionSource &&
+            !directUploadPositionSource &&
             (entry.positionBuffer == nullptr ||
              entry.positionCapacity < posBytes);
+#if defined(WARVK_ENABLE_SHADOW_OBSERVERS_DEV) && \
+    WARVK_ENABLE_SHADOW_OBSERVERS_DEV
+        war3::render::War3Stage11PositionAllocationClass
+            observerPositionAllocationClass =
+                war3::render::War3Stage11PositionAllocationClass::NewEntry;
         if (needsNewPositionBuffer &&
-            dxvk::war3::internal::kShadowDrawTimeVBCacheAllocBudgetEnabled) {
-          if (m_war3DrawTimeVBCacheAllocBudgetThisFrame >=
-              dxvk::war3::internal::
-                  kShadowDrawTimeVBCacheAllocBudgetPerFrame) {
-            m_war3DrawTimeVBCacheBudgetDeferredCount++;
-            // The entry may still own an older, undersized buffer. Invalidate
-            // its descriptor so this frame cannot publish stale/out-of-range
-            // backing while allocation is deferred.
-            entry.positionInfo = {};
-            War3MarkDrawTimeExactRejectedCurrentFrame(vbCacheKey);
-            break;
+            War3Stage11AllocationObserverRuntime()) {
+          auto& observerStats = m_war3Scene.shadowStats;
+          observerStats.drawTimeAllocObserverEnabled = 1u;
+          ++observerStats.drawTimePositionAllocRequestCount;
+          if (generationBackedStaticCandidate)
+            ++observerStats.drawTimePositionAllocStaticRequestCount;
+          else {
+            ++observerStats.drawTimePositionAllocDynamicRequestCount;
+            if (!DynamicSysmemVBOs)
+              ++observerStats.drawTimePositionAllocDirectMutableRequestCount;
+          }
+          observerPositionAllocationClass =
+              war3::render::ClassifyWar3Stage11PositionAllocation(
+                  observerEntryExisted, observerHadPositionBuffer,
+                  observerPreviousPositionCapacity, uint64_t(posBytes),
+                  observerReplacingGpuSkinLease);
+          switch (observerPositionAllocationClass) {
+          case war3::render::War3Stage11PositionAllocationClass::NewEntry:
+            ++observerStats.drawTimePositionAllocNewEntryCount; break;
+          case war3::render::War3Stage11PositionAllocationClass::
+              ExistingMissingBacking:
+            ++observerStats.drawTimePositionAllocMissingBackingCount; break;
+          case war3::render::War3Stage11PositionAllocationClass::
+              CapacityGrowth:
+            ++observerStats.drawTimePositionAllocCapacityGrowthCount; break;
+          case war3::render::War3Stage11PositionAllocationClass::
+              GpuSkinLeaseDetach:
+            ++observerStats.drawTimePositionAllocLeaseDetachCount; break;
           }
         }
+#endif
+        bool positionPageBudgetDeferred = false;
+        bool positionPageAllocationFailed = false;
         if (needsNewPositionBuffer) {
-          DxvkBufferCreateInfo posInfoCi = {};
-          posInfoCi.size = War3AlignPersistentBytes(posBytes);
-          posInfoCi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
-                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-          posInfoCi.stages = VK_PIPELINE_STAGE_TRANSFER_BIT |
-                             VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
-          posInfoCi.access = VK_ACCESS_TRANSFER_WRITE_BIT |
-                             VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
-          posInfoCi.debugName = "War3DrawTimeVBPos";
-          auto buf = m_dxvkDevice->createBuffer(
-              posInfoCi, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-          if (buf != nullptr) {
-            entry.positionBuffer = std::move(buf);
-            entry.positionCapacity = posInfoCi.size;
+          std::shared_ptr<War3Stage11SnapshotPage> snapshotPage;
+          VkDeviceSize snapshotOffset = 0u;
+          VkDeviceSize snapshotCapacity = 0u;
+          const auto snapshotResult = War3AllocateStage11Snapshot(
+              posBytes, snapshotPage, snapshotOffset, snapshotCapacity);
+          if (snapshotResult ==
+              War3Stage11SnapshotAllocationResult::Success) {
+            entry.positionSnapshotPage = std::move(snapshotPage);
+            entry.positionSnapshotOffset = snapshotOffset;
+            entry.positionBuffer = entry.positionSnapshotPage->buffer;
+            entry.positionCapacity = snapshotCapacity;
             m_war3Scene.shadowStats.drawTimeVBCachePositionAllocCount++;
-            // Phase 7.123：扣减预算。
-            m_war3DrawTimeVBCacheAllocBudgetThisFrame++;
+          } else if (snapshotResult ==
+                     War3Stage11SnapshotAllocationResult::PageCreateBudget) {
+            positionPageBudgetDeferred = true;
+            m_war3DrawTimeVBCacheBudgetDeferredCount++;
+#if defined(WARVK_ENABLE_SHADOW_OBSERVERS_DEV) && \
+    WARVK_ENABLE_SHADOW_OBSERVERS_DEV
+            if (War3Stage11AllocationObserverRuntime()) {
+              auto& observerStats = m_war3Scene.shadowStats;
+              switch (observerPositionAllocationClass) {
+              case war3::render::War3Stage11PositionAllocationClass::NewEntry:
+                ++observerStats.drawTimePositionDeferredNewEntryCount; break;
+              case war3::render::War3Stage11PositionAllocationClass::
+                  ExistingMissingBacking:
+                ++observerStats.drawTimePositionDeferredMissingBackingCount;
+                break;
+              case war3::render::War3Stage11PositionAllocationClass::
+                  CapacityGrowth:
+                ++observerStats.drawTimePositionDeferredCapacityGrowthCount;
+                break;
+              case war3::render::War3Stage11PositionAllocationClass::
+                  GpuSkinLeaseDetach:
+                ++observerStats.drawTimePositionDeferredLeaseDetachCount;
+                break;
+              }
+            }
+#endif
+          } else {
+            positionPageAllocationFailed = true;
           }
         }
         if (!gpuSkinSemanticBacking && !gpuSkinSemanticDirectOnly &&
+            !directStaticPositionSource &&
+            !directUploadPositionSource &&
             (entry.positionBuffer == nullptr ||
              entry.positionCapacity < posBytes)) {
           entry.positionInfo = {};
           War3MarkDrawTimeExactRejectedCurrentFrame(vbCacheKey);
+          if (positionPageBudgetDeferred) {
+            War3RecordRequiredCasterOmission(
+                vbCacheKey,
+                War3RequiredCasterOmissionReason::PositionAllocBudget);
+          } else if (needsNewPositionBuffer ||
+                     positionPageAllocationFailed) {
+            War3RecordRequiredCasterOmission(
+                vbCacheKey,
+                War3RequiredCasterOmissionReason::AllocationFailure);
+          }
           m_war3Scene.shadowStats.drawTimeVBCacheRejectNoBuffer++;
           break;
         }
-        if (!gpuSkinSemanticBacking && !gpuSkinSemanticDirectOnly) {
+        if (!gpuSkinSemanticBacking && !gpuSkinSemanticDirectOnly &&
+            !directStaticPositionSource &&
+            !directUploadPositionSource &&
+            !generationBackedPositionReuse) {
           auto srcBuf = posSlice.buffer();
           EmitCs([cDst = entry.positionBuffer, cSrc = srcBuf,
+                  cDstOff = entry.positionSnapshotOffset,
                   cSrcOff = posSrcOffset,
                   cBytes = posBytes](DxvkContext *ctx) {
-            ctx->copyBuffer(cDst, 0, cSrc, cSrcOff, cBytes);
+            ctx->copyBuffer(cDst, cDstOff, cSrc, cSrcOff, cBytes);
           });
           m_war3Scene.shadowStats.drawTimeVBCachePositionCopyCount++;
           m_war3Scene.shadowStats.drawTimeVBCachePositionCopyBytes +=
@@ -42710,8 +45209,19 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
             m_war3Scene.shadowStats.gpuSkinShadowBackingFallbackCount++;
             ++m_war3GpuSkinP2BackingFallbacks;
           }
-          entry.positionInfo =
-              entry.positionBuffer->getSliceInfo(0, posBytes);
+        }
+        if (!gpuSkinSemanticBacking && !gpuSkinSemanticDirectOnly) {
+          if (!directStaticPositionSource && !directUploadPositionSource) {
+            entry.positionInfo =
+                entry.positionBuffer->getSliceInfo(
+                    entry.positionSnapshotOffset, posBytes);
+          }
+          if (generationBackedPositionReuse) {
+            m_war3Scene.shadowStats
+                .drawTimeGenerationBackedPositionReuseCount++;
+            m_war3Scene.shadowStats
+                .drawTimeGenerationBackedCopyBytesSaved += uint64_t(posBytes);
+          }
         }
 
         drawTimeCaptureTiming.enter(
@@ -42722,11 +45232,16 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           entry.uvBuffer = nullptr;
           entry.uvInfo = {};
           entry.uvCapacity = 0u;
+          entry.uvSnapshotPage.reset();
+          entry.uvSnapshotOffset = 0u;
         }
+        entry.uvPinnedAllocation = nullptr;
         entry.uvStride = 0u;
         entry.uvOffset = 0u;
         entry.uvFormat = VK_FORMAT_UNDEFINED;
         entry.uvSharesPositionBuffer = false;
+        bool mandatoryUvBudgetDeferred = false;
+        bool mandatoryUvAllocationFailed = false;
         const bool gpuSkinOutputHasUv = gpuSkinSemanticOutputHasUv;
         if (gpuSkinSemanticDirectOnly && gpuSkinOutputHasUv) {
           const auto directLayout =
@@ -42742,13 +45257,18 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           entry.uvOffset = 0u;
           entry.uvFormat = VK_FORMAT_R32G32_SFLOAT;
           entry.uvCapacity = 0u;
+          entry.uvSnapshotPage.reset();
+          entry.uvSnapshotOffset = 0u;
         } else if (gpuSkinOutputHasUv) {
           entry.uvSharesPositionBuffer = true;
           entry.uvBuffer = entry.positionBuffer;
+          entry.uvPinnedAllocation = entry.positionPinnedAllocation;
           entry.uvInfo = entry.positionInfo;
           entry.uvStride = entry.positionStride;
           entry.uvOffset = 24u;
           entry.uvFormat = VK_FORMAT_R32G32_SFLOAT;
+          entry.uvSnapshotPage = entry.positionSnapshotPage;
+          entry.uvSnapshotOffset = entry.positionSnapshotOffset;
           m_war3Scene.shadowStats.drawTimeVBCacheUvSharedPositionCount++;
         } else if (!gpuSkinIrreversibleBypass) {
           // Format 0 不包含 UV payload，因此保留原有 source-UV capture；
@@ -42777,7 +45297,10 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                 entry.uvOffset = uvElem->Offset;
                 entry.uvFormat = uvFmt;
                 entry.uvBuffer = entry.positionBuffer;
+                entry.uvPinnedAllocation = entry.positionPinnedAllocation;
                 entry.uvInfo = entry.positionInfo;
+                entry.uvSnapshotPage = entry.positionSnapshotPage;
+                entry.uvSnapshotOffset = entry.positionSnapshotOffset;
                 m_war3Scene.shadowStats
                     .drawTimeVBCacheUvSharedPositionCount++;
               } else {
@@ -42834,56 +45357,106 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                   if (uvSrcSlice.length() >=
                       VkDeviceSize(vRangeStart + vRangeCount) *
                           VkDeviceSize(uvStride)) {
-                    if (entry.uvBuffer == nullptr ||
-                        entry.uvCapacity < uvBytes) {
-                    // Phase 7.123：UV buffer alloc 也扣预算（同帧多次 alloc
-                    // 才是真正的卡点）。如果预算耗尽就保留 entry 现有 uvBuffer
-                    // 状态（可能是 nullptr → 下游 alpha-test 暂时不可用，但
-                    // position 已经 ready，可以照常画硬阴影）。
-                    if (dxvk::war3::internal::
-                            kShadowDrawTimeVBCacheAllocBudgetEnabled &&
-                        m_war3DrawTimeVBCacheAllocBudgetThisFrame >=
-                            dxvk::war3::internal::
-                                kShadowDrawTimeVBCacheAllocBudgetPerFrame) {
-                      m_war3DrawTimeVBCacheBudgetDeferredCount++;
+                    GenerationBackedStreamProof currentUvSourceProof = {};
+                    if (DynamicSysmemVBOs) {
+                      currentUvSourceProof = makeUploadVertexStreamProof(
+                          uvStream,
+                          uint64_t(vRangeStart) * uint64_t(uvStride),
+                          uint64_t(uvBytes), ShadowStreamKind::Uv);
                     } else {
-                    DxvkBufferCreateInfo uvCi = {};
-                    uvCi.size = War3AlignPersistentBytes(uvBytes);
-                    uvCi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                                 VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
-                                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-                    uvCi.stages = VK_PIPELINE_STAGE_TRANSFER_BIT |
-                                  VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
-                    uvCi.access = VK_ACCESS_TRANSFER_WRITE_BIT |
-                                  VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
-                    uvCi.debugName = "War3DrawTimeVBUv";
-                    auto uvBuf = m_dxvkDevice->createBuffer(
-                        uvCi, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-                    if (uvBuf != nullptr) {
-                      entry.uvBuffer = std::move(uvBuf);
-                      entry.uvCapacity = uvCi.size;
-                      m_war3Scene.shadowStats.drawTimeVBCacheUvAllocCount++;
-                      // Phase 7.123：扣 UV alloc 预算。
-                      m_war3DrawTimeVBCacheAllocBudgetThisFrame++;
+                      auto* uvVb =
+                          m_state.vertexBuffers[uvStream].vertexBuffer.ptr();
+                      auto* uvCommon =
+                          uvVb != nullptr ? uvVb->GetCommonBuffer() : nullptr;
+                      currentUvSourceProof = makeDirectStreamProof(
+                          uvCommon, uint64_t(uvSrcOffset), uint64_t(uvBytes),
+                          uvStride, uvStride, ShadowStreamKind::Uv);
                     }
-                    } // end Phase 7.123 budget else
+                    const Rc<DxvkResourceAllocation> directUploadUvAllocation =
+                        War3Stage11DirectUploadSourceRuntime() &&
+                        DynamicSysmemVBOs && currentUvSourceProof.valid() &&
+                        m_war3PerDrawUpload.storage != nullptr
+                            ? m_war3PerDrawUpload.storage : nullptr;
+                    const DxvkResourceBufferInfo directUploadUvInfo =
+                        War3PinnedAllocationSliceInfo(
+                            directUploadUvAllocation, uvSrcOffset, uvBytes);
+                    const bool directUploadUvSource =
+                        directUploadUvInfo.buffer != VK_NULL_HANDLE;
+                    if (directUploadUvSource) {
+                      entry.uvBuffer = uvSrcSlice.buffer();
+                      entry.uvPinnedAllocation = directUploadUvAllocation;
+                      entry.uvInfo = directUploadUvInfo;
+                      entry.uvCapacity = 0u;
+                      entry.uvSnapshotPage.reset();
+                      entry.uvSnapshotOffset = 0u;
+                      m_war3Scene.shadowStats
+                          .drawTimeDirectUploadUvBindCount++;
+                      m_war3Scene.shadowStats.drawTimeDirectUploadUvBytes +=
+                          uint64_t(uvBytes);
                     }
-                    if (entry.uvBuffer != nullptr &&
-                        entry.uvCapacity >= uvBytes) {
+                    if (!directUploadUvSource &&
+                        (entry.uvBuffer == nullptr ||
+                         entry.uvCapacity < uvBytes)) {
+                      std::shared_ptr<War3Stage11SnapshotPage> snapshotPage;
+                      VkDeviceSize snapshotOffset = 0u;
+                      VkDeviceSize snapshotCapacity = 0u;
+                      const auto snapshotResult = War3AllocateStage11Snapshot(
+                          uvBytes, snapshotPage, snapshotOffset,
+                          snapshotCapacity);
+                      if (snapshotResult ==
+                          War3Stage11SnapshotAllocationResult::Success) {
+                        entry.uvSnapshotPage = std::move(snapshotPage);
+                        entry.uvSnapshotOffset = snapshotOffset;
+                        entry.uvBuffer = entry.uvSnapshotPage->buffer;
+                        entry.uvCapacity = snapshotCapacity;
+                        m_war3Scene.shadowStats
+                            .drawTimeVBCacheUvAllocCount++;
+                      } else if (snapshotResult ==
+                          War3Stage11SnapshotAllocationResult::
+                              PageCreateBudget) {
+                        ++m_war3DrawTimeVBCacheBudgetDeferredCount;
+                        mandatoryUvBudgetDeferred = true;
+                      } else {
+                        mandatoryUvAllocationFailed = true;
+                      }
+                    }
+                    const bool generationBackedUvReuse =
+                        generationBackedStaticCandidate &&
+                        entry.isStaticGeometry &&
+                        entry.uvSourceProof.matches(currentUvSourceProof) &&
+                        entry.uvBuffer != nullptr &&
+                        entry.uvCapacity >= uvBytes;
+                    if (directUploadUvSource ||
+                        (entry.uvBuffer != nullptr &&
+                         entry.uvCapacity >= uvBytes)) {
+                    if (!directUploadUvSource &&
+                        !generationBackedUvReuse) {
                     auto uvSrcBuf = uvSrcSlice.buffer();
                     EmitCs([cDst = entry.uvBuffer, cSrc = uvSrcBuf,
+                            cDstOff = entry.uvSnapshotOffset,
                             cSrcOff = uvSrcOffset,
                             cBytes = uvBytes](DxvkContext* ctx) {
-                      ctx->copyBuffer(cDst, 0, cSrc, cSrcOff, cBytes);
+                      ctx->copyBuffer(cDst, cDstOff, cSrc, cSrcOff, cBytes);
                     });
                     m_war3Scene.shadowStats.drawTimeVBCacheUvCopyCount++;
                     m_war3Scene.shadowStats.drawTimeVBCacheUvCopyBytes +=
                         uint64_t(uvBytes);
-                    entry.uvInfo =
-                        entry.uvBuffer->getSliceInfo(0, uvBytes);
+                    } else if (generationBackedUvReuse) {
+                      m_war3Scene.shadowStats
+                          .drawTimeGenerationBackedUvReuseCount++;
+                      m_war3Scene.shadowStats
+                          .drawTimeGenerationBackedCopyBytesSaved +=
+                              uint64_t(uvBytes);
+                    }
+                    if (!directUploadUvSource) {
+                      entry.uvInfo =
+                          entry.uvBuffer->getSliceInfo(
+                              entry.uvSnapshotOffset, uvBytes);
+                    }
                     entry.uvStride = uvStride;
                     entry.uvOffset = uvElem->Offset;
                     entry.uvFormat = uvFmt;
+                    entry.uvSourceProof = currentUvSourceProof;
                     } else {
                       // Never submit a larger copy into an older allocation
                       // when the per-frame budget or allocation failed.
@@ -42904,6 +45477,15 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           // degrade to an opaque rectangle or escape through a generic lane.
           entry.captureComplete = false;
           War3MarkDrawTimeExactRejectedCurrentFrame(vbCacheKey);
+          if (mandatoryUvBudgetDeferred) {
+            War3RecordRequiredCasterOmission(
+                vbCacheKey,
+                War3RequiredCasterOmissionReason::UvAllocBudget);
+          } else if (mandatoryUvAllocationFailed) {
+            War3RecordRequiredCasterOmission(
+                vbCacheKey,
+                War3RequiredCasterOmissionReason::AllocationFailure);
+          }
           m_war3Scene.shadowStats.drawTimeVBCacheRejectNoSlice++;
           break;
         }
@@ -42916,57 +45498,110 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         // command sequence without reading write-combined memory or pinning a
         // frame allocator chunk. Indices are never rebased.
         bool idxOk = false;
+        bool indexBudgetDeferred = false;
+        bool indexAllocationFailed = false;
+        entry.indexPinnedAllocation = nullptr;
         if (indexed && drawTimeIndexSlice.buffer() != nullptr) {
           const VkDeviceSize idxSrcOffset =
               drawTimeIndexSlice.offset() + drawTimeIndexRangeOffset;
           const VkDeviceSize idxBytes = drawTimeIndexRangeBytes;
+          const Rc<DxvkResourceAllocation> directStaticIndexAllocation =
+              War3Stage11DirectStaticSourceRuntime() &&
+              generationBackedStaticCandidate && !DynamicSysmemIBO &&
+              currentIndexSourceProof.valid() &&
+              drawTimeIndexSlice.buffer() != nullptr
+                  ? drawTimeIndexSlice.buffer()->storage() : nullptr;
+          const DxvkResourceBufferInfo directStaticIndexInfo =
+              War3PinnedAllocationSliceInfo(
+                  directStaticIndexAllocation, idxSrcOffset, idxBytes);
+          const bool directStaticIndexSource =
+              directStaticIndexInfo.buffer != VK_NULL_HANDLE;
+          const Rc<DxvkResourceAllocation> directUploadIndexAllocation =
+              War3Stage11DirectUploadSourceRuntime() && DynamicSysmemIBO &&
+              currentIndexSourceProof.valid() &&
+              m_war3PerDrawUpload.ibStorage != nullptr
+                  ? m_war3PerDrawUpload.ibStorage : nullptr;
+          const DxvkResourceBufferInfo directUploadIndexInfo =
+              War3PinnedAllocationSliceInfo(
+                  directUploadIndexAllocation, idxSrcOffset, idxBytes);
+          const bool directUploadIndexSource =
+              directUploadIndexInfo.buffer != VK_NULL_HANDLE;
           if (drawTimeIndexRangeOffset <= drawTimeIndexSlice.length() &&
               idxBytes <=
                   drawTimeIndexSlice.length() - drawTimeIndexRangeOffset) {
-            if (entry.indexBuffer == nullptr ||
-                entry.indexCapacity < idxBytes) {
-              // Phase 7.123：IB alloc 也扣预算。预算耗尽时跳过 IB alloc，
-              // 整条 entry 留作"无 IB 状态"。下游消费者看到 indexBuffer ==
-              // nullptr 会跳过这次 caster 提交，第二帧补齐。
-              if (dxvk::war3::internal::
-                      kShadowDrawTimeVBCacheAllocBudgetEnabled &&
-                  m_war3DrawTimeVBCacheAllocBudgetThisFrame >=
-                      dxvk::war3::internal::
-                          kShadowDrawTimeVBCacheAllocBudgetPerFrame) {
-                m_war3DrawTimeVBCacheBudgetDeferredCount++;
-              } else {
-                DxvkBufferCreateInfo idxInfoCi = {};
-                idxInfoCi.size = War3AlignPersistentBytes(idxBytes);
-                idxInfoCi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                                  VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
-                idxInfoCi.stages = VK_PIPELINE_STAGE_TRANSFER_BIT |
-                                   VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
-                idxInfoCi.access = VK_ACCESS_TRANSFER_WRITE_BIT |
-                                   VK_ACCESS_INDEX_READ_BIT;
-                idxInfoCi.debugName = "War3DrawTimeVBIdx";
-                auto idxBuf = m_dxvkDevice->createBuffer(
-                    idxInfoCi, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-                if (idxBuf != nullptr) {
-                  entry.indexBuffer = std::move(idxBuf);
-                  entry.indexCapacity = idxInfoCi.size;
-                  m_war3Scene.shadowStats.drawTimeVBCacheIndexAllocCount++;
-                  // Phase 7.123：扣 IB alloc 预算。
-                  m_war3DrawTimeVBCacheAllocBudgetThisFrame++;
-                }
-              } // end Phase 7.123 budget else
+            if (directStaticIndexSource) {
+              entry.indexBuffer = drawTimeIndexSlice.buffer();
+              entry.indexPinnedAllocation = directStaticIndexAllocation;
+              entry.indexInfo = directStaticIndexInfo;
+              entry.indexCapacity = 0u;
+              entry.indexSnapshotPage.reset();
+              entry.indexSnapshotOffset = 0u;
+              m_war3Scene.shadowStats.drawTimeDirectStaticIndexBindCount++;
+              m_war3Scene.shadowStats.drawTimeDirectStaticIndexBytes +=
+                  uint64_t(idxBytes);
+            } else if (directUploadIndexSource) {
+              entry.indexBuffer = drawTimeIndexSlice.buffer();
+              entry.indexPinnedAllocation = directUploadIndexAllocation;
+              entry.indexInfo = directUploadIndexInfo;
+              entry.indexCapacity = 0u;
+              entry.indexSnapshotPage.reset();
+              entry.indexSnapshotOffset = 0u;
+              m_war3Scene.shadowStats.drawTimeDirectUploadIndexBindCount++;
+              m_war3Scene.shadowStats.drawTimeDirectUploadIndexBytes +=
+                  uint64_t(idxBytes);
             }
-            if (entry.indexBuffer != nullptr &&
-                entry.indexCapacity >= idxBytes) {
+            if (!directStaticIndexSource && !directUploadIndexSource &&
+                (entry.indexBuffer == nullptr ||
+                 entry.indexCapacity < idxBytes)) {
+              std::shared_ptr<War3Stage11SnapshotPage> snapshotPage;
+              VkDeviceSize snapshotOffset = 0u;
+              VkDeviceSize snapshotCapacity = 0u;
+              const auto snapshotResult = War3AllocateStage11Snapshot(
+                  idxBytes, snapshotPage, snapshotOffset,
+                  snapshotCapacity);
+              if (snapshotResult ==
+                  War3Stage11SnapshotAllocationResult::Success) {
+                entry.indexSnapshotPage = std::move(snapshotPage);
+                entry.indexSnapshotOffset = snapshotOffset;
+                entry.indexBuffer = entry.indexSnapshotPage->buffer;
+                entry.indexCapacity = snapshotCapacity;
+                m_war3Scene.shadowStats
+                    .drawTimeVBCacheIndexAllocCount++;
+              } else if (snapshotResult ==
+                  War3Stage11SnapshotAllocationResult::PageCreateBudget) {
+                ++m_war3DrawTimeVBCacheBudgetDeferredCount;
+                indexBudgetDeferred = true;
+              } else {
+                indexAllocationFailed = true;
+              }
+            }
+            if (directStaticIndexSource || directUploadIndexSource ||
+                (entry.indexBuffer != nullptr &&
+                 entry.indexCapacity >= idxBytes)) {
+              if (!directStaticIndexSource && !directUploadIndexSource &&
+                  !generationBackedIndexReuse) {
               auto idxSrcBuf = drawTimeIndexSlice.buffer();
               EmitCs([cDst = entry.indexBuffer, cSrc = idxSrcBuf,
+                      cDstOff = entry.indexSnapshotOffset,
                       cSrcOff = idxSrcOffset,
                       cBytes = idxBytes](DxvkContext *ctx) {
-                ctx->copyBuffer(cDst, 0, cSrc, cSrcOff, cBytes);
+                ctx->copyBuffer(cDst, cDstOff, cSrc, cSrcOff, cBytes);
               });
               m_war3Scene.shadowStats.drawTimeVBCacheIndexCopyCount++;
               m_war3Scene.shadowStats.drawTimeVBCacheIndexCopyBytes +=
                   uint64_t(idxBytes);
-              entry.indexInfo = entry.indexBuffer->getSliceInfo(0, idxBytes);
+              } else if (generationBackedIndexReuse) {
+                m_war3Scene.shadowStats
+                    .drawTimeGenerationBackedIndexReuseCount++;
+                m_war3Scene.shadowStats
+                    .drawTimeGenerationBackedCopyBytesSaved +=
+                        uint64_t(idxBytes);
+              }
+              if (!directStaticIndexSource && !directUploadIndexSource) {
+                entry.indexInfo =
+                    entry.indexBuffer->getSliceInfo(
+                        entry.indexSnapshotOffset, idxBytes);
+              }
               entry.indexed = true;
               entry.indexCount = CountVal;
               entry.indexType = drawTimeIndexType;
@@ -42991,6 +45626,15 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           entry.indexCount = 0u;
           entry.captureComplete = false;
           War3MarkDrawTimeExactRejectedCurrentFrame(vbCacheKey);
+          if (indexBudgetDeferred) {
+            War3RecordRequiredCasterOmission(
+                vbCacheKey,
+                War3RequiredCasterOmissionReason::IndexAllocBudget);
+          } else if (indexAllocationFailed) {
+            War3RecordRequiredCasterOmission(
+                vbCacheKey,
+                War3RequiredCasterOmissionReason::AllocationFailure);
+          }
           m_war3Scene.shadowStats.drawTimeVBCacheRejectIncompleteIndex++;
           break;
         }
@@ -43000,6 +45644,17 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           entry.indexCount = 0u;
         }
         entry.captureComplete = true;
+        if (generationBackedStaticCandidate) {
+          entry.positionSourceProof = currentPositionSourceProof;
+          entry.indexSourceProof = indexed
+              ? currentIndexSourceProof : GenerationBackedStreamProof{};
+          if (entry.uvSharesPositionBuffer)
+            entry.uvSourceProof = {};
+        } else {
+          entry.positionSourceProof = {};
+          entry.indexSourceProof = {};
+          entry.uvSourceProof = {};
+        }
         drawTimeCaptureTiming.enter(
             War3ShadowDrawTimeCapturePhase::FinalizeAccounting);
         m_war3Scene.shadowStats.drawTimeVBCacheCaptureCount++;
@@ -43028,9 +45683,10 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           m_war3Scene.shadowStats.drawTimeVBCacheAlphaBlendStateCaptureCount++;
         if (entry.diffuseTexture != nullptr)
           m_war3Scene.shadowStats.drawTimeVBCacheDiffuseTextureCaptureCount++;
-        // Phase 7.70：记下本次 capture 的源数据指纹。
-        // 同帧后续相同来源的 capture 会命中上方 fast path 并跳过 GPU copy。
-        entry.lastCaptureFingerprint = captureFingerprint;
+        if constexpr (!dxvk::war3::internal::
+                          kReleaseFreezeExperimentalShadowRoutes) {
+          entry.lastCaptureFingerprint = captureFingerprint;
+        }
 
         // 2026-05-30/05-31 问题2 根因修复：标记静态几何 + 记录占用字节用于 LRU。
         //
@@ -43045,25 +45701,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         // 但同时没有 unit/rawcode/handle/runtime pose。若继续把这种匿名
         // Unit 当动态单位，它会按 16 帧 TTL 回收，导致离开视野后再次进入
         // 时重复 createBuffer。真正的动态单位必须有稳定单位身份或 pose。
-        const bool semanticHasDynamicPose =
-            War3SemanticContextHasDynamicPoseEvidence(semantic);
-        const bool unitKindWithIdentity =
-            semantic.objectKind == dxvk::war3::render::ObjectKind::Unit &&
-            War3SemanticContextHasDynamicUnitObjectEvidence(semantic);
-        const bool unitKindWithoutIdentity =
-            semantic.objectKind == dxvk::war3::render::ObjectKind::Unit &&
-            !unitKindWithIdentity && !semanticHasDynamicPose;
-        const bool treatUnitlessRigidAsStatic =
-            dxvk::war3::internal::
-                kShadowDrawTimeVBCacheUnitlessRigidStaticPersistEnabled &&
-            unitKindWithoutIdentity;
-        const bool isDynamicUnit =
-            semanticHasDynamicPose ||
-            (semantic.objectKind == dxvk::war3::render::ObjectKind::Unit &&
-             !treatUnitlessRigidAsStatic);
-        entry.isStaticGeometry =
-            dxvk::war3::internal::kShadowDrawTimeVBCacheStaticPersistEnabled &&
-            !isDynamicUnit && !entry.gpuSkinLeaseBacked;
+        entry.isStaticGeometry = generationBackedStaticCandidate &&
+            !entry.gpuSkinLeaseBacked;
         entry.lastAccessFrameSerial = m_war3ShadowPersistentFrameSerial;
         entry.ownedGpuBytes =
             uint64_t(entry.positionCapacity) + uint64_t(entry.indexCapacity) +
@@ -43462,11 +46101,13 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   // 2026-07-09：legacy ShadowCapture（含 S1 地形）用 TLS 累加归属，避免每 tile 开 scope。
   shadowCaptureGateTiming.pause();
   shadowCaptureGatesSample.stop();
-  War3CaptureCpuSample shadowCaptureSample;
-  shadowCaptureSample.bucketTicks = &g_war3CaptureCpuTls.shadowCaptureTicks;
-  shadowCaptureSample.bucketCalls = &g_war3CaptureCpuTls.shadowCaptureCalls;
+  War3CaptureCpuSample shadowCaptureSample(trackShadowCaptureCpu);
+  if (trackShadowCaptureCpu) {
+    shadowCaptureSample.bucketTicks = &g_war3CaptureCpuTls.shadowCaptureTicks;
+    shadowCaptureSample.bucketCalls = &g_war3CaptureCpuTls.shadowCaptureCalls;
+  }
   const bool traceShadowCapturePost =
-      War3ShadowCapturePostBreakdownRuntime();
+      trackShadowCaptureCpu && War3ShadowCapturePostBreakdownRuntime();
   const uint32_t shadowCapturePostTracePeriod = traceShadowCapturePost
       ? War3ShadowCapturePostTracePeriod() : 1u;
   const bool traceThisShadowCapturePost =
@@ -43510,12 +46151,15 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       m_state.renderStates[D3DRS_ALPHATESTENABLE] == FALSE &&
       m_state.renderStates[D3DRS_ALPHABLENDENABLE] == FALSE &&
       War3S1TerrainPersistentGeometryRuntime() &&
-      captureSettings.shadows.enabled) {
-    War3CaptureCpuSample s1EarlySample;
-    s1EarlySample.bucketTicks =
-        &g_war3CaptureCpuTls.shadowCaptureS1EarlyTicks;
-    s1EarlySample.bucketCalls =
-        &g_war3CaptureCpuTls.shadowCaptureS1EarlyCalls;
+      captureSettings.shadows.enabled &&
+      !m_war3S1TerrainEarlyCache.empty()) {
+    War3CaptureCpuSample s1EarlySample(trackShadowCaptureCpu);
+    if (trackShadowCaptureCpu) {
+      s1EarlySample.bucketTicks =
+          &g_war3CaptureCpuTls.shadowCaptureS1EarlyTicks;
+      s1EarlySample.bucketCalls =
+          &g_war3CaptureCpuTls.shadowCaptureS1EarlyCalls;
+    }
     Matrix4 s1World = m_state.transforms[GetTransformIndex(D3DTS_WORLD)];
     if (War3S1ForceIdentityWorldRuntime()) {
       s1World = Matrix4();
@@ -43523,12 +46167,16 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     }
     const uint64_t s1EarlyKey = War3BuildS1TerrainEarlyKey(
         s1World, indexed, PrimitiveType, NumVertices, CountVal);
-    const uint64_t s1SourceFingerprint =
-        War3ComputeS1TerrainSourceFingerprint(indexed, BaseVertexIndex,
-                                              MinVertexIndex, StartVal);
     auto earlyIt = m_war3S1TerrainEarlyCache.find(s1EarlyKey);
     if (earlyIt != m_war3S1TerrainEarlyCache.end()) {
+      // Computing the source fingerprint walks every active vertex stream.
+      // It only distinguishes a true key hit from an alias, so an empty cache
+      // or a key miss must continue directly to the canonical slow path.
+      const uint64_t s1SourceFingerprint =
+          War3ComputeS1TerrainSourceFingerprint(indexed, BaseVertexIndex,
+                                                MinVertexIndex, StartVal);
       bool backingValid = true;
+      const War3ShadowPersistentGeometry* earlyPersistentGeometry = nullptr;
       if (earlyIt->second.sourceFingerprint != s1SourceFingerprint) {
         // early key 碰撞（identity world + 相同顶点数的不同 tile）或 VB 指针
         // 复用：冻结内容不属于本 draw，重放会画出另一块地形并让本块缺失。
@@ -43557,6 +46205,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
               m_war3ShadowPersistentFrameSerial;
           backingIt->second.geometry.lastSeenFrame =
               m_war3ShadowPersistentFrameSerial;
+          earlyPersistentGeometry = &backingIt->second.geometry;
         }
       }
 
@@ -43576,6 +46225,38 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         hitDraw.worldMatrix = s1World;
         hitDraw.category = War3RenderState::StageCategory::Terrain;
         hitDraw.stage = 1;
+        // The cached draw's world-space sphere and frame stamp belong to the
+        // insertion frame. Refresh them from the registry-owned immutable
+        // local bounds and this draw's current transform. If that proof is not
+        // present, remove culling authority instead of replaying stale bounds.
+        if (earlyPersistentGeometry != nullptr &&
+            earlyPersistentGeometry->localBoundsIdentityProven &&
+            earlyPersistentGeometry->localBoundsSourceGeneration != 0u &&
+            earlyPersistentGeometry->localBoundsRadius > 0.0f &&
+            std::isfinite(earlyPersistentGeometry->localBoundsRadius)) {
+          War3ApplySemanticBoundsFromMatrix(
+              hitDraw, hitDraw.worldMatrix,
+              earlyPersistentGeometry->localBoundsCenter,
+              earlyPersistentGeometry->localBoundsRadius);
+          hitDraw.boundsProvenance = dxvk::war3::render::
+              War3ShadowBoundsProvenance::ExactLocalGeoset;
+          hitDraw.boundsSourceGeneration =
+              earlyPersistentGeometry->localBoundsSourceGeneration;
+          hitDraw.boundsFrameSerial =
+              m_war3ShadowPersistentFrameSerial + 1u;
+          hitDraw.boundsIdentityProven = true;
+          hitDraw.boundsSourceWasSkinned = false;
+          hitDraw.boundsFrameLocalDynamic = false;
+          hitDraw.boundsAnimatedAttachment = false;
+          ++m_war3Scene.shadowStats
+                .semanticSceneTerrainBoundsProducerPublishedExactCount;
+        } else {
+          hitDraw.boundsProvenance = dxvk::war3::render::
+              War3ShadowBoundsProvenance::Unknown;
+          hitDraw.boundsSourceGeneration = 0u;
+          hitDraw.boundsFrameSerial = 0u;
+          hitDraw.boundsIdentityProven = false;
+        }
         earlyIt->second.lastSeenFrame = m_war3ShadowPersistentFrameSerial;
 
         auto& persistentDiagnostics =
@@ -43609,10 +46290,12 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                nullptr,
                nullptr,
                0u});
+          const auto& appendedFallback =
+              m_war3Scene.shadowFallbacks.back().snapshot;
+          war3::render::War3NoteShadowFallbackAppended(
+              m_war3Scene.shadowStats, m_war3Scene.shadowFallbacks.size(),
+              appendedFallback.category, appendedFallback.objectKind);
           m_war3Scene.shadowStats.fallbackSnapshotCount++;
-          m_war3Scene.shadowStats.fallbackDrawCount =
-              static_cast<uint32_t>(m_war3Scene.shadowFallbacks.size());
-          m_war3Scene.shadowStats.fallbackDrawCountTerrain++;
           persistentDiagnostics.s1EarlyReplayFallbackCount++;
         }
         m_war3Scene.shadowCasters.emplace_back(std::move(hitDraw));
@@ -44564,11 +47247,13 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
 
   auto finalizeShadowDrawCommon = [&](War3ShadowCasterDraw &draw) -> bool {
     shadowCapturePostTiming.enter(War3ShadowCapturePostPhase::Finalize);
-    War3CaptureCpuSample finalizeSample;
-    finalizeSample.bucketTicks =
-        &g_war3CaptureCpuTls.shadowCaptureFinalizeTicks;
-    finalizeSample.bucketCalls =
-        &g_war3CaptureCpuTls.shadowCaptureFinalizeCalls;
+    War3CaptureCpuSample finalizeSample(trackShadowCaptureCpu);
+    if (trackShadowCaptureCpu) {
+      finalizeSample.bucketTicks =
+          &g_war3CaptureCpuTls.shadowCaptureFinalizeTicks;
+      finalizeSample.bucketCalls =
+          &g_war3CaptureCpuTls.shadowCaptureFinalizeCalls;
+    }
     draw.category = cat;
     draw.batchTag = (execTag != War3BatchTag::Unknown) ? execTag : tag;
     draw.stage = static_cast<int16_t>(stage);
@@ -45009,6 +47694,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     draw.indexed = geometry->indexed;
     draw.positionStorage = geometry->positionStorage;
     draw.positionInfo = geometry->positionInfo;
+    War3CopyPersistentReplayBindings(draw, *geometry);
     draw.positionStride = geometry->positionStride;
     draw.positionOffset = geometry->positionOffset;
     draw.positionFormat = geometry->positionFormat;
@@ -45189,6 +47875,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   DxvkBufferSlice posSlice;
   uint32_t posStride = 0;
   Rc<DxvkBuffer> posAlloc;
+  Rc<DxvkResourceAllocation> posPinnedAllocation;
   if (gpuSkinLegacyBacking) {
     posSlice = gpuSkinResolved->lease.slice;
     posStride = gpuSkinResolved->lease.desc.vertexStride;
@@ -45470,8 +48157,94 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   uint32_t exactIndexedFreezeMinIndex = 0u;
   uint32_t exactIndexedFreezeMaxIndex = 0u;
   bool exactIndexedFreezeRebased = false;
+  // The domain proof is useful even when the position range already spans the
+  // complete buffer and no rebasing is necessary. Keep it separate from the
+  // freeze optimization so bounds never fall back to D3D9's Min/Num hint.
+  uint32_t exactIndexedDomainFirstVertex = 0u;
+  uint32_t exactIndexedDomainVertexCount = 0u;
+  bool exactIndexedDomainKnown = false;
   thread_local std::vector<uint8_t> s_exactRebasedIndexScratch;
   s_exactRebasedIndexScratch.clear();
+  using CoherentUpTrimMode =
+      dxvk::war3::memory::War3CoherentUpIndexTrimMode;
+  const CoherentUpTrimMode coherentUpTrimMode =
+      War3CoherentUpIndexTrimModeRuntime();
+  const uint32_t coherentUpIndexElementBytes =
+      indexType == VK_INDEX_TYPE_UINT32 ? 4u : 2u;
+  const bool coherentUpTrimConsidered =
+      coherentUpTrimMode != CoherentUpTrimMode::Off && indexed &&
+      (DynamicSysmemVBOs || DynamicSysmemIBO);
+  const auto coherentUpTrimDecision =
+      dxvk::war3::memory::EvaluateWar3CoherentUpIndexTrim({
+          indexed,
+          gpuSkinLegacyBacking,
+          DynamicSysmemVBOs && posStream < caps::MaxStreams &&
+              m_war3PerDrawUpload.vbValid[posStream] &&
+              m_war3PerDrawUpload.vbSourceValid[posStream],
+          DynamicSysmemIBO && m_war3PerDrawUpload.ibValid &&
+              m_war3PerDrawUpload.ibSourceValid,
+          m_war3PerDrawUpload.storage != nullptr &&
+              m_war3PerDrawUpload.ibStorage.ptr() ==
+                  m_war3PerDrawUpload.storage.ptr(),
+          posStream < caps::MaxStreams &&
+              m_war3PerDrawUpload.vbUploadBytes[posStream] != nullptr,
+          m_war3PerDrawUpload.ibUploadBytes != nullptr,
+          posStream < caps::MaxStreams
+              ? uint64_t(m_war3PerDrawUpload.vbUploadLength[posStream])
+              : 0u,
+          uint64_t(posSlice.length()),
+          posStride,
+          uint64_t(m_war3PerDrawUpload.ibUploadLength),
+          uint64_t(idxSlice.length()),
+          coherentUpIndexElementBytes,
+          CountVal,
+          StartVal,
+      });
+  const bool coherentUpTrimCandidate =
+      coherentUpTrimConsidered && bool(coherentUpTrimDecision);
+  bool coherentUpTrimEligible = false;
+  uint64_t coherentUpTrimBytesBefore = 0u;
+  uint64_t coherentUpTrimBytesAfter = 0u;
+  using CoherentRealTrimMode =
+      dxvk::war3::memory::War3CoherentRealIndexTrimMode;
+  const CoherentRealTrimMode coherentRealTrimMode =
+      War3CoherentRealIndexTrimModeRuntime();
+  const bool coherentRealTrimObserved =
+      coherentRealTrimMode != CoherentRealTrimMode::Off && indexed &&
+      terrainCaster;
+  Rc<DxvkResourceAllocation> coherentRealPositionMappedAllocation = nullptr;
+  dxvk::war3::memory::War3CpuReadableBufferSpan
+      coherentRealPositionSpan = {};
+  if (coherentRealTrimObserved && !DynamicSysmemVBOs && posDynamic &&
+      vbCommon != nullptr && !vbCommon->NeedsReadback()) {
+    coherentRealPositionMappedAllocation = vbCommon->GetMappedSlice();
+    if (coherentRealPositionMappedAllocation != nullptr) {
+      const auto allocationInfo =
+          coherentRealPositionMappedAllocation->getBufferInfo();
+      const bool hostVisible =
+          (coherentRealPositionMappedAllocation->getMemoryProperties() &
+           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0u;
+      coherentRealPositionSpan =
+          dxvk::war3::memory::BuildWar3CpuReadableBufferSpan({
+              coherentRealPositionMappedAllocation->mapPtr(),
+              uint64_t(allocationInfo.size), uint64_t(posSlice.offset()),
+              uint64_t(posSlice.length()),
+              reinterpret_cast<uintptr_t>(vbCommon),
+              vbCommon->War3IdentityGeneration(),
+              vbCommon->War3MapAllocationGeneration(),
+              vbCommon->War3ContentGeneration(), hostVisible});
+    }
+  }
+  const bool coherentRealTrimScanCandidate =
+      coherentRealTrimObserved && bool(coherentRealPositionSpan);
+  bool coherentRealTrimEligible = false;
+  bool coherentRealTrimConsumed = false;
+  uint64_t coherentRealTrimBytesBefore = 0u;
+  uint64_t coherentRealTrimBytesAfter = 0u;
+  Rc<DxvkResourceAllocation> coherentRealIndexMappedAllocation = nullptr;
+  const uint8_t* coherentRealIndexBytes = nullptr;
+  VkDeviceSize coherentRealIndexLength = 0u;
+  bool coherentRealIndexRangeSnapshot = false;
   // Both per-draw SYSTEMMEM uploads and ordinary D3DUSAGE_DYNAMIC position
   // buffers are frozen into the Arena below.  The latter are the dominant
   // Warcraft terrain path, so restricting this proof to DynamicSysmemVBOs
@@ -45479,17 +48252,55 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   // separately validated IB mapping here; the position payload remains a GPU
   // copy ordered on the render command stream.
   const bool exactIndexedFreezeTrimCandidate =
-      War3ExactIndexedFreezeTrimRuntime() && indexed && !gpuSkinLegacyBacking &&
-      (DynamicSysmemVBOs || posDynamic) && posStride != 0u &&
-      posInfo.size >= posStride;
-  if (exactIndexedFreezeTrimCandidate) {
-    auto* exactIndexCommon = m_state.indices.ptr() != nullptr
-        ? m_state.indices.ptr()->GetCommonBuffer() : nullptr;
+      (War3ExactIndexedFreezeTrimRuntime() && indexed &&
+       !gpuSkinLegacyBacking && (DynamicSysmemVBOs || posDynamic) &&
+       posStride != 0u && posInfo.size >= posStride) ||
+      (coherentUpTrimMode == CoherentUpTrimMode::Consume &&
+       coherentUpTrimCandidate);
+  // The release freeze disables geometry trimming. The development bounds
+  // observer uses D3D9's documented draw range conservatively and audits a
+  // deterministic 1/64 sample against current-generation exact IB bytes.
+  // Neither path authorizes draw mutation; rebasing/trimming remains guarded
+  // solely by exactIndexedFreezeTrimCandidate below.
+  const bool exactIndexedTerrainBoundsObserveCandidate =
+      indexed && terrainCaster && !gpuSkinLegacyBacking &&
+      dxvk::war3::internal::kShadowCascadeCullTerrainWithBounds &&
+      War3TerrainBoundsCullModeRuntime() !=
+          dxvk::war3::render::War3TerrainBoundsCullMode::Off &&
+      posStride != 0u && posInfo.size >= posStride;
+  auto* exactIndexCommon = m_state.indices.ptr() != nullptr
+      ? m_state.indices.ptr()->GetCommonBuffer() : nullptr;
+  const bool exactIndexedTerrainBoundsAuditSample =
+      exactIndexedTerrainBoundsObserveCandidate &&
+      dxvk::war3::render::War3ShouldAuditTerrainIndexedHint(
+          m_war3ShadowPersistentFrameSerial + 1u,
+          reinterpret_cast<uintptr_t>(exactIndexCommon), StartVal, CountVal);
+  const bool exactIndexedDomainScanCandidate =
+      exactIndexedFreezeTrimCandidate ||
+      coherentUpTrimCandidate ||
+      coherentRealTrimScanCandidate ||
+      exactIndexedTerrainBoundsAuditSample;
+  const uint64_t positionCapacity64 = posInfo.size / posStride;
+  if (exactIndexedDomainScanCandidate) {
     dxvk::war3::memory::War3CpuReadableBufferSpan exactIndexSpan = {};
     bool exactIndexHostCached = false;
     const uint32_t indexElementBytes =
         indexType == VK_INDEX_TYPE_UINT32 ? 4u : 2u;
-    if (DynamicSysmemIBO && StartVal == 0u &&
+    if (coherentUpTrimCandidate) {
+      const auto memoryProperties =
+          m_war3PerDrawUpload.ibStorage->getMemoryProperties();
+      exactIndexHostCached = (memoryProperties &
+          VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0u;
+      exactIndexSpan =
+          dxvk::war3::memory::BuildWar3CpuReadableBufferSpan({
+              m_war3PerDrawUpload.ibUploadBytes,
+              uint64_t(m_war3PerDrawUpload.ibUploadLength), 0u,
+              coherentUpTrimDecision.indexBytes,
+              m_war3PerDrawUpload.ibSourceResource,
+              m_war3PerDrawUpload.ibSourceIdentityGeneration,
+              m_war3PerDrawUpload.ibSourceSequence,
+              m_war3PerDrawUpload.ibSourceContentGeneration, true});
+    } else if (DynamicSysmemIBO && StartVal == 0u &&
         exactIndexCommon != nullptr &&
         m_war3PerDrawUpload.ibSourceValid &&
         m_war3PerDrawUpload.ibSourceResource != 0u &&
@@ -45529,9 +48340,13 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       // buffer still has pending CPU writes, queue its normal upload before
       // the Arena copy so the scanned generation and frozen IB are identical.
       const bool uploadReady = !exactIndexCommon->NeedsUpload() ||
-          SUCCEEDED(FlushBuffer(exactIndexCommon));
+          coherentRealTrimScanCandidate ||
+          (exactIndexedFreezeTrimCandidate &&
+           SUCCEEDED(FlushBuffer(exactIndexCommon)));
       auto exactIndexAllocation = exactIndexCommon->GetMappedSlice();
       if (uploadReady && exactIndexAllocation != nullptr) {
+        if (coherentRealTrimScanCandidate)
+          coherentRealIndexMappedAllocation = exactIndexAllocation;
         const auto allocationInfo = exactIndexAllocation->getBufferInfo();
         const auto memoryProperties =
             exactIndexAllocation->getMemoryProperties();
@@ -45554,15 +48369,147 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       }
     }
 
-    const uint64_t positionCapacity64 = posInfo.size / posStride;
     if (exactIndexSpan && positionCapacity64 != 0u &&
         positionCapacity64 <=
             uint64_t(std::numeric_limits<uint32_t>::max())) {
-      const auto exactDomain =
-          dxvk::war3::memory::ComputeWar3ExactIndexVertexDomainPrepared({
-              exactIndexSpan, indexElementBytes, CountVal, BaseVertexIndex,
-              uint32_t(positionCapacity64), exactIndexHostCached,
-              s_exactIndexDomainBulkReadEnabled});
+      dxvk::war3::memory::War3ExactIndexVertexDomain exactDomain = {};
+      const bool useCoherentRealDeclaredDomain =
+          coherentRealTrimScanCandidate &&
+          coherentRealTrimMode == CoherentRealTrimMode::Consume &&
+          War3CoherentRealHintDomainRuntime() &&
+          !exactIndexedFreezeTrimCandidate;
+      bool exactDomainFromDeclaredHint = false;
+      if (useCoherentRealDeclaredDomain) {
+        const auto declaredDomain = dxvk::war3::render::
+            War3ResolveTerrainIndexedDeclaredDomain(
+                BaseVertexIndex, MinVertexIndex, NumVertices,
+                uint32_t(positionCapacity64), indexElementBytes);
+        if (declaredDomain.valid) {
+          exactDomain.firstVertex = declaredDomain.firstVertex;
+          exactDomain.vertexCount = declaredDomain.vertexCount;
+          exactDomain.minIndex = declaredDomain.minIndex;
+          exactDomain.maxIndex = declaredDomain.maxIndex;
+          exactDomain.valid = true;
+          exactDomainFromDeclaredHint = true;
+        }
+      }
+      const bool useBoundsObserverDomainCache =
+          exactIndexedTerrainBoundsAuditSample &&
+          !exactIndexedFreezeTrimCandidate &&
+          !exactDomainFromDeclaredHint;
+      // The coherent REAL route already rebuilds a current mapped span and
+      // revalidates owner plus identity/allocation/content generations before
+      // every draw. Reuse only the derived POD min/max domain when that full
+      // immutable key still matches. No CPU pointer, DxvkBuffer slice or
+      // Vulkan binding is retained by this cache.
+      const bool useCoherentRealDomainCache =
+          coherentRealTrimScanCandidate &&
+          coherentRealTrimMode == CoherentRealTrimMode::Consume &&
+          War3CoherentRealDomainCacheRuntime() &&
+          !exactIndexedFreezeTrimCandidate &&
+          !exactDomainFromDeclaredHint;
+      const bool useGenerationBackedDomainCache =
+          useBoundsObserverDomainCache || useCoherentRealDomainCache;
+      bool observerDomainCacheHit = false;
+      if (useGenerationBackedDomainCache) {
+        // The useful hits are repeated draws inside the current generation,
+        // while most misses are genuine content-generation changes. Keep the
+        // table small and bounded: a 16K-entry A/B produced the same hit count
+        // as this 1024-entry table and only increased TLS residency.
+        using ObserverCache = dxvk::war3::memory::
+            War3ExactIndexDomainObserverCache<256u, 4u>;
+        using Lookup = dxvk::war3::memory::
+            War3ExactIndexDomainObserverLookup;
+        using Store = dxvk::war3::memory::
+            War3ExactIndexDomainObserverStore;
+        static thread_local ObserverCache s_observerDomainCache = {};
+        const dxvk::war3::memory::War3ExactIndexDomainObserverKey cacheKey = {
+            dxvk::war3::model::ShadowModelResourceCache::instance().mapEpoch(),
+            m_war3GpuSkinDeviceEpoch,
+            exactIndexSpan.ownerIdentity,
+            reinterpret_cast<uintptr_t>(exactIndexSpan.data),
+            exactIndexSpan.identityGeneration,
+            exactIndexSpan.allocationGeneration,
+            exactIndexSpan.contentGeneration,
+            exactIndexSpan.length,
+            indexElementBytes,
+            CountVal,
+            BaseVertexIndex,
+            uint32_t(positionCapacity64),
+        };
+        auto& cacheStats = m_war3Scene.shadowStats;
+        ++cacheStats.semanticSceneTerrainBoundsProducerDomainCacheLookupCount;
+        const Lookup lookup =
+            s_observerDomainCache.lookup(cacheKey, exactDomain);
+        observerDomainCacheHit = lookup == Lookup::Hit;
+        if (observerDomainCacheHit) {
+          ++cacheStats.semanticSceneTerrainBoundsProducerDomainCacheHitCount;
+        } else {
+          ++cacheStats.semanticSceneTerrainBoundsProducerDomainCacheMissCount;
+          if (lookup == Lookup::MissCollision) {
+            ++cacheStats.
+                semanticSceneTerrainBoundsProducerDomainCacheCollisionMissCount;
+          }
+          exactDomain =
+              dxvk::war3::memory::ComputeWar3ExactIndexVertexDomainPrepared({
+                  exactIndexSpan, indexElementBytes, CountVal,
+                  BaseVertexIndex, uint32_t(positionCapacity64),
+                  exactIndexHostCached, s_exactIndexDomainBulkReadEnabled});
+          const Store store = s_observerDomainCache.store(cacheKey, exactDomain);
+          if (store != Store::InvalidKey) {
+            ++cacheStats.
+                semanticSceneTerrainBoundsProducerDomainCacheStoreCount;
+          }
+          if (store == Store::Replaced) {
+            ++cacheStats.
+                semanticSceneTerrainBoundsProducerDomainCacheEvictionCount;
+          }
+        }
+      }
+      if (!exactDomainFromDeclaredHint &&
+          (!useGenerationBackedDomainCache || !observerDomainCacheHit)) {
+        if (!useGenerationBackedDomainCache) {
+          exactDomain =
+              dxvk::war3::memory::ComputeWar3ExactIndexVertexDomainPrepared({
+                  exactIndexSpan, indexElementBytes, CountVal,
+                  BaseVertexIndex, uint32_t(positionCapacity64),
+                  exactIndexHostCached, s_exactIndexDomainBulkReadEnabled});
+        }
+      }
+      // Coherent REAL Consume has already paid for the exact domain, so also
+      // compare D3D9's caller-supplied MinVertexIndex/NumVertices range here.
+      // This is observation only: neither relation can authorize trimming or
+      // culling in this candidate.
+      if (!exactDomainFromDeclaredHint &&
+          (exactIndexedTerrainBoundsObserveCandidate ||
+           coherentRealTrimScanCandidate) && exactDomain.valid) {
+        using HintRelation =
+            dxvk::war3::render::War3TerrainIndexedHintRelation;
+        const auto hintDecision = dxvk::war3::render::
+            War3EvaluateTerrainIndexedHintAgainstExactDomain({
+                BaseVertexIndex, MinVertexIndex, NumVertices,
+                uint32_t(positionCapacity64), exactDomain.firstVertex,
+                exactDomain.vertexCount, true});
+        auto& hintStats = m_war3Scene.shadowStats;
+        switch (hintDecision.relation) {
+          case HintRelation::Exact:
+            ++hintStats.semanticSceneTerrainBoundsProducerHintComparableCount;
+            ++hintStats.semanticSceneTerrainBoundsProducerHintExactCount;
+            break;
+          case HintRelation::ConservativeSuperset:
+            ++hintStats.semanticSceneTerrainBoundsProducerHintComparableCount;
+            ++hintStats.semanticSceneTerrainBoundsProducerHintSupersetCount;
+            break;
+          case HintRelation::UnderCoversExactDomain:
+            ++hintStats.semanticSceneTerrainBoundsProducerHintComparableCount;
+            ++hintStats.
+                semanticSceneTerrainBoundsProducerHintUnderCoverageCount;
+            break;
+          case HintRelation::Invalid:
+            ++hintStats.semanticSceneTerrainBoundsProducerHintInvalidCount;
+            break;
+        }
+      }
       if (exactDomain.valid) {
         const uint64_t first = exactDomain.firstVertex;
         const uint64_t count = exactDomain.vertexCount;
@@ -45574,6 +48521,14 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                 int64_t(std::numeric_limits<int32_t>::min()) &&
             adjustedVertexOffset <=
                 int64_t(std::numeric_limits<int32_t>::max());
+        if (!exactDomainFromDeclaredHint && end <= positionCapacity64 &&
+            first <= uint64_t(std::numeric_limits<uint32_t>::max()) &&
+            count <= uint64_t(std::numeric_limits<uint32_t>::max()) &&
+            count != 0u) {
+          exactIndexedDomainFirstVertex = uint32_t(first);
+          exactIndexedDomainVertexCount = uint32_t(count);
+          exactIndexedDomainKnown = true;
+        }
         if (allStreamsFit && blendBinding == 1u) {
           allStreamsFit = blendStride != 0u &&
               end <= uint64_t(blendInfo.size / blendStride);
@@ -45589,7 +48544,9 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         const bool compactVertexRange =
             first != 0u || count != positionCapacity64;
         bool rebasedIndexReady = false;
-        if (allStreamsFit && compactVertexRange && exactIndexBytes != 0u &&
+        const bool needsRebasedIndex = exactIndexedFreezeTrimCandidate;
+        if (needsRebasedIndex && allStreamsFit && compactVertexRange &&
+            exactIndexBytes != 0u &&
             exactIndexBytes <= uint64_t(std::numeric_limits<size_t>::max())) {
           s_exactRebasedIndexScratch.resize(size_t(exactIndexBytes));
           rebasedIndexReady =
@@ -45599,7 +48556,105 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                   s_exactRebasedIndexScratch.data(), exactIndexBytes);
         }
 
-        if (allStreamsFit && compactVertexRange && rebasedIndexReady) {
+        if (coherentUpTrimCandidate) {
+          coherentUpTrimBytesBefore = uint64_t(posBytesNeeded) +
+              uint64_t(blendBytesNeeded) +
+              (captureAlphaTest && resolvedUvBinding == 2u
+                   ? uint64_t(uvBytesNeeded) : 0u);
+          coherentUpTrimBytesAfter = uint64_t(count) * uint64_t(posStride) +
+              (blendBinding == 1u
+                   ? uint64_t(count) * uint64_t(blendStride) : 0u) +
+              (captureAlphaTest && resolvedUvBinding == 2u
+                   ? uint64_t(count) * uint64_t(uvStride) : 0u);
+          coherentUpTrimEligible = allStreamsFit && compactVertexRange &&
+              rebasedIndexReady &&
+              coherentUpTrimBytesAfter < coherentUpTrimBytesBefore;
+        }
+
+        if (coherentRealTrimScanCandidate) {
+          const auto coherentRealDecision =
+              dxvk::war3::memory::EvaluateWar3CoherentRealIndexTrim({
+                  indexed && terrainCaster,
+                  gpuSkinLegacyBacking,
+                  vertexBlendEnabled,
+                  captureAlphaTest,
+                  alphaBlend,
+                  !DynamicSysmemVBOs && posDynamic,
+                  bool(coherentRealPositionSpan),
+                  bool(exactIndexSpan),
+                  coherentRealPositionSpan.length,
+                  posStride,
+                  exactIndexSpan.length,
+                  indexElementBytes,
+                  CountVal,
+              });
+          if (coherentRealDecision) {
+            coherentRealTrimBytesBefore = uint64_t(posBytesNeeded);
+            coherentRealTrimBytesAfter = uint64_t(count) * uint64_t(posStride);
+            coherentRealTrimEligible = allStreamsFit && compactVertexRange &&
+                exactIndexBytes != 0u &&
+                coherentRealTrimBytesAfter < coherentRealTrimBytesBefore;
+          }
+        }
+
+        bool coherentRealPositionSpanStillCurrent = false;
+        bool coherentRealIndexSpanStillCurrent = false;
+        if (coherentRealTrimEligible &&
+            coherentRealTrimMode == CoherentRealTrimMode::Consume) {
+          const uint64_t compactPositionOffset = first * uint64_t(posStride);
+          const uint64_t compactPositionBytes = count * uint64_t(posStride);
+          const auto currentMapping = vbCommon != nullptr
+              ? vbCommon->GetMappedSlice() : nullptr;
+          const bool generationStillCurrent =
+              vbCommon != nullptr && currentMapping != nullptr &&
+              coherentRealPositionMappedAllocation != nullptr &&
+              currentMapping.ptr() ==
+                  coherentRealPositionMappedAllocation.ptr() &&
+              vbCommon->War3IdentityGeneration() ==
+                  coherentRealPositionSpan.identityGeneration &&
+              vbCommon->War3MapAllocationGeneration() ==
+                  coherentRealPositionSpan.allocationGeneration &&
+              vbCommon->War3ContentGeneration() ==
+                  coherentRealPositionSpan.contentGeneration;
+          if (generationStillCurrent &&
+               compactPositionOffset <= coherentRealPositionSpan.length &&
+               compactPositionBytes <=
+                   coherentRealPositionSpan.length - compactPositionOffset &&
+               compactPositionOffset <=
+                   uint64_t(std::numeric_limits<size_t>::max()) &&
+               compactPositionBytes <=
+                   uint64_t(std::numeric_limits<size_t>::max())) {
+            // The Arena transaction below consumes this validated mapping
+            // synchronously before the D3D draw returns. Point it at the exact
+            // compact subrange instead of copying hundreds of KiB into an
+            // intermediate thread-local vector and then copying it again.
+            coherentRealPositionSpanStillCurrent = true;
+          }
+          const auto currentIndexMapping = exactIndexCommon != nullptr
+              ? exactIndexCommon->GetMappedSlice() : nullptr;
+          coherentRealIndexSpanStillCurrent =
+              exactIndexCommon != nullptr && currentIndexMapping != nullptr &&
+              coherentRealIndexMappedAllocation != nullptr &&
+              currentIndexMapping.ptr() ==
+                  coherentRealIndexMappedAllocation.ptr() &&
+              exactIndexCommon->War3IdentityGeneration() ==
+                  exactIndexSpan.identityGeneration &&
+              exactIndexCommon->War3MapAllocationGeneration() ==
+                  exactIndexSpan.allocationGeneration &&
+              exactIndexCommon->War3ContentGeneration() ==
+                  exactIndexSpan.contentGeneration &&
+              exactIndexBytes <= exactIndexSpan.length;
+        }
+
+        const bool consumeCoherentRealTrim =
+            coherentRealTrimEligible && coherentRealPositionSpanStillCurrent &&
+            coherentRealIndexSpanStillCurrent &&
+            coherentRealTrimMode == CoherentRealTrimMode::Consume;
+        if ((exactIndexedFreezeTrimCandidate || consumeCoherentRealTrim) &&
+            allStreamsFit &&
+            compactVertexRange &&
+            (needsRebasedIndex ? rebasedIndexReady
+                               : consumeCoherentRealTrim)) {
           exactIndexedFreezeBytesBefore = uint64_t(posBytesNeeded) +
               uint64_t(blendBytesNeeded) +
               (captureAlphaTest && resolvedUvBinding == 2u
@@ -45621,8 +48676,14 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           exactIndexedFreezeMinIndex = exactDomain.minIndex;
           exactIndexedFreezeMaxIndex = exactDomain.maxIndex;
           exactIndexedFreezeTrimmed = true;
-          exactIndexedFreezeRebased = true;
+          exactIndexedFreezeRebased = needsRebasedIndex;
+          coherentRealTrimConsumed = consumeCoherentRealTrim;
           idxBytesNeeded = VkDeviceSize(exactIndexBytes);
+          if (consumeCoherentRealTrim) {
+            coherentRealIndexBytes = exactIndexSpan.data;
+            coherentRealIndexLength = VkDeviceSize(exactIndexSpan.length);
+            coherentRealIndexRangeSnapshot = true;
+          }
           exactIndexedFreezeBytesAfter = uint64_t(posBytesNeeded) +
               uint64_t(blendBytesNeeded) +
               (captureAlphaTest && resolvedUvBinding == 2u
@@ -45636,6 +48697,41 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         exactIndexedFreezeTrimmed, exactIndexedFreezeBytesBefore,
         exactIndexedFreezeBytesAfter);
   }
+  if (coherentUpTrimConsidered) {
+    dxvk::war3::memory::ShadowArena_NoteCoherentUpIndexTrim(
+        coherentUpTrimEligible,
+        coherentUpTrimMode == CoherentUpTrimMode::Consume &&
+            exactIndexedFreezeTrimmed,
+        coherentUpTrimBytesBefore, coherentUpTrimBytesAfter);
+  }
+  if (coherentRealTrimObserved) {
+    dxvk::war3::memory::ShadowArena_NoteCoherentRealIndexTrim(
+        true, coherentRealTrimEligible, coherentRealTrimConsumed,
+        coherentRealTrimBytesBefore, coherentRealTrimBytesAfter);
+  }
+
+  auto resolveTerrainBoundsVertexRange = [&]() {
+    auto range = dxvk::war3::render::War3ResolveTerrainBoundsVertexRange(
+        indexed, StartVal, CountVal, exactIndexedDomainKnown,
+        exactIndexedDomainFirstVertex, exactIndexedDomainVertexCount);
+    if (!range.exact && exactIndexedTerrainBoundsObserveCandidate &&
+        positionCapacity64 != 0u &&
+        positionCapacity64 <=
+            uint64_t(std::numeric_limits<uint32_t>::max())) {
+      range = dxvk::war3::render::
+          War3ResolveConservativeTerrainIndexedHintRange(
+              BaseVertexIndex, MinVertexIndex, NumVertices,
+              uint32_t(positionCapacity64));
+      if (range.exact) {
+        ++m_war3Scene.shadowStats.
+            semanticSceneTerrainBoundsProducerHintRangeAcceptedCount;
+      } else {
+        ++m_war3Scene.shadowStats.
+            semanticSceneTerrainBoundsProducerHintRangeRejectedCount;
+      }
+    }
+    return range;
+  };
 
   const bool dynamicShadowSource =
       DynamicSysmemVBOs || DynamicSysmemIBO || posDynamic || blendDynamic ||
@@ -45679,6 +48775,244 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     return currentWorld;
   };
   Matrix4 shadowWorldMatrix = chooseShadowWorldMatrix(currentWorldMatrix);
+
+  // Development-only observation of whether opaque S1 terrain has an exact
+  // source generation stable across adjacent frames. Release builds compile
+  // out the observer; routing always remains on the established paths.
+  if constexpr (dxvk::war3::render::kDevelopmentShadowObserversEnabled) {
+  using GenerationBackedGeometryProof =
+      dxvk::war3::render::War3ShadowGenerationBackedGeometryProof;
+  using GenerationBackedStreamProof =
+      dxvk::war3::render::War3ShadowGenerationBackedStreamProof;
+  using ShadowStreamKind = dxvk::war3::render::War3ShadowStreamKind;
+  GenerationBackedGeometryProof s1GenerationProof = {};
+  bool s1GenerationProofPromotionReady = false;
+  if (terrainS1Caster && !alphaTestEnabled && !alphaBlend &&
+      War3ClassifyShadowReplayMode(vertexBlendEnabled, vbIndexed) ==
+          War3ShadowReplayMode::FixedWorld) {
+    const auto makeDirectProof =
+        [&](const D3D9CommonBuffer* common, uint64_t sourceOffset,
+            uint64_t sourceLength, uint32_t elementStride,
+            ShadowStreamKind streamKind) {
+          GenerationBackedStreamProof proof = {};
+          if (common == nullptr || common->NeedsReadback() ||
+              sourceLength == 0u || elementStride == 0u)
+            return proof;
+          proof.ownerIdentity = reinterpret_cast<uintptr_t>(common);
+          proof.identityGeneration = common->War3IdentityGeneration();
+          proof.allocationGeneration = common->War3MapAllocationGeneration();
+          proof.contentGeneration = common->War3ContentGeneration();
+          proof.sourceOffset = sourceOffset;
+          proof.sourceLength = sourceLength;
+          proof.elementStride = elementStride;
+          proof.elementSize = elementStride;
+          proof.mapEpoch = m_war3GpuSkinMapEpoch;
+          proof.deviceEpoch = m_war3GpuSkinDeviceEpoch;
+          proof.streamKind = streamKind;
+          return proof.valid() ? proof : GenerationBackedStreamProof{};
+        };
+    const auto makeUploadPositionProof = [&]() {
+      GenerationBackedStreamProof proof = {};
+      if (!DynamicSysmemVBOs || posStream >= caps::MaxStreams ||
+          vbCommon == nullptr ||
+          !m_war3PerDrawUpload.vbSourceValid[posStream] ||
+          m_war3PerDrawUpload.vbSourceResource[posStream] !=
+              reinterpret_cast<uintptr_t>(vbCommon) ||
+          m_war3PerDrawUpload.vbSourceIdentityGeneration[posStream] !=
+              vbCommon->War3IdentityGeneration() ||
+          m_war3PerDrawUpload.vbSourceSequence[posStream] !=
+              vbCommon->GetMappingBufferSequenceNumber() ||
+          m_war3PerDrawUpload.vbSourceContentGeneration[posStream] !=
+              vbCommon->War3ContentGeneration()) {
+        return proof;
+      }
+      const uint32_t sourceStride =
+          m_war3PerDrawUpload.vbSourceElementStride[posStream];
+      const uint32_t packedStride =
+          m_war3PerDrawUpload.vbSourceElementSize[posStream];
+      if (sourceStride == 0u || packedStride == 0u ||
+          packedStride > sourceStride ||
+          uint64_t(posFreezeByteOffset) % packedStride != 0u ||
+          uint64_t(posBytesNeeded) % packedStride != 0u)
+        return proof;
+      const uint64_t firstElement = uint64_t(posFreezeByteOffset) / packedStride;
+      const uint64_t elementCount = uint64_t(posBytesNeeded) / packedStride;
+      if (elementCount == 0u ||
+          firstElement >
+              (UINT64_MAX -
+               m_war3PerDrawUpload.vbSourceOffset[posStream]) /
+                  sourceStride ||
+          elementCount - 1u >
+              (UINT64_MAX - packedStride) / sourceStride)
+        return proof;
+      const uint64_t canonicalOffset =
+          uint64_t(m_war3PerDrawUpload.vbSourceOffset[posStream]) +
+          firstElement * uint64_t(sourceStride);
+      const uint64_t canonicalLength =
+          (elementCount - 1u) * uint64_t(sourceStride) + packedStride;
+      const uint64_t sourceBegin =
+          m_war3PerDrawUpload.vbSourceOffset[posStream];
+      const uint64_t sourceLength =
+          m_war3PerDrawUpload.vbSourceLength[posStream];
+      if (canonicalOffset < sourceBegin ||
+          canonicalOffset - sourceBegin > sourceLength ||
+          canonicalLength > sourceLength - (canonicalOffset - sourceBegin))
+        return proof;
+      proof.ownerIdentity =
+          m_war3PerDrawUpload.vbSourceResource[posStream];
+      proof.identityGeneration =
+          m_war3PerDrawUpload.vbSourceIdentityGeneration[posStream];
+      proof.allocationGeneration =
+          m_war3PerDrawUpload.vbSourceSequence[posStream];
+      proof.contentGeneration =
+          m_war3PerDrawUpload.vbSourceContentGeneration[posStream];
+      proof.sourceOffset = canonicalOffset;
+      proof.sourceLength = canonicalLength;
+      proof.elementStride = sourceStride;
+      proof.elementSize = packedStride;
+      proof.mapEpoch = m_war3GpuSkinMapEpoch;
+      proof.deviceEpoch = m_war3GpuSkinDeviceEpoch;
+      proof.streamKind = ShadowStreamKind::Position;
+      return proof.valid() ? proof : GenerationBackedStreamProof{};
+    };
+
+    s1GenerationProof.indexed = indexed;
+    if (DynamicSysmemVBOs) {
+      s1GenerationProof.position = makeUploadPositionProof();
+    } else if (uint64_t(posFreezeByteOffset) <= posSlice.length() &&
+               uint64_t(posBytesNeeded) <=
+                   posSlice.length() - uint64_t(posFreezeByteOffset)) {
+      s1GenerationProof.position = makeDirectProof(
+          vbCommon, uint64_t(posSlice.offset()) + uint64_t(posFreezeByteOffset),
+          uint64_t(posBytesNeeded), posStride, ShadowStreamKind::Position);
+    }
+
+    if (indexed) {
+      const uint32_t indexStride =
+          indexType == VK_INDEX_TYPE_UINT32 ? 4u : 2u;
+      const uint64_t drawIndexOffset = uint64_t(StartVal) * indexStride;
+      const uint64_t drawIndexBytes = uint64_t(CountVal) * indexStride;
+      auto* indexCommon = m_state.indices.ptr() != nullptr
+          ? m_state.indices.ptr()->GetCommonBuffer()
+          : nullptr;
+      if (DynamicSysmemIBO && indexCommon != nullptr &&
+          m_war3PerDrawUpload.ibSourceValid &&
+          m_war3PerDrawUpload.ibSourceResource ==
+              reinterpret_cast<uintptr_t>(indexCommon) &&
+          m_war3PerDrawUpload.ibSourceIdentityGeneration ==
+              indexCommon->War3IdentityGeneration() &&
+          m_war3PerDrawUpload.ibSourceSequence ==
+              indexCommon->GetMappingBufferSequenceNumber() &&
+          m_war3PerDrawUpload.ibSourceContentGeneration ==
+              indexCommon->War3ContentGeneration() &&
+          drawIndexOffset <= m_war3PerDrawUpload.ibSourceLength &&
+          drawIndexBytes <=
+              uint64_t(m_war3PerDrawUpload.ibSourceLength) - drawIndexOffset) {
+        auto& proof = s1GenerationProof.index;
+        proof.ownerIdentity = m_war3PerDrawUpload.ibSourceResource;
+        proof.identityGeneration =
+            m_war3PerDrawUpload.ibSourceIdentityGeneration;
+        proof.allocationGeneration = m_war3PerDrawUpload.ibSourceSequence;
+        proof.contentGeneration =
+            m_war3PerDrawUpload.ibSourceContentGeneration;
+        proof.sourceOffset =
+            uint64_t(m_war3PerDrawUpload.ibSourceOffset) + drawIndexOffset;
+        proof.sourceLength = drawIndexBytes;
+        proof.elementStride = indexStride;
+        proof.elementSize = indexStride;
+        proof.mapEpoch = m_war3GpuSkinMapEpoch;
+        proof.deviceEpoch = m_war3GpuSkinDeviceEpoch;
+        proof.streamKind = ShadowStreamKind::Index;
+        if (!proof.valid())
+          proof = {};
+      } else if (!DynamicSysmemIBO &&
+                 drawIndexOffset <= idxSlice.length() &&
+                 drawIndexBytes <= idxSlice.length() - drawIndexOffset) {
+        s1GenerationProof.index = makeDirectProof(
+            indexCommon, uint64_t(idxSlice.offset()) + drawIndexOffset,
+            drawIndexBytes, indexStride, ShadowStreamKind::Index);
+      }
+    }
+
+    if (s1GenerationProof.valid()) {
+      auto& diagnostics = m_war3ShadowPersistentDiagnosticsFrame;
+      diagnostics.s1GenerationProofEligibleCount++;
+      uint64_t observationKey = bit::fnv1a_init();
+      const auto hashProofIdentity = [&](const GenerationBackedStreamProof& p) {
+        observationKey = bit::fnv1a_iter(observationKey, p.ownerIdentity);
+        observationKey = bit::fnv1a_iter(
+            observationKey, p.identityGeneration);
+        observationKey = bit::fnv1a_iter(observationKey, p.sourceOffset);
+        observationKey = bit::fnv1a_iter(observationKey, p.sourceLength);
+        observationKey = bit::fnv1a_iter(observationKey, p.elementStride);
+        observationKey = bit::fnv1a_iter(observationKey, p.elementSize);
+      };
+      hashProofIdentity(s1GenerationProof.position);
+      if (indexed)
+        hashProofIdentity(s1GenerationProof.index);
+      observationKey = bit::fnv1a_iter(observationKey, uint32_t(topo));
+      observationKey = bit::fnv1a_iter(observationKey, uint32_t(StartVal));
+      observationKey = bit::fnv1a_iter(observationKey, uint32_t(CountVal));
+      observationKey = bit::fnv1a_iter(
+          observationKey, uint32_t(BaseVertexIndex));
+      for (uint32_t col = 0u; col < 4u; ++col) {
+        for (uint32_t row = 0u; row < 4u; ++row) {
+          observationKey = bit::fnv1a_iter(
+              observationKey,
+              bit::cast<uint32_t>(shadowWorldMatrix[col][row]));
+        }
+      }
+
+      constexpr size_t kMaxS1GenerationProofObservations = 16384u;
+      auto observationIt =
+          m_war3S1GenerationProofObservations.find(observationKey);
+      if (observationIt != m_war3S1GenerationProofObservations.end() ||
+          m_war3S1GenerationProofObservations.size() <
+              kMaxS1GenerationProofObservations) {
+        auto [it, inserted] =
+            m_war3S1GenerationProofObservations.try_emplace(observationKey);
+        (void)inserted;
+        const uint64_t observationFrame =
+            dxvk::war3::render::
+                AdvanceWar3ShadowGenerationObservationClock(
+                    m_war3S1GenerationProofObservationClock,
+                    m_war3ShadowPersistentFrameSerial + 1u);
+        const auto result =
+            dxvk::war3::render::ObserveWar3ShadowGenerationStability(
+                it->second.state, s1GenerationProof, observationFrame);
+        it->second.lastSeenFrame = observationFrame;
+        using Observation =
+            dxvk::war3::render::War3ShadowGenerationObservation;
+        switch (result.observation) {
+        case Observation::First:
+          diagnostics.s1GenerationProofFirstCount++;
+          break;
+        case Observation::SameFrame:
+          diagnostics.s1GenerationProofSameFrameCount++;
+          break;
+        case Observation::Advanced:
+          diagnostics.s1GenerationProofAdvancedCount++;
+          break;
+        case Observation::Changed:
+          diagnostics.s1GenerationProofChangedCount++;
+          break;
+        case Observation::StaleRestart:
+          diagnostics.s1GenerationProofStaleRestartCount++;
+          break;
+        case Observation::Invalid:
+          break;
+        }
+        if (result.promotionReady) {
+          diagnostics.s1GenerationProofPromotionReadyCount++;
+          s1GenerationProofPromotionReady = true;
+        }
+      } else {
+        diagnostics.s1GenerationProofCapacityRejectCount++;
+      }
+    }
+  }
+  (void)s1GenerationProofPromotionReady;
+  }
   if (terrainDoodadCaster) {
     const float translationLenSq =
         matrixTranslationLenSq(shadowWorldMatrix);
@@ -45883,20 +49217,24 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   const VkDeviceSize stage13IndexRangeBytes =
       VkDeviceSize(CountVal) * stage13IndexElementBytes;
 
-  uint64_t stage13WorldMatrixHash = bit::fnv1a_init();
-  for (uint32_t col = 0u; col < 4u; ++col) {
-    for (uint32_t row = 0u; row < 4u; ++row) {
-      stage13WorldMatrixHash = bit::fnv1a_iter(
-          stage13WorldMatrixHash,
-          bit::cast<uint32_t>(shadowWorldMatrix[col][row]));
+  uint64_t stage13WorldMatrixHash = 0u;
+  uint64_t stage13MaterialHash = 0u;
+  if (stage13BaseRetentionEligible) {
+    stage13WorldMatrixHash = bit::fnv1a_init();
+    for (uint32_t col = 0u; col < 4u; ++col) {
+      for (uint32_t row = 0u; row < 4u; ++row) {
+        stage13WorldMatrixHash = bit::fnv1a_iter(
+            stage13WorldMatrixHash,
+            bit::cast<uint32_t>(shadowWorldMatrix[col][row]));
+      }
     }
+    stage13MaterialHash = bit::fnv1a_init();
+    stage13MaterialHash = bit::fnv1a_iter(
+        stage13MaterialHash,
+        reinterpret_cast<uintptr_t>(GetCommonTexture(m_state.textures[0])));
+    stage13MaterialHash = bit::fnv1a_iter(
+        stage13MaterialHash, uint32_t(m_state.renderStates[D3DRS_CULLMODE]));
   }
-  uint64_t stage13MaterialHash = bit::fnv1a_init();
-  stage13MaterialHash = bit::fnv1a_iter(
-      stage13MaterialHash,
-      reinterpret_cast<uintptr_t>(GetCommonTexture(m_state.textures[0])));
-  stage13MaterialHash = bit::fnv1a_iter(
-      stage13MaterialHash, uint32_t(m_state.renderStates[D3DRS_CULLMODE]));
 
   const auto buildStage13RetentionKey =
       [&](uint32_t identityTag, uint64_t identityHash) {
@@ -46237,9 +49575,11 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       };
 
   uint64_t stage13CanonicalReferencedContentHash = 0u;
-  computeStage13ReferencedContentHash(
-      stage13CanonicalPositionBytes, stage13CanonicalIndexBytes,
-      stage13CanonicalReferencedContentHash, nullptr);
+  if (stage13BaseRetentionEligible) {
+    computeStage13ReferencedContentHash(
+        stage13CanonicalPositionBytes, stage13CanonicalIndexBytes,
+        stage13CanonicalReferencedContentHash, nullptr);
+  }
   const bool stage13CanonicalReferencedContentHashValid =
       stage13CanonicalReferencedContentHash != 0u;
   const bool stage13PositionSourceValid =
@@ -46524,10 +49864,12 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                      ? stage13PositionReadableSpan.data : nullptr)
           : nullptr;
   stage13SourceTiming.pause();
-  const bool stage13ReferencedPositionEligible =
-      computeStage13ReferencedContentHash(
-          stage13MappedPositionBytes, stage13MappedIndexBytes,
-          stage13ReferencedVertexContentHash, &stage13StrongTiming);
+  bool stage13ReferencedPositionEligible = false;
+  if (stage13NeedsReferencedPositionIdentity) {
+    stage13ReferencedPositionEligible = computeStage13ReferencedContentHash(
+        stage13MappedPositionBytes, stage13MappedIndexBytes,
+        stage13ReferencedVertexContentHash, &stage13StrongTiming);
+  }
   stage13StrongTiming.enter(
       War3ShadowStage13StrongPhase::VerifyAndLookup);
 
@@ -47031,6 +50373,95 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       candidate.numVertices = indexed ? NumVertices : CountVal;
       candidate.uvBinding = persistentUvBinding;
 
+      // S1 can return through the persistent path before the legacy bounds
+      // block below. Compute its local bounds on the miss that creates the
+      // immutable geometry, using a validated current draw range and a
+      // generation-validated CPU-readable position span. Cache hits reuse the
+      // bounds owned by that immutable geometry. The development observer may
+      // use D3D9's documented conservative range; Release remains Off.
+      if (s1TerrainPersistentPath &&
+          dxvk::war3::internal::kShadowCascadeCullTerrainWithBounds &&
+          War3TerrainBoundsCullModeRuntime() !=
+              dxvk::war3::render::War3TerrainBoundsCullMode::Off) {
+        auto& boundsStats = m_war3Scene.shadowStats;
+        ++boundsStats.semanticSceneTerrainBoundsProducerS1AttemptCount;
+        const auto boundsRange = resolveTerrainBoundsVertexRange();
+        if (boundsRange.exact)
+          ++boundsStats.semanticSceneTerrainBoundsProducerExactRangeCount;
+        else
+          ++boundsStats.semanticSceneTerrainBoundsProducerMissingExactRangeCount;
+        Rc<DxvkResourceAllocation> mappedAllocation = nullptr;
+        dxvk::war3::memory::War3CpuReadableBufferSpan positionSpan = {};
+        bool positionSpanBuildAttempted = false;
+        const bool upSourceExact =
+            DynamicSysmemVBOs && posStream < caps::MaxStreams &&
+            m_war3PerDrawUpload.vbSourceValid[posStream] &&
+            m_war3PerDrawUpload.vbSourceResource[posStream] ==
+                reinterpret_cast<uintptr_t>(vbCommon) &&
+            m_war3PerDrawUpload.vbSourceIdentityGeneration[posStream] != 0u &&
+            m_war3PerDrawUpload.vbSourceSequence[posStream] != 0u &&
+            m_war3PerDrawUpload.vbSourceContentGeneration[posStream] != 0u &&
+            m_war3PerDrawUpload.vbUploadBytes[posStream] != nullptr &&
+            m_war3PerDrawUpload.vbUploadLength[posStream] != 0u;
+        if (upSourceExact) {
+          ++boundsStats.semanticSceneTerrainBoundsProducerUpSourceAttemptCount;
+          positionSpanBuildAttempted = true;
+          positionSpan = dxvk::war3::memory::BuildWar3CpuReadableBufferSpan({
+              m_war3PerDrawUpload.vbUploadBytes[posStream],
+              m_war3PerDrawUpload.vbUploadLength[posStream], 0u,
+              m_war3PerDrawUpload.vbUploadLength[posStream],
+              m_war3PerDrawUpload.vbSourceResource[posStream],
+              m_war3PerDrawUpload.vbSourceIdentityGeneration[posStream],
+              m_war3PerDrawUpload.vbSourceSequence[posStream],
+              m_war3PerDrawUpload.vbSourceContentGeneration[posStream], true});
+        } else if (!DynamicSysmemVBOs && vbCommon != nullptr &&
+                   !vbCommon->NeedsReadback()) {
+          ++boundsStats.semanticSceneTerrainBoundsProducerMappedSourceAttemptCount;
+          mappedAllocation = vbCommon->GetMappedSlice();
+          if (mappedAllocation != nullptr) {
+            positionSpanBuildAttempted = true;
+            const auto allocationInfo = mappedAllocation->getBufferInfo();
+            const bool hostVisible =
+                (mappedAllocation->getMemoryProperties() &
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0u;
+            positionSpan =
+                dxvk::war3::memory::BuildWar3CpuReadableBufferSpan({
+                    mappedAllocation->mapPtr(), uint64_t(allocationInfo.size),
+                    uint64_t(posSlice.offset()), uint64_t(posSlice.length()),
+                    reinterpret_cast<uintptr_t>(vbCommon),
+                    vbCommon->War3IdentityGeneration(),
+                    vbCommon->War3MapAllocationGeneration(),
+                    vbCommon->War3ContentGeneration(), hostVisible});
+          }
+        }
+        War3RecordTerrainBoundsProducerSpan(
+            boundsStats, positionSpan, positionSpanBuildAttempted);
+
+        War3LocalGeometryBounds localBounds = {};
+        if (boundsRange.exact && positionSpan &&
+            War3ComputeCachedMappedTerrainBoundsFromSpan(
+                positionSpan, posStride, uint32_t(declInfo.posOffset),
+                posFormat, boundsRange.firstVertex, boundsRange.vertexCount,
+                false, localBounds)) {
+          ++boundsStats.semanticSceneTerrainBoundsProducerComputeSuccessCount;
+          War3LocalBoundsToSphere(localBounds, candidate.localBoundsCenter,
+                                  candidate.localBoundsRadius);
+          candidate.localBoundsIdentityProven =
+              candidate.localBoundsRadius > 0.0f &&
+              std::isfinite(candidate.localBoundsRadius);
+          if (candidate.localBoundsIdentityProven)
+            ++boundsStats.semanticSceneTerrainBoundsProducerValidSphereCount;
+          else
+            ++boundsStats.semanticSceneTerrainBoundsProducerInvalidSphereCount;
+          candidate.localBoundsSourceGeneration =
+              candidate.localBoundsIdentityProven
+                  ? positionSpan.contentGeneration
+                  : 0u;
+        } else if (boundsRange.exact && positionSpan) {
+          ++boundsStats.semanticSceneTerrainBoundsProducerComputeFailureCount;
+        }
+      }
+
       persistentGeometryReady = War3CreateShadowPersistentGeometryAfterMiss(
           key, candidate, uploads, geometryId, geometry, createdNewGeometry,
           &persistentCreateFailure);
@@ -47059,6 +50490,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       compatDraw.indexed = geometry->indexed;
       compatDraw.positionStorage = geometry->positionStorage;
       compatDraw.positionInfo = geometry->positionInfo;
+      War3CopyPersistentReplayBindings(compatDraw, *geometry);
       compatDraw.positionStride = geometry->positionStride;
       compatDraw.positionOffset = geometry->positionOffset;
       compatDraw.positionFormat = geometry->positionFormat;
@@ -47123,6 +50555,26 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           compatDraw.uvStorage = geometry->uvStorage;
           compatDraw.uvInfo = geometry->uvInfo;
         }
+      }
+      if (terrainS1Caster && geometry->localBoundsIdentityProven &&
+          geometry->localBoundsSourceGeneration != 0u &&
+          geometry->localBoundsRadius > 0.0f &&
+          std::isfinite(geometry->localBoundsRadius)) {
+        War3ApplySemanticBoundsFromMatrix(
+            compatDraw, compatDraw.worldMatrix, geometry->localBoundsCenter,
+            geometry->localBoundsRadius);
+        compatDraw.boundsProvenance = dxvk::war3::render::
+            War3ShadowBoundsProvenance::ExactLocalGeoset;
+        compatDraw.boundsSourceGeneration =
+            geometry->localBoundsSourceGeneration;
+        compatDraw.boundsFrameSerial =
+            m_war3ShadowPersistentFrameSerial + 1u;
+        compatDraw.boundsIdentityProven = true;
+        compatDraw.boundsSourceWasSkinned = false;
+        compatDraw.boundsFrameLocalDynamic = false;
+        compatDraw.boundsAnimatedAttachment = false;
+        ++m_war3Scene.shadowStats
+              .semanticSceneTerrainBoundsProducerPublishedExactCount;
       }
 
       shadowCapturePersistentTiming.pause();
@@ -47317,8 +50769,57 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       (ibDynamic || forceFreezeUnitLikeGeometry ||
        forceFreezeFallbackWorldGeometry || exactIndexedFreezeRebased);
 
+  using CurrentUpReplayMode =
+      dxvk::war3::memory::War3CurrentUpShadowReplayMode;
+  const CurrentUpReplayMode currentUpReplayMode =
+      War3CurrentUpShadowReplayModeRuntime();
+  const bool currentUpReplayObserved =
+      currentUpReplayMode != CurrentUpReplayMode::Off &&
+      shouldFreezePosBuffer && !exactIndexedFreezeTrimmed;
+  const auto& currentUpPositionSlice = posStream < caps::MaxStreams
+      ? m_war3PerDrawUpload.vbSlices[posStream]
+      : DxvkBufferSlice();
+  const auto currentUpReplayDecision =
+      dxvk::war3::memory::EvaluateWar3CurrentUpPositionReplay({
+          DynamicSysmemVBOs && posStream < caps::MaxStreams &&
+              m_war3PerDrawUpload.vbValid[posStream],
+          gpuSkinLegacyBacking,
+          m_war3PerDrawUpload.storage != nullptr,
+          currentUpPositionSlice.buffer() != nullptr,
+          currentUpPositionSlice.buffer() == posSlice.buffer(),
+          uint64_t(currentUpPositionSlice.offset()),
+          uint64_t(currentUpPositionSlice.length()),
+          uint64_t(posInfo.offset) + uint64_t(posFreezeByteOffset),
+          uint64_t(posBytesNeeded),
+      });
+  DxvkResourceBufferInfo currentUpPinnedPositionInfo = {};
+  bool currentUpReplayEligible = currentUpReplayObserved &&
+      bool(currentUpReplayDecision);
+  if (currentUpReplayEligible) {
+    currentUpPinnedPositionInfo = War3PinnedAllocationSliceInfo(
+        m_war3PerDrawUpload.storage,
+        VkDeviceSize(currentUpReplayDecision.replayOffset),
+        VkDeviceSize(currentUpReplayDecision.replayLength));
+    currentUpReplayEligible =
+        currentUpPinnedPositionInfo.buffer != VK_NULL_HANDLE &&
+        currentUpPinnedPositionInfo.buffer == posInfo.buffer;
+  }
+  const bool currentUpReplayConsumed = currentUpReplayEligible &&
+      currentUpReplayMode == CurrentUpReplayMode::Consume;
+  dxvk::war3::memory::ShadowArena_NoteCurrentUpPositionReplay(
+      currentUpReplayObserved, currentUpReplayEligible,
+      currentUpReplayConsumed,
+      currentUpReplayEligible ? uint64_t(posBytesNeeded) : 0u);
+  if (currentUpReplayConsumed) {
+    posPinnedAllocation = m_war3PerDrawUpload.storage;
+    posInfo = currentUpPinnedPositionInfo;
+  }
+  const bool shouldFreezePosBufferIntoArena =
+      shouldFreezePosBuffer && !currentUpReplayConsumed;
+
   const uint64_t fallbackPosBudgetBytes =
-      shouldFreezePosBuffer ? static_cast<uint64_t>(posBytesNeeded) : 0ull;
+      shouldFreezePosBufferIntoArena
+          ? static_cast<uint64_t>(posBytesNeeded) : 0ull;
   const uint64_t fallbackBlendBudgetBytes =
       shouldFreezeBlendBuffer ? static_cast<uint64_t>(blendBytesNeeded) : 0ull;
   const uint64_t fallbackUvBudgetBytes = estimateFallbackUvBytes();
@@ -47351,20 +50852,24 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           (std::max)(1.0f, (std::max)(sx, (std::max)(sy, sz)));
       estimatedBoundsRadius *= maxScale;
     }
-  } else if (terrainS1Caster &&
+  } else if (terrainCaster &&
              dxvk::war3::internal::kShadowCascadeCullTerrainWithBounds &&
              War3TerrainBoundsCullModeRuntime() !=
                  dxvk::war3::render::War3TerrainBoundsCullMode::Off) {
+    auto& boundsStats = m_war3Scene.shadowStats;
+    ++boundsStats.semanticSceneTerrainBoundsProducerFallbackAttemptCount;
     shadowCaptureBoundsTiming.enter(
         War3ShadowCaptureBoundsPhase::TerrainBoundsKey);
     War3LocalGeometryBounds terrainBounds = {};
-    const int64_t terrainFirstVertex =
-        indexed ? int64_t(BaseVertexIndex) + int64_t(MinVertexIndex)
-                : int64_t(StartVal);
-    const uint32_t terrainVertexCount = indexed ? NumVertices : CountVal;
+    const auto terrainVertexRange = resolveTerrainBoundsVertexRange();
+    if (terrainVertexRange.exact)
+      ++boundsStats.semanticSceneTerrainBoundsProducerExactRangeCount;
+    else
+      ++boundsStats.semanticSceneTerrainBoundsProducerMissingExactRangeCount;
     Rc<DxvkResourceAllocation> terrainMappedAllocation = nullptr;
     dxvk::war3::memory::War3CpuReadableBufferSpan
         terrainPositionReadableSpan = {};
+    bool terrainSpanBuildAttempted = false;
     const bool terrainUpSourceExact =
         DynamicSysmemVBOs && posStream < caps::MaxStreams &&
         m_war3PerDrawUpload.vbSourceValid[posStream] &&
@@ -47373,6 +50878,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         m_war3PerDrawUpload.vbUploadBytes[posStream] != nullptr &&
         m_war3PerDrawUpload.vbUploadLength[posStream] != 0u;
     if (terrainUpSourceExact) {
+      ++boundsStats.semanticSceneTerrainBoundsProducerUpSourceAttemptCount;
+      terrainSpanBuildAttempted = true;
       terrainPositionReadableSpan =
           dxvk::war3::memory::BuildWar3CpuReadableBufferSpan({
               m_war3PerDrawUpload.vbUploadBytes[posStream],
@@ -47384,8 +50891,10 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
               m_war3PerDrawUpload.vbSourceContentGeneration[posStream], true});
     } else if (!DynamicSysmemVBOs && vbCommon != nullptr &&
                !vbCommon->NeedsReadback()) {
+      ++boundsStats.semanticSceneTerrainBoundsProducerMappedSourceAttemptCount;
       terrainMappedAllocation = vbCommon->GetMappedSlice();
       if (terrainMappedAllocation != nullptr) {
+        terrainSpanBuildAttempted = true;
         const auto allocationInfo = terrainMappedAllocation->getBufferInfo();
         const bool hostVisible =
             (terrainMappedAllocation->getMemoryProperties() &
@@ -47401,6 +50910,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                 vbCommon->War3ContentGeneration(), hostVisible});
       }
     }
+    War3RecordTerrainBoundsProducerSpan(
+        boundsStats, terrainPositionReadableSpan, terrainSpanBuildAttempted);
     const bool terrainUploadSourceKeyValid =
         terrainUpSourceExact && terrainPositionReadableSpan &&
         dxvk::war3::internal::
@@ -47413,20 +50924,22 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           !DynamicSysmemVBOs && posDynamic && vbCommon != nullptr &&
           terrainPositionReadableSpan;
       terrainDynamicSliceContentKey =
-          (terrainDynamicSliceKeyValid && terrainFirstVertex >= 0 &&
-           terrainVertexCount != 0u)
+          (terrainDynamicSliceKeyValid && terrainVertexRange.exact)
               ? War3ComputeTerrainBoundsContentKey(
-                    terrainPositionReadableSpan, posStride,
-                    uint32_t(declInfo.posOffset),
-                    posFormat, uint32_t(terrainFirstVertex),
-                    terrainVertexCount)
+                  terrainPositionReadableSpan, posStride,
+                  uint32_t(declInfo.posOffset),
+                    posFormat, terrainVertexRange.firstVertex,
+                    terrainVertexRange.vertexCount)
               : 0u;
       terrainDynamicSliceContentKeyValid =
           terrainDynamicSliceKeyValid && terrainDynamicSliceContentKey != 0u;
     }
     const bool allowTerrainBoundsCache =
         (!DynamicSysmemVBOs && !posDynamic) || terrainUploadSourceKeyValid ||
-        terrainDynamicSliceContentKeyValid;
+        terrainDynamicSliceContentKeyValid ||
+        (dxvk::war3::internal::
+             kShadowS1TerrainBoundsCacheCurrentGenerationObserverEnabled &&
+         terrainPositionReadableSpan);
     static const uint8_t s_war3TerrainDynamicBoundsContentKey = 0u;
     const void* terrainStableKeyBase =
         terrainUploadSourceKeyValid
@@ -47443,8 +50956,9 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     const uint64_t terrainStableKeyLength =
         terrainUploadSourceKeyValid
             ? uint64_t(m_war3PerDrawUpload.vbSourceLength[posStream])
-            : (terrainDynamicSliceContentKeyValid ? uint64_t(terrainVertexCount)
-                                                  : 0u);
+             : (terrainDynamicSliceContentKeyValid
+                    ? uint64_t(terrainVertexRange.vertexCount)
+                                                   : 0u);
     const uint32_t terrainStableKeyElementCount =
         terrainUploadSourceKeyValid
             ? m_war3PerDrawUpload.vbSourceElementCount[posStream]
@@ -47463,17 +50977,18 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
             : (terrainDynamicSliceContentKeyValid
                    ? terrainDynamicSliceContentKey
                    : 0u);
-    if (terrainFirstVertex >= 0 && terrainVertexCount != 0u) {
+    if (terrainVertexRange.exact) {
       shadowCaptureBoundsTiming.enter(
           War3ShadowCaptureBoundsPhase::TerrainBoundsCompute);
       if (War3ComputeCachedMappedTerrainBoundsFromSpan(
               terrainPositionReadableSpan, posStride,
               uint32_t(declInfo.posOffset), posFormat,
-              uint32_t(terrainFirstVertex), terrainVertexCount,
+              terrainVertexRange.firstVertex, terrainVertexRange.vertexCount,
               allowTerrainBoundsCache, terrainBounds, terrainStableKeyBase,
               terrainStableKeyOffset, terrainStableKeyLength,
               terrainStableKeyElementCount, terrainStableKeyElementStride,
               terrainStableKeyElementSize, terrainStableKeySequence)) {
+        ++boundsStats.semanticSceneTerrainBoundsProducerComputeSuccessCount;
         Vector4 localCenter = Vector4(0.0f, 0.0f, 0.0f, 1.0f);
         float localRadius = 0.0f;
         War3LocalBoundsToSphere(terrainBounds, localCenter, localRadius);
@@ -47486,6 +51001,14 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
             terrainPositionReadableSpan.contentGeneration;
         estimatedBoundsExactCurrentWorld =
             static_cast<bool>(terrainPositionReadableSpan);
+        if (estimatedBoundsExactCurrentWorld &&
+            estimatedBoundsRadius > 0.0f &&
+            std::isfinite(estimatedBoundsRadius))
+          ++boundsStats.semanticSceneTerrainBoundsProducerValidSphereCount;
+        else
+          ++boundsStats.semanticSceneTerrainBoundsProducerInvalidSphereCount;
+      } else if (terrainPositionReadableSpan) {
+        ++boundsStats.semanticSceneTerrainBoundsProducerComputeFailureCount;
       }
     }
   }
@@ -47593,6 +51116,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
 
   if (overWorldFreezeCountCap || overUnitFreezeCountCap) {
     m_war3Scene.shadowStats.skippedCasterCap++;
+    War3RecordRequiredCasterOmission(
+        War3RequiredCasterOmissionReason::FreezeFailure);
     m_war3Scene.shadowStats.fallbackBudgetBytes =
         m_war3ShadowFallbackBudgetCapBytes;
     m_war3Scene.shadowStats.fallbackBudgetUsedBytes =
@@ -47628,16 +51153,14 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   budgetPolicy.indexBytes = fallbackIndexBudgetBytes;
   budgetPolicy.freezeDynamicEnabled = s_freezeDynamicShadowBuffers;
   budgetPolicy.aggressiveExperimental = false;
+  budgetPolicy.requiredDirectionalCaster = true;
 
   shadowCaptureBoundsTiming.enter(War3ShadowCaptureBoundsPhase::BudgetDecision);
   const auto budgetDecision =
       dxvk::war3::render::DecideShadowCaptureBudget(budgetCandidate,
                                                     budgetPolicy);
-  const uint64_t requestedFallbackBytes =
-      budgetPolicy.posBytes + budgetPolicy.blendBytes + budgetPolicy.uvBytes +
-      budgetPolicy.indexBytes;
-  const uint64_t predictedFallbackBytes =
-      budgetPolicy.usedBudgetBytes + requestedFallbackBytes;
+  const bool requestedBundleFitsHardBudget =
+      dxvk::war3::render::RequiredShadowCasterFitsHardBudget(budgetPolicy);
 
   shadowCaptureBoundsTiming.enter(
       War3ShadowCaptureBoundsPhase::BudgetAccounting);
@@ -47647,16 +51170,22 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     m_war3Scene.shadowStats.degradedAlphaBudget++;
     m_war3Scene.shadowStats.skippedAlphaTest++;
     m_war3Scene.shadowStats.budgetExceeded = 1u;
+    War3RecordRequiredCasterOmission(
+        War3RequiredCasterOmissionReason::FallbackByteBudget);
     m_war3ShadowFallbackBudgetExceeded = true;
     return;
   }
 
   if (budgetDecision.skipCaster) {
-    if (predictedFallbackBytes > budgetPolicy.hardBudgetBytes)
+    if (!requestedBundleFitsHardBudget)
       m_war3Scene.shadowStats.skippedFreezeBudget++;
     else
       m_war3Scene.shadowStats.skippedPriorityBudget++;
     m_war3Scene.shadowStats.budgetExceeded = 1u;
+    War3RecordRequiredCasterOmission(
+        !requestedBundleFitsHardBudget
+            ? War3RequiredCasterOmissionReason::FallbackByteBudget
+            : War3RequiredCasterOmissionReason::SoftPriorityBudget);
     m_war3Scene.shadowStats.fallbackBudgetBytes =
         m_war3ShadowFallbackBudgetCapBytes;
     m_war3Scene.shadowStats.fallbackBudgetUsedBytes =
@@ -47886,14 +51415,16 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       [&](War3FrameFreezeStreamType streamType,
           dxvk::war3::memory::ShadowArenaAllocationTag allocationTag,
           const DxvkBufferSlice& sourceSlice, VkDeviceSize bytes,
-          bool stableUpload, uint32_t sourceStream,
+          bool stableUpload, bool immediateCpuSnapshot,
+          uint32_t sourceStream,
           D3D9CommonBuffer* common, const void* stableBytes,
           VkDeviceSize stableLength, Rc<DxvkBuffer>& outputStorage,
           DxvkResourceBufferInfo& outputInfo) {
     if (freezePlanCount >= freezePlans.size() ||
         sourceSlice.buffer() == nullptr || bytes == 0u ||
         bytes > sourceSlice.length() ||
-        (stableUpload && (stableBytes == nullptr || bytes > stableLength))) {
+        (immediateCpuSnapshot &&
+         (stableBytes == nullptr || bytes > stableLength))) {
       freezePlanInvalid = true;
       return;
     }
@@ -47926,8 +51457,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     auto& plan = freezePlans[freezePlanCount++];
     plan.sourceSlice = sourceSlice;
     plan.bytes = bytes;
-    plan.stableSourceBytes = stableUpload ? stableBytes : nullptr;
-    plan.stableSourceLength = stableUpload ? stableLength : 0u;
+    plan.stableSourceBytes = immediateCpuSnapshot ? stableBytes : nullptr;
+    plan.stableSourceLength = immediateCpuSnapshot ? stableLength : 0u;
     plan.outputStorage = &outputStorage;
     plan.outputInfo = &outputInfo;
     plan.cacheKey = key;
@@ -47942,36 +51473,42 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                 : dxvk::war3::memory::ShadowArenaSourceClass::Model;
   };
 
-  if (shouldFreezePosBuffer) {
+  if (shouldFreezePosBufferIntoArena) {
     if (gpuSkinFormalShadowMode) {
       m_war3Scene.shadowStats.gpuSkinShadowBackingFallbackCount++;
       ++m_war3GpuSkinP2BackingFallbacks;
     }
-    const bool stable =
+    const bool currentUpStable =
         DynamicSysmemVBOs && m_war3PerDrawUpload.vbValid[posStream];
+    const bool immediateCpuSnapshot =
+        currentUpStable || coherentRealTrimConsumed;
     const bool positionRangeValid =
         posFreezeByteOffset <= posSlice.length() &&
         posBytesNeeded <= posSlice.length() - posFreezeByteOffset;
     const auto positionFreezeSlice = positionRangeValid
         ? posSlice.subSlice(posFreezeByteOffset, posBytesNeeded)
         : DxvkBufferSlice();
-    const auto* positionStableBytes = stable &&
-            posFreezeByteOffset <=
-                VkDeviceSize(m_war3PerDrawUpload.vbUploadLength[posStream])
-        ? reinterpret_cast<const uint8_t*>(
-              m_war3PerDrawUpload.vbUploadBytes[posStream]) +
-              size_t(posFreezeByteOffset)
-        : nullptr;
-    const VkDeviceSize positionStableLength = stable &&
-            posFreezeByteOffset <=
-                VkDeviceSize(m_war3PerDrawUpload.vbUploadLength[posStream])
-        ? VkDeviceSize(m_war3PerDrawUpload.vbUploadLength[posStream]) -
-              posFreezeByteOffset
-        : 0u;
+    const auto* positionStableBytes = coherentRealTrimConsumed
+        ? coherentRealPositionSpan.data + size_t(posFreezeByteOffset)
+        : currentUpStable && posFreezeByteOffset <=
+                  VkDeviceSize(m_war3PerDrawUpload.vbUploadLength[posStream])
+            ? reinterpret_cast<const uint8_t*>(
+                  m_war3PerDrawUpload.vbUploadBytes[posStream]) +
+                  size_t(posFreezeByteOffset)
+            : nullptr;
+    const VkDeviceSize positionStableLength = coherentRealTrimConsumed
+        ? VkDeviceSize(coherentRealPositionSpan.length -
+                       uint64_t(posFreezeByteOffset))
+        : currentUpStable && posFreezeByteOffset <=
+                  VkDeviceSize(m_war3PerDrawUpload.vbUploadLength[posStream])
+            ? VkDeviceSize(m_war3PerDrawUpload.vbUploadLength[posStream]) -
+                  posFreezeByteOffset
+            : 0u;
     appendFreezePlan(
         War3FrameFreezeStreamType::Position,
         dxvk::war3::memory::ShadowArenaAllocationTag::Position,
-        positionFreezeSlice, posBytesNeeded, stable, posStream,
+        positionFreezeSlice, posBytesNeeded, currentUpStable,
+        immediateCpuSnapshot, posStream,
         gpuSkinLegacyBacking ? nullptr : commonForStream(posStream),
         positionStableBytes, positionStableLength,
         posAlloc, posInfo);
@@ -48002,7 +51539,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     appendFreezePlan(
         War3FrameFreezeStreamType::Blend,
         dxvk::war3::memory::ShadowArenaAllocationTag::Blend,
-        blendFreezeSlice, blendBytesNeeded, stable, blendStream,
+        blendFreezeSlice, blendBytesNeeded, stable, stable, blendStream,
         commonForStream(blendStream),
         blendStableBytes, blendStableLength,
         blendAlloc, blendInfo);
@@ -48035,39 +51572,51 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     appendFreezePlan(
         War3FrameFreezeStreamType::Uv,
         dxvk::war3::memory::ShadowArenaAllocationTag::Uv,
-        uvFreezeSlice, uvBytesNeeded, uvRequiresStableUploadSource, uvStream,
+        uvFreezeSlice, uvBytesNeeded, uvRequiresStableUploadSource,
+        uvRequiresStableUploadSource, uvStream,
         commonForStream(uvStream),
         uvStableBytes, uvStableLength,
         uvAlloc, uvInfo);
   }
 
   if (shouldFreezeIndexBuffer) {
-    const bool stable = exactIndexedFreezeRebased ||
-        (DynamicSysmemIBO && m_war3PerDrawUpload.ibValid);
+    const bool currentUpStable = !exactIndexedFreezeRebased &&
+        !coherentRealIndexRangeSnapshot &&
+        DynamicSysmemIBO && m_war3PerDrawUpload.ibValid;
+    const bool immediateCpuSnapshot =
+        exactIndexedFreezeRebased || coherentRealIndexRangeSnapshot ||
+        currentUpStable;
     auto* indexCommon = m_state.indices.ptr() != nullptr
         ? m_state.indices.ptr()->GetCommonBuffer() : nullptr;
     const VkDeviceSize indexElementBytes =
         indexType == VK_INDEX_TYPE_UINT32 ? 4u : 2u;
     const VkDeviceSize exactIndexOffset =
         VkDeviceSize(StartVal) * indexElementBytes;
-    const bool exactIndexRangeValid = exactIndexedFreezeRebased &&
+    const bool exactIndexRangeValid =
+        (exactIndexedFreezeRebased || coherentRealIndexRangeSnapshot) &&
         exactIndexOffset <= idxSlice.length() &&
         idxBytesNeeded <= idxSlice.length() - exactIndexOffset;
-    const auto indexFreezeSlice = exactIndexedFreezeRebased
+    const auto indexFreezeSlice =
+        (exactIndexedFreezeRebased || coherentRealIndexRangeSnapshot)
         ? (exactIndexRangeValid
                ? idxSlice.subSlice(exactIndexOffset, idxBytesNeeded)
                : DxvkBufferSlice())
         : idxSlice;
     const void* stableIndexBytes = exactIndexedFreezeRebased
         ? static_cast<const void*>(s_exactRebasedIndexScratch.data())
-        : (stable ? m_war3PerDrawUpload.ibUploadBytes : nullptr);
+        : coherentRealIndexRangeSnapshot
+            ? static_cast<const void*>(coherentRealIndexBytes)
+        : (currentUpStable ? m_war3PerDrawUpload.ibUploadBytes : nullptr);
     const VkDeviceSize stableIndexLength = exactIndexedFreezeRebased
         ? VkDeviceSize(s_exactRebasedIndexScratch.size())
-        : (stable ? m_war3PerDrawUpload.ibUploadLength : 0u);
+        : coherentRealIndexRangeSnapshot
+            ? coherentRealIndexLength
+        : (currentUpStable ? m_war3PerDrawUpload.ibUploadLength : 0u);
     appendFreezePlan(
         War3FrameFreezeStreamType::Index,
         dxvk::war3::memory::ShadowArenaAllocationTag::Index,
-        indexFreezeSlice, idxBytesNeeded, stable, 0u,
+        indexFreezeSlice, idxBytesNeeded, currentUpStable,
+        immediateCpuSnapshot, 0u,
         exactIndexedFreezeRebased ? nullptr : indexCommon,
         stableIndexBytes, stableIndexLength,
         idxAlloc, idxInfo);
@@ -48075,6 +51624,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
 
   if (freezePlanInvalid) {
     m_war3Scene.shadowStats.budgetExceeded = 1u;
+    War3RecordRequiredCasterOmission(
+        War3RequiredCasterOmissionReason::FreezeFailure);
     m_war3ShadowFallbackBudgetExceeded = true;
     return;
   }
@@ -48085,6 +51636,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   std::array<VkDeviceSize, 4> snapshotOffset = {};
   dxvk::war3::memory::ShadowArenaBundleTransaction arenaTransaction = {};
   bool arenaTransactionActive = false;
+  bool arenaAdmissionRejected = false;
   if (freezePlanCount != 0u && arenaCaptureEnabled) {
     std::array<dxvk::war3::memory::ShadowArenaBundleRequest, 4> requests = {};
     for (uint32_t i = 0u; i < freezePlanCount; ++i) {
@@ -48109,6 +51661,10 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       }
     } else {
       freezePlanInvalid = true;
+      arenaAdmissionRejected = true;
+      // Arena admission is all-or-nothing for this caster bundle.
+      War3RecordRequiredCasterOmission(
+          War3RequiredCasterOmissionReason::ArenaAdmission);
     }
   } else if (freezePlanCount != 0u) {
     for (uint32_t i = 0u; i < freezePlanCount; ++i) {
@@ -48148,6 +51704,12 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     if (arenaTransactionActive)
       dxvk::war3::memory::ShadowArena_RollbackBundle(arenaTransaction);
     m_war3Scene.shadowStats.budgetExceeded = 1u;
+    // The Arena path recorded admission above; source/snapshot failures are
+    // separately observable as a freeze failure.
+    if (!arenaTransactionActive && !arenaAdmissionRejected) {
+      War3RecordRequiredCasterOmission(
+          War3RequiredCasterOmissionReason::FreezeFailure);
+    }
     m_war3ShadowFallbackBudgetExceeded = true;
     return;
   }
@@ -48155,6 +51717,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   if (arenaTransactionActive &&
       !dxvk::war3::memory::ShadowArena_CommitBundle(arenaTransaction)) {
     m_war3Scene.shadowStats.budgetExceeded = 1u;
+    War3RecordRequiredCasterOmission(
+        War3RequiredCasterOmissionReason::ArenaAdmission);
     m_war3ShadowFallbackBudgetExceeded = true;
     return;
   }
@@ -48216,7 +51780,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     }
   }
 
-  if ((shouldFreezePosBuffer &&
+  if ((shouldFreezePosBufferIntoArena &&
        (posAlloc == nullptr || posInfo.buffer == VK_NULL_HANDLE)) ||
       (shouldFreezeBlendBuffer &&
        (blendAlloc == nullptr || blendInfo.buffer == VK_NULL_HANDLE)) ||
@@ -48225,6 +51789,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       (shouldFreezeIndexBuffer &&
        (idxAlloc == nullptr || idxInfo.buffer == VK_NULL_HANDLE))) {
     m_war3Scene.shadowStats.budgetExceeded = 1u;
+    War3RecordRequiredCasterOmission(
+        War3RequiredCasterOmissionReason::FreezeFailure);
     m_war3ShadowFallbackBudgetExceeded = true;
     return;
   }
@@ -48270,6 +51836,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   }
   draw.indexed = indexed;
   draw.positionStorage = std::move(posAlloc);
+  draw.positionPinnedAllocation = std::move(posPinnedAllocation);
   draw.positionInfo = posInfo;
   draw.positionStride = posStride;
   draw.positionOffset = capturedPositionOffset;
@@ -48280,16 +51847,19 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     draw.indexInfo = idxInfo;
     draw.indexType = indexType;
     draw.indexCount = CountVal;
-    draw.firstIndex = exactIndexedFreezeRebased ? 0u : StartVal;
+    draw.firstIndex =
+        (exactIndexedFreezeRebased || coherentRealIndexRangeSnapshot)
+        ? 0u : StartVal;
     draw.vertexOffset = capturedVertexOffset;
     draw.vertexCount = 0;
     draw.firstVertex = 0;
     draw.minVertexIndex = MinVertexIndex;
     draw.numVertices = capturedNumVertices;
     // The compact Arena position slice begins at BaseVertexIndex +
-    // exactDomain.minIndex. The production path rewrites the exact IB range to
-    // [0, max-min], so replay no longer relies on a negative vertexOffset.
-    // Preserve that rewritten domain for the final range validator.
+    // exactDomain.minIndex. Existing UP trim rewrites the IB to [0, max-min];
+    // coherent REAL trim freezes the current raw IB range and applies the
+    // corresponding signed vertex offset. Preserve the matching domain for
+    // the final range validator in either case.
     if (exactIndexedFreezeTrimmed) {
       draw.shadowActualIndexMin = exactIndexedFreezeRebased
           ? 0u : exactIndexedFreezeMinIndex;
@@ -48363,7 +51933,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   draw.depthWriteEnabled = zWriteEnabled;
   draw.depthTestEnabled = zTestEnabled;
   draw.additiveBlend = additiveBlend;
-  if (terrainS1Caster && estimatedBoundsRadius > 0.0f) {
+  if (terrainCaster && estimatedBoundsRadius > 0.0f) {
     draw.boundsCenter = estimatedBoundsCenter;
     draw.boundsRadius = estimatedBoundsRadius;
     draw.boundsProvenance =
@@ -48381,6 +51951,9 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     draw.boundsSourceWasSkinned = false;
     draw.boundsFrameLocalDynamic = posDynamic || DynamicSysmemVBOs;
     draw.boundsAnimatedAttachment = false;
+    if (draw.boundsIdentityProven)
+      ++m_war3Scene.shadowStats
+            .semanticSceneTerrainBoundsProducerPublishedExactCount;
   }
   if (!finalizeShadowDrawCommon(draw))
     return;
@@ -48479,8 +52052,12 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
            : semantic.sceneNode,
        semantic.runtimeModelPtr,
        semantic.modelKey});
+  const auto& appendedFallback =
+      m_war3Scene.shadowFallbacks.back().snapshot;
+  war3::render::War3NoteShadowFallbackAppended(
+      m_war3Scene.shadowStats, m_war3Scene.shadowFallbacks.size(),
+      appendedFallback.category, appendedFallback.objectKind);
   m_war3Scene.shadowStats.fallbackSnapshotCount++;
-  War3RecomputeFallbackBreakdown(m_war3Scene);
   m_war3Scene.shadowStats.fallbackArenaBytes =
       dxvk::war3::memory::ShadowArena_UsedBytes();
   // S1 period 诊断路径：仅 period>1 时在采集帧写入 stash（默认 period=1 跳过，

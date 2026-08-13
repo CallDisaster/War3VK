@@ -104,6 +104,20 @@ ShadowCaptureBudgetDecision DecideShadowCaptureBudget(
 
   const uint64_t usedBytes = policy.usedBudgetBytes;
   const uint64_t hardBudgetBytes = policy.hardBudgetBytes;
+
+  // Required directional casters form one atomic publication. Applying an
+  // order-dependent soft threshold here makes a scene that fits the Arena
+  // alternate between complete and incomplete as Warcraft changes draw order.
+  // Preserve the hard cap, but never trade one required caster for a partial
+  // CSM candidate.
+  if (policy.requiredDirectionalCaster) {
+    if (RequiredShadowCasterFitsHardBudget(policy))
+      return decision;
+    decision.skipCaster = true;
+    decision.reason = "required_caster_hard_budget";
+    return decision;
+  }
+
   const uint64_t predictedBytes = usedBytes + totalBytes;
   const double budgetPressure =
       hardBudgetBytes != 0

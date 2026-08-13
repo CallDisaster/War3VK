@@ -43,16 +43,16 @@ class ShadowReplayDomainPropagationStaticTests(unittest.TestCase):
 
     def test_legacy_exact_trim_publishes_scanned_domain(self) -> None:
         # The legacy current-frame/Arena lane independently compacts dynamic
-        # Stage10 terrain-decoration streams. It must rewrite the exact IB
-        # range to a zero-based domain rather than pair the compact VB with a
-        # negative vertexOffset.
+        # Stage10 terrain-decoration streams. UP data rewrites the exact IB to
+        # a zero-based domain; the coherent REAL path retains the validated raw
+        # IB subrange and publishes its matching signed vertex offset.
         for token in (
             "exactIndexedFreezeMinIndex = exactDomain.minIndex;",
             "exactIndexedFreezeMaxIndex = exactDomain.maxIndex;",
             "RebaseWar3ExactIndexDomain(",
-            "draw.firstIndex = exactIndexedFreezeRebased ? 0u : StartVal;",
+            "(exactIndexedFreezeRebased || coherentRealIndexRangeSnapshot)",
             "? 0u : exactIndexedFreezeMinIndex;",
-            "? 0\n             : int32_t(int64_t(BaseVertexIndex)",
+            "draw.vertexOffset = capturedVertexOffset;",
             "draw.shadowActualIndexDomainKnown = true;",
         ):
             self.assertIn(token, self.source)

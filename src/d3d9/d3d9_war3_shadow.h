@@ -2,7 +2,11 @@
 
 #include "d3d9_war3_pipeline.h"
 #include "d3d9_war3_csm.h"
+#include "war3/render/war3_outline_mask_layout.h"
+#include "war3/render/war3_gpu_workload_governor.h"
 #include "war3/render/war3_point_shadow_cpu_plan.h"
+#include "war3/render/war3_tracked_vk_pipeline.h"
+#include "war3/render/war3_owned_image_layout.h"
 
 #include "../dxvk/dxvk_hash.h"
 
@@ -258,6 +262,8 @@ namespace dxvk {
     PointShadowPersistentDiagnostics
     QueryPointShadowPersistentDiagnostics();
     ShadowReplayDiagnostics QueryShadowReplayDiagnostics();
+    war3::render::War3GpuWorkloadGovernorDiagnostics
+    QueryWar3GpuWorkloadGovernorDiagnostics();
     void PublishShadowTaaDiagnostics(const ShadowTaaDiagnostics& diagnostics);
     void PublishCsmResolutionDiagnostics(
         const CsmResolutionDiagnostics& diagnostics);
@@ -325,6 +331,9 @@ namespace dxvk {
           uint32_t terrainBoundsCandidateCount = 0;
           uint32_t terrainBoundsProofAcceptedCount = 0;
           uint32_t terrainBoundsFailVisibleCount = 0;
+          std::array<uint32_t,
+              war3::render::kWar3ShadowBoundsCullRejectReasonCount>
+              terrainBoundsRejectReasonHistogram = {};
           uint32_t terrainBoundsWouldCullCount = 0;
           uint32_t terrainBoundsAppliedCullCount = 0;
           uint32_t terrainBoundsC0WouldCullCount = 0;
@@ -334,6 +343,9 @@ namespace dxvk {
           uint32_t objectBoundsCandidateCount = 0;
           uint32_t objectBoundsProofAcceptedCount = 0;
           uint32_t objectBoundsFailVisibleCount = 0;
+          std::array<uint32_t,
+              war3::render::kWar3ShadowBoundsCullRejectReasonCount>
+              objectBoundsRejectReasonHistogram = {};
           uint32_t objectBoundsWouldCullCount = 0;
           uint32_t objectBoundsAppliedCullCount = 0;
           uint32_t unionCullMode = 0;
@@ -557,12 +569,17 @@ namespace dxvk {
         struct ShadowCasterPipeline {
             const DxvkPipelineLayout* layout = nullptr;
             VkPipeline pipeline = VK_NULL_HANDLE;
+            // Every command list that binds pipeline must track this owner.
+            // Cache invalidation may release its reference immediately; the
+            // VkPipeline is destroyed only after all tracked GPU work retires.
+            Rc<war3::render::War3TrackedVkPipeline> lifetime;
         };
 
         struct PreparedShadowCaster {
             bool valid = false;
             ShadowCasterPipeline pipeline = {};
             size_t pipelineHash = 0;
+            const DxvkDescriptor* alphaDescriptor = nullptr;
             VkImageView alphaImageView = VK_NULL_HANDLE;
             VkBuffer positionBuffer = VK_NULL_HANDLE;
             VkBuffer indexBuffer = VK_NULL_HANDLE;
@@ -594,9 +611,15 @@ namespace dxvk {
         Com<IDirect3DSurface9> m_shadowSurface;
         
         Rc<DxvkSampler> m_samplerLinear;
+        // Directional CSM keeps raw-depth reads separate from comparison
+        // sampling. PCSS blocker search, caster masks, diagnostics and point
+        // shadows must never inherit comparison filtering.
         Rc<DxvkSampler> m_shadowSampler;
-        Rc<DxvkSampler> m_shadowSamplerLinear;
-        Rc<DxvkSampler> m_shadowSamplerActive;
+        Rc<DxvkSampler> m_shadowCompareSampler;
+        Rc<DxvkSampler> m_shadowCompareSamplerLinear;
+        Rc<DxvkSampler> m_shadowCompareSamplerActive;
+        uint32_t m_shadowCompareMode = 0u;
+        bool m_shadowCompareLinearSupported = false;
         float m_shadowCasterBiasConstant = 1.0f;
         float m_shadowCasterBiasSlope = 1.5f;
         float m_shadowCasterBiasClamp = 0.0f;
@@ -642,10 +665,13 @@ namespace dxvk {
         Rc<DxvkImage> m_outlineMaskAll;
         Rc<DxvkImageView> m_outlineMaskAllView;
         VkExtent3D m_outlineMaskExtent = {0, 0, 1};
+        war3::render::War3OutlineMaskLayoutState m_outlineMaskLayoutState =
+            war3::render::War3OutlineMaskLayoutState::Undefined;
 
         // 中间颜色副本（可采样）
         Rc<DxvkImage> m_colorCopy;
         Rc<DxvkImageView> m_colorCopyView;
+        war3::render::War3OwnedImageLayoutState m_colorCopyLayout;
         VkExtent3D m_cachedExtent = {0, 0, 1};
         VkFormat m_cachedFormat = VK_FORMAT_UNDEFINED;
 
@@ -653,6 +679,7 @@ namespace dxvk {
         Rc<DxvkImage> m_depthCopy;
         Rc<DxvkImageView> m_depthCopyView;   // 2D array，用于 ShadowReceiver
         Rc<DxvkImageView> m_depthCopyView2D; // 2D 视图，用于描边遮罩
+        war3::render::War3OwnedImageLayoutState m_depthCopyLayout;
         VkExtent3D m_cachedDepthExtent = {0, 0, 1};
         VkFormat m_cachedDepthFormat = VK_FORMAT_UNDEFINED;
 
@@ -660,16 +687,20 @@ namespace dxvk {
         // 说明：当前阶段仅提供“相机运动向量”（基于深度 + prevViewProj 重投影）。
         Rc<DxvkImage> m_motionVectorImage;
         Rc<DxvkImageView> m_motionVectorView;
+        war3::render::War3OwnedImageLayoutState m_motionVectorLayout;
         VkExtent3D m_mvCachedExtent = {0, 0, 1};
 
         // Shadow TAA 资源：当前帧阴影因子（未滤波）+ 历史（Ping-Pong）
         Rc<DxvkImage> m_shadowCurrent;
         Rc<DxvkImageView> m_shadowCurrentView;
+        war3::render::War3OwnedImageLayoutState m_shadowCurrentLayout;
         VkExtent3D m_shadowCurrentExtent = {0, 0, 1};
 
         std::array<Rc<DxvkImage>, 2> m_shadowHistory = { };
         std::array<Rc<DxvkImageView>, 2> m_shadowHistoryView = { };
         std::array<Rc<DxvkImageView>, 2> m_shadowHistoryStorageView = { };
+        std::array<war3::render::War3OwnedImageLayoutState, 2>
+            m_shadowHistoryLayouts = { };
         VkExtent3D m_shadowHistoryExtent = {0, 0, 1};
         uint32_t m_shadowHistoryIndex = 0; // 当前作为“历史读取”的索引
         bool m_shadowHistoryValid = false; // 历史是否已写入过（避免首次启用时读到旧数据）
@@ -770,6 +801,8 @@ namespace dxvk {
         War3CsmData m_csmData;
         bool m_hasCompleteShadowMap = false;
         bool m_replayValidationFailedThisFrame = false;
+        bool m_workloadGovernorRejectedThisFrame = false;
+        war3::render::War3GpuWorkloadGovernor m_gpuWorkloadGovernor;
         uint32_t m_replayValidationHoldFramesRemaining = 0u;
         uint64_t m_epochFirstCandidateFrameSerial = 0u;
         uint64_t m_epochFirstCompleteLatencyFrames = 0u;
@@ -831,6 +864,8 @@ namespace dxvk {
         Rc<DxvkImage> m_shadowCasterMask;
         Rc<DxvkImageView> m_shadowCasterMaskSampleView;
         std::array<Rc<DxvkImageView>, 4> m_shadowCasterMaskLayerViews = { };
+        war3::render::War3OwnedImageLayoutState m_shadowMapLayout;
+        war3::render::War3OwnedImageLayoutState m_shadowCasterMaskLayout;
         uint32_t m_shadowMapLayers = 0;
         uint32_t m_shadowMapResolution = 0;
 
@@ -838,6 +873,7 @@ namespace dxvk {
         Rc<DxvkImage> m_volumeSunShadowMap;
         Rc<DxvkImageView> m_volumeSunShadowSampleView;
         std::array<Rc<DxvkImageView>, 2> m_volumeSunShadowLayerViews = {};
+        war3::render::War3OwnedImageLayoutState m_volumeSunShadowLayout;
         uint32_t m_volumeSunShadowResolution = 0;
         uint32_t m_volumeSunShadowLayers = 0;
         Matrix4 m_volumeSunLightViewProj[2] = {};
@@ -855,14 +891,16 @@ namespace dxvk {
         static constexpr uint32_t kMaxPointShadowLights = 4;  // 限制投射阴影的点光源数量
         uint32_t m_pointShadowResolution = 0;                 // 当前 cube face 分辨率
         uint32_t m_pointShadowCapacityLights = 0;             // 当前 cube array 实际容量（1..4）
+        uint64_t m_pointShadowResourceGeneration = 0;
         Rc<DxvkImage> m_pointShadowCube;                      // Cube Depth Texture
         Rc<DxvkImageView> m_pointShadowCubeView;              // CubeArray 采样视图
-        bool m_pointShadowCubeLayoutInitialized = false;
+        std::array<war3::render::War3OwnedImageLayoutState,
+                   kMaxPointShadowLights * 6u> m_pointShadowFaceLayouts = {};
         // Receiver shader 静态声明 textureCubeArray；点阴影未就绪时也必须
         // 绑定维度匹配的合法 view，不能用 CSM texture2DArray 充当 fallback。
         Rc<DxvkImage> m_pointShadowNeutralCube;
         Rc<DxvkImageView> m_pointShadowNeutralCubeView;
-        bool m_pointShadowNeutralReady = false;
+        war3::render::War3OwnedImageLayoutState m_pointShadowNeutralLayout;
         std::array<Rc<DxvkImageView>, kMaxPointShadowLights * 6> m_pointShadowFaceViews; // 每光源6个面的渲染视图
         std::array<bool, kMaxPointShadowLights> m_pointShadowReady = {};
         uint32_t m_pointShadowReadyCount = 0;
@@ -889,6 +927,10 @@ namespace dxvk {
         // current CPU plan's semantic content signature both match.
         uint64_t m_pointShadowPublishedLightGeneration = 0;
         uint64_t m_pointShadowPublishedFrameSerial = 0;
+        uint64_t m_pointShadowPublishedMapEpoch = 0;
+        uint64_t m_pointShadowPublishedDeviceEpoch = 0;
+        uint64_t m_pointShadowPublishedResourceGeneration = 0;
+        uint64_t m_pointShadowPublishedPolicyRevision = 0;
         uint32_t m_pointShadowPublishedLightCount = 0;
         std::array<int32_t, kMaxPointShadowLights>
             m_pointShadowPublishedLightIds = {};
@@ -1081,6 +1123,13 @@ namespace dxvk {
         // [NEW] MRT Outline Pipeline Helpers
         const DxvkPipelineLayout* createOutlineMaskPipelineLayout() const;
         ShadowCasterPipeline createOutlineMaskPipeline(const ShadowCasterPipelineKey& key) const;
+        ShadowCasterPipelineKey makeUnitOutlinePipelineKey(
+            const War3ShadowCasterDraw& draw,
+            War3OutlineMode mode) const;
+        VkPipeline getOrCreateUnitOutlinePipeline(
+            const ShadowCasterPipelineKey& key,
+            VkFormat colorFormat,
+            VkFormat depthFormat);
 
         void ensureCopyResources(VkExtent3D extent, VkFormat format);
         void ensureDepthCopyResources(VkExtent3D extent, VkFormat format);
@@ -1112,6 +1161,8 @@ namespace dxvk {
             const War3PipelineInput& input,
             const std::vector<const War3ShadowCasterDraw*>& replayDraws,
             const char* consumer);
+        bool validateShadowProducerCompleteness(
+            const War3PipelineInput& input, const char* consumer);
         /**
          * @brief 渲染体积专用太阳 ortho 深度（单层 texture2DArray）。
          * @note 复用本帧 replay draws 与矩阵 SSBO；不改表面 CSM 资源。
@@ -1171,6 +1222,10 @@ namespace dxvk {
         /** @brief Whether the current immutable plan names the exact published
          *         cube content/light generation. */
         bool pointShadowPublishedStateMatchesCurrentPlan() const;
+        bool holdPointShadowLastCompleteAfterBudgetReject(
+            const War3PipelineInput& input,
+            const War3PointLightFrameSnapshot& lightSnapshot,
+            const War3RenderSettings& settings);
         /**
          * @brief 点阴影 CPU 计划：签名、face budget、range/face caster 列表。
          * @return false 表示本帧应跳过 GPU cube 渲染（关闭/无灯/时序复用）。

@@ -39,6 +39,17 @@ py AutoTest\run_light_feature_matrix.py
 如果某轮低于护栏，先在前台 / clean machine state 复测一次再判定。
 后台 Defender 扫描、热节流、其他游戏运行 都会污染 isolated desktop 的基线。
 
+## 非交互隔离桌面安全边界
+
+隔离桌面只用于后台正确性、稳定性和运行时取证，不用于发布 FPS。它通过
+`CreateDesktopW` 与 `CreateProcessW/STARTUPINFO.lpDesktop` 创建进程，但 AutoTest
+不申请桌面切换权限，也不调用桌面切换 API。
+
+隔离会话禁止键盘、鼠标、前台窗口和输入计划。场景控制只能使用 named pipe/JASS
+内部测试命令，截图只能使用内部 framebuffer 或隔离窗口的 `PrintWindow` 路径。
+若地图必须通过点击或按键才能进入，测试会 fail-closed；不会切换用户桌面，也不会
+自动回退到可见桌面。默认桌面上的显式人工测试仍可使用现有输入工具。
+
 ## 多实例稳定性测试
 
 多实例接口强制使用 `E:\Work\War3_AutoTestSandbox`。先调用

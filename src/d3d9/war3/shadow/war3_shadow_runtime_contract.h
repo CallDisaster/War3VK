@@ -125,6 +125,7 @@ struct ShadowModelResourceMemorySnapshot {
 class ShadowModelResourceStore {
 public:
   void clear();
+  void reserve(size_t geosetRecordCapacity, size_t runtimeAliasCapacity);
   void add(ShadowModelResourceRecord record);
   void bindRuntimeModelAlias(void* runtimeModelPtr, uint32_t geosetIndex,
                              void* modelResourcePtr);

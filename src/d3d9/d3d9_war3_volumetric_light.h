@@ -3,6 +3,8 @@
 #include "d3d9_war3_fog_volume.h"
 #include "d3d9_war3_light.h"
 #include "d3d9_war3_pipeline.h"
+#include "war3/render/war3_owned_image_layout.h"
+#include "war3/render/war3_volumetric_shader_work_admission.h"
 #include "../dxvk/dxvk_hash.h"
 #include "../dxvk/dxvk_buffer.h"
 
@@ -10,6 +12,18 @@
 #include <unordered_map>
 
 namespace dxvk {
+
+    struct War3VolumetricShaderWorkRuntimeDiagnostics {
+        uint64_t frameSerial = 0u;
+        uint64_t evaluatedFrameCount = 0u;
+        uint64_t acceptedFrameCount = 0u;
+        uint64_t rejectedFrameCount = 0u;
+        uint64_t arithmeticOverflowCount = 0u;
+        war3::render::War3VolumetricShaderWorkEstimate last = {};
+    };
+
+    War3VolumetricShaderWorkRuntimeDiagnostics
+    QueryWar3VolumetricShaderWorkRuntimeDiagnostics() noexcept;
 
     class D3D9DeviceEx;
 
@@ -69,10 +83,11 @@ namespace dxvk {
                                      selectedPointIndices,
                                  uint32_t selectedPointCount,
                                  const Vector4& cameraPos,
-                                 float farClearRaw, float rawDepthQuantum,
-                                 bool farIsOne,
-                                 const VkRect2D& effectScissor,
-                                 uint32_t& outPointShadowedLightCount);
+                                  float farClearRaw, float rawDepthQuantum,
+                                  bool farIsOne,
+                                  const VkRect2D& effectScissor,
+                                  int effectiveSamples,
+                                  uint32_t& outPointShadowedLightCount);
         bool compositeVolumetricLight(const Rc<DxvkCommandList>& ctx,
                                       const War3PipelineInput& input,
                                       const VkRect2D& compositeScissor);
@@ -94,17 +109,20 @@ namespace dxvk {
 
         Rc<DxvkImage> m_colorCopy;
         Rc<DxvkImageView> m_colorCopyView;
+        war3::render::War3OwnedImageLayoutState m_colorCopyLayout;
         VkExtent3D m_cachedExtent = {0, 0, 1};
         VkFormat m_cachedFormat = VK_FORMAT_UNDEFINED;
 
         Rc<DxvkImage> m_depthCopy;
         Rc<DxvkImageView> m_depthCopyView;
+        war3::render::War3OwnedImageLayoutState m_depthCopyLayout;
         VkExtent3D m_cachedDepthExtent = {0, 0, 1};
         VkFormat m_cachedDepthFormat = VK_FORMAT_UNDEFINED;
 
         Rc<DxvkImage> m_effectImage;
         Rc<DxvkImageView> m_effectView;
         Rc<DxvkImageView> m_effectStorageView;
+        war3::render::War3OwnedImageLayoutState m_effectLayout;
         VkExtent3D m_cachedEffectExtent = {0, 0, 1};
         VkFormat m_cachedEffectFormat = VK_FORMAT_UNDEFINED;
         bool m_effectStorageEnabled = false;
@@ -134,6 +152,7 @@ namespace dxvk {
         // where no exact point-shadow publication is available.
         Rc<DxvkImage> m_pointShadowFallbackCube;
         Rc<DxvkImageView> m_pointShadowFallbackCubeView;
+        war3::render::War3OwnedImageLayoutState m_pointShadowFallbackLayout;
         bool m_pointShadowFallbackReady = false;
 
         // CSM / 点光 UBO：每帧更新。改为环形缓冲，消除与上一帧 volumetric draw

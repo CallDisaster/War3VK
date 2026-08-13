@@ -75,7 +75,10 @@ namespace dxvk {
     info.pSemaphores = &semaphore;
     info.pValues = &acquire.FenceValue;
 
-    if (m_vkd->vkWaitSemaphores(m_vkd->device(), &info, -1)) {
+    VkResult vr = m_vkd->vkWaitSemaphores(m_vkd->device(), &info, -1);
+    m_vkd->notifyDeviceErrorFromDriverResult(vr);
+
+    if (vr) {
       Logger::warn("DxvkKeyedMutex::AcquireSync: Failed to wait semaphore");
       return DXGI_ERROR_INVALID_CALL;
     }
@@ -129,7 +132,8 @@ namespace dxvk {
     copyFormatList(createInfo.viewFormatCount, createInfo.viewFormats);
 
     // Assign debug name to image
-    if (device->debugFlags().test(DxvkDebugFlag::Capture)) {
+    if (device->debugFlags().test(DxvkDebugFlag::Capture) ||
+        DxvkDeviceAddressBindingBuildEnabled) {
       m_debugName = createDebugName(createInfo.debugName);
       m_info.debugName = m_debugName.c_str();
     } else {

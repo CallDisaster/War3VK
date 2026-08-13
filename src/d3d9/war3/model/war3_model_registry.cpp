@@ -1441,6 +1441,73 @@ bool ModelInstanceRegistry::findByRuntimeModel(void *runtimeModelPtr,
   return true;
 }
 
+void ProjectModelInstanceDirectPacketView(
+    const ModelInstanceRecord& src,
+    ModelInstanceDirectPacketView& out) noexcept {
+  out.worldObjectEntry = src.worldObjectEntry;
+  out.sceneNode = src.sceneNode;
+  out.unitPtr = src.unitPtr;
+  out.runtimeModelPtr = src.runtimeModelPtr;
+  out.modelResourcePtr = src.modelResourcePtr;
+  out.jHandle = src.jHandle;
+  out.rawcode = src.rawcode;
+  out.modelKey = src.modelKey;
+}
+
+bool ModelInstanceRegistry::findFirstForDirectPacket(
+    void* sceneNode, void* unitPtr, void* worldObjectEntry,
+    void* runtimeModelPtr, ModelInstanceRecord& out) const {
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
+
+  const auto findPointer = [&](const auto& map, void* key) -> bool {
+    if (key == nullptr)
+      return false;
+    const auto it = map.find(key);
+    if (it == map.end())
+      return false;
+    out = it->second;
+    return true;
+  };
+
+  return findPointer(m_bySceneNode, sceneNode) ||
+         findPointer(m_byUnitPtr, unitPtr) ||
+         findPointer(m_byWorldObjectEntry, worldObjectEntry) ||
+         findPointer(m_byRuntimeModel, runtimeModelPtr);
+}
+
+bool ModelInstanceRegistry::findFirstForDirectPacketView(
+    void* sceneNode, void* unitPtr, void* worldObjectEntry,
+    void* runtimeModelPtr, ModelInstanceDirectPacketView& out,
+    uint64_t* mutationGenerationOut) const {
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
+  if (mutationGenerationOut != nullptr) {
+    *mutationGenerationOut =
+        m_mutationGeneration.load(std::memory_order_acquire);
+  }
+
+  const ModelInstanceRecord* record = nullptr;
+  const auto findPointer = [&](const auto& map, void* key) {
+    if (key == nullptr)
+      return false;
+    const auto it = map.find(key);
+    if (it == map.end())
+      return false;
+    record = &it->second;
+    return true;
+  };
+
+  findPointer(m_bySceneNode, sceneNode) ||
+      findPointer(m_byUnitPtr, unitPtr) ||
+      findPointer(m_byWorldObjectEntry, worldObjectEntry) ||
+      findPointer(m_byRuntimeModel, runtimeModelPtr);
+  if (record == nullptr) {
+    out = {};
+    return false;
+  }
+  ProjectModelInstanceDirectPacketView(*record, out);
+  return true;
+}
+
 bool ModelInstanceRegistry::findBySourceObject(void* sourceObjectPtr,
                                                ModelInstanceRecord& out) const {
   out = {};
@@ -1740,6 +1807,7 @@ void PoseRegistry::endFrame() {
 
 void PoseRegistry::resetMapSession() {
   std::unique_lock<std::shared_mutex> lock(m_mutex);
+  RegistryMutationGenerationGuard mutation(m_mutationGeneration);
   ClearRegistryMap(m_byRuntimeModel);
   ClearRegistryMap(m_bySceneNode);
   ClearRegistryMap(m_byUnitPtr);
@@ -1819,6 +1887,7 @@ void PoseRegistry::recordPose(void *runtimeModelPtr, void *sceneNode,
     return;
 
   std::unique_lock<std::shared_mutex> lock(m_mutex);
+  RegistryMutationGenerationGuard mutation(m_mutationGeneration);
   PoseRecord record = {};
   record.runtimeModelPtr = runtimeModelPtr;
   record.sceneNode = sceneNode;
@@ -1853,6 +1922,7 @@ void PoseRegistry::recordSpriteFramePose(void *runtimeModelPtr, void *spritePtr,
     return;
 
   std::unique_lock<std::shared_mutex> lock(m_mutex);
+  RegistryMutationGenerationGuard mutation(m_mutationGeneration);
   PoseRecord record = {};
   record.runtimeModelPtr = runtimeModelPtr;
   record.spritePtr = spritePtr;
@@ -1886,6 +1956,7 @@ void PoseRegistry::recordMatrixPalette(void* runtimeModelPtr, void* sceneNode,
     return;
 
   std::unique_lock<std::shared_mutex> lock(m_mutex);
+  RegistryMutationGenerationGuard mutation(m_mutationGeneration);
   PoseRecord record = {};
   record.runtimeModelPtr = runtimeModelPtr;
   record.sceneNode = sceneNode;
@@ -1938,10 +2009,33 @@ bool PoseRegistry::findByUnitPtr(void *unitPtr, PoseRecord &out) const {
   return true;
 }
 
+bool PoseRegistry::findFirstForDirectPacket(
+    void* runtimeModelPtr, void* sceneNode, void* unitPtr,
+    PoseRecord& out) const {
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
+
+  const auto findPointer = [&](const auto& map, void* key) -> bool {
+    if (key == nullptr)
+      return false;
+    const auto it = map.find(key);
+    if (it == map.end())
+      return false;
+    out = it->second;
+    return true;
+  };
+
+  return findPointer(m_byRuntimeModel, runtimeModelPtr) ||
+         findPointer(m_bySceneNode, sceneNode) ||
+         findPointer(m_byUnitPtr, unitPtr);
+}
+
 // Project the fields the per-draw shadow augment path actually consumes,
 // skipping the matrixPalette vector so no heap allocation/copy happens.
 static inline void ProjectPoseAugment(const PoseRecord &rec,
                                       PoseAugmentView &out) {
+  out.runtimeModelPtr = rec.runtimeModelPtr;
+  out.sceneNode = rec.sceneNode;
+  out.unitPtr = rec.unitPtr;
   out.hasWorldTransform = rec.hasWorldTransform;
   out.worldTransform = rec.worldTransform;
   out.hasSpriteFrameTransform = rec.hasSpriteFrameTransform;
@@ -1991,6 +2085,37 @@ bool PoseRegistry::findByUnitPtrAugment(void *unitPtr,
   if (it == m_byUnitPtr.end())
     return false;
   ProjectPoseAugment(it->second, out);
+  return true;
+}
+
+bool PoseRegistry::findFirstForDirectPacketAugment(
+    void* runtimeModelPtr, void* sceneNode, void* unitPtr,
+    PoseAugmentView& out, uint64_t* mutationGenerationOut) const {
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
+
+  if (mutationGenerationOut != nullptr) {
+    *mutationGenerationOut =
+        m_mutationGeneration.load(std::memory_order_acquire);
+  }
+
+  const PoseRecord* record = nullptr;
+  const auto findPointer = [&](const auto& map, void* key) -> bool {
+    if (key == nullptr)
+      return false;
+    const auto it = map.find(key);
+    if (it == map.end())
+      return false;
+    record = &it->second;
+    return true;
+  };
+
+  if (!findPointer(m_byRuntimeModel, runtimeModelPtr) &&
+      !findPointer(m_bySceneNode, sceneNode) &&
+      !findPointer(m_byUnitPtr, unitPtr)) {
+    return false;
+  }
+
+  ProjectPoseAugment(*record, out);
   return true;
 }
 
@@ -2093,6 +2218,10 @@ PoseTrackingHealthSnapshot PoseRegistry::trackingHealthSnapshotLocked(
 uint64_t PoseRegistry::frameNumber() const {
   // Phase 7.83锛歮_frameNumber 宸叉敼 atomic锛屼笉鍐嶉渶瑕侀攣銆?
   return m_frameNumber.load(std::memory_order_relaxed);
+}
+
+uint64_t PoseRegistry::mutationGeneration() const {
+  return m_mutationGeneration.load(std::memory_order_acquire);
 }
 
 AttachmentRigidRegistry& AttachmentRigidRegistry::instance() {

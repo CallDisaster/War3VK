@@ -1,5 +1,6 @@
 // war3_shadow_arena.cpp
 #include "war3_shadow_arena.h"
+#include "war3_shadow_arena_budget.h"
 #include "war3_shadow_arena_lifecycle.h"
 
 #include "../../d3d9_device.h"
@@ -8,6 +9,7 @@
 #include "../../../util/util_env.h"
 
 #include <atomic>
+#include <algorithm>
 #include <cstdlib>
 #include <limits>
 #include <vector>
@@ -19,9 +21,9 @@ namespace {
 constexpr uint32_t kDefaultArenaPageSize = 64 * 1024 * 1024;
 constexpr uint32_t kCaptureArenaPageSize = 64 * 1024 * 1024;
 constexpr uint32_t kCaptureArenaMaxFrameSize = 384 * 1024 * 1024;
-constexpr uint64_t kArenaMaxResidentSize = 1152ull * 1024ull * 1024ull;
 constexpr uint32_t kDefaultArenaFrameCount = 3;
 constexpr uint32_t kCaptureArenaFrameCount = 3;
+constexpr uint64_t kArenaBudgetRefreshIntervalFrames = 30u;
 constexpr uint32_t kInvalidGenerationIndex = std::numeric_limits<uint32_t>::max();
 
 struct ShadowArenaPage {
@@ -42,11 +44,29 @@ struct ShadowArenaFrameState {
 };
 
 std::vector<ShadowArenaFrameState> g_frameStates;
+DxvkDevice* g_ownerDevice = nullptr;
+uint32_t g_allocationHeapIndex = kInvalidGenerationIndex;
 std::atomic<uint32_t> g_currentFrameIndex{kInvalidGenerationIndex};
 uint32_t g_arenaPageSize = kDefaultArenaPageSize;
 uint32_t g_arenaMaxFrameSize = kDefaultArenaPageSize;
 uint32_t g_arenaFrameCount = kDefaultArenaFrameCount;
 std::atomic<uint64_t> g_residentBytes{0u};
+std::atomic<uint64_t> g_residentLimitBytes{
+    kShadowArenaFixedResidentLimitBytes};
+std::atomic<uint64_t> g_fixedResidentLimitBytes{
+    kShadowArenaFixedResidentLimitBytes};
+std::atomic<uint64_t> g_budgetHeapSizeBytes{0u};
+std::atomic<uint64_t> g_budgetHeapBudgetBytes{0u};
+std::atomic<uint64_t> g_budgetHeapAllocatedBytes{0u};
+std::atomic<uint64_t> g_budgetAvailableBytes{0u};
+std::atomic<uint64_t> g_budgetProportionalLimitBytes{0u};
+std::atomic<uint64_t> g_budgetReserveLimitBytes{0u};
+std::atomic<uint64_t> g_budgetRefreshCount{0u};
+std::atomic<uint64_t> g_budgetGrowthRejectCount{0u};
+std::atomic<uint64_t> g_budgetSnapshotFrameSerial{0u};
+std::atomic<uint32_t> g_budgetPrimaryHeapIndex{kInvalidGenerationIndex};
+std::atomic<uint32_t> g_memoryBudgetSupported{0u};
+std::atomic<uint32_t> g_memoryBudgetTrusted{0u};
 std::atomic<uint64_t> g_generationCounter{0u};
 std::atomic<uint64_t> g_lastSubmittedSerial{0u};
 std::atomic<uint64_t> g_lastCompletedSerial{0u};
@@ -70,6 +90,21 @@ std::atomic<uint64_t> g_duplicateBytesSaved{0u};
 std::atomic<uint64_t> g_exactIndexTrimAcceptedCount{0u};
 std::atomic<uint64_t> g_exactIndexTrimRejectedCount{0u};
 std::atomic<uint64_t> g_exactIndexTrimBytesSaved{0u};
+std::atomic<uint64_t> g_coherentUpTrimObservedCount{0u};
+std::atomic<uint64_t> g_coherentUpTrimEligibleCount{0u};
+std::atomic<uint64_t> g_coherentUpTrimWouldSaveBytes{0u};
+std::atomic<uint64_t> g_coherentUpTrimConsumedCount{0u};
+std::atomic<uint64_t> g_coherentUpTrimConsumedBytesSaved{0u};
+std::atomic<uint64_t> g_coherentRealTrimObservedCount{0u};
+std::atomic<uint64_t> g_coherentRealTrimEligibleCount{0u};
+std::atomic<uint64_t> g_coherentRealTrimWouldSaveBytes{0u};
+std::atomic<uint64_t> g_coherentRealTrimConsumedCount{0u};
+std::atomic<uint64_t> g_coherentRealTrimConsumedBytesSaved{0u};
+std::atomic<uint64_t> g_currentUpPositionReplayObservedCount{0u};
+std::atomic<uint64_t> g_currentUpPositionReplayEligibleCount{0u};
+std::atomic<uint64_t> g_currentUpPositionReplayWouldAvoidBytes{0u};
+std::atomic<uint64_t> g_currentUpPositionReplayConsumedCount{0u};
+std::atomic<uint64_t> g_currentUpPositionReplayAvoidedBytes{0u};
 std::atomic<uint64_t> g_quarantineCount{0u};
 std::atomic<uint64_t> g_lastQuarantinedGeneration{0u};
 std::atomic<uint64_t> g_lastQuarantinedRetireSerial{0u};
@@ -151,6 +186,78 @@ DxvkBufferCreateInfo MakeArenaBufferInfo(uint32_t size) {
   return info;
 }
 
+void PublishArenaMemoryBudget(
+    const ShadowArenaMemoryBudgetPolicy& policy,
+    uint32_t primaryHeapIndex, uint64_t frameSerial) {
+  g_fixedResidentLimitBytes.store(policy.fixedResidentLimitBytes,
+                                  std::memory_order_release);
+  g_residentLimitBytes.store(policy.effectiveResidentLimitBytes,
+                             std::memory_order_release);
+  g_budgetHeapSizeBytes.store(policy.heapSizeBytes,
+                              std::memory_order_release);
+  g_budgetHeapBudgetBytes.store(policy.heapBudgetBytes,
+                                std::memory_order_release);
+  g_budgetHeapAllocatedBytes.store(policy.heapAllocatedBytes,
+                                   std::memory_order_release);
+  g_budgetAvailableBytes.store(policy.availableBytes,
+                               std::memory_order_release);
+  g_budgetProportionalLimitBytes.store(policy.proportionalLimitBytes,
+                                       std::memory_order_release);
+  g_budgetReserveLimitBytes.store(policy.reserveLimitBytes,
+                                  std::memory_order_release);
+  g_budgetPrimaryHeapIndex.store(primaryHeapIndex,
+                                 std::memory_order_release);
+  g_memoryBudgetSupported.store(policy.supported ? 1u : 0u,
+                                std::memory_order_release);
+  g_memoryBudgetTrusted.store(policy.trusted ? 1u : 0u,
+                              std::memory_order_release);
+  g_budgetSnapshotFrameSerial.store(frameSerial,
+                                    std::memory_order_release);
+  g_budgetRefreshCount.fetch_add(1u, std::memory_order_relaxed);
+}
+
+void RefreshArenaMemoryBudget(uint64_t frameSerial) {
+  ShadowArenaMemoryBudgetInput input = {};
+  const uint32_t primaryHeapIndex = g_allocationHeapIndex;
+  DxvkDevice* const device = g_ownerDevice;
+  if (device != nullptr) {
+    input.extensionSupported = device->features().extMemoryBudget != 0u;
+    if (input.extensionSupported &&
+        primaryHeapIndex != kInvalidGenerationIndex) {
+      const DxvkAdapterMemoryInfo memoryInfo =
+          device->adapter()->getMemoryHeapInfo();
+      if (primaryHeapIndex < memoryInfo.heapCount) {
+        const auto& heap = memoryInfo.heaps[primaryHeapIndex];
+        if ((heap.heapFlags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0u) {
+        input.primaryDeviceLocalHeapFound = true;
+        input.heapSizeBytes = heap.heapSize;
+        input.heapBudgetBytes = heap.memoryBudget;
+        input.heapAllocatedBytes = heap.memoryAllocated;
+        }
+      }
+    }
+  }
+
+  PublishArenaMemoryBudget(ResolveShadowArenaMemoryBudget(input),
+                           primaryHeapIndex, frameSerial);
+}
+
+bool CanGrowArenaBy(uint64_t growthBytes) {
+  const uint64_t residentBytes =
+      g_residentBytes.load(std::memory_order_acquire);
+  const uint64_t residentLimitBytes =
+      g_residentLimitBytes.load(std::memory_order_acquire);
+  if (ShadowArenaCanGrowResident(
+          residentBytes, growthBytes, residentLimitBytes))
+    return true;
+
+  if (g_memoryBudgetTrusted.load(std::memory_order_acquire) != 0u &&
+      residentLimitBytes < kShadowArenaFixedResidentLimitBytes) {
+    g_budgetGrowthRejectCount.fetch_add(1u, std::memory_order_relaxed);
+  }
+  return false;
+}
+
 bool AllocateArenaPage(ShadowArenaFrameState& frameState,
                        uint32_t minCapacityBytes,
                        bool logGrowth) {
@@ -170,25 +277,44 @@ bool AllocateArenaPage(ShadowArenaFrameState& frameState,
   const uint32_t pageCapacity =
       (std::min)(g_arenaPageSize, remainingCapacity);
 
-  const uint64_t residentBefore =
-      g_residentBytes.load(std::memory_order_acquire);
-  if (residentBefore + uint64_t(pageCapacity) > kArenaMaxResidentSize)
+  const bool allocationHeapKnown =
+      g_allocationHeapIndex != kInvalidGenerationIndex;
+  if (allocationHeapKnown && !CanGrowArenaBy(pageCapacity))
     return false;
 
-  Rc<DxvkBuffer> pageBuffer;
-  const bool activeOwner = dxvk::war3::RunWithActiveDevice(
-      [&](D3D9DeviceEx& device) {
-        pageBuffer = device.GetDXVKDevice()->createBuffer(
-            MakeArenaBufferInfo(pageCapacity),
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-      });
-  if (!activeOwner)
+  DxvkDevice* const device = g_ownerDevice;
+  if (device == nullptr)
     return false;
+  Rc<DxvkBuffer> pageBuffer = device->createBuffer(
+      MakeArenaBufferInfo(pageCapacity),
+      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
   if (pageBuffer == nullptr || !pageBuffer->storage()) {
     war3dbg::Print("DXVK War3[ShadowArena]: Arena 页创建失败 size=%u MB。\n",
                    pageCapacity >> 20);
     return false;
   }
+
+  const uint32_t pageHeapIndex = pageBuffer->storage()->getMemoryHeapIndex();
+  if (pageHeapIndex == kInvalidGenerationIndex)
+    return false;
+
+  if (!allocationHeapKnown) {
+    // The allocator's actual memory type is the only valid authority for the
+    // budget heap. Query that exact heap before publishing the first page.
+    g_allocationHeapIndex = pageHeapIndex;
+    RefreshArenaMemoryBudget(0u);
+    if (!CanGrowArenaBy(pageCapacity)) {
+      g_allocationHeapIndex = kInvalidGenerationIndex;
+      RefreshArenaMemoryBudget(0u);
+      return false;
+    }
+  } else if (pageHeapIndex != g_allocationHeapIndex) {
+    // Never authorize a page using a different heap's budget snapshot.
+    return false;
+  }
+
+  const uint64_t residentBefore =
+      g_residentBytes.load(std::memory_order_acquire);
 
   frameState.pages.push_back(ShadowArenaPage{std::move(pageBuffer), pageCapacity});
   frameState.totalCapacity += pageCapacity;
@@ -196,9 +322,14 @@ bool AllocateArenaPage(ShadowArenaFrameState& frameState,
 
   if (logGrowth) {
     war3dbg::Print(
-        "DXVK War3[ShadowArena]: Arena 扩容 +%uMB => %uMB/%uMB (pages=%u)\n",
+        "DXVK War3[ShadowArena]: Arena 扩容 +%uMB => %uMB/%uMB "
+        "resident=%lluMB/%lluMB (pages=%u)\n",
         pageCapacity >> 20, frameState.totalCapacity >> 20,
-        g_arenaMaxFrameSize >> 20, uint32_t(frameState.pages.size()));
+        g_arenaMaxFrameSize >> 20,
+        static_cast<unsigned long long>((residentBefore + pageCapacity) >> 20),
+        static_cast<unsigned long long>(
+            g_residentLimitBytes.load(std::memory_order_acquire) >> 20),
+        uint32_t(frameState.pages.size()));
   }
 
   return true;
@@ -269,15 +400,21 @@ void NoteArenaAdmissionFailure(const ShadowArenaFrameState& frameState) {
 
 } // namespace
 
-bool ShadowArena_Init() {
-  if (ShadowArena_IsInitialized())
-    return true;
-
-  if (!dxvk::war3::HasActivePipeline()) {
+bool ShadowArena_Init(DxvkDevice* device) {
+  if (device == nullptr) {
     war3dbg::Print(
         "DXVK War3[ShadowArena]: 活跃 D3D9 设备为空，初始化延期。\n");
     return false;
   }
+
+  if (ShadowArena_IsInitialized())
+    return g_ownerDevice == device;
+
+  // A non-empty owner stamp without pages indicates an interrupted teardown
+  // or failed initialization. Never let a different VkDevice inherit it.
+  if (g_ownerDevice != nullptr && g_ownerDevice != device)
+    return false;
+  g_ownerDevice = device;
 
   g_arenaPageSize = ResolveArenaPageSize();
   g_arenaMaxFrameSize = ResolveArenaMaxFrameSize(g_arenaPageSize);
@@ -285,7 +422,12 @@ bool ShadowArena_Init() {
 
   g_frameStates.clear();
   g_frameStates.resize(g_arenaFrameCount);
+  g_allocationHeapIndex = kInvalidGenerationIndex;
   g_residentBytes.store(0u, std::memory_order_release);
+  g_budgetRefreshCount.store(0u, std::memory_order_release);
+  g_budgetGrowthRejectCount.store(0u, std::memory_order_release);
+  g_budgetSnapshotFrameSerial.store(0u, std::memory_order_release);
+  RefreshArenaMemoryBudget(0u);
 
   // Three 64 MiB warm pages = 192 MiB. Extra pages grow on demand only.
   for (uint32_t i = 0; i < g_arenaFrameCount; i++) {
@@ -295,6 +437,8 @@ bool ShadowArena_Init() {
           i, g_arenaPageSize >> 20);
       g_frameStates.clear();
       g_residentBytes.store(0u, std::memory_order_release);
+      g_allocationHeapIndex = kInvalidGenerationIndex;
+      g_ownerDevice = nullptr;
       return false;
     }
   }
@@ -325,6 +469,26 @@ bool ShadowArena_Init() {
   g_exactIndexTrimAcceptedCount.store(0u, std::memory_order_release);
   g_exactIndexTrimRejectedCount.store(0u, std::memory_order_release);
   g_exactIndexTrimBytesSaved.store(0u, std::memory_order_release);
+  g_coherentUpTrimObservedCount.store(0u, std::memory_order_release);
+  g_coherentUpTrimEligibleCount.store(0u, std::memory_order_release);
+  g_coherentUpTrimWouldSaveBytes.store(0u, std::memory_order_release);
+  g_coherentUpTrimConsumedCount.store(0u, std::memory_order_release);
+  g_coherentUpTrimConsumedBytesSaved.store(0u, std::memory_order_release);
+  g_coherentRealTrimObservedCount.store(0u, std::memory_order_release);
+  g_coherentRealTrimEligibleCount.store(0u, std::memory_order_release);
+  g_coherentRealTrimWouldSaveBytes.store(0u, std::memory_order_release);
+  g_coherentRealTrimConsumedCount.store(0u, std::memory_order_release);
+  g_coherentRealTrimConsumedBytesSaved.store(0u, std::memory_order_release);
+  g_currentUpPositionReplayObservedCount.store(0u,
+                                               std::memory_order_release);
+  g_currentUpPositionReplayEligibleCount.store(0u,
+                                               std::memory_order_release);
+  g_currentUpPositionReplayWouldAvoidBytes.store(0u,
+                                                 std::memory_order_release);
+  g_currentUpPositionReplayConsumedCount.store(0u,
+                                               std::memory_order_release);
+  g_currentUpPositionReplayAvoidedBytes.store(0u,
+                                              std::memory_order_release);
   g_quarantineCount.store(0u, std::memory_order_release);
   g_lastQuarantinedGeneration.store(0u, std::memory_order_release);
   g_lastQuarantinedRetireSerial.store(0u, std::memory_order_release);
@@ -334,14 +498,41 @@ bool ShadowArena_Init() {
 
   war3dbg::Print(
       "DXVK War3[ShadowArena]: 初始化成功 (DEVICE_LOCAL) page=%uMB "
-      "maxPerFrame=%uMB frames=%u warmupTotal=%uMB\n",
+      "maxPerFrame=%uMB frames=%u warmupTotal=%uMB residentLimit=%lluMB "
+      "memoryBudget=%s\n",
       g_arenaPageSize >> 20, g_arenaMaxFrameSize >> 20, g_arenaFrameCount,
-      (g_arenaPageSize * g_arenaFrameCount) >> 20);
+      (g_arenaPageSize * g_arenaFrameCount) >> 20,
+      static_cast<unsigned long long>(
+          g_residentLimitBytes.load(std::memory_order_acquire) >> 20),
+      g_memoryBudgetTrusted.load(std::memory_order_acquire) != 0u
+          ? "trusted" : "fallback-fixed");
   return true;
 }
 
 bool ShadowArena_IsInitialized() {
-  return !g_frameStates.empty();
+  return g_ownerDevice != nullptr && !g_frameStates.empty();
+}
+
+bool ShadowArena_IsOwnedBy(const DxvkDevice* device) {
+  return device != nullptr && g_ownerDevice == device &&
+      ShadowArena_IsInitialized();
+}
+
+void ShadowArena_Shutdown(DxvkDevice* device) {
+  if (device == nullptr || g_ownerDevice != device)
+    return;
+
+  // The D3D9 owner calls this only after CS drain and device idle (or terminal
+  // device loss). Releasing the Rc pages here prevents a later CreateDeviceEx
+  // from binding buffers whose parent VkDevice has already been destroyed.
+  g_currentFrameIndex.store(kInvalidGenerationIndex,
+                            std::memory_order_release);
+  g_frameStates.clear();
+  g_residentBytes.store(0u, std::memory_order_release);
+  g_currentUsedBytes.store(0u, std::memory_order_release);
+  g_activeGenerationCount.store(0u, std::memory_order_release);
+  g_allocationHeapIndex = kInvalidGenerationIndex;
+  g_ownerDevice = nullptr;
 }
 
 bool ShadowArena_BeginFrame(uint64_t frameSerial, uint64_t completedSerial) {
@@ -363,6 +554,15 @@ bool ShadowArena_BeginFrame(uint64_t frameSerial, uint64_t completedSerial) {
   g_frameIncomplete.store(0u, std::memory_order_release);
   g_currentUsedBytes.store(0u, std::memory_order_release);
 
+  const uint64_t lastBudgetFrame =
+      g_budgetSnapshotFrameSerial.load(std::memory_order_acquire);
+  if (lastBudgetFrame == 0u || frameSerial < lastBudgetFrame ||
+      frameSerial - lastBudgetFrame >= kArenaBudgetRefreshIntervalFrames) {
+    // Budget queries are confined to this Present-owned generation switch.
+    // Draw-time allocation only consumes this immutable snapshot.
+    RefreshArenaMemoryBudget(frameSerial);
+  }
+
   uint32_t generationIndex = kInvalidGenerationIndex;
   const uint32_t preferred =
       static_cast<uint32_t>(frameSerial % g_arenaFrameCount);
@@ -380,9 +580,7 @@ bool ShadowArena_BeginFrame(uint64_t frameSerial, uint64_t completedSerial) {
     }
   }
 
-  if (generationIndex == kInvalidGenerationIndex &&
-      g_residentBytes.load(std::memory_order_acquire) + g_arenaPageSize <=
-          kArenaMaxResidentSize) {
+  if (generationIndex == kInvalidGenerationIndex) {
     ShadowArenaFrameState spill = {};
     if (AllocateArenaPage(spill, g_arenaPageSize, true)) {
       g_frameStates.push_back(std::move(spill));
@@ -638,6 +836,64 @@ void ShadowArena_NoteExactIndexTrim(
   }
 }
 
+void ShadowArena_NoteCoherentUpIndexTrim(
+    bool eligible, bool consumed, uint64_t bytesBefore,
+    uint64_t bytesAfter) {
+  g_coherentUpTrimObservedCount.fetch_add(1u, std::memory_order_relaxed);
+  if (!eligible)
+    return;
+  g_coherentUpTrimEligibleCount.fetch_add(1u, std::memory_order_relaxed);
+  const uint64_t saved = bytesAfter < bytesBefore
+      ? bytesBefore - bytesAfter : 0u;
+  g_coherentUpTrimWouldSaveBytes.fetch_add(saved,
+                                           std::memory_order_relaxed);
+  if (!consumed)
+    return;
+  g_coherentUpTrimConsumedCount.fetch_add(1u, std::memory_order_relaxed);
+  g_coherentUpTrimConsumedBytesSaved.fetch_add(saved,
+                                                std::memory_order_relaxed);
+}
+
+void ShadowArena_NoteCoherentRealIndexTrim(
+    bool observed, bool eligible, bool consumed, uint64_t bytesBefore,
+    uint64_t bytesAfter) {
+  if (!observed)
+    return;
+  g_coherentRealTrimObservedCount.fetch_add(1u, std::memory_order_relaxed);
+  if (!eligible)
+    return;
+  g_coherentRealTrimEligibleCount.fetch_add(1u, std::memory_order_relaxed);
+  const uint64_t saved = bytesAfter < bytesBefore
+      ? bytesBefore - bytesAfter : 0u;
+  g_coherentRealTrimWouldSaveBytes.fetch_add(saved,
+                                              std::memory_order_relaxed);
+  if (!consumed)
+    return;
+  g_coherentRealTrimConsumedCount.fetch_add(1u, std::memory_order_relaxed);
+  g_coherentRealTrimConsumedBytesSaved.fetch_add(saved,
+                                                  std::memory_order_relaxed);
+}
+
+void ShadowArena_NoteCurrentUpPositionReplay(
+    bool observed, bool eligible, bool consumed, uint64_t avoidedBytes) {
+  if (!observed)
+    return;
+  g_currentUpPositionReplayObservedCount.fetch_add(
+      1u, std::memory_order_relaxed);
+  if (!eligible)
+    return;
+  g_currentUpPositionReplayEligibleCount.fetch_add(
+      1u, std::memory_order_relaxed);
+  g_currentUpPositionReplayWouldAvoidBytes.fetch_add(
+      avoidedBytes, std::memory_order_relaxed);
+  if (!consumed)
+    return;
+  g_currentUpPositionReplayConsumedCount.fetch_add(
+      1u, std::memory_order_relaxed);
+  g_currentUpPositionReplayAvoidedBytes.fetch_add(
+      avoidedBytes, std::memory_order_relaxed);
+}
+
 void ShadowArena_Reset() {
   if (!ShadowArena_IsInitialized())
     return;
@@ -681,8 +937,27 @@ uint32_t ShadowArena_CapacityBytes() {
 uint32_t ShadowArena_RemainingBytes() {
   if (!ShadowArena_IsInitialized())
     return 0u;
-  const uint32_t used = ShadowArena_UsedBytes();
-  return used < g_arenaMaxFrameSize ? g_arenaMaxFrameSize - used : 0u;
+  const uint32_t generationIndex =
+      g_currentFrameIndex.load(std::memory_order_acquire);
+  if (generationIndex >= g_frameStates.size())
+    return 0u;
+  const auto& frameState = g_frameStates[generationIndex];
+  const uint64_t used = ShadowArena_UsedBytes();
+  const uint64_t perGenerationRemaining = used < g_arenaMaxFrameSize
+      ? g_arenaMaxFrameSize - used
+      : 0u;
+  const uint64_t existingRemaining = frameState.totalCapacity > used
+      ? uint64_t(frameState.totalCapacity) - used
+      : 0u;
+  const uint64_t residentHeadroom = ShadowArenaGrowthHeadroom(
+      g_residentBytes.load(std::memory_order_acquire),
+      g_residentLimitBytes.load(std::memory_order_acquire));
+  const uint64_t growablePages =
+      (residentHeadroom / g_arenaPageSize) * g_arenaPageSize;
+  const uint64_t admitted = std::min(
+      perGenerationRemaining, existingRemaining + growablePages);
+  return static_cast<uint32_t>(std::min<uint64_t>(
+      admitted, std::numeric_limits<uint32_t>::max()));
 }
 
 uint64_t ShadowArena_ResidentBytes() {
@@ -696,7 +971,34 @@ ShadowArenaDiagnostics ShadowArena_QueryDiagnostics() {
   diagnostics.residentBytes =
       g_residentBytes.load(std::memory_order_acquire);
   diagnostics.perGenerationCapacityBytes = g_arenaMaxFrameSize;
-  diagnostics.residentLimitBytes = kArenaMaxResidentSize;
+  diagnostics.residentLimitBytes =
+      g_residentLimitBytes.load(std::memory_order_acquire);
+  diagnostics.fixedResidentLimitBytes =
+      g_fixedResidentLimitBytes.load(std::memory_order_acquire);
+  diagnostics.memoryHeapSizeBytes =
+      g_budgetHeapSizeBytes.load(std::memory_order_acquire);
+  diagnostics.memoryBudgetBytes =
+      g_budgetHeapBudgetBytes.load(std::memory_order_acquire);
+  diagnostics.memoryAllocatedBytes =
+      g_budgetHeapAllocatedBytes.load(std::memory_order_acquire);
+  diagnostics.memoryAvailableBytes =
+      g_budgetAvailableBytes.load(std::memory_order_acquire);
+  diagnostics.proportionalLimitBytes =
+      g_budgetProportionalLimitBytes.load(std::memory_order_acquire);
+  diagnostics.reserveLimitBytes =
+      g_budgetReserveLimitBytes.load(std::memory_order_acquire);
+  diagnostics.budgetRefreshCount =
+      g_budgetRefreshCount.load(std::memory_order_acquire);
+  diagnostics.budgetGrowthRejectCount =
+      g_budgetGrowthRejectCount.load(std::memory_order_acquire);
+  diagnostics.budgetSnapshotFrameSerial =
+      g_budgetSnapshotFrameSerial.load(std::memory_order_acquire);
+  diagnostics.primaryHeapIndex =
+      g_budgetPrimaryHeapIndex.load(std::memory_order_acquire);
+  diagnostics.memoryBudgetSupported =
+      g_memoryBudgetSupported.load(std::memory_order_acquire);
+  diagnostics.memoryBudgetTrusted =
+      g_memoryBudgetTrusted.load(std::memory_order_acquire);
   diagnostics.generation =
       g_generationCounter.load(std::memory_order_acquire);
   diagnostics.submittedSerial =
@@ -740,6 +1042,36 @@ ShadowArenaDiagnostics ShadowArena_QueryDiagnostics() {
       g_exactIndexTrimRejectedCount.load(std::memory_order_acquire);
   diagnostics.exactIndexTrimBytesSaved =
       g_exactIndexTrimBytesSaved.load(std::memory_order_acquire);
+  diagnostics.coherentUpTrimObservedCount =
+      g_coherentUpTrimObservedCount.load(std::memory_order_acquire);
+  diagnostics.coherentUpTrimEligibleCount =
+      g_coherentUpTrimEligibleCount.load(std::memory_order_acquire);
+  diagnostics.coherentUpTrimWouldSaveBytes =
+      g_coherentUpTrimWouldSaveBytes.load(std::memory_order_acquire);
+  diagnostics.coherentUpTrimConsumedCount =
+      g_coherentUpTrimConsumedCount.load(std::memory_order_acquire);
+  diagnostics.coherentUpTrimConsumedBytesSaved =
+      g_coherentUpTrimConsumedBytesSaved.load(std::memory_order_acquire);
+  diagnostics.coherentRealTrimObservedCount =
+      g_coherentRealTrimObservedCount.load(std::memory_order_acquire);
+  diagnostics.coherentRealTrimEligibleCount =
+      g_coherentRealTrimEligibleCount.load(std::memory_order_acquire);
+  diagnostics.coherentRealTrimWouldSaveBytes =
+      g_coherentRealTrimWouldSaveBytes.load(std::memory_order_acquire);
+  diagnostics.coherentRealTrimConsumedCount =
+      g_coherentRealTrimConsumedCount.load(std::memory_order_acquire);
+  diagnostics.coherentRealTrimConsumedBytesSaved =
+      g_coherentRealTrimConsumedBytesSaved.load(std::memory_order_acquire);
+  diagnostics.currentUpPositionReplayObservedCount =
+      g_currentUpPositionReplayObservedCount.load(std::memory_order_acquire);
+  diagnostics.currentUpPositionReplayEligibleCount =
+      g_currentUpPositionReplayEligibleCount.load(std::memory_order_acquire);
+  diagnostics.currentUpPositionReplayWouldAvoidBytes =
+      g_currentUpPositionReplayWouldAvoidBytes.load(std::memory_order_acquire);
+  diagnostics.currentUpPositionReplayConsumedCount =
+      g_currentUpPositionReplayConsumedCount.load(std::memory_order_acquire);
+  diagnostics.currentUpPositionReplayAvoidedBytes =
+      g_currentUpPositionReplayAvoidedBytes.load(std::memory_order_acquire);
   diagnostics.quarantineCount =
       g_quarantineCount.load(std::memory_order_acquire);
   diagnostics.lastQuarantinedGeneration =

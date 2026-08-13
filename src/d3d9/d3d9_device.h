@@ -45,6 +45,9 @@
 #include "d3d9_war3_shadow.h"
 #include "d3d9_war3_ssao.h"
 #include "war3/shadow/war3_shadow_backend_dxvk.h"
+#include "war3/render/war3_shadow_generation_backed_stream.h"
+#include "war3/render/war3_drawtime_active_ledger.h"
+#include "war3/render/war3_stage11_snapshot_page_policy.h"
 #include "war3/gpu_skin/war3_persistent_gpu_package_d3d9_observe_owner.h"
 #include "war3/gpu_skin/war3_persistent_gpu_package_stage11_observe_adapter.h"
 #include <type_traits>
@@ -61,6 +64,7 @@ struct ShadowSubmissionFrame;
 }
 namespace render {
 enum class ObjectKind : uint8_t;
+struct CurrentDrawContractRecord;
 struct CurrentDrawAuthoritativeSample;
 }
 namespace gpu_skin {
@@ -86,6 +90,7 @@ struct NativeVertexOutputProof;
 // War3 渲染增强：帧捕获数据结构
 #include "../util/util_lru.h"
 #include "d3d9_war3_scene.h"
+#include "war3/render/war3_frame_hash_index.h"
 
 
 namespace dxvk {
@@ -142,6 +147,9 @@ struct War3DrawTimeVBCacheKeyHash {
     return hash;
   }
 };
+
+using War3DrawTimeActiveLedger =
+    war3::render::War3DrawTimeActiveLedger<War3DrawTimeVBCacheKey>;
 
 // A verified anonymous LOSBlocker rejection must also outrank a short-lived
 // CurrentDraw/packet representation captured before the exact Stage11 draw.
@@ -1248,8 +1256,30 @@ public:
 
   // Device Lost
   bool IsDeviceLost() const {
-    return m_deviceLostState != D3D9DeviceLostState::Ok;
+    return m_deviceLostState != D3D9DeviceLostState::Ok ||
+           IsVulkanDeviceLostFailStop();
   }
+
+  /**
+   * \brief Tests the irreversible Vulkan device-loss latch
+   *
+   * Unlike the legacy D3D9 focus-loss state, a lost Vulkan logical device
+   * cannot be recovered by Reset. This query is lock-free so command emission
+   * can stop as soon as the submission queue publishes VK_ERROR_DEVICE_LOST.
+   */
+  bool IsVulkanDeviceLostFailStop() const {
+    return m_vkDeviceLostFailStop.load(std::memory_order_acquire) ||
+           (m_dxvkDevice != nullptr &&
+            m_dxvkDevice->getDeviceStatus() == VK_ERROR_DEVICE_LOST);
+  }
+
+  /**
+   * \brief Latches and records the first Vulkan device-loss observation
+   *
+   * \param origin Stable diagnostic label for the observing front-end path.
+   * \returns true if the Vulkan logical device is lost.
+   */
+  bool CheckVulkanDeviceLostFailStop(const char* origin);
 
   void NotifyFullscreen(HWND window, bool fullscreen);
   void NotifyWindowActivated(HWND window, bool activated);
@@ -1310,6 +1340,9 @@ public:
   void InjectCsChunk(DxvkCsChunkRef &&Chunk, bool Synchronize);
 
   template <typename Fn> void InjectCs(Fn &&Command) {
+    if (unlikely(IsVulkanDeviceLostFailStop()))
+      return;
+
     auto chunk = AllocCsChunk();
     chunk->push(std::move(Command));
 
@@ -1325,6 +1358,9 @@ public:
 
 private:
   template <bool AllowFlush = true, typename Cmd> void EmitCs(Cmd &&command) {
+    if (unlikely(IsVulkanDeviceLostFailStop()))
+      return;
+
     if (unlikely(!m_csChunk->push(command))) {
       EmitCsChunk(std::move(m_csChunk));
       m_csChunk = AllocCsChunk();
@@ -1339,6 +1375,13 @@ private:
   void EmitCsChunk(DxvkCsChunkRef &&chunk);
 
   void FlushCsChunk() {
+    if (unlikely(IsVulkanDeviceLostFailStop())) {
+      // Drop CPU-side commands which can no longer be submitted. Releasing the
+      // chunk here also releases resource references retained by those lambdas.
+      m_csChunk = AllocCsChunk();
+      return;
+    }
+
     if (likely(!m_csChunk->empty())) {
       EmitCsChunk(std::move(m_csChunk));
       m_csChunk = AllocCsChunk();
@@ -1964,7 +2007,7 @@ private:
       m_war3ShadowDeclCache;
   size_t m_shadowCasterReserveHint = 0;
   size_t m_shadowPaletteReserveHint = 0;
-  std::unordered_multimap<uint64_t, uint32_t> m_war3ShadowPaletteHashIndex;
+  dxvk::war3::render::War3FrameHashIndex m_war3ShadowPaletteHashIndex;
   struct War3SemanticPaletteCacheEntry {
     const void* runtimeModelPtr = nullptr;
     const void* paletteData = nullptr;
@@ -1977,12 +2020,11 @@ private:
     std::vector<Matrix4> composedPalette;
   };
   std::vector<War3SemanticPaletteCacheEntry> m_war3SemanticPaletteCache;
-  // Phase 7.121：用 multimap<matrixHash, vector_index> 把
-  // War3GetOrCreateSemanticShadowPalette 的"线性扫描 m_war3SemanticPaletteCache"
-  // 改成 hash 查找。matrixHash 已经把 runtimeModelPtr / pose / worldHash 等
-  // 都揉进去，命中后还要做完整的 entry 比较（runtimeModelPtr / matrixCount /
-  // worldHash / objectKind / composedWorldPalette），命中率与之前完全一致。
-  std::unordered_multimap<uint64_t, uint32_t> m_war3SemanticPaletteCacheHashIndex;
+  // Frame-local retained hash nodes avoid allocating one unordered-map node
+  // per palette every frame. Hash hits still require the complete semantic
+  // comparison below, so collision and identity behavior remain unchanged.
+  dxvk::war3::render::War3FrameHashIndex
+      m_war3SemanticPaletteCacheHashIndex;
   // War3：当 D3D9 走 UploadPerDrawData（SYSTEMMEM|DYNAMIC/UP 路径）时，
   // 实际 draw 绑定的 VB/IB 会被替换为 UP buffer 的子切片，且底层 VkBuffer
   // 可能被 invalidate。 为了让 shadow caster drawlist 在 BeforeUi
@@ -2150,6 +2192,8 @@ private:
   std::atomic<int64_t> m_availableMemory = {0};
 
   D3D9DeviceLostState m_deviceLostState = D3D9DeviceLostState::Ok;
+  std::atomic<bool> m_vkDeviceLostFailStop{false};
+  std::atomic<bool> m_vkDeviceLostBaseIncidentReady{false};
   HWND m_fullscreenWindow = NULL;
   std::atomic<uint32_t> m_losableResourceCounter = {0};
 
@@ -2363,6 +2407,20 @@ private:
     // 命中但源指纹不匹配（key 碰撞或 VB 指针复用）而被淘汰的次数。
     // 非零即证明 early key 碰撞在真实运行中发生过。
     uint64_t s1EarlySourceMismatchEvictCount = 0;
+
+    // Observe-only generation proof for dynamic S1 terrain. These counters do
+    // not authorize cache consumption; they establish whether the exact owner,
+    // allocation, content generation and source ranges remain identical on
+    // adjacent frames before a later persistent-promotion candidate is built.
+    uint64_t s1GenerationProofEntryCount = 0;
+    uint64_t s1GenerationProofEligibleCount = 0;
+    uint64_t s1GenerationProofFirstCount = 0;
+    uint64_t s1GenerationProofSameFrameCount = 0;
+    uint64_t s1GenerationProofAdvancedCount = 0;
+    uint64_t s1GenerationProofChangedCount = 0;
+    uint64_t s1GenerationProofStaleRestartCount = 0;
+    uint64_t s1GenerationProofPromotionReadyCount = 0;
+    uint64_t s1GenerationProofCapacityRejectCount = 0;
   };
   struct War3ShadowPersistentGeometryEntry {
     War3ShadowGeometryRegistryKey key = {};
@@ -2494,6 +2552,24 @@ private:
   uint64_t m_war3SemanticDrawTimePoseDirtyFrameSerial = 0;
   uint64_t m_war3SemanticLastMatrixPublisherPoseRevision = 0;
   std::vector<uint64_t> m_war3SemanticDrawTimePoseKeys;
+  struct War3Stage11SnapshotPage {
+    uint64_t id = 0u;
+    Rc<DxvkBuffer> buffer;
+    VkDeviceSize capacity = 0u;
+    VkDeviceSize used = 0u;
+  };
+  enum class War3Stage11SnapshotAllocationResult : uint8_t {
+    Success,
+    PageCreateBudget,
+    ResidentCapacity,
+    AllocationFailure,
+    InvalidRange,
+  };
+  std::vector<std::shared_ptr<War3Stage11SnapshotPage>>
+      m_war3Stage11SnapshotPages;
+  uint64_t m_war3Stage11SnapshotNextPageId = 1u;
+  uint64_t m_war3Stage11SnapshotResidentBytes = 0u;
+  uint64_t m_war3Stage11SnapshotReclaimedPages = 0u;
   // Phase 7.55 v4：draw-time VB position cache（GPU copy 自有 buffer 版本）。
   // ring buffer 问题：保存 Rc<DxvkBuffer> 引用不够——War3 后续 draw 会覆盖
   // 同一 buffer 的不同 offset，cache 里的引用 read 时拿到的是错乱数据。
@@ -2501,6 +2577,7 @@ private:
   // 拷贝到我们自己的 device-local buffer。以后再有 draw 覆盖原 buffer 也
   // 不影响我们的 buffer。
   struct War3DrawTimeVBEntry {
+    War3DrawTimeActiveLedger::EntryStamp activeLedgerStamp = {};
     uint64_t mapEpoch = 0u;
     void* renderablePart = nullptr;
     uint32_t layerIndex = 0u;
@@ -2522,6 +2599,9 @@ private:
     // 包含完整 stride 的 vertex 数据；shader 用 positionStride/positionOffset
     // 读取 xyz。
     Rc<DxvkBuffer> positionBuffer;
+    Rc<DxvkResourceAllocation> positionPinnedAllocation;
+    std::shared_ptr<War3Stage11SnapshotPage> positionSnapshotPage;
+    VkDeviceSize positionSnapshotOffset = 0u;
     DxvkResourceBufferInfo positionInfo = {};
     uint32_t positionStride = 0u;
     uint32_t positionOffset = 0u;
@@ -2539,6 +2619,9 @@ private:
     int32_t consumeVertexOffset = 0;
     // index buffer（未 rebase；index 值仍指向原 vertex 编号空间）
     Rc<DxvkBuffer> indexBuffer;
+    Rc<DxvkResourceAllocation> indexPinnedAllocation;
+    std::shared_ptr<War3Stage11SnapshotPage> indexSnapshotPage;
+    VkDeviceSize indexSnapshotOffset = 0u;
     DxvkResourceBufferInfo indexInfo = {};
     VkIndexType indexType = VK_INDEX_TYPE_UINT16;
     uint32_t indexCount = 0u;
@@ -2565,6 +2648,12 @@ private:
     // no GPU slice and cannot authorize a renderer mutation.
     war3::gpu_skin::PersistentGpuPackageCurrentDrawProof
         persistentPackageCurrentDrawProof = {};
+    // Cross-frame reuse is authorized only by the exact D3D9 source owner and
+    // its allocation/content generations.  These proofs never accept the
+    // historical pointer/fingerprint shortcut.
+    war3::render::War3ShadowGenerationBackedStreamProof positionSourceProof = {};
+    war3::render::War3ShadowGenerationBackedStreamProof uvSourceProof = {};
+    war3::render::War3ShadowGenerationBackedStreamProof indexSourceProof = {};
 
     bool MatchesKey(const War3DrawTimeVBCacheKey& key) const {
       return mapEpoch == key.mapEpoch &&
@@ -2617,6 +2706,9 @@ private:
     // 注意：可能与 positionBuffer 不在同一个 stream。capture 时如果 UV stream
     // 与 position stream 相同，复用 positionBuffer；否则单独 GPU copy 一份。
     Rc<DxvkBuffer> uvBuffer;
+    Rc<DxvkResourceAllocation> uvPinnedAllocation;
+    std::shared_ptr<War3Stage11SnapshotPage> uvSnapshotPage;
+    VkDeviceSize uvSnapshotOffset = 0u;
     DxvkResourceBufferInfo uvInfo = {};
     uint32_t uvStride = 0u;
     uint32_t uvOffset = 0u;
@@ -2691,12 +2783,59 @@ private:
   std::unordered_map<War3DrawTimeVBCacheKey, War3DrawTimeVBEntry,
                      War3DrawTimeVBCacheKeyHash>
       m_war3DrawTimeVBCache;
+  War3DrawTimeActiveLedger m_war3DrawTimeActiveLedger;
+#if defined(WARVK_ENABLE_SHADOW_OBSERVERS_DEV) && \
+    WARVK_ENABLE_SHADOW_OBSERVERS_DEV
+  struct War3Stage11AllocationObserverProofHash {
+    size_t operator()(
+        const war3::render::War3ShadowGenerationBackedStreamProof& proof)
+        const noexcept {
+      size_t h = size_t(proof.ownerIdentity);
+      const auto fold = [&h](uint64_t value) {
+        h ^= size_t(value) + size_t(0x9e3779b9u) + (h << 6u) + (h >> 2u);
+      };
+      fold(proof.identityGeneration);
+      fold(proof.allocationGeneration);
+      fold(proof.contentGeneration);
+      fold(proof.sourceOffset);
+      fold(proof.sourceLength);
+      fold(proof.elementStride);
+      fold(proof.elementSize);
+      fold(proof.mapEpoch);
+      fold(proof.deviceEpoch);
+      fold(static_cast<uint8_t>(proof.streamKind));
+      return h;
+    }
+  };
+  struct War3Stage11AllocationObserverProofEqual {
+    bool operator()(
+        const war3::render::War3ShadowGenerationBackedStreamProof& lhs,
+        const war3::render::War3ShadowGenerationBackedStreamProof& rhs)
+        const noexcept {
+      return lhs.matches(rhs);
+    }
+  };
+  static constexpr size_t kWar3Stage11AllocationObserverMaxProofs = 65536u;
+  std::unordered_set<
+      war3::render::War3ShadowGenerationBackedStreamProof,
+      War3Stage11AllocationObserverProofHash,
+      War3Stage11AllocationObserverProofEqual>
+      m_war3Stage11AllocationObserverProofs;
+  uint64_t m_war3Stage11AllocationObserverFrameSerial = 0u;
+#endif
   // A positive current-frame rejection is an owner decision even when no VB
   // entry was published.  It prevents generic reconstruction and historical
   // packet leases from resurrecting a blocker after an early capture gate.
   std::unordered_set<War3DrawTimeVBCacheKey, War3DrawTimeVBCacheKeyHash>
       m_war3DrawTimeExactRejectedKeys;
   uint64_t m_war3DrawTimeExactRejectedFrameSerial = 0u;
+  // Producer completeness is intentionally independent from the exact reject
+  // owner set above: blocker/transparent fail-closed rejections protect
+  // representation ownership, but do not by themselves prove a required
+  // caster was omitted.
+  std::unordered_set<War3DrawTimeVBCacheKey, War3DrawTimeVBCacheKeyHash>
+      m_war3RequiredCasterOmissionKeys;
+  uint64_t m_war3RequiredCasterOmissionFrameSerial = 0u;
   // Short-lived terminal witnesses for the verified anonymous 4v/6i marker
   // only. The value is the last exact-proof frame. This weaker slice identity
   // exists solely to stop a prior CurrentDraw/Grace representation from
@@ -2705,6 +2844,7 @@ private:
                      War3DrawTimeAnonymousMarkerSliceKeyHash>
       m_war3DrawTimeAnonymousMarkerRejectedSlices;
   uint64_t m_war3DrawTimeVBCacheLastCleanFrame = 0u;
+  uint64_t m_war3DrawTimeVBCacheStaticOverCapFrameCount = 0u;
   // S1 地形 legacy capture 分帧复用：period>1 时 off 帧注入上一批 stash，
   // 避免每帧数千 tile 全量 freeze（实测 ~6ms/帧）。
   std::vector<War3ShadowCasterDraw> m_war3S1TerrainCasterStash;
@@ -2762,6 +2902,15 @@ private:
   };
   std::vector<War3RetiredShadowSession> m_war3RetiredShadowSessions;
   War3S1TerrainEarlyCache m_war3S1TerrainEarlyCache;
+  struct War3S1GenerationProofObservationEntry {
+    dxvk::war3::render::War3ShadowGenerationStabilityState state = {};
+    uint64_t lastSeenFrame = 0u;
+  };
+  std::unordered_map<uint64_t, War3S1GenerationProofObservationEntry>
+      m_war3S1GenerationProofObservations;
+  dxvk::war3::render::War3ShadowGenerationObservationClock
+      m_war3S1GenerationProofObservationClock = {};
+  uint64_t m_war3S1GenerationProofLastGcFrame = 0u;
   // One persistent geometry can back multiple S1 tiles because the persistent
   // key may omit worldMatrix while the early key includes it. Keep a one-to-many
   // reverse index so retiring a persistent geometry also releases every strong
@@ -2869,6 +3018,13 @@ private:
   void War3EraseS1TerrainEarlyAliasesForPersistentGeometry(
       uint32_t persistentGeometryId);
   void War3GcS1TerrainEarlyCache();
+  void War3GcS1GenerationProofObservations();
+  War3Stage11SnapshotAllocationResult War3AllocateStage11Snapshot(
+      VkDeviceSize requiredBytes,
+      std::shared_ptr<War3Stage11SnapshotPage>& outPage,
+      VkDeviceSize& outOffset, VkDeviceSize& outCapacity);
+  void War3CollectUnusedStage11SnapshotPages();
+  void War3ResetStage11SnapshotPages();
   void War3TryCaptureShadowCaster(D3DPRIMITIVETYPE PrimitiveType,
                                   INT BaseVertexIndex, UINT MinVertexIndex,
                                   UINT NumVertices, UINT StartVal,
@@ -2897,8 +3053,23 @@ private:
       const dxvk::war3::render::CurrentDrawAuthoritativeSample*
           directCurrentDrawSample,
       bool fromStalePoseRestore);
+  bool War3TryAppendSemanticShadowPacket(
+      const dxvk::war3::shadow::ShadowDrawPacket& packet,
+      const dxvk::war3::render::CurrentDrawAuthoritativeSample*
+          directCurrentDrawSample,
+      bool fromStalePoseRestore,
+      bool currentFrameExactOwnerPrefiltered);
   void War3MarkDrawTimeExactRejectedCurrentFrame(
       const War3DrawTimeVBCacheKey& key);
+  void War3RecordRequiredCasterOmission(
+      const War3DrawTimeVBCacheKey& key,
+      War3RequiredCasterOmissionReason reason);
+  void War3RecordRequiredCasterOmission(
+      War3RequiredCasterOmissionReason reason);
+  void War3SealShadowProducerCompleteness(War3FrameScene& scene,
+                                          uint64_t frameSerial,
+                                          uint64_t mapEpoch,
+                                          uint64_t deviceEpoch) const;
   bool War3DrawTimeExactRejectedCurrentFrame(
       const War3DrawTimeVBCacheKey& key) const;
   void War3RememberDrawTimeAnonymousMarkerRejection(
@@ -2906,7 +3077,11 @@ private:
   bool War3DrawTimeAnonymousMarkerRejectionActive(
       void* renderablePart, void* meshPayloadPtr,
       uint32_t layerIndex) const;
-  uint32_t War3TryPopulateDrawTimeSemanticProducer();
+  void War3ActivateDrawTimeCacheEntry(
+      const War3DrawTimeVBCacheKey& key, War3DrawTimeVBEntry& entry);
+  uint32_t War3TryPopulateDrawTimeSemanticProducer(
+      std::vector<dxvk::war3::render::CurrentDrawContractRecord>&
+          exactSubmittedManifestRecords);
   void War3ObservePersistentPackageStage11Evidence(
       const War3DrawTimeVBCacheKey& key,
       const War3DrawTimeVBEntry& entry, int16_t exactProducerStage,
@@ -2930,7 +3105,9 @@ private:
       bool readyOnly,
       bool unitsOnly,
       uint64_t currentVisibleFrameSerial,
-      uint64_t currentDrawMinVisibleFrameSerial);
+      uint64_t currentDrawMinVisibleFrameSerial,
+      const std::vector<dxvk::war3::render::CurrentDrawContractRecord>&
+          exactSubmittedManifestRecords);
   uint32_t War3TryPopulateSemanticShadowScene(
       bool unitsOnly,
       bool executeNativeBackendValidation = false);

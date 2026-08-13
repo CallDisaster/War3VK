@@ -42,6 +42,19 @@ def valid_data() -> dict:
     }
 
 
+def current_schema_data() -> dict:
+    data = valid_data()
+    nested = {
+        key: value
+        for key, value in list(data.items())
+        if key.startswith("semanticScene")
+    }
+    for key in nested:
+        del data[key]
+    data["shadowRuntimeV2Summary"] = nested
+    return data
+
+
 class Issue5ShadowObserveAnalysisContracts(unittest.TestCase):
     def test_report_metadata_records_the_exact_observer_environment(self) -> None:
         source = PERF_MONITOR.read_text(encoding="utf-8")
@@ -53,6 +66,13 @@ class Issue5ShadowObserveAnalysisContracts(unittest.TestCase):
         self.assertTrue(result["gate"]["consumeAdmissionReady"])
         self.assertEqual(result["terrain"]["farCascadeWouldCullPct"], 30.0)
         self.assertEqual(result["union"]["bothFarWouldCullPct"], 40.0)
+
+    def test_current_nested_report_schema_does_not_misreport_observe_as_off(self) -> None:
+        result = war3._extract_shadow_cull_observe_summary(current_schema_data())
+        self.assertEqual(result["terrain"]["mode"], 1)
+        self.assertEqual(result["union"]["mode"], 1)
+        self.assertEqual(result["union"]["observeFrameCount"], 10000)
+        self.assertTrue(result["gate"]["consumeAdmissionReady"])
 
     def test_consume_or_output_mutation_is_never_accepted_as_observe(self) -> None:
         data = valid_data()

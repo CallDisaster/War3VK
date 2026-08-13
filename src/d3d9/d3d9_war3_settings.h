@@ -82,8 +82,11 @@ struct War3ShadowSettings {
   float receiverBias = 0.004f;
   float cascadeBlendRange = 120.0f;
   War3ShadowPcfKernel pcfKernel = War3ShadowPcfKernel::Poisson16;
-  bool pcfRotate = true;
-  War3ShadowPcfRotateMode pcfRotateMode = War3ShadowPcfRotateMode::World;
+  // DirectInline has no temporal integration. Rotating a PCF kernel with a
+  // periodic world-position seed makes moving sun shadows crawl through a
+  // visible stripe field, so the release baseline is deterministic.
+  bool pcfRotate = false;
+  War3ShadowPcfRotateMode pcfRotateMode = War3ShadowPcfRotateMode::Off;
   float cascadeBiasScale = 0.5f;
   float pcfCascadeRadiusScale = 0.5f;
 
@@ -105,7 +108,10 @@ struct War3ShadowSettings {
   bool alphaShadowHashed = false;
   bool alphaShadowUseMip = false;
   float alphaShadowMipLodBias = 0.0f;
-  float alphaShadowFarAlphaRefBias = 0.05f;
+  // Release keeps the same cutout threshold in every directional cascade so
+  // a cascade blend or transition cannot change a foliage silhouette. A
+  // non-zero value is only an explicit debug or author opt-in.
+  float alphaShadowFarAlphaRefBias = 0.0f;
 
   // The bool remains as a compatibility surface for the existing UI and
   // DXVK_WAR3_SHADOW_TAA switch. A true legacy value promotes the default

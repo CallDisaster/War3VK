@@ -85,6 +85,8 @@ dxvk_src = [
   'dxvk_descriptor_pool.cpp',
   'dxvk_descriptor_worker.cpp',
   'dxvk_device.cpp',
+  'dxvk_device_address_binding.cpp',
+  'dxvk_device_fault.cpp',
   'dxvk_device_filter.cpp',
   'dxvk_device_info.cpp',
   'dxvk_fence.cpp',
@@ -143,10 +145,16 @@ if platform == 'linux'
   dxvk_extra_deps += [ cpp.find_library('dl', required: false) ]
 endif
 
+dxvk_cpp_args = []
+if get_option('warvk_device_address_binding_report_dev')
+  dxvk_cpp_args += [ '-DWARVK_ENABLE_DEVICE_ADDRESS_BINDING_REPORT_DEV=1' ]
+endif
+
 dxvk_lib = static_library('dxvk', dxvk_src, glsl_generator.process(dxvk_shaders),
   link_with           : [ util_lib, spirv_lib, wsi_lib ],
   dependencies        : [ dxbc_spirv_dep, vkcommon_dep ] + dxvk_extra_deps,
   include_directories : [ dxvk_include_path ],
+  cpp_args            : dxvk_cpp_args,
 )
 
 dxvk_dep = declare_dependency(

@@ -8,7 +8,7 @@
  * - 注册渲染事件回调
  * - 禁用内置渲染效果
  * 
- * @version 1.2.0 Release
+ * @version 1.2003
  * @date 2024-12-21
  * 
  * @copyright Copyright (c) 2024 War3MapReforge

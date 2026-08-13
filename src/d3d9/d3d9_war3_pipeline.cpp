@@ -1311,6 +1311,14 @@ namespace dxvk {
 void War3RenderPipeline::Execute(War3InsertionPoint point,
                                      const Rc<DxvkCommandList>& ctx,
                                      const War3PipelineInput& input) {
+        if (unlikely(m_device == nullptr ||
+                     m_device->getDeviceStatus() == VK_ERROR_DEVICE_LOST)) {
+            // Device loss is irreversible. In particular, do not let optional
+            // pass exception handling turn it into a per-pass disable while
+            // later passes continue recording against the same lost device.
+            return;
+        }
+
         if (point == War3InsertionPoint::BeforeUi) {
             dxvk::war3::tools::SetGpuFlightBreadcrumb(
                 dxvk::war3::tools::GpuFlightBreadcrumb::PipelineBeforeUi);
@@ -1329,6 +1337,8 @@ void War3RenderPipeline::Execute(War3InsertionPoint point,
         if (hasListeners) {
             UpdateShaderApiFrameBuffers(input);
             auto contextScope = perf.cpuScope("UpdateRenderContext");
+            war3shader::internal::ValidateWar3ShaderContextAbi(
+                War3ShaderContextAbi { });
             war3shader::internal::UpdateRenderContext(input);
 
             if (point == War3InsertionPoint::BeforeUi) {

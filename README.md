@@ -1,4 +1,4 @@
-# WarVK 1.2.0 Release
+# WarVK 1.2003
 
 [![Platform](https://img.shields.io/badge/platform-Windows-lightgrey.svg)]()
 ![Vulkan](https://img.shields.io/badge/Vulkan-1.3+-red)
@@ -8,7 +8,7 @@
 
 WarVK is a graphics enhancement runtime for Warcraft III 1.27a. It uses a DXVK-derived D3D9-to-Vulkan backend and adds modern directional and point shadows, volumetric lighting, post-processing, diagnostics, and an author-facing JASS API.
 
-Version 1.2.0 is the first public release of the newer semantic rendering architecture. WarVK now combines Warcraft runtime identity, model, pose, material, and current-draw evidence to construct its own shadow scene. Legacy D3D9 capture remains a guarded compatibility path rather than the only source of rendering truth.
+Version 1.2003 is Hotfix 3 for the 1.2 semantic rendering architecture. WarVK combines Warcraft runtime identity, model, pose, material, and current-draw evidence to construct its own shadow scene. Legacy D3D9 capture remains a guarded, current-frame compatibility path rather than the only source of rendering truth.
 
 > [!IMPORTANT]
 > Update to the latest official NVIDIA, AMD, or Intel graphics driver before installing. The current runtime requests **Vulkan 1.3**, which includes Vulkan 1.2; a driver that exposes only Vulkan 1.2 is not sufficient for this build.
@@ -16,16 +16,17 @@ Version 1.2.0 is the first public release of the newer semantic rendering archit
 > [!NOTE]
 > WarVK prioritizes rendering quality and correctness. 4096-resolution cascaded shadows, point shadows, volumetric effects, and post-processing all have a real performance cost.
 
-## Highlights in 1.2.0
+## Highlights in 1.2003
 
 ### Shadows and lighting
 
 - Four-cascade directional shadows now default to a stable 4096 resolution, with a latched 2048 fallback only when allocation cannot be completed safely.
 - Sharper PCF tuning reduces overly soft CSM edges without changing point-shadow filtering.
 - Alpha-tested foliage, animated/skinned units, rigid geometry, buildings, and terrain use stricter current-frame source ownership.
+- Construction attachments rendered through Warcraft's Transparent Type0 path now retain their parent object identity while capturing the exact child draw and current matrix palette. This fixes missing or periodically flickering Undead and Night Elf construction-animation shadows without restoring an unsafe cross-frame VB/IB cache.
 - Path blockers and native static/blob shadow residue are excluded from the WarVK shadow scene.
 - Fixes Issue #4, where broad filtering of the native shadow layer also removed unit selection circles. UI decals such as selection circles are now preserved while legacy unit/building shadows remain precisely rejected. Physical retesting confirmed that selection circles are restored and the reported tree flicker was no longer observed.
-- Point-light shadows use radial depth, receiver-plane bias, texel-centred sampling, and explicit depth synchronization to substantially reduce the previous severe moiré/banding artifacts. Some surfaces and viewing angles remain affected; see Known issues below.
+- Point-light shadows keep every PCF tap in one exact radial receiver-depth domain, with a bounded slope fallback only when no trustworthy receiver plane exists. Physical retesting confirms that the previous ground/unit moiré and coherent banding are fixed.
 - TAA v2 is available as an optional temporal mode with variance clipping, reactive feedback, history diagnostics, and one-shot history invalidation. DirectInline remains the release default.
 - Volumetric sunlight, volumetric point lights, and independently controlled global height fog are available through the runtime and author API.
 
@@ -36,6 +37,9 @@ Version 1.2.0 is the first public release of the newer semantic rendering archit
 - Map/device epochs isolate manifests, cached geometry, GPU skinning, point-shadow work, TAA history, and receiver publications across map changes.
 - Final CSM and point-shadow replay validates buffer ranges, index domains, formats, generations, matrices, and skinning inputs before issuing Vulkan draws.
 - Incomplete CSM candidates are never published caster by caster. A complete same-map shadow is published atomically, or the receiver safely shows no directional shadow.
+- Release builds compile out the legacy `warvk:cmd` development entry point, and JASS VM rebuilds no longer release render-owned resources from a hook thread.
+- Render settings cross asynchronous work through a locked mailbox and immutable frame snapshots; active device and pipeline pointers no longer escape without lifetime protection.
+- `Reset`/`ResetEx` device-epoch changes, Arena quarantine, GPU-skin rebinding, and receiver invalidation are serialized by the Present owner and remain fail-closed on failure.
 - Bounded bulk reads for write-combined index buffers remove a major CPU regression without restoring unsafe cross-frame VB/IB caches.
 - Compact work tables, conservative union culling, persistent GPU packages, a persistent point-shadow planner, and CPU multi-threaded skinning contracts are included as guarded infrastructure. Experimental Consume paths remain disabled until their correctness and performance gates pass.
 
@@ -62,7 +66,7 @@ WarVK targets the classic 1.27a executable and verified `Game.dll` layouts. Unkn
 
 1. Back up the Warcraft III directory, especially any existing `d3d9.dll`.
 2. Copy the release `d3d9.dll` next to `war3.exe`.
-3. Start the game and confirm that `d3d9.log` reports `DXVK: 1.2.0 Release`.
+3. Start the game and confirm that `d3d9.log` reports `DXVK: 1.2003`.
 4. Press `Ctrl + F1` to open or close the WarVK settings panel.
 
 The player package needs only the files explicitly listed in the release archive. Source folders, test tools, research data, and the YDWE author package do not belong in the game directory.
@@ -77,12 +81,11 @@ The player package needs only the files explicitly listed in the release archive
 - Configure volumetric lighting and fog
 - Adjust anti-aliasing, bloom, exposure, and outlines
 
-## Known issues in 1.2.0 Release
+## Known issues in 1.2003
 
 - In dense scenes, lowering the camera can push directional-shadow candidate collection, skinning, and four-cascade replay beyond the safe budget. To avoid submitting excessive GPU work that may trigger a TDR, an incomplete CSM is rejected; this can appear as flickering or temporarily missing shadows while preparation cost remains. We plan to address this with conservative culling and work reuse in the next minor release where possible. Progress is tracked in [#5](https://github.com/CallDisaster/War3VK/issues/5).
-- Point lights with point shadows enabled can still produce moire or banding artifacts on some ground surfaces and viewing angles. This is not fully fixed in 1.2.0; if the artifact is distracting, keep the point light enabled but disable its point shadow.
-- Leaving a map and then loading another map in the same Warcraft III process can cause persistent performance loss, shadow corruption, or other resource-lifetime problems. Reliable cross-map sessions are not supported in 1.2.0. Fully exit Warcraft III and restart it before loading another map.
-- These issues remain scheduled for follow-up; cross-map lifetime and point-shadow artifacts are tracked in [#6](https://github.com/CallDisaster/War3VK/issues/6) and [#7](https://github.com/CallDisaster/War3VK/issues/7). Launching the game, playing one map, and then exiting remains the recommended workflow for the 1.2.0 series.
+- Leaving a map and then loading another map in the same Warcraft III process can cause persistent performance loss, shadow corruption, or other resource-lifetime problems. Reliable cross-map sessions are not supported in 1.2003. Fully exit Warcraft III and restart it before loading another map.
+- These issues remain scheduled for follow-up; low-angle shadow-budget work is tracked in [#5](https://github.com/CallDisaster/War3VK/issues/5), and cross-map lifetime is tracked in [#6](https://github.com/CallDisaster/War3VK/issues/6). Launching the game, playing one map, and then exiting remains the recommended workflow for the 1.2 series.
 
 ## Troubleshooting and reports
 

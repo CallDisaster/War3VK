@@ -1,4 +1,8 @@
 #include "../war3_cpu_readable_buffer_span.h"
+#include "../war3_coherent_up_index_trim_contract.h"
+#include "../war3_coherent_real_index_trim_contract.h"
+#include "../war3_current_up_shadow_replay_contract.h"
+#include "../war3_exact_index_domain_observer_cache.h"
 
 #include <windows.h>
 
@@ -214,6 +218,270 @@ bool TestExactIndexDomainRebase() {
   return true;
 }
 
+bool TestCoherentCurrentUpIndexTrimContract() {
+  War3CoherentUpIndexTrimInput input = {};
+  input.indexed = true;
+  input.currentPositionUpload = true;
+  input.currentIndexUpload = true;
+  input.samePinnedAllocation = true;
+  input.hasPositionBytes = true;
+  input.hasIndexBytes = true;
+  input.positionUploadBytes = 16u * 32u;
+  input.positionSliceBytes = 16u * 32u;
+  input.positionStride = 16u;
+  input.indexUploadBytes = 12u;
+  input.indexSliceBytes = 12u;
+  input.indexElementBytes = 2u;
+  input.indexCount = 6u;
+  input.firstIndex = 0u;
+  const auto accepted = EvaluateWar3CoherentUpIndexTrim(input);
+  CHECK(accepted);
+  CHECK(accepted.indexBytes == 12u);
+  CHECK(accepted.positionCapacity == 32u);
+
+  auto rejected = input;
+  rejected.samePinnedAllocation = false;
+  CHECK(!EvaluateWar3CoherentUpIndexTrim(rejected));
+  rejected = input;
+  rejected.firstIndex = 1u;
+  CHECK(EvaluateWar3CoherentUpIndexTrim(rejected).rejectReason ==
+        War3CoherentUpIndexTrimRejectReason::NonZeroUploadedFirstIndex);
+  rejected = input;
+  rejected.indexUploadBytes = 10u;
+  CHECK(EvaluateWar3CoherentUpIndexTrim(rejected).rejectReason ==
+        War3CoherentUpIndexTrimRejectReason::IndexRangeOutsideUpload);
+  rejected = input;
+  rejected.positionUploadBytes = 15u;
+  CHECK(EvaluateWar3CoherentUpIndexTrim(rejected).rejectReason ==
+        War3CoherentUpIndexTrimRejectReason::PositionRangeOutsideUpload);
+
+  CHECK(ParseWar3CoherentUpIndexTrimMode(0u) ==
+        War3CoherentUpIndexTrimMode::Off);
+  CHECK(ParseWar3CoherentUpIndexTrimMode(1u) ==
+        War3CoherentUpIndexTrimMode::Observe);
+  CHECK(ParseWar3CoherentUpIndexTrimMode(2u) ==
+        War3CoherentUpIndexTrimMode::Consume);
+  CHECK(ParseWar3CoherentUpIndexTrimMode(3u) ==
+        War3CoherentUpIndexTrimMode::Off);
+  return true;
+}
+
+bool TestCurrentUpPositionReplayContract() {
+  War3CurrentUpPositionReplayInput input = {};
+  input.currentPositionUpload = true;
+  input.hasPinnedAllocation = true;
+  input.hasUploadBuffer = true;
+  input.sameBuffer = true;
+  input.uploadOffset = 4096u;
+  input.uploadLength = 16384u;
+  input.replayOffset = 6144u;
+  input.replayLength = 8192u;
+  const auto accepted = EvaluateWar3CurrentUpPositionReplay(input);
+  CHECK(accepted);
+  CHECK(accepted.replayOffset == 6144u);
+  CHECK(accepted.replayLength == 8192u);
+
+  auto rejected = input;
+  rejected.sameBuffer = false;
+  CHECK(EvaluateWar3CurrentUpPositionReplay(rejected).rejectReason ==
+        War3CurrentUpPositionReplayRejectReason::BufferMismatch);
+  rejected = input;
+  rejected.replayOffset = 2048u;
+  CHECK(EvaluateWar3CurrentUpPositionReplay(rejected).rejectReason ==
+        War3CurrentUpPositionReplayRejectReason::RangeOutsideUpload);
+  rejected = input;
+  rejected.replayOffset = UINT64_MAX - 4u;
+  rejected.replayLength = 16u;
+  CHECK(EvaluateWar3CurrentUpPositionReplay(rejected).rejectReason ==
+        War3CurrentUpPositionReplayRejectReason::RangeOutsideUpload);
+
+  CHECK(ParseWar3CurrentUpShadowReplayMode(0u) ==
+        War3CurrentUpShadowReplayMode::Off);
+  CHECK(ParseWar3CurrentUpShadowReplayMode(1u) ==
+        War3CurrentUpShadowReplayMode::Observe);
+  CHECK(ParseWar3CurrentUpShadowReplayMode(2u) ==
+        War3CurrentUpShadowReplayMode::Consume);
+  CHECK(ParseWar3CurrentUpShadowReplayMode(3u) ==
+        War3CurrentUpShadowReplayMode::Off);
+  return true;
+}
+
+bool TestCoherentCurrentRealIndexTrimContract() {
+  War3CoherentRealIndexTrimInput input = {};
+  input.indexedTerrain = true;
+  input.dynamicRealPosition = true;
+  input.currentPositionSpan = true;
+  input.currentIndexSpan = true;
+  input.positionSpanBytes = 512u * 1024u;
+  input.positionStride = 32u;
+  input.indexSpanBytes = 12u;
+  input.indexElementBytes = 2u;
+  input.indexCount = 6u;
+  const auto accepted = EvaluateWar3CoherentRealIndexTrim(input);
+  CHECK(accepted);
+  CHECK(accepted.indexBytes == 12u);
+  CHECK(accepted.positionCapacity == 16384u);
+
+  auto rejected = input;
+  rejected.vertexBlendEnabled = true;
+  CHECK(EvaluateWar3CoherentRealIndexTrim(rejected).rejectReason ==
+        War3CoherentRealIndexTrimRejectReason::NotRigidOpaque);
+  rejected = input;
+  rejected.alphaTestEnabled = true;
+  CHECK(EvaluateWar3CoherentRealIndexTrim(rejected).rejectReason ==
+        War3CoherentRealIndexTrimRejectReason::NotRigidOpaque);
+  rejected = input;
+  rejected.dynamicRealPosition = false;
+  CHECK(EvaluateWar3CoherentRealIndexTrim(rejected).rejectReason ==
+        War3CoherentRealIndexTrimRejectReason::NotDynamicRealPosition);
+  rejected = input;
+  rejected.currentPositionSpan = false;
+  CHECK(EvaluateWar3CoherentRealIndexTrim(rejected).rejectReason ==
+        War3CoherentRealIndexTrimRejectReason::MissingCurrentPositionSpan);
+  rejected = input;
+  rejected.currentIndexSpan = false;
+  CHECK(EvaluateWar3CoherentRealIndexTrim(rejected).rejectReason ==
+        War3CoherentRealIndexTrimRejectReason::MissingCurrentIndexSpan);
+  rejected = input;
+  rejected.indexSpanBytes = 10u;
+  CHECK(EvaluateWar3CoherentRealIndexTrim(rejected).rejectReason ==
+        War3CoherentRealIndexTrimRejectReason::IndexRangeOutsideSpan);
+
+  CHECK(ParseWar3CoherentRealIndexTrimMode(0u) ==
+        War3CoherentRealIndexTrimMode::Off);
+  CHECK(ParseWar3CoherentRealIndexTrimMode(1u) ==
+        War3CoherentRealIndexTrimMode::Observe);
+  CHECK(ParseWar3CoherentRealIndexTrimMode(2u) ==
+        War3CoherentRealIndexTrimMode::Consume);
+  CHECK(ParseWar3CoherentRealIndexTrimMode(3u) ==
+        War3CoherentRealIndexTrimMode::Off);
+  return true;
+}
+
+War3ExactIndexDomainObserverKey ObserverKey(uint64_t contentGeneration) {
+  War3ExactIndexDomainObserverKey key = {};
+  key.mapEpoch = 3u;
+  key.deviceEpoch = 5u;
+  key.ownerIdentity = 0x1010u;
+  key.spanDataIdentity = 0x2020u;
+  key.identityGeneration = 7u;
+  key.allocationGeneration = 11u;
+  key.contentGeneration = contentGeneration;
+  key.spanLength = 24u;
+  key.indexElementBytes = 2u;
+  key.indexCount = 12u;
+  key.baseVertex = -4;
+  key.vertexCapacity = 256u;
+  return key;
+}
+
+bool TestExactIndexDomainObserverCacheIdentity() {
+  War3ExactIndexDomainObserverCache<1u, 16u> cache;
+  const auto key = ObserverKey(13u);
+  War3ExactIndexVertexDomain domain = {};
+  domain.firstVertex = 2u;
+  domain.vertexCount = 9u;
+  domain.minIndex = 6u;
+  domain.maxIndex = 14u;
+  domain.valid = true;
+  CHECK(cache.store(key, domain) ==
+        War3ExactIndexDomainObserverStore::Inserted);
+
+  War3ExactIndexVertexDomain observed = {};
+  CHECK(cache.lookup(key, observed) ==
+        War3ExactIndexDomainObserverLookup::Hit);
+  CHECK(observed.valid && observed.firstVertex == domain.firstVertex &&
+        observed.vertexCount == domain.vertexCount &&
+        observed.minIndex == domain.minIndex &&
+        observed.maxIndex == domain.maxIndex);
+
+  auto expectMiss = [&](War3ExactIndexDomainObserverKey changed) {
+    War3ExactIndexVertexDomain ignored = {};
+    return cache.lookup(changed, ignored) !=
+        War3ExactIndexDomainObserverLookup::Hit;
+  };
+  auto changed = key;
+  changed.mapEpoch++;
+  CHECK(expectMiss(changed));
+  changed = key;
+  changed.deviceEpoch++;
+  CHECK(expectMiss(changed));
+  changed = key;
+  changed.ownerIdentity++;
+  CHECK(expectMiss(changed));
+  changed = key;
+  changed.spanDataIdentity++;
+  CHECK(expectMiss(changed));
+  changed = key;
+  changed.identityGeneration++;
+  CHECK(expectMiss(changed));
+  changed = key;
+  changed.allocationGeneration++;
+  CHECK(expectMiss(changed));
+  changed = key;
+  changed.contentGeneration++;
+  CHECK(expectMiss(changed));
+  changed = key;
+  changed.spanLength += 2u;
+  CHECK(expectMiss(changed));
+  changed = key;
+  changed.indexElementBytes = 4u;
+  CHECK(expectMiss(changed));
+  changed = key;
+  changed.indexCount++;
+  CHECK(expectMiss(changed));
+  changed = key;
+  changed.baseVertex++;
+  CHECK(expectMiss(changed));
+  changed = key;
+  changed.vertexCapacity++;
+  CHECK(expectMiss(changed));
+
+  auto invalid = key;
+  invalid.mapEpoch = 0u;
+  CHECK(cache.lookup(invalid, observed) ==
+        War3ExactIndexDomainObserverLookup::InvalidKey);
+  CHECK(cache.store(invalid, domain) ==
+        War3ExactIndexDomainObserverStore::InvalidKey);
+  return true;
+}
+
+bool TestExactIndexDomainObserverCacheDeterministicReplacement() {
+  War3ExactIndexDomainObserverCache<1u, 2u> cache;
+  const auto first = ObserverKey(101u);
+  const auto second = ObserverKey(103u);
+  const auto third = ObserverKey(107u);
+  War3ExactIndexVertexDomain domain = {};
+  domain.valid = true;
+  domain.vertexCount = 1u;
+
+  CHECK(cache.store(first, domain) ==
+        War3ExactIndexDomainObserverStore::Inserted);
+  CHECK(cache.store(second, domain) ==
+        War3ExactIndexDomainObserverStore::Inserted);
+  War3ExactIndexVertexDomain observed = {};
+  CHECK(cache.lookup(first, observed) ==
+        War3ExactIndexDomainObserverLookup::Hit);
+  CHECK(cache.store(third, domain) ==
+        War3ExactIndexDomainObserverStore::Replaced);
+  CHECK(cache.lookup(first, observed) ==
+        War3ExactIndexDomainObserverLookup::Hit);
+  CHECK(cache.lookup(third, observed) ==
+        War3ExactIndexDomainObserverLookup::Hit);
+  CHECK(cache.lookup(second, observed) ==
+        War3ExactIndexDomainObserverLookup::MissCollision);
+
+  War3ExactIndexVertexDomain invalidDomain = {};
+  const auto invalidDomainKey = ObserverKey(109u);
+  CHECK(cache.store(invalidDomainKey, invalidDomain) ==
+        War3ExactIndexDomainObserverStore::Replaced);
+  observed.valid = true;
+  CHECK(cache.lookup(invalidDomainKey, observed) ==
+        War3ExactIndexDomainObserverLookup::Hit);
+  CHECK(!observed.valid);
+  return true;
+}
+
 }  // namespace
 
 int main() {
@@ -223,7 +491,12 @@ int main() {
       !TestCurrentUpBytesAndAddressOverflow() || !TestDiagnostics() ||
       !TestExactIndexVertexDomain() ||
       !TestExactIndexVertexDomainBulkRead() ||
-      !TestExactIndexDomainRebase())
+      !TestExactIndexDomainRebase() ||
+      !TestCoherentCurrentUpIndexTrimContract() ||
+      !TestCurrentUpPositionReplayContract() ||
+      !TestCoherentCurrentRealIndexTrimContract() ||
+      !TestExactIndexDomainObserverCacheIdentity() ||
+      !TestExactIndexDomainObserverCacheDeterministicReplacement())
     return 1;
   std::cout << "war3_cpu_readable_buffer_span_test: PASS\n";
   return 0;

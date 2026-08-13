@@ -53,6 +53,9 @@ namespace dxvk {
     m_status = vk->vkGetEventStatus(
       vk->device(), m_gpuEvent->handle());
 
+    if (m_status != VK_EVENT_SET && m_status != VK_EVENT_RESET)
+      m_device->notifyDeviceErrorFromDriverResult(m_status);
+
     switch (m_status) {
       case VK_EVENT_SET:
         m_gpuEvent = nullptr;

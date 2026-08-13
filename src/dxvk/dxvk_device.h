@@ -5,6 +5,7 @@
 #include "dxvk_compute.h"
 #include "dxvk_constant_state.h"
 #include "dxvk_context.h"
+#include "dxvk_device_fault.h"
 #include "dxvk_fence.h"
 #include "dxvk_framebuffer.h"
 #include "dxvk_image.h"
@@ -248,7 +249,65 @@ namespace dxvk {
      * \returns Device status
      */
     VkResult getDeviceStatus() const {
-      return m_submissionQueue.getLastError();
+      if (m_vkd->driverDeviceLossObserved())
+        return VK_ERROR_DEVICE_LOST;
+      const VkResult terminal = m_terminalStatus.load(std::memory_order_acquire);
+      return terminal != VK_SUCCESS
+        ? terminal
+        : m_submissionQueue.getLastError();
+    }
+
+    void notifyDeviceError(VkResult status) {
+      if (status != VK_ERROR_DEVICE_LOST)
+        return;
+      VkResult expected = VK_SUCCESS;
+      m_terminalStatus.compare_exchange_strong(
+        expected, status, std::memory_order_acq_rel,
+        std::memory_order_acquire);
+    }
+
+    /**
+     * \brief Reports a direct Vulkan driver result
+     *
+     * Only this provenance-aware entrypoint may request the bounded
+     * VK_EXT_device_fault text record. Derived terminal states use
+     * notifyDeviceError and must not be treated as a driver query trigger.
+     */
+    void notifyDeviceErrorFromDriverResult(VkResult status) noexcept {
+      if (status == VK_ERROR_DEVICE_LOST)
+        GetDxvkDeviceAddressBindingTracker().markDriverLossObserved();
+      m_vkd->notifyDeviceErrorFromDriverResult(status);
+      notifyDeviceError(status);
+    }
+
+    uint32_t deviceAddressBindingSequenceBeforeDriverCall() const noexcept {
+      return GetDxvkDeviceAddressBindingTracker().sequenceBeforeDriverCall();
+    }
+
+    void notifyDeviceErrorFromDriverResult(
+            VkResult status,
+            uint32_t bindingSequenceBeforeCall) noexcept {
+      if (status == VK_ERROR_DEVICE_LOST)
+        GetDxvkDeviceAddressBindingTracker().markDriverLossObserved(
+          bindingSequenceBeforeCall);
+      m_vkd->notifyDeviceErrorFromDriverResult(status);
+      notifyDeviceError(status);
+    }
+
+    /**
+     * \brief Captures bounded fault text after a direct driver loss
+     *
+     * This is deliberately separate from the driver-result notifier. The D3D
+     * owner invokes it only after a base terminal incident is durable and the
+     * queue has been allowed to drain its CPU-side retirement work.
+     */
+    void captureDeviceFaultIfDriverLossObserved() noexcept {
+      if (m_vkd->driverDeviceLossObserved())
+        m_deviceFault.captureOnce(VK_ERROR_DEVICE_LOST);
+    }
+
+    DxvkDeviceFaultSnapshot getDeviceFaultSnapshot() const noexcept {
+      return m_deviceFault.snapshot();
     }
 
     /**
@@ -735,6 +794,8 @@ namespace dxvk {
 
     DxvkRecycler<DxvkCommandList, 16> m_recycledCommandLists;
 
+    std::atomic<VkResult>       m_terminalStatus = { VK_SUCCESS };
+    DxvkDeviceFaultCapture      m_deviceFault;
     DxvkSubmissionQueue         m_submissionQueue;
 
     Rc<DxvkShaderCache>         m_shaderCache;

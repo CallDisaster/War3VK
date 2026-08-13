@@ -42,7 +42,7 @@ class Stage11ExactIndexBlockerStaticTests(unittest.TestCase):
         cls.capture = cls.device[capture_start:]
         cls.producer = source_block(
             cls.device,
-            "uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer()",
+            "uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer(",
             "bool D3D9DeviceEx::War3DrainShadowCasterTombstones()",
         )
         cls.grouped = source_block(
@@ -146,11 +146,14 @@ class Stage11ExactIndexBlockerStaticTests(unittest.TestCase):
         for token in (
             "drawTimeIndexSlice.buffer() != nullptr",
             "idxSrcOffset",
-            "entry.indexCapacity = idxInfoCi.size;",
+            "War3AllocateStage11Snapshot(",
+            "entry.indexCapacity = snapshotCapacity;",
+            "entry.indexSnapshotOffset",
             "entry.firstIndex = 0u;",
             "ctx->copyBuffer",
         ):
             self.assertIn(token, backing)
+        self.assertIn("cDstOff = entry.indexSnapshotOffset", backing)
         self.assertNotIn("drawTimeIndexCpuSnapshot", backing)
         self.assertNotIn("indexHostSnapshot", backing)
 
@@ -691,11 +694,9 @@ class Stage11ExactIndexBlockerStaticTests(unittest.TestCase):
             "War3ShadowDrawTimeCapturePhase::PositionBacking",
             "War3ShadowDrawTimeCapturePhase::UvBacking",
         )
-        budget = source_block(
-            backing,
-            "if (needsNewPositionBuffer &&",
-            "if (needsNewPositionBuffer) {",
-        )
+        budget = backing[
+            backing.index("bool positionPageBudgetDeferred = false;") :
+        ]
         self.assertIn(
             "War3MarkDrawTimeExactRejectedCurrentFrame(vbCacheKey)",
             budget,
@@ -703,7 +704,7 @@ class Stage11ExactIndexBlockerStaticTests(unittest.TestCase):
         no_buffer = source_block(
             backing,
             "if (!gpuSkinSemanticBacking && !gpuSkinSemanticDirectOnly &&\n"
-            "            (entry.positionBuffer == nullptr",
+            "            !directStaticPositionSource &&",
             "if (!gpuSkinSemanticBacking && !gpuSkinSemanticDirectOnly) {",
         )
         self.assertIn(
@@ -880,7 +881,9 @@ class Stage11ExactIndexBlockerStaticTests(unittest.TestCase):
             "War3DrawTimeVBCacheKey War3MakeDrawTimeVBCacheKey(",
             "bool War3CurrentDrawContractNamesExactSlice(",
         )
-        self.assertIn("contract != nullptr && contract->known", key_factory)
+        self.assertIn(
+            "CurrentDrawContractHasCanonicalIdentity(*contract)", key_factory
+        )
         tombstones = source_block(
             self.device,
             "bool D3D9DeviceEx::War3DrainShadowCasterTombstones()",
@@ -946,10 +949,9 @@ class Stage11ExactIndexBlockerStaticTests(unittest.TestCase):
         )
 
         manifest = source_block(
-            self.grouped,
-            "std::vector<dxvk::war3::render::CurrentDrawContractRecord>\n"
-            "      exactSubmittedManifestRecords;",
-            "shadowEligibleManifestRecords.reserve(",
+            self.producer,
+            "const auto appendExactSubmittedManifestRecord =",
+            "uint32_t submitted = 0u;",
         )
         self.assertIn(
             "exactRecord.objectKind = entry.objectKind;",
@@ -1096,7 +1098,7 @@ class Stage11ExactIndexBlockerStaticTests(unittest.TestCase):
 
         current_owner = source_block(
             self.grouped,
-            "const auto currentFrameDrawTimeProducerEntry =",
+            "const auto currentFrameDrawTimeProducerOwnsRecord =",
             "struct DirectObjectCompletenessBucket",
         )
         self.assertIn(

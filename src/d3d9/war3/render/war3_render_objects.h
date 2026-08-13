@@ -117,6 +117,8 @@ public:
   // 根据 jHandle 查询
   const RenderObjectInfo *findByHandle(uint32_t jHandle) const;
   const RenderObjectInfo *findByEntry(void *worldObjectEntry) const;
+  const RenderObjectInfo *findFirstForDirectPacket(
+      void* worldObjectEntry, void* sceneNode, uint32_t jHandle) const;
 
   // ========== 批量查询 ==========
 

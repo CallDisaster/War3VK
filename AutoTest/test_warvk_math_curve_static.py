@@ -101,7 +101,7 @@ class WarVKMathCurveStaticTests(unittest.TestCase):
         self.assertIn("nowSec - record.createdSec", center)
 
     def test_japi_exposes_cpu_only_math_curve_contract(self):
-        self.assertIn('kApiVersion = "WarVK JAPI 1.2.0 Release"', self.japi)
+        self.assertIn('kApiVersion = "WarVK JAPI 1.2003"', self.japi)
         self.assertIn("kFeatureMathCurve = 0x00002000u", self.japi)
         for command in (
             "math.program.compile",
@@ -133,7 +133,7 @@ class WarVKMathCurveStaticTests(unittest.TestCase):
         )
         self.assertIn("math::CurveRuntime::instance().reset()", self.japi)
         bridge = JASS_BRIDGE.read_text(encoding="utf-8")
-        self.assertIn("WarVK JAPI 1.2.0 Release", bridge)
+        self.assertIn("WarVK JAPI 1.2003", bridge)
         self.assertNotIn("WarVK JAPI 1.2.0-math-curves", bridge)
         bootstrap = RUNTIME_BOOTSTRAP.read_text(encoding="utf-8")
         self.assertIn("math::CurveRuntime::instance().reset()", bootstrap)

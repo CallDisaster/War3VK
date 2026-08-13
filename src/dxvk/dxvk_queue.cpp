@@ -126,6 +126,22 @@ namespace dxvk {
   }
 
 
+  void DxvkSubmissionQueue::setQueueError(VkResult status) {
+    if (status == VK_SUCCESS)
+      return;
+
+    if (status == VK_ERROR_DEVICE_LOST) {
+      m_lastError.store(status);
+      return;
+    }
+
+    VkResult current = m_lastError.load();
+
+    while (current != VK_ERROR_DEVICE_LOST
+        && !m_lastError.compare_exchange_weak(current, status)) { }
+  }
+
+
   void DxvkSubmissionQueue::submitCmdLists() {
     env::setThreadName("dxvk-submit");
 
@@ -147,14 +163,37 @@ namespace dxvk {
         entry = std::move(m_submitQueue.front());
       }
 
-      // Submit command buffer to device
-      if (m_lastError != VK_ERROR_DEVICE_LOST) {
+      auto retireTerminalPresent = [&] {
+        if (entry.latency.tracker)
+          entry.latency.tracker->notifyQueuePresentBegin(entry.latency.frameId);
+
+        entry.present.presenter->retireTerminalFrame(
+          entry.present.frameId, entry.latency.tracker);
+
+        if (entry.latency.tracker) {
+          entry.latency.tracker->notifyQueuePresentEnd(
+            entry.latency.frameId, VK_ERROR_DEVICE_LOST);
+
+          trackedPresentId = entry.latency.frameId;
+          trackedSubmitId = 0u;
+        }
+      };
+
+      // The device terminal latch is authoritative. Do not use the
+      // queue-local error here: a different queue may have observed the
+      // loss first while this entry was waiting to be submitted.
+      if (m_device->getDeviceStatus() != VK_ERROR_DEVICE_LOST) {
         std::lock_guard<dxvk::mutex> lock(m_mutexQueue);
 
         if (m_callback)
           m_callback(true);
 
-        if (entry.submit.cmdList != nullptr) {
+        if (m_device->getDeviceStatus() == VK_ERROR_DEVICE_LOST) {
+          entry.result = VK_ERROR_DEVICE_LOST;
+
+          if (entry.present.presenter != nullptr)
+            retireTerminalPresent();
+        } else if (entry.submit.cmdList != nullptr) {
           if (entry.latency.tracker) {
             entry.latency.tracker->notifyQueueSubmit(entry.latency.frameId);
 
@@ -162,8 +201,12 @@ namespace dxvk {
               trackedSubmitId = entry.latency.frameId;
           }
 
+          const uint32_t bindingSequenceBeforeSubmit =
+            m_device->deviceAddressBindingSequenceBeforeDriverCall();
           entry.result = entry.submit.cmdList->submit(
             m_semaphores, m_timelines, trackedSubmitId);
+          m_device->notifyDeviceErrorFromDriverResult(
+            entry.result, bindingSequenceBeforeSubmit);
           entry.timelines = m_timelines;
         } else if (entry.present.presenter != nullptr) {
           if (entry.latency.tracker)
@@ -171,6 +214,9 @@ namespace dxvk {
 
           entry.result = entry.present.presenter->presentImage(
             entry.present.frameId, entry.latency.tracker);
+
+          if (m_device->getDeviceStatus() == VK_ERROR_DEVICE_LOST)
+            entry.result = VK_ERROR_DEVICE_LOST;
 
           if (entry.latency.tracker) {
             entry.latency.tracker->notifyQueuePresentEnd(
@@ -184,27 +230,51 @@ namespace dxvk {
         if (m_callback)
           m_callback(false);
       } else {
-        // Don't submit anything after device loss
-        // so that drivers get a chance to recover
+        // Do not submit after terminal loss. Present entries must still
+        // enter the CPU-only frame drain so that latency/frame signals do
+        // not remain blocked forever.
         entry.result = VK_ERROR_DEVICE_LOST;
+
+        if (entry.present.presenter != nullptr)
+          retireTerminalPresent();
       }
 
-      if (entry.status)
-        entry.status->result = entry.result;
+      // A device loss can be latched after a successful Vulkan call. Keep
+      // the entry terminal in that case so the finish thread will only do
+      // CPU retirement instead of waiting on a GPU timeline.
+      if (m_device->getDeviceStatus() == VK_ERROR_DEVICE_LOST)
+        entry.result = VK_ERROR_DEVICE_LOST;
       
-      // On success, pass it on to the queue thread
+      // Successful work and terminal work both need the finish thread. The
+      // latter releases command-list references and completes frame signals
+      // without issuing any more Vulkan work.
       { std::unique_lock<dxvk::mutex> lock(m_mutex);
+
+        const bool terminal = entry.result == VK_ERROR_DEVICE_LOST
+                           || m_device->getDeviceStatus() == VK_ERROR_DEVICE_LOST;
+
+        if (terminal)
+          entry.result = VK_ERROR_DEVICE_LOST;
+
+        if (entry.status)
+          entry.status->result = entry.result;
 
         bool doForward = (entry.result == VK_SUCCESS) ||
           (entry.present.presenter != nullptr && entry.result != VK_ERROR_DEVICE_LOST);
 
-        if (doForward) {
+        if (terminal) {
+          m_device->notifyDeviceError(VK_ERROR_DEVICE_LOST);
+          setQueueError(VK_ERROR_DEVICE_LOST);
+          m_finishQueue.push(std::move(entry));
+        } else if (doForward) {
           m_finishQueue.push(std::move(entry));
         } else {
           Logger::err(str::format("DxvkSubmissionQueue: Command submission failed: ", entry.result));
-          m_lastError = entry.result;
+          m_device->notifyDeviceError(entry.result);
+          setQueueError(entry.result);
 
-          if (m_lastError != VK_ERROR_DEVICE_LOST)
+          if (m_lastError.load() != VK_ERROR_DEVICE_LOST
+           && m_device->getDeviceStatus() != VK_ERROR_DEVICE_LOST)
             m_device->waitForIdle();
         }
 
@@ -245,9 +315,15 @@ namespace dxvk {
       lock.unlock();
       
       if (entry.submit.cmdList != nullptr) {
-        VkResult status = m_lastError.load();
+        VkResult status = entry.result;
 
-        if (status != VK_ERROR_DEVICE_LOST) {
+        // The global terminal latch must be checked before vkWaitSemaphores.
+        // Entries that were never submitted, or that become terminal while
+        // queued, are retired on the CPU below instead of waiting forever.
+        if (m_device->getDeviceStatus() == VK_ERROR_DEVICE_LOST)
+          status = VK_ERROR_DEVICE_LOST;
+
+        if (status == VK_SUCCESS) {
           std::array<VkSemaphore, 2> semaphores = { m_semaphores.graphics, m_semaphores.transfer };
           std::array<uint64_t, 2> timelines = { entry.timelines.graphics, entry.timelines.transfer };
 
@@ -259,23 +335,37 @@ namespace dxvk {
           waitInfo.pSemaphores = semaphores.data();
           waitInfo.pValues = timelines.data();
 
+          const uint32_t bindingSequenceBeforeWait =
+            m_device->deviceAddressBindingSequenceBeforeDriverCall();
           status = vk->vkWaitSemaphores(vk->device(), &waitInfo, ~0ull);
+
+          m_device->notifyDeviceErrorFromDriverResult(
+            status, bindingSequenceBeforeWait);
+
+          if (m_device->getDeviceStatus() == VK_ERROR_DEVICE_LOST)
+            status = VK_ERROR_DEVICE_LOST;
 
           if (entry.latency.tracker && status == VK_SUCCESS)
             entry.latency.tracker->notifyGpuExecutionEnd(entry.latency.frameId);
         }
 
         if (status != VK_SUCCESS) {
-          m_lastError = status;
+          m_device->notifyDeviceError(status);
+          setQueueError(status);
 
-          if (status != VK_ERROR_DEVICE_LOST)
+          if (status != VK_ERROR_DEVICE_LOST
+           && m_device->getDeviceStatus() != VK_ERROR_DEVICE_LOST)
             m_device->waitForIdle();
         }
       } else if (entry.present.presenter != nullptr) {
         // Signal the frame and then immediately destroy the reference.
         // This is necessary since the front-end may want to explicitly
         // destroy the presenter object. 
-        entry.present.presenter->signalFrame(entry.present.frameId, entry.latency.tracker);
+        const bool terminal = entry.result == VK_ERROR_DEVICE_LOST
+                           || m_device->getDeviceStatus() == VK_ERROR_DEVICE_LOST;
+
+        entry.present.presenter->signalFrame(
+          entry.present.frameId, entry.latency.tracker, terminal);
         entry.present.presenter = nullptr;
       }
 

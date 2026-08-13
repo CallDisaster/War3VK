@@ -35,7 +35,20 @@ enum class War3ShadowBoundsCullRejectReason : uint8_t {
   AnimatedAttachment,
   NonFiniteBounds,
   InvalidRadius,
+  Count,
 };
+
+inline constexpr uint32_t kWar3ShadowBoundsCullRejectReasonCount =
+    static_cast<uint32_t>(War3ShadowBoundsCullRejectReason::Count);
+
+constexpr uint32_t War3ShadowBoundsCullRejectReasonIndex(
+    War3ShadowBoundsCullRejectReason reason) {
+  const uint32_t index = static_cast<uint32_t>(reason);
+  return index < kWar3ShadowBoundsCullRejectReasonCount
+      ? index
+      : static_cast<uint32_t>(
+            War3ShadowBoundsCullRejectReason::UnknownProvenance);
+}
 
 struct War3ShadowBoundsCullEvidence {
   War3ShadowBoundsProvenance provenance =

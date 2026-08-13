@@ -67,6 +67,20 @@ struct ModelInstanceAugmentView {
   uint64_t modelKey = 0;
 };
 
+// Fixed-size projection for the DirectGrouped packet builder.  It deliberately
+// excludes creator/source provenance and frame bookkeeping: that hot path only
+// consumes identity fields used to resolve one immutable geoset packet.
+struct ModelInstanceDirectPacketView {
+  void* worldObjectEntry = nullptr;
+  void* sceneNode = nullptr;
+  void* unitPtr = nullptr;
+  void* runtimeModelPtr = nullptr;
+  void* modelResourcePtr = nullptr;
+  uint32_t jHandle = 0;
+  uint32_t rawcode = 0;
+  uint64_t modelKey = 0;
+};
+
 struct ModelIdentitySameFrameDedupStats {
   // attempts == hits + every miss* counter. batchMarked is independent.
   uint64_t attempts = 0;
@@ -179,6 +193,9 @@ struct PoseRecord {
 // the per-draw heap deep-copy of matrixPalette (up to 256 Matrix4) that a full
 // PoseRecord copy would incur for every skinned unit every frame.
 struct PoseAugmentView {
+  void* runtimeModelPtr = nullptr;
+  void* sceneNode = nullptr;
+  void* unitPtr = nullptr;
   bool hasWorldTransform = false;
   Matrix4 worldTransform;
   bool hasSpriteFrameTransform = false;
@@ -294,6 +311,17 @@ public:
   bool findByUnitPtr(void *unitPtr, ModelInstanceRecord &out) const;
   bool findBySpritePtr(void *spritePtr, ModelInstanceRecord &out) const;
   bool findByRuntimeModel(void *runtimeModelPtr, ModelInstanceRecord &out) const;
+  // Direct packet lookup keeps the historical priority while holding one
+  // shared lock across all aliases.
+  bool findFirstForDirectPacket(void* sceneNode, void* unitPtr,
+                                void* worldObjectEntry,
+                                void* runtimeModelPtr,
+                                ModelInstanceRecord& out) const;
+  bool findFirstForDirectPacketView(void* sceneNode, void* unitPtr,
+                                    void* worldObjectEntry,
+                                    void* runtimeModelPtr,
+                                    ModelInstanceDirectPacketView& out,
+                                    uint64_t* mutationGenerationOut = nullptr) const;
   bool findOwnerByRuntimeModel(void *runtimeModelPtr,
                                ModelInstanceRecord &out) const;
   bool findBySourceObject(void* sourceObjectPtr, ModelInstanceRecord& out) const;
@@ -413,6 +441,8 @@ public:
   bool findBySceneNode(void *sceneNode, PoseRecord &out) const;
   bool findByUnitPtr(void *unitPtr, PoseRecord &out) const;
   bool findByRuntimeModel(void *runtimeModelPtr, PoseRecord &out) const;
+  bool findFirstForDirectPacket(void* runtimeModelPtr, void* sceneNode,
+                                void* unitPtr, PoseRecord& out) const;
   // Augment-only lookups: project the matched record into a fixed-size POD
   // under the shared lock, skipping the matrixPalette deep-copy. Used by the
   // per-draw shadow semantic augment path.
@@ -420,6 +450,23 @@ public:
   bool findByUnitPtrAugment(void *unitPtr, PoseAugmentView &out) const;
   bool findByRuntimeModelAugment(void *runtimeModelPtr,
                                  PoseAugmentView &out) const;
+  bool findFirstForDirectPacketAugment(void* runtimeModelPtr,
+                                       void* sceneNode, void* unitPtr,
+                                       PoseAugmentView& out,
+                                       uint64_t* mutationGenerationOut = nullptr) const;
+  // Same logical record set and order as snapshot(), without cloning each
+  // matrix palette into an intermediate vector. References are callback-only;
+  // callbacks must not re-enter PoseRegistry while the shared lock is held.
+  template <typename Fn>
+  void forEachSnapshotPose(Fn&& fn) const {
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
+    for (const auto& it : m_byRuntimeModel)
+      fn(it.second);
+    for (const auto& it : m_bySceneNode) {
+      if (it.second.runtimeModelPtr == nullptr)
+        fn(it.second);
+    }
+  }
   std::vector<PoseRecord> snapshot() const;
   size_t recordCount() const;
   size_t readyPoseCount() const;
@@ -434,6 +481,7 @@ public:
   PoseTrackingHealthSnapshot debugVerifyTrackingHealthAggregate() const;
 
   uint64_t frameNumber() const;
+  uint64_t mutationGeneration() const;
 
 private:
   PoseRegistry() = default;
@@ -467,6 +515,10 @@ private:
   uint64_t m_trackingSpriteFramePoseCount = 0;
   uint64_t m_trackingMatrixPaletteCount = 0;
   std::atomic<uint64_t> m_frameNumber{0};
+  // Even values describe a stable lookup-visible snapshot. Writers advance
+  // once before and once after mutating pose maps so a Populate-local POD
+  // cache can reject a hit that overlaps any pose publication.
+  std::atomic<uint64_t> m_mutationGeneration{0};
 };
 
 class AttachmentRigidRegistry {

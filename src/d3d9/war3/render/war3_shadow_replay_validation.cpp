@@ -76,6 +76,10 @@ bool RangeFits(uint64_t total, uint64_t offset, uint64_t length,
 
 War3ShadowReplayValidationResult ValidateWar3ShadowReplayDraw(
     const War3ShadowReplayValidationInput& input) noexcept {
+  if (!input.bufferBindingsResolved) {
+    return Reject(War3ShadowReplayRejectReason::UnresolvedBufferBinding,
+                  input.bufferBindingRejectReason, 0u);
+  }
   if (input.drawMapEpoch == 0u || input.expectedMapEpoch == 0u)
     return Reject(War3ShadowReplayRejectReason::MissingMapEpoch);
   if (input.drawMapEpoch != input.expectedMapEpoch)
@@ -187,6 +191,31 @@ War3ShadowReplayValidationResult ValidateWar3ShadowReplayDraw(
       return uv;
   }
 
+  if (input.paletteRequired) {
+    if (input.paletteCount == 0u ||
+        input.paletteIndex >= input.paletteCount ||
+        input.paletteMatricesPerEntry == 0u) {
+      return Reject(War3ShadowReplayRejectReason::InvalidPaletteIndex,
+                    input.paletteIndex, input.paletteCount);
+    }
+
+    uint64_t paletteOffset = 0u;
+    uint64_t paletteEnd = 0u;
+    uint64_t totalMatrices = 0u;
+    if (!CheckedMul(uint64_t(input.paletteIndex),
+                    uint64_t(input.paletteMatricesPerEntry), paletteOffset) ||
+        !CheckedAdd(paletteOffset,
+                    uint64_t(input.paletteMatricesPerEntry), paletteEnd) ||
+        !CheckedMul(uint64_t(input.paletteCount),
+                    uint64_t(input.paletteMatricesPerEntry), totalMatrices)) {
+      return Reject(War3ShadowReplayRejectReason::PaletteRangeOverflow);
+    }
+    if (paletteEnd > totalMatrices) {
+      return Reject(War3ShadowReplayRejectReason::InvalidPaletteIndex,
+                    paletteEnd, totalMatrices);
+    }
+  }
+
   if (input.gpuSkinRequired) {
     if (!input.gpuSkinLeaseValid)
       return Reject(War3ShadowReplayRejectReason::InvalidGpuSkinLease);
@@ -211,6 +240,31 @@ War3ShadowReplayValidationResult ValidateWar3ShadowReplayDraw(
   return {};
 }
 
+War3ShadowReplayBatchValidationResult ValidateWar3ShadowReplayBatch(
+    const War3ShadowReplayValidationInput* inputs,
+    std::size_t count) noexcept {
+  War3ShadowReplayBatchValidationResult batch = {};
+  if (count != 0u && inputs == nullptr) {
+    batch.valid = false;
+    batch.failure.reason =
+        War3ShadowReplayRejectReason::MissingPositionBuffer;
+    return batch;
+  }
+
+  for (std::size_t i = 0u; i < count; ++i) {
+    const War3ShadowReplayValidationResult result =
+        ValidateWar3ShadowReplayDraw(inputs[i]);
+    if (!result) {
+      batch.valid = false;
+      batch.failureIndex = i;
+      batch.failure = result;
+      return batch;
+    }
+    ++batch.validatedCount;
+  }
+  return batch;
+}
+
 const char* War3ShadowReplayRejectReasonName(
     War3ShadowReplayRejectReason reason) noexcept {
   static constexpr const char* kNames[] = {
@@ -223,11 +277,13 @@ const char* War3ShadowReplayRejectReasonName(
       "vertex-domain-overflow", "invalid-actual-index-domain",
       "missing-blend-buffer", "invalid-blend-layout",
       "blend-range-out-of-bounds", "missing-uv-buffer", "invalid-uv-layout",
-      "uv-range-out-of-bounds", "invalid-gpu-skin-lease",
+      "uv-range-out-of-bounds", "invalid-palette-index",
+      "palette-range-overflow", "invalid-gpu-skin-lease",
       "stale-gpu-skin-map-epoch", "stale-gpu-skin-device-epoch",
       "gpu-skin-source-range-out-of-bounds",
       "gpu-skin-palette-range-out-of-bounds",
-      "incomplete-replay-plan"};
+      "incomplete-replay-plan", "producer-incomplete",
+      "producer-stamp-mismatch", "unresolved-buffer-binding"};
   const uint32_t index = static_cast<uint32_t>(reason);
   return index < static_cast<uint32_t>(War3ShadowReplayRejectReason::Count)
       ? kNames[index]

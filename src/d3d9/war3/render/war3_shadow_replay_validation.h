@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 namespace dxvk::war3::render {
@@ -28,12 +29,17 @@ enum class War3ShadowReplayRejectReason : uint32_t {
   MissingUvBuffer,
   InvalidUvLayout,
   UvRangeOutOfBounds,
+  InvalidPaletteIndex,
+  PaletteRangeOverflow,
   InvalidGpuSkinLease,
   StaleGpuSkinMapEpoch,
   StaleGpuSkinDeviceEpoch,
   GpuSkinSourceRangeOutOfBounds,
   GpuSkinPaletteRangeOutOfBounds,
   IncompleteReplayPlan,
+  ProducerIncomplete,
+  ProducerStampMismatch,
+  UnresolvedBufferBinding,
   Count,
 };
 
@@ -51,6 +57,8 @@ struct War3ShadowReplayValidationInput {
   uint64_t drawMapEpoch = 0u;
   uint64_t drawDeviceEpoch = 0u;
   bool worldMatrixFinite = false;
+  bool bufferBindingsResolved = true;
+  uint32_t bufferBindingRejectReason = 0u;
 
   War3ShadowReplayBufferAccess position = {};
   bool indexed = false;
@@ -77,6 +85,11 @@ struct War3ShadowReplayValidationInput {
   bool uvRequired = false;
   War3ShadowReplayBufferAccess uv = {};
 
+  bool paletteRequired = false;
+  uint32_t paletteIndex = 0u;
+  uint32_t paletteCount = 0u;
+  uint32_t paletteMatricesPerEntry = 256u;
+
   bool gpuSkinRequired = false;
   bool gpuSkinLeaseValid = false;
   uint64_t gpuSkinMapEpoch = 0u;
@@ -102,8 +115,28 @@ struct War3ShadowReplayValidationResult {
   }
 };
 
+/**
+ * Result of validating one immutable replay batch before command recording.
+ * A consumer must reject the entire batch when valid is false; failureIndex
+ * names the first malformed draw and no earlier draw is permission to submit.
+ */
+struct War3ShadowReplayBatchValidationResult {
+  bool valid = true;
+  std::size_t failureIndex = 0u;
+  std::size_t validatedCount = 0u;
+  War3ShadowReplayValidationResult failure = {};
+
+  explicit operator bool() const noexcept {
+    return valid;
+  }
+};
+
 War3ShadowReplayValidationResult ValidateWar3ShadowReplayDraw(
     const War3ShadowReplayValidationInput& input) noexcept;
+
+War3ShadowReplayBatchValidationResult ValidateWar3ShadowReplayBatch(
+    const War3ShadowReplayValidationInput* inputs,
+    std::size_t count) noexcept;
 
 const char* War3ShadowReplayRejectReasonName(
     War3ShadowReplayRejectReason reason) noexcept;

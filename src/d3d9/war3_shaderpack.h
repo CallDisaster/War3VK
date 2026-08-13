@@ -3,7 +3,8 @@
  * @brief War3MapReforge ShaderPack 执行框架公开头文件
  * 
  * @details
- * 本文件定义了 ShaderPack 的加载、执行和参数控制 API，允许二开开发者：
+ * 本文件定义了 ShaderPack 的加载、执行和参数控制 API。在显式启用
+ * WARVK_ENABLE_RAW_SHADERPACK_DEV 的开发构建中，二开开发者可以：
  * - 从文件夹加载自定义 shader pack
  * - 设置 uniform 参数（float/vec/mat）
  * - 绑定自定义纹理（LUT、噪声、mask）
@@ -73,7 +74,7 @@
  * // vec4 color = texture(sampler2D(u_colorTex, s_samplers[u_samplerColor]), uv);
  * ```
  * 
- * @version 1.2.0 Release
+ * @version 1.2003
  * @date 2024-12-21
  * 
  * @copyright Copyright (c) 2024 War3MapReforge
@@ -121,6 +122,7 @@ enum class ShaderPackError : uint32_t {
     NO_PACK_LOADED,             ///< 未加载任何 pack
     INVALID_SLOT,               ///< 无效的槽位索引
     INTERNAL_ERROR,             ///< 内部错误
+    POLICY_DISABLED,            ///< 发布构建禁用原始 SPIR-V 加载
 };
 
 /**
@@ -131,6 +133,7 @@ enum ShaderPackFlags : uint32_t {
     PACK_FLAG_LOADED    = 1 << 0,   ///< pack 已加载
     PACK_FLAG_ENABLED   = 1 << 1,   ///< pack 已启用
     PACK_FLAG_HAS_ERROR = 1 << 2,   ///< pack 有错误
+    PACK_FLAG_POLICY_DISABLED = 1 << 3, ///< 发布策略禁止原始 SPIR-V
 };
 
 //=============================================================================
@@ -220,6 +223,14 @@ WAR3_PACK_API bool EnableShaderPack(bool enable);
  * @return true 如果已加载
  */
 WAR3_PACK_API bool IsShaderPackLoaded();
+
+/**
+ * @brief 当前二进制是否允许从磁盘加载原始 SPIR-V ShaderPack
+ *
+ * 发布构建始终返回 false；该能力只能由显式开发编译宏启用，不能通过
+ * 环境变量或运行时配置绕过。
+ */
+WAR3_PACK_API bool IsRawShaderPackLoadingEnabled();
 
 /**
  * @brief 获取 ShaderPack 信息

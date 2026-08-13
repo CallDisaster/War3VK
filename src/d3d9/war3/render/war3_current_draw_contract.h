@@ -8,9 +8,13 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 namespace dxvk::war3::render {
+
+class VisibleRenderablePartLayerQueryCache;
+struct CurrentDrawImmutableGroupSlotHint;
 
 enum class CurrentDrawResolveStatus : uint8_t {
   MissingContract = 0,
@@ -85,6 +89,16 @@ struct CurrentDrawContractRecord {
   bool alphaPayloadComplete = false;
 };
 
+// CurrentDraw publishes the exact part/mesh identity before the optional
+// palette/group resolver finishes.  Keep the normalization rule in one pure
+// helper so pre-build owner checks and the authoritative packet resolver do
+// not disagree about the same record.
+inline bool CurrentDrawContractHasCanonicalIdentity(
+    const CurrentDrawContractRecord& record) noexcept {
+  return record.known ||
+      (record.renderablePart != nullptr && record.meshPayloadPtr != nullptr);
+}
+
 struct CurrentDrawDispatchContext {
   bool valid = false;
   CurrentDrawDispatchDomain domain = CurrentDrawDispatchDomain::Unknown;
@@ -114,6 +128,11 @@ struct CurrentDrawAuthoritativeSample {
   std::vector<uint8_t> groupSlots;
   uint64_t groupHash = 0u;         // 诊断 hash（含 stream1Ptr）
   uint64_t stableGroupHash = 0u;   // 稳定 hash（不含 stream1Ptr），用于 geometry key
+  uint32_t maxGroupSlot = 0u;      // 与 group hash 在同一次验证遍历中生成
+  // True only when the complete current-draw stream matched a generation-
+  // backed immutable geoset byte-for-byte. The sample owns no bytes in this
+  // case; the packet must independently retain and validate that geoset.
+  bool groupSlotsBorrowedFromImmutableHint = false;
   CurrentDrawResolveStatus status = CurrentDrawResolveStatus::MissingContract;
   // Phase 1：palette bytes 的来源标记。
   PaletteProvenance paletteProvenance = PaletteProvenance::Unknown;
@@ -128,9 +147,27 @@ struct CurrentDrawAuthoritativeSample {
   }
 
   bool groupSlotsReady() const {
-    return !groupSlots.empty();
+    return groupSlotsBorrowedFromImmutableHint || !groupSlots.empty();
   }
 };
+
+// Reset all authority-bearing state while retaining only caller-owned scratch
+// capacity. Empty buffers carry no cross-frame palette or group-slot proof.
+inline void ResetCurrentDrawAuthoritativeSamplePreserveScratch(
+    CurrentDrawAuthoritativeSample& sample) noexcept {
+  auto palette = std::move(sample.palette);
+  auto groupSlots = std::move(sample.groupSlots);
+
+  sample = {};
+  palette.clear();
+  groupSlots.clear();
+  if (palette.capacity() > 256u)
+    std::vector<Matrix4>().swap(palette);
+  if (groupSlots.capacity() > 200000u)
+    std::vector<uint8_t>().swap(groupSlots);
+  sample.palette = std::move(palette);
+  sample.groupSlots = std::move(groupSlots);
+}
 
 // Optional low-overhead phase observer for the authoritative decode hot path.
 // The caller owns timing policy and sampling; production calls pass nullptr.
@@ -296,7 +333,8 @@ struct CurrentDrawContractDiagnosticsSummary {
   // Phase 7.49：per-publish provenance probe
   // 目的：在 full trace 里把 FROZEN/NON-FROZEN 窗口里的 Publish 行为拆开。
   //   publishCallCumulative：Publish 被调的累计次数
-  //   publishTrustedHitCumulative：trusted path 命中累计（与 g_paletteCaptureTrustedSourceHitCount 对齐）
+  //   publishTrustedHitCumulative：trusted path 命中累计（默认由 model-hook
+  //     canonical Exact-query hit counter 提供；legacy A/B 保留旧 duplicate）。
   //   publishRecordFrameTagSameRunMax：Publish 时 record.frameTag 连续相同的最长 run
   //     如果在 FROZEN 段里它 ≥ FROZEN 长度 → record.frameTag 真的多帧不推进（分支 1）
   //   publishRecordFrameTagDistinctInWindowCount：本累计窗口内 record.frameTag 出现过的不同值数量
@@ -329,6 +367,46 @@ struct CurrentDrawContractSnapshotOptions {
   bool unitsOnly = false;
   bool pruneOlderThanMinVisibleFrame = true;
   std::vector<uint64_t> preferredSelectionKeys;
+  // Synchronous hot-path callers may borrow an already sorted key vector to
+  // avoid cloning it into preferredSelectionKeys. The pointed-to vector must
+  // remain alive and immutable for the complete snapshot call. Owned keys
+  // remain the compatibility/default source when this is null.
+  const std::vector<uint64_t>* preferredSelectionKeysView = nullptr;
+  // Callers may skip the defensive order scan only when they own the borrowed
+  // view and have already canonicalized it to strictly increasing unique
+  // values. The default remains defensive for all compatibility callers.
+  bool preferredSelectionKeysViewSortedUnique = false;
+  // Synchronous render-thread callers may share a bounded exact part/layer
+  // lookup cache with the selection pass that immediately consumes this
+  // snapshot. The cache owns only value copies from the current immutable
+  // VisibleRenderable snapshot and is reset by its caller for every populate;
+  // it never grants cross-frame identity or lifetime authority.
+  VisibleRenderablePartLayerQueryCache* visiblePartLayerQueryCache = nullptr;
+  // The Release DirectGrouped path may reject a canonical winner that is
+  // already owned by the exact Stage11 producer. The callback is synchronous
+  // and non-owning: it runs only after exact part-slice dedupe and bounded
+  // ordering have selected the final winner. Rejecting a winner never revives
+  // a weaker duplicate or backfills a lower-priority record.
+  struct CanonicalWinnerFilter {
+    const void* context = nullptr;
+    bool (*keep)(const void* context,
+                 const CurrentDrawContractRecord& record) noexcept = nullptr;
+
+    inline bool valid() const noexcept {
+      return keep != nullptr;
+    }
+
+    inline bool accepts(const CurrentDrawContractRecord& record) const noexcept {
+      return keep == nullptr || keep(context, record);
+    }
+  } canonicalWinnerFilter;
+
+  struct SnapshotSummary {
+    uint32_t canonicalWinnerCount = 0u;
+    uint32_t filteredCanonicalWinnerCount = 0u;
+    uint32_t canonicalLayerNonZeroCount = 0u;
+    bool canonicalWinnerFilterApplied = false;
+  }* summary = nullptr;
 };
 
 struct CurrentDrawRetireResult {
@@ -404,16 +482,22 @@ bool QueryCurrentDrawGeometryContract(
 bool QueryCurrentDrawContractCapturedPalette(
     void* renderablePart,
     std::vector<Matrix4>& outPalette,
-    uint32_t& outGroupCount);
+    uint32_t& outGroupCount,
+    uint64_t* outPaletteHash = nullptr);
 
 bool DecodeCurrentDrawGroupSlots(const CurrentDrawContractRecord& record,
                                  uint32_t vertexCount,
                                  uint32_t paletteCount,
                                  std::vector<uint8_t>& outGroupSlots,
                                  uint64_t& outGroupHash,
+                                 uint64_t& outStableGroupHash,
+                                 uint32_t& outMaxGroupSlot,
                                  const CurrentDrawResolveTrace* trace = nullptr,
                                  const CurrentDrawRangeValidator* rangeValidator =
-                                     nullptr);
+                                     nullptr,
+                                 const CurrentDrawImmutableGroupSlotHint*
+                                     immutableHint = nullptr,
+                                 bool* outBorrowedImmutableHint = nullptr);
 
 /**
  * @brief Legacy diagnostic normalization for the raw +0x58 bind value.
@@ -445,6 +529,13 @@ std::vector<CurrentDrawContractRecord> SnapshotPublishedCurrentDrawContracts(
 std::vector<CurrentDrawContractRecord> SnapshotPublishedCurrentDrawContracts(
     const CurrentDrawContractSnapshotOptions& options);
 
+// Caller-owned output form for render-thread hot paths. The function clears
+// and rebuilds out from the same immutable snapshot policy; retaining vector
+// capacity never authorizes record identity or cross-frame publication.
+void SnapshotPublishedCurrentDrawContracts(
+    const CurrentDrawContractSnapshotOptions& options,
+    std::vector<CurrentDrawContractRecord>& out);
+
 CurrentDrawResolveStatus ResolveCurrentDrawAuthoritativeSample(
     void* renderablePart,
     uint32_t vertexCount,
@@ -457,7 +548,8 @@ CurrentDrawResolveStatus ResolveCurrentDrawAuthoritativeSampleFromRecord(
     uint64_t expectedVisibleFrameSerial,
     CurrentDrawAuthoritativeSample& out,
     const CurrentDrawResolveTrace* trace = nullptr,
-    const CurrentDrawRangeValidator* rangeValidator = nullptr);
+    const CurrentDrawRangeValidator* rangeValidator = nullptr,
+    const CurrentDrawImmutableGroupSlotHint* immutableGroupSlotHint = nullptr);
 
 /**
  * @brief Phase 7.35：记录一次 submit 观察到的 palette 时间滞后。

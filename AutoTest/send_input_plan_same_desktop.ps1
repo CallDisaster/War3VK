@@ -80,10 +80,22 @@ public static class War3DesktopInputPlan {
   public static extern IntPtr GetThreadDesktop(uint threadId);
   [DllImport("user32.dll", SetLastError=true)]
   public static extern IntPtr OpenInputDesktop(uint flags, bool inherit, uint desiredAccess);
-  [DllImport("user32.dll")]
-  public static extern bool SwitchDesktop(IntPtr desktop);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+  public static extern bool GetUserObjectInformation(
+    IntPtr handle, int index, System.Text.StringBuilder info, uint length, out uint needed);
   [DllImport("user32.dll")]
   public static extern bool CloseDesktop(IntPtr desktop);
+
+  public static string DesktopName(IntPtr desktop) {
+    if (desktop == IntPtr.Zero) return "";
+    uint needed;
+    GetUserObjectInformation(desktop, 2, null, 0, out needed);
+    if (needed == 0) return "";
+    var value = new System.Text.StringBuilder((int)(needed / 2 + 2));
+    if (!GetUserObjectInformation(desktop, 2, value,
+        (uint)(value.Capacity * 2), out needed)) return "";
+    return value.ToString();
+  }
 
   public static IntPtr FindLargestWindow(uint targetPid) {
     IntPtr best = IntPtr.Zero;
@@ -183,20 +195,25 @@ if ($hwnd -eq [IntPtr]::Zero) {
 $targetThread = [War3DesktopInputPlan]::GetWindowThreadProcessId($hwnd, [ref]$actualPid)
 $currentThread = [War3DesktopInputPlan]::GetCurrentThreadId()
 $helperDesktop = [War3DesktopInputPlan]::GetThreadDesktop($currentThread)
-$originalInputDesktop = [War3DesktopInputPlan]::OpenInputDesktop(0, $false, [uint32]0x0100)
-$switched = $false
+$inputDesktop = [War3DesktopInputPlan]::OpenInputDesktop(0, $false, [uint32]0x0001)
 $attached = $false
 $top = $false
 $foreground = $false
 $ok = $true
 $executed = 0
 try {
-  if ($helperDesktop -eq [IntPtr]::Zero -or $originalInputDesktop -eq [IntPtr]::Zero) {
+  if ($helperDesktop -eq [IntPtr]::Zero -or $inputDesktop -eq [IntPtr]::Zero) {
     throw "unable to resolve input desktops"
   }
-  $switched = [War3DesktopInputPlan]::SwitchDesktop($helperDesktop)
-  if (-not $switched) {
-    throw "unable to switch input desktop to target session"
+  $helperDesktopName = [War3DesktopInputPlan]::DesktopName($helperDesktop)
+  $inputDesktopName = [War3DesktopInputPlan]::DesktopName($inputDesktop)
+  if (-not $helperDesktopName -or -not $inputDesktopName) {
+    throw "unable to prove desktop identities"
+  }
+  if (-not [String]::Equals(
+      $helperDesktopName, $inputDesktopName,
+      [StringComparison]::OrdinalIgnoreCase)) {
+    throw "non-input desktop injection is forbidden"
   }
 
   $attached = [War3DesktopInputPlan]::AttachThreadInput($currentThread, $targetThread, $true)
@@ -235,17 +252,14 @@ try {
   if ($attached) {
     [void][War3DesktopInputPlan]::AttachThreadInput($currentThread, $targetThread, $false)
   }
-  if ($switched -and $originalInputDesktop -ne [IntPtr]::Zero) {
-    [void][War3DesktopInputPlan]::SwitchDesktop($originalInputDesktop)
-  }
-  if ($originalInputDesktop -ne [IntPtr]::Zero) {
-    [void][War3DesktopInputPlan]::CloseDesktop($originalInputDesktop)
+  if ($inputDesktop -ne [IntPtr]::Zero) {
+    [void][War3DesktopInputPlan]::CloseDesktop($inputDesktop)
   }
 }
 
 $result = "hwnd=" + $hwnd.ToInt64() + ";actions=" + $executed +
   ";ok=" + $ok + ";attached=" + $attached + ";top=" + $top +
-  ";foreground=" + $foreground + ";desktopSwitched=" + $switched
+  ";foreground=" + $foreground + ";desktopMatched=True"
 if ($StatusPath) {
   Set-Content -LiteralPath $StatusPath -Value ("OK:" + $result) -Encoding UTF8
 }

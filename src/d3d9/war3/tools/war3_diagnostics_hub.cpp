@@ -48,6 +48,10 @@ uint64_t s_gpuLastCompletedSerial = 0u;
 std::chrono::steady_clock::time_point s_gpuLastProgressAt =
     std::chrono::steady_clock::now();
 bool s_gpuIncidentLatched = false;
+bool s_gpuDeviceLostIncidentLatched = false;
+bool s_gpuDeviceLostDeviceFaultEnrichmentLatched = false;
+uint64_t s_gpuDeviceLostBaseTimestampMs = 0u;
+std::string s_gpuDeviceLostFirstErrorOrigin;
 bool s_shadowArenaIncidentLatched = false;
 uint64_t s_shadowArenaLastOverflowCount = 0u;
 uint64_t s_shadowArenaLastAdmissionRejectedCount = 0u;
@@ -72,6 +76,28 @@ std::atomic<uint32_t> s_gpuFlightAutoTestWaypointIndex{0xFFFFFFFFu};
 std::array<std::atomic<uint32_t>, 11u> s_gpuFlightAutoTestFloatBits = {};
 uint64_t s_gpuFlightLastArenaGeneration = 0u;
 uint64_t s_gpuFlightLastArenaUsedBytes = 0u;
+
+const char* DeviceFaultCaptureStateName(
+    ::dxvk::DxvkDeviceFaultCaptureState state) noexcept {
+  switch (state) {
+    case ::dxvk::DxvkDeviceFaultCaptureState::Disabled:
+      return "disabled";
+    case ::dxvk::DxvkDeviceFaultCaptureState::Armed:
+      return "armed";
+    case ::dxvk::DxvkDeviceFaultCaptureState::Capturing:
+      return "capturing";
+    case ::dxvk::DxvkDeviceFaultCaptureState::Complete:
+      return "complete";
+  }
+  return "unknown";
+}
+
+std::string BoundedDeviceFaultText(const char* text, size_t capacity) {
+  size_t length = 0u;
+  while (length < capacity && text[length] != '\0')
+    ++length;
+  return std::string(text, length);
+}
 
 uint32_t FloatBits(float value) noexcept {
   uint32_t bits = 0u;
@@ -367,19 +393,120 @@ void WriteGpuIncidentSnapshot(const GpuIncidentSnapshot& incident) {
   if (directory.empty())
     return;
 
+  const ::dxvk::DxvkDeviceFaultSnapshot& deviceFault = incident.deviceFault;
+  const bool hasDeviceFaultData = deviceFault.complete &&
+      (deviceFault.queryResult == VK_SUCCESS ||
+       deviceFault.queryResult == VK_INCOMPLETE);
+  const uint32_t addressInfoCount = hasDeviceFaultData ? std::min(
+      deviceFault.addressInfoCount,
+      ::dxvk::DxvkDeviceFaultSnapshot::MaxAddressInfos) : 0u;
+  const uint32_t vendorInfoCount = hasDeviceFaultData ? std::min(
+      deviceFault.vendorInfoCount,
+      ::dxvk::DxvkDeviceFaultSnapshot::MaxVendorInfos) : 0u;
+  json deviceFaultPayload = {
+      {"supported", deviceFault.supported},
+      {"captureState", DeviceFaultCaptureStateName(deviceFault.captureState)},
+      {"complete", deviceFault.complete},
+      {"queryResult", static_cast<int64_t>(deviceFault.queryResult)},
+      {"truncated", deviceFault.truncated},
+      {"description", hasDeviceFaultData ? BoundedDeviceFaultText(
+          deviceFault.description.data(), VK_MAX_DESCRIPTION_SIZE) : std::string{}},
+      {"vendorBinaryEnabled", false},
+      {"addressInfos", json::array()},
+      {"vendorInfos", json::array()},
+  };
+  const ::dxvk::DxvkDeviceAddressBindingSnapshot& addressBinding =
+      deviceFault.addressBinding;
+  const uint32_t addressBindingMatchCount = std::min(
+      addressBinding.matchCount,
+      ::dxvk::DxvkDeviceAddressBindingSnapshot::MaxMatches);
+  json addressBindingPayload = {
+      {"buildEnabled", addressBinding.buildEnabled},
+      {"messengerAvailable", addressBinding.messengerAvailable},
+      {"deviceFeatureEnabled", addressBinding.deviceFeatureEnabled},
+      {"observedEventCount", addressBinding.observedEventCount},
+      {"droppedEventCount", addressBinding.droppedEventCount},
+      {"driverLossObserved", addressBinding.driverLossObserved},
+      {"driverLossSequence", addressBinding.driverLossSequence},
+      {"postDriverLossEventCount", addressBinding.postDriverLossEventCount},
+      {"truncated", addressBinding.truncated},
+      {"matches", json::array()},
+  };
+
+  if (!deviceFault.supported) {
+    deviceFaultPayload["reason"] =
+        "VK_EXT_device_fault was unavailable for this Vulkan device";
+  } else if (!deviceFault.complete) {
+    deviceFaultPayload["reason"] =
+        "no completed VK_EXT_device_fault query was available";
+  } else if (deviceFault.queryResult != VK_SUCCESS &&
+             deviceFault.queryResult != VK_INCOMPLETE) {
+    deviceFaultPayload["reason"] =
+        "vkGetDeviceFaultInfoEXT returned an error";
+  }
+
+  for (uint32_t index = 0u; index < addressInfoCount; ++index) {
+    const VkDeviceFaultAddressInfoEXT& address =
+        deviceFault.addressInfos[index];
+    deviceFaultPayload["addressInfos"].push_back({
+        {"type", static_cast<int64_t>(address.addressType)},
+        {"reportedAddress", address.reportedAddress},
+        {"addressPrecision", address.addressPrecision},
+    });
+  }
+
+  for (uint32_t index = 0u; index < vendorInfoCount; ++index) {
+    const VkDeviceFaultVendorInfoEXT& vendor = deviceFault.vendorInfos[index];
+    deviceFaultPayload["vendorInfos"].push_back({
+        {"description", BoundedDeviceFaultText(
+            vendor.description, VK_MAX_DESCRIPTION_SIZE)},
+        {"faultCode", vendor.vendorFaultCode},
+        {"faultData", vendor.vendorFaultData},
+    });
+  }
+
+  for (uint32_t index = 0u; index < addressBindingMatchCount; ++index) {
+    const ::dxvk::DxvkDeviceAddressBindingMatch& match =
+        addressBinding.matches[index];
+    addressBindingPayload["matches"].push_back({
+        {"faultInfoIndex", match.faultInfoIndex},
+        {"sequence", match.sequence},
+        {"bindingType", static_cast<int64_t>(match.bindingType)},
+        {"flags", static_cast<uint64_t>(match.flags)},
+        {"baseAddress", match.baseAddress},
+        {"size", match.size},
+        {"objectType", static_cast<int64_t>(match.objectType)},
+        {"objectHandle", match.objectHandle},
+        {"objectName", BoundedDeviceFaultText(
+            match.objectName.data(), match.objectName.size())},
+        {"latestForObjectRange", match.latestForObjectRange},
+        {"latestState", match.bindingType ==
+            VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT ? "bound" : "unbound"},
+        {"hasPreviousEvent", match.hasPreviousEvent},
+        {"previousSequence", match.previousSequence},
+        {"previousBindingType",
+         static_cast<int64_t>(match.previousBindingType)},
+        {"hasPriorBind", match.hasPriorBind},
+        {"priorBindSequence", match.priorBindSequence},
+        {"nameSourceSequence", match.nameSourceSequence},
+        {"nameObservedAfterDriverLoss", match.nameObservedAfterDriverLoss},
+    });
+  }
+  deviceFaultPayload["addressBindingReport"] =
+      std::move(addressBindingPayload);
+
   json payload = {
       {"timestampMs", incident.timestampMs},
+      {"deviceLossBaseTimestampMs", incident.deviceLossBaseTimestampMs},
       {"reason", incident.reason},
+      {"firstErrorOrigin", incident.firstErrorOrigin},
       {"queueResult", incident.queueResult},
       {"stalledMilliseconds", incident.stalledMilliseconds},
       {"lastRenderStage",
        incident.recentFrames.empty()
            ? std::string{}
            : incident.recentFrames.back().lastRenderStage},
-      {"deviceFault", {
-          {"supported", false},
-          {"reason", "VK_EXT_device_fault is not exposed by this DXVK build"},
-      }},
+      {"deviceFault", std::move(deviceFaultPayload)},
       {"frames", json::array()},
   };
   for (const auto& frame : incident.recentFrames) {
@@ -408,6 +535,54 @@ void WriteGpuIncidentSnapshot(const GpuIncidentSnapshot& incident) {
         {"csmPartialPreventedCount", frame.csmPartialPreventedCount},
         {"csmFirstCompleteLatencyFrames",
          frame.csmFirstCompleteLatencyFrames},
+        {"producerSealFrameSerial", frame.producerSealFrameSerial},
+        {"producerSealMapEpoch", frame.producerSealMapEpoch},
+        {"producerSealDeviceEpoch", frame.producerSealDeviceEpoch},
+        {"producerRequiredCasterOmissionCount",
+         frame.producerRequiredCasterOmissionCount},
+        {"producerExactBudgetDeferredUniqueCasterCount",
+         frame.producerExactBudgetDeferredUniqueCasterCount},
+        {"producerPositionAllocBudgetCount",
+         frame.producerPositionAllocBudgetCount},
+        {"producerUvAllocBudgetCount", frame.producerUvAllocBudgetCount},
+        {"producerIndexAllocBudgetCount",
+         frame.producerIndexAllocBudgetCount},
+        {"producerAllocationFailureCount",
+         frame.producerAllocationFailureCount},
+        {"producerFallbackByteBudgetCount",
+         frame.producerFallbackByteBudgetCount},
+        {"producerArenaAdmissionCount",
+         frame.producerArenaAdmissionCount},
+        {"producerFreezeFailureCount", frame.producerFreezeFailureCount},
+        {"producerSoftPriorityBudgetCount",
+         frame.producerSoftPriorityBudgetCount},
+        {"producerCompletenessReasonMask",
+         frame.producerCompletenessReasonMask},
+        {"producerCompletenessSealed", frame.producerCompletenessSealed},
+        {"producerCompletenessCounterOverflow",
+         frame.producerCompletenessCounterOverflow},
+        {"drawTimeVBCacheStaticLiveBytes",
+         frame.drawTimeVBCacheStaticLiveBytes},
+        {"drawTimeVBCacheStaticProtectedBytes",
+         frame.drawTimeVBCacheStaticProtectedBytes},
+        {"drawTimeVBCacheStaticOverCapBytes",
+         frame.drawTimeVBCacheStaticOverCapBytes},
+        {"drawTimeVBCacheStaticOverCapFrameCount",
+         frame.drawTimeVBCacheStaticOverCapFrameCount},
+        {"drawTimeVBCacheStaticEvictedBytes",
+         frame.drawTimeVBCacheStaticEvictedBytes},
+        {"drawTimeVBCacheStaticEvictedEntryCount",
+         frame.drawTimeVBCacheStaticEvictedEntryCount},
+        {"drawTimeVBCacheIndexedUnknownRangeFallbackCount",
+         frame.drawTimeVBCacheIndexedUnknownRangeFallbackCount},
+        {"drawTimeGenerationBackedPositionReuseCount",
+         frame.drawTimeGenerationBackedPositionReuseCount},
+        {"drawTimeGenerationBackedUvReuseCount",
+         frame.drawTimeGenerationBackedUvReuseCount},
+        {"drawTimeGenerationBackedIndexReuseCount",
+         frame.drawTimeGenerationBackedIndexReuseCount},
+        {"drawTimeGenerationBackedCopyBytesSaved",
+         frame.drawTimeGenerationBackedCopyBytesSaved},
         {"csmCascadeDrawCount", frame.csmCascadeDrawCount},
         {"csmCascadeTriangleCount", frame.csmCascadeTriangleCount},
         {"pointShadowLightCount", frame.pointShadowLightCount},
@@ -432,6 +607,13 @@ void WriteGpuIncidentSnapshot(const GpuIncidentSnapshot& incident) {
         {"arenaUsedBytes", frame.arenaUsedBytes},
         {"arenaFrameUsedDeltaBytes", frame.arenaFrameUsedDeltaBytes},
         {"arenaResidentBytes", frame.arenaResidentBytes},
+        {"arenaResidentLimitBytes", frame.arenaResidentLimitBytes},
+        {"arenaMemoryAvailableBytes", frame.arenaMemoryAvailableBytes},
+        {"arenaBudgetGrowthRejectCount",
+         frame.arenaBudgetGrowthRejectCount},
+        {"arenaMemoryBudgetSupported",
+         frame.arenaMemoryBudgetSupported},
+        {"arenaMemoryBudgetTrusted", frame.arenaMemoryBudgetTrusted},
         {"arenaGeneration", frame.arenaGeneration},
         {"arenaQuarantineCount", frame.arenaQuarantineCount},
         {"arenaQuarantinedRetireSerial",
@@ -451,6 +633,36 @@ void WriteGpuIncidentSnapshot(const GpuIncidentSnapshot& incident) {
          frame.arenaExactIndexTrimRejectedCount},
         {"arenaExactIndexTrimBytesSaved",
          frame.arenaExactIndexTrimBytesSaved},
+        {"arenaCoherentUpTrimObservedCount",
+         frame.arenaCoherentUpTrimObservedCount},
+        {"arenaCoherentUpTrimEligibleCount",
+         frame.arenaCoherentUpTrimEligibleCount},
+        {"arenaCoherentUpTrimWouldSaveBytes",
+         frame.arenaCoherentUpTrimWouldSaveBytes},
+        {"arenaCoherentUpTrimConsumedCount",
+         frame.arenaCoherentUpTrimConsumedCount},
+        {"arenaCoherentUpTrimConsumedBytesSaved",
+         frame.arenaCoherentUpTrimConsumedBytesSaved},
+        {"arenaCoherentRealTrimObservedCount",
+         frame.arenaCoherentRealTrimObservedCount},
+        {"arenaCoherentRealTrimEligibleCount",
+         frame.arenaCoherentRealTrimEligibleCount},
+        {"arenaCoherentRealTrimWouldSaveBytes",
+         frame.arenaCoherentRealTrimWouldSaveBytes},
+        {"arenaCoherentRealTrimConsumedCount",
+         frame.arenaCoherentRealTrimConsumedCount},
+        {"arenaCoherentRealTrimConsumedBytesSaved",
+         frame.arenaCoherentRealTrimConsumedBytesSaved},
+        {"arenaCurrentUpPositionReplayObservedCount",
+         frame.arenaCurrentUpPositionReplayObservedCount},
+        {"arenaCurrentUpPositionReplayEligibleCount",
+         frame.arenaCurrentUpPositionReplayEligibleCount},
+        {"arenaCurrentUpPositionReplayWouldAvoidBytes",
+         frame.arenaCurrentUpPositionReplayWouldAvoidBytes},
+        {"arenaCurrentUpPositionReplayConsumedCount",
+         frame.arenaCurrentUpPositionReplayConsumedCount},
+        {"arenaCurrentUpPositionReplayAvoidedBytes",
+         frame.arenaCurrentUpPositionReplayAvoidedBytes},
         {"exactIndexDomainScannedBytes",
          frame.exactIndexDomainScannedBytes},
         {"exactIndexDomainNonHostCachedScanCount",
@@ -550,6 +762,8 @@ void RecordGpuFlightFrame(uint64_t frameSerial) {
   frame.worldMaxX = loadAutoTestFloat(9u);
   frame.worldMaxY = loadAutoTestFloat(10u);
   const auto replay = dxvk::QueryShadowReplayDiagnostics();
+  const auto producer =
+      dxvk::war3::render::QueryShadowProducerRuntimeDiagnostics();
   frame.csmPlannedCasterCount = replay.plannedCasterCount;
   frame.csmValidatedCasterCount = replay.validatedCasterCount;
   frame.csmDrawnCasterCount = replay.drawnCasterCount;
@@ -557,6 +771,56 @@ void RecordGpuFlightFrame(uint64_t frameSerial) {
   frame.csmValidationRejectCount = replay.validationRejectCount;
   frame.csmPartialPreventedCount = replay.partialPreventedCount;
   frame.csmFirstCompleteLatencyFrames = replay.firstCompleteLatencyFrames;
+  frame.producerSealFrameSerial = producer.producerSealFrameSerial;
+  frame.producerSealMapEpoch = producer.producerSealMapEpoch;
+  frame.producerSealDeviceEpoch = producer.producerSealDeviceEpoch;
+  frame.producerRequiredCasterOmissionCount =
+      producer.producerRequiredCasterOmissionCount;
+  frame.producerExactBudgetDeferredUniqueCasterCount =
+      producer.producerExactBudgetDeferredUniqueCasterCount;
+  frame.producerPositionAllocBudgetCount =
+      producer.producerPositionAllocBudgetCount;
+  frame.producerUvAllocBudgetCount = producer.producerUvAllocBudgetCount;
+  frame.producerIndexAllocBudgetCount =
+      producer.producerIndexAllocBudgetCount;
+  frame.producerAllocationFailureCount =
+      producer.producerAllocationFailureCount;
+  frame.producerFallbackByteBudgetCount =
+      producer.producerFallbackByteBudgetCount;
+  frame.producerArenaAdmissionCount =
+      producer.producerArenaAdmissionCount;
+  frame.producerFreezeFailureCount =
+      producer.producerFreezeFailureCount;
+  frame.producerSoftPriorityBudgetCount =
+      producer.producerSoftPriorityBudgetCount;
+  frame.producerCompletenessReasonMask =
+      producer.producerCompletenessReasonMask;
+  frame.producerCompletenessSealed =
+      producer.producerCompletenessSealed;
+  frame.producerCompletenessCounterOverflow =
+      producer.producerCompletenessCounterOverflow;
+  frame.drawTimeVBCacheStaticLiveBytes =
+      producer.drawTimeVBCacheStaticLiveBytes;
+  frame.drawTimeVBCacheStaticProtectedBytes =
+      producer.drawTimeVBCacheStaticProtectedBytes;
+  frame.drawTimeVBCacheStaticOverCapBytes =
+      producer.drawTimeVBCacheStaticOverCapBytes;
+  frame.drawTimeVBCacheStaticOverCapFrameCount =
+      producer.drawTimeVBCacheStaticOverCapFrameCount;
+  frame.drawTimeVBCacheStaticEvictedBytes =
+      producer.drawTimeVBCacheStaticEvictedBytes;
+  frame.drawTimeVBCacheStaticEvictedEntryCount =
+      producer.drawTimeVBCacheStaticEvictedEntryCount;
+  frame.drawTimeVBCacheIndexedUnknownRangeFallbackCount =
+      producer.drawTimeVBCacheIndexedUnknownRangeFallbackCount;
+  frame.drawTimeGenerationBackedPositionReuseCount =
+      producer.drawTimeGenerationBackedPositionReuseCount;
+  frame.drawTimeGenerationBackedUvReuseCount =
+      producer.drawTimeGenerationBackedUvReuseCount;
+  frame.drawTimeGenerationBackedIndexReuseCount =
+      producer.drawTimeGenerationBackedIndexReuseCount;
+  frame.drawTimeGenerationBackedCopyBytesSaved =
+      producer.drawTimeGenerationBackedCopyBytesSaved;
   for (size_t index = 0u; index < frame.csmCascadeDrawCount.size(); ++index) {
     frame.csmCascadeDrawCount[index] =
         s_gpuFlightCsmCascadeDrawCount[index].load(std::memory_order_acquire);
@@ -605,6 +869,11 @@ void RecordGpuFlightFrame(uint64_t frameSerial) {
   s_gpuFlightLastArenaGeneration = arena.generation;
   s_gpuFlightLastArenaUsedBytes = arena.usedBytes;
   frame.arenaResidentBytes = arena.residentBytes;
+  frame.arenaResidentLimitBytes = arena.residentLimitBytes;
+  frame.arenaMemoryAvailableBytes = arena.memoryAvailableBytes;
+  frame.arenaBudgetGrowthRejectCount = arena.budgetGrowthRejectCount;
+  frame.arenaMemoryBudgetSupported = arena.memoryBudgetSupported;
+  frame.arenaMemoryBudgetTrusted = arena.memoryBudgetTrusted;
   frame.arenaGeneration = arena.generation;
   frame.arenaQuarantineCount = arena.quarantineCount;
   frame.arenaQuarantinedRetireSerial =
@@ -621,6 +890,36 @@ void RecordGpuFlightFrame(uint64_t frameSerial) {
   frame.arenaExactIndexTrimAcceptedCount = arena.exactIndexTrimAcceptedCount;
   frame.arenaExactIndexTrimRejectedCount = arena.exactIndexTrimRejectedCount;
   frame.arenaExactIndexTrimBytesSaved = arena.exactIndexTrimBytesSaved;
+  frame.arenaCoherentUpTrimObservedCount =
+      arena.coherentUpTrimObservedCount;
+  frame.arenaCoherentUpTrimEligibleCount =
+      arena.coherentUpTrimEligibleCount;
+  frame.arenaCoherentUpTrimWouldSaveBytes =
+      arena.coherentUpTrimWouldSaveBytes;
+  frame.arenaCoherentUpTrimConsumedCount =
+      arena.coherentUpTrimConsumedCount;
+  frame.arenaCoherentUpTrimConsumedBytesSaved =
+      arena.coherentUpTrimConsumedBytesSaved;
+  frame.arenaCoherentRealTrimObservedCount =
+      arena.coherentRealTrimObservedCount;
+  frame.arenaCoherentRealTrimEligibleCount =
+      arena.coherentRealTrimEligibleCount;
+  frame.arenaCoherentRealTrimWouldSaveBytes =
+      arena.coherentRealTrimWouldSaveBytes;
+  frame.arenaCoherentRealTrimConsumedCount =
+      arena.coherentRealTrimConsumedCount;
+  frame.arenaCoherentRealTrimConsumedBytesSaved =
+      arena.coherentRealTrimConsumedBytesSaved;
+  frame.arenaCurrentUpPositionReplayObservedCount =
+      arena.currentUpPositionReplayObservedCount;
+  frame.arenaCurrentUpPositionReplayEligibleCount =
+      arena.currentUpPositionReplayEligibleCount;
+  frame.arenaCurrentUpPositionReplayWouldAvoidBytes =
+      arena.currentUpPositionReplayWouldAvoidBytes;
+  frame.arenaCurrentUpPositionReplayConsumedCount =
+      arena.currentUpPositionReplayConsumedCount;
+  frame.arenaCurrentUpPositionReplayAvoidedBytes =
+      arena.currentUpPositionReplayAvoidedBytes;
   const auto cpuSpan =
       dxvk::war3::memory::QueryWar3CpuReadableSpanDiagnostics();
   frame.exactIndexDomainScannedBytes =
@@ -683,8 +982,14 @@ void RecordGpuFlightFrame(uint64_t frameSerial) {
         frame.arenaAdmissionRejectedCount;
     s_shadowArenaLastPartialTransactionCount =
         frame.arenaPartialTransactionCount;
+    const bool terminalQueueFailure =
+        frame.queueResult == VK_ERROR_DEVICE_LOST;
+    // A terminal device-lost incident belongs exclusively to the D3D owner.
+    // The flight poll may observe it first, but must not consume its base or
+    // device-fault enrichment latches with a partial snapshot.
     const bool queueIncident =
-        (queueFailed || queueStalled) && !s_gpuIncidentLatched;
+        !terminalQueueFailure && (queueFailed || queueStalled) &&
+        !s_gpuIncidentLatched;
     const bool arenaIncident =
         (arenaOverflow || arenaAdmissionRejected || arenaPartial) &&
         !s_shadowArenaIncidentLatched;
@@ -694,9 +999,10 @@ void RecordGpuFlightFrame(uint64_t frameSerial) {
       if (arenaIncident)
         s_shadowArenaIncidentLatched = true;
       incident.timestampMs = frame.timestampMs;
-      if (queueFailed)
+      incident.firstErrorOrigin = "gpu-flight-poll";
+      if (queueIncident && queueFailed)
         incident.reason = "queue-error";
-      else if (queueStalled)
+      else if (queueIncident && queueStalled)
         incident.reason = "gpu-no-progress-10s";
       else if (arenaPartial)
         incident.reason = "shadow-arena-partial-transaction";
@@ -1002,6 +1308,31 @@ War3RuntimeStatusShadowSnapshot BuildShadowSnapshot() {
   summary.shadowArenaResidentBytes = arenaDiagnostics.residentBytes;
   summary.shadowArenaResidentLimitBytes =
       arenaDiagnostics.residentLimitBytes;
+  summary.shadowArenaFixedResidentLimitBytes =
+      arenaDiagnostics.fixedResidentLimitBytes;
+  summary.shadowArenaMemoryHeapSizeBytes =
+      arenaDiagnostics.memoryHeapSizeBytes;
+  summary.shadowArenaMemoryBudgetBytes =
+      arenaDiagnostics.memoryBudgetBytes;
+  summary.shadowArenaMemoryAllocatedBytes =
+      arenaDiagnostics.memoryAllocatedBytes;
+  summary.shadowArenaMemoryAvailableBytes =
+      arenaDiagnostics.memoryAvailableBytes;
+  summary.shadowArenaProportionalLimitBytes =
+      arenaDiagnostics.proportionalLimitBytes;
+  summary.shadowArenaReserveLimitBytes =
+      arenaDiagnostics.reserveLimitBytes;
+  summary.shadowArenaBudgetRefreshCount =
+      arenaDiagnostics.budgetRefreshCount;
+  summary.shadowArenaBudgetGrowthRejectCount =
+      arenaDiagnostics.budgetGrowthRejectCount;
+  summary.shadowArenaBudgetSnapshotFrameSerial =
+      arenaDiagnostics.budgetSnapshotFrameSerial;
+  summary.shadowArenaPrimaryHeapIndex = arenaDiagnostics.primaryHeapIndex;
+  summary.shadowArenaMemoryBudgetSupported =
+      arenaDiagnostics.memoryBudgetSupported;
+  summary.shadowArenaMemoryBudgetTrusted =
+      arenaDiagnostics.memoryBudgetTrusted;
   summary.shadowArenaGeneration = arenaDiagnostics.generation;
   summary.shadowArenaQuarantineCount = arenaDiagnostics.quarantineCount;
   summary.shadowArenaLastQuarantinedGeneration =
@@ -1038,6 +1369,36 @@ War3RuntimeStatusShadowSnapshot BuildShadowSnapshot() {
       arenaDiagnostics.exactIndexTrimRejectedCount;
   summary.shadowArenaExactIndexTrimBytesSaved =
       arenaDiagnostics.exactIndexTrimBytesSaved;
+  summary.shadowArenaCoherentUpTrimObservedCount =
+      arenaDiagnostics.coherentUpTrimObservedCount;
+  summary.shadowArenaCoherentUpTrimEligibleCount =
+      arenaDiagnostics.coherentUpTrimEligibleCount;
+  summary.shadowArenaCoherentUpTrimWouldSaveBytes =
+      arenaDiagnostics.coherentUpTrimWouldSaveBytes;
+  summary.shadowArenaCoherentUpTrimConsumedCount =
+      arenaDiagnostics.coherentUpTrimConsumedCount;
+  summary.shadowArenaCoherentUpTrimConsumedBytesSaved =
+      arenaDiagnostics.coherentUpTrimConsumedBytesSaved;
+  summary.shadowArenaCoherentRealTrimObservedCount =
+      arenaDiagnostics.coherentRealTrimObservedCount;
+  summary.shadowArenaCoherentRealTrimEligibleCount =
+      arenaDiagnostics.coherentRealTrimEligibleCount;
+  summary.shadowArenaCoherentRealTrimWouldSaveBytes =
+      arenaDiagnostics.coherentRealTrimWouldSaveBytes;
+  summary.shadowArenaCoherentRealTrimConsumedCount =
+      arenaDiagnostics.coherentRealTrimConsumedCount;
+  summary.shadowArenaCoherentRealTrimConsumedBytesSaved =
+      arenaDiagnostics.coherentRealTrimConsumedBytesSaved;
+  summary.shadowArenaCurrentUpPositionReplayObservedCount =
+      arenaDiagnostics.currentUpPositionReplayObservedCount;
+  summary.shadowArenaCurrentUpPositionReplayEligibleCount =
+      arenaDiagnostics.currentUpPositionReplayEligibleCount;
+  summary.shadowArenaCurrentUpPositionReplayWouldAvoidBytes =
+      arenaDiagnostics.currentUpPositionReplayWouldAvoidBytes;
+  summary.shadowArenaCurrentUpPositionReplayConsumedCount =
+      arenaDiagnostics.currentUpPositionReplayConsumedCount;
+  summary.shadowArenaCurrentUpPositionReplayAvoidedBytes =
+      arenaDiagnostics.currentUpPositionReplayAvoidedBytes;
   summary.shadowArenaFrameIncomplete = arenaDiagnostics.frameIncomplete;
   const auto cpuSpanDiagnostics =
       dxvk::war3::memory::QueryWar3CpuReadableSpanDiagnostics();
@@ -1913,6 +2274,57 @@ War3RuntimeStatusShadowSnapshot BuildShadowSnapshot() {
       bridgeSummary.semanticSceneShadowMapDrawnCasters;
   summary.semanticSceneShadowMapCascadeCulledCount =
       bridgeSummary.semanticSceneShadowMapCascadeCulledCount;
+  summary.producerSealFrameSerial = bridgeSummary.producerSealFrameSerial;
+  summary.producerSealMapEpoch = bridgeSummary.producerSealMapEpoch;
+  summary.producerSealDeviceEpoch = bridgeSummary.producerSealDeviceEpoch;
+  summary.producerRequiredCasterOmissionCount =
+      bridgeSummary.producerRequiredCasterOmissionCount;
+  summary.producerExactBudgetDeferredUniqueCasterCount =
+      bridgeSummary.producerExactBudgetDeferredUniqueCasterCount;
+  summary.producerPositionAllocBudgetCount =
+      bridgeSummary.producerPositionAllocBudgetCount;
+  summary.producerUvAllocBudgetCount =
+      bridgeSummary.producerUvAllocBudgetCount;
+  summary.producerIndexAllocBudgetCount =
+      bridgeSummary.producerIndexAllocBudgetCount;
+  summary.producerAllocationFailureCount =
+      bridgeSummary.producerAllocationFailureCount;
+  summary.producerFallbackByteBudgetCount =
+      bridgeSummary.producerFallbackByteBudgetCount;
+  summary.producerArenaAdmissionCount =
+      bridgeSummary.producerArenaAdmissionCount;
+  summary.producerFreezeFailureCount =
+      bridgeSummary.producerFreezeFailureCount;
+  summary.producerSoftPriorityBudgetCount =
+      bridgeSummary.producerSoftPriorityBudgetCount;
+  summary.producerCompletenessReasonMask =
+      bridgeSummary.producerCompletenessReasonMask;
+  summary.producerCompletenessSealed =
+      bridgeSummary.producerCompletenessSealed;
+  summary.producerCompletenessCounterOverflow =
+      bridgeSummary.producerCompletenessCounterOverflow;
+  summary.drawTimeVBCacheStaticLiveBytes =
+      bridgeSummary.drawTimeVBCacheStaticLiveBytes;
+  summary.drawTimeVBCacheStaticProtectedBytes =
+      bridgeSummary.drawTimeVBCacheStaticProtectedBytes;
+  summary.drawTimeVBCacheStaticOverCapBytes =
+      bridgeSummary.drawTimeVBCacheStaticOverCapBytes;
+  summary.drawTimeVBCacheStaticOverCapFrameCount =
+      bridgeSummary.drawTimeVBCacheStaticOverCapFrameCount;
+  summary.drawTimeVBCacheStaticEvictedBytes =
+      bridgeSummary.drawTimeVBCacheStaticEvictedBytes;
+  summary.drawTimeVBCacheStaticEvictedEntryCount =
+      bridgeSummary.drawTimeVBCacheStaticEvictedEntryCount;
+  summary.drawTimeVBCacheIndexedUnknownRangeFallbackCount =
+      bridgeSummary.drawTimeVBCacheIndexedUnknownRangeFallbackCount;
+  summary.drawTimeGenerationBackedPositionReuseCount =
+      bridgeSummary.drawTimeGenerationBackedPositionReuseCount;
+  summary.drawTimeGenerationBackedUvReuseCount =
+      bridgeSummary.drawTimeGenerationBackedUvReuseCount;
+  summary.drawTimeGenerationBackedIndexReuseCount =
+      bridgeSummary.drawTimeGenerationBackedIndexReuseCount;
+  summary.drawTimeGenerationBackedCopyBytesSaved =
+      bridgeSummary.drawTimeGenerationBackedCopyBytesSaved;
   summary.semanticSceneTerrainBoundsCullMode =
       bridgeSummary.semanticSceneTerrainBoundsCullMode;
   summary.semanticSceneTerrainBoundsCandidateCount =
@@ -3299,6 +3711,32 @@ json BuildRuntimeStatusJson(const War3RuntimeStatusSnapshot& snapshot) {
         {"shadowArenaResidentBytes", snapshot.shadow.shadowArenaResidentBytes},
         {"shadowArenaResidentLimitBytes",
          snapshot.shadow.shadowArenaResidentLimitBytes},
+        {"shadowArenaFixedResidentLimitBytes",
+         snapshot.shadow.shadowArenaFixedResidentLimitBytes},
+        {"shadowArenaMemoryHeapSizeBytes",
+         snapshot.shadow.shadowArenaMemoryHeapSizeBytes},
+        {"shadowArenaMemoryBudgetBytes",
+         snapshot.shadow.shadowArenaMemoryBudgetBytes},
+        {"shadowArenaMemoryAllocatedBytes",
+         snapshot.shadow.shadowArenaMemoryAllocatedBytes},
+        {"shadowArenaMemoryAvailableBytes",
+         snapshot.shadow.shadowArenaMemoryAvailableBytes},
+        {"shadowArenaProportionalLimitBytes",
+         snapshot.shadow.shadowArenaProportionalLimitBytes},
+        {"shadowArenaReserveLimitBytes",
+         snapshot.shadow.shadowArenaReserveLimitBytes},
+        {"shadowArenaBudgetRefreshCount",
+         snapshot.shadow.shadowArenaBudgetRefreshCount},
+        {"shadowArenaBudgetGrowthRejectCount",
+         snapshot.shadow.shadowArenaBudgetGrowthRejectCount},
+        {"shadowArenaBudgetSnapshotFrameSerial",
+         snapshot.shadow.shadowArenaBudgetSnapshotFrameSerial},
+        {"shadowArenaPrimaryHeapIndex",
+         snapshot.shadow.shadowArenaPrimaryHeapIndex},
+        {"shadowArenaMemoryBudgetSupported",
+         snapshot.shadow.shadowArenaMemoryBudgetSupported},
+        {"shadowArenaMemoryBudgetTrusted",
+         snapshot.shadow.shadowArenaMemoryBudgetTrusted},
         {"shadowArenaGeneration", snapshot.shadow.shadowArenaGeneration},
         {"shadowArenaQuarantineCount",
          snapshot.shadow.shadowArenaQuarantineCount},
@@ -3340,6 +3778,36 @@ json BuildRuntimeStatusJson(const War3RuntimeStatusSnapshot& snapshot) {
          snapshot.shadow.shadowArenaExactIndexTrimRejectedCount},
         {"shadowArenaExactIndexTrimBytesSaved",
          snapshot.shadow.shadowArenaExactIndexTrimBytesSaved},
+        {"shadowArenaCoherentUpTrimObservedCount",
+         snapshot.shadow.shadowArenaCoherentUpTrimObservedCount},
+        {"shadowArenaCoherentUpTrimEligibleCount",
+         snapshot.shadow.shadowArenaCoherentUpTrimEligibleCount},
+        {"shadowArenaCoherentUpTrimWouldSaveBytes",
+         snapshot.shadow.shadowArenaCoherentUpTrimWouldSaveBytes},
+        {"shadowArenaCoherentUpTrimConsumedCount",
+         snapshot.shadow.shadowArenaCoherentUpTrimConsumedCount},
+        {"shadowArenaCoherentUpTrimConsumedBytesSaved",
+         snapshot.shadow.shadowArenaCoherentUpTrimConsumedBytesSaved},
+        {"shadowArenaCoherentRealTrimObservedCount",
+         snapshot.shadow.shadowArenaCoherentRealTrimObservedCount},
+        {"shadowArenaCoherentRealTrimEligibleCount",
+         snapshot.shadow.shadowArenaCoherentRealTrimEligibleCount},
+        {"shadowArenaCoherentRealTrimWouldSaveBytes",
+         snapshot.shadow.shadowArenaCoherentRealTrimWouldSaveBytes},
+        {"shadowArenaCoherentRealTrimConsumedCount",
+         snapshot.shadow.shadowArenaCoherentRealTrimConsumedCount},
+        {"shadowArenaCoherentRealTrimConsumedBytesSaved",
+         snapshot.shadow.shadowArenaCoherentRealTrimConsumedBytesSaved},
+        {"shadowArenaCurrentUpPositionReplayObservedCount",
+         snapshot.shadow.shadowArenaCurrentUpPositionReplayObservedCount},
+        {"shadowArenaCurrentUpPositionReplayEligibleCount",
+         snapshot.shadow.shadowArenaCurrentUpPositionReplayEligibleCount},
+        {"shadowArenaCurrentUpPositionReplayWouldAvoidBytes",
+         snapshot.shadow.shadowArenaCurrentUpPositionReplayWouldAvoidBytes},
+        {"shadowArenaCurrentUpPositionReplayConsumedCount",
+         snapshot.shadow.shadowArenaCurrentUpPositionReplayConsumedCount},
+        {"shadowArenaCurrentUpPositionReplayAvoidedBytes",
+         snapshot.shadow.shadowArenaCurrentUpPositionReplayAvoidedBytes},
         {"shadowArenaFrameIncomplete",
          snapshot.shadow.shadowArenaFrameIncomplete},
         {"shadowCpuSpanAcceptedCount",
@@ -3658,6 +4126,83 @@ void SetGpuFlightBreadcrumb(
   s_gpuFlightBreadcrumb.store(
       static_cast<uint32_t>(breadcrumb), std::memory_order_release);
   s_gpuFlightBreadcrumbSerial.fetch_add(1u, std::memory_order_acq_rel);
+}
+
+void NotifyGpuDeviceLostFailStop(
+    const char* origin,
+    const ::dxvk::DxvkDeviceFaultSnapshot& deviceFault) noexcept {
+  try {
+    GpuIncidentSnapshot incident = {};
+    bool writeIncident = false;
+    {
+      std::lock_guard<std::mutex> lock(s_gpuFlightMutex);
+      const bool captureFinal =
+          deviceFault.captureState ==
+              ::dxvk::DxvkDeviceFaultCaptureState::Disabled ||
+          deviceFault.captureState ==
+              ::dxvk::DxvkDeviceFaultCaptureState::Complete;
+
+      // Terminal loss has independent base and enrichment gates. A prior
+      // recoverable queue incident must never suppress either record.
+      if (!s_gpuDeviceLostIncidentLatched) {
+        s_gpuDeviceLostIncidentLatched = true;
+        s_gpuDeviceLostBaseTimestampMs = EpochMilliseconds();
+        s_gpuDeviceLostFirstErrorOrigin =
+            origin != nullptr ? origin : "unknown";
+        incident.timestampMs = s_gpuDeviceLostBaseTimestampMs;
+        incident.deviceLossBaseTimestampMs = s_gpuDeviceLostBaseTimestampMs;
+        incident.reason = "queue-error-device-lost-fail-stop";
+        incident.firstErrorOrigin = s_gpuDeviceLostFirstErrorOrigin;
+        incident.queueResult = VK_ERROR_DEVICE_LOST;
+        incident.deviceFault = deviceFault;
+        s_gpuDeviceLostDeviceFaultEnrichmentLatched = captureFinal;
+        writeIncident = true;
+      } else if (!s_gpuDeviceLostDeviceFaultEnrichmentLatched &&
+                 deviceFault.captureState ==
+                     ::dxvk::DxvkDeviceFaultCaptureState::Complete) {
+        s_gpuDeviceLostDeviceFaultEnrichmentLatched = true;
+        incident.timestampMs = EpochMilliseconds();
+        incident.deviceLossBaseTimestampMs = s_gpuDeviceLostBaseTimestampMs;
+        incident.reason = "queue-error-device-lost-device-fault-enrichment";
+        incident.firstErrorOrigin = s_gpuDeviceLostFirstErrorOrigin;
+        incident.queueResult = VK_ERROR_DEVICE_LOST;
+        incident.deviceFault = deviceFault;
+        writeIncident = true;
+      }
+
+      if (!writeIncident)
+        return;
+
+      incident.recentFrames.assign(
+          s_gpuFlightFrames.begin(), s_gpuFlightFrames.end());
+
+      // Add a terminal record from atomics only. Do not query the active D3D9
+      // device here: callers may already hold its lock while observing the
+      // first error, and diagnostics must not re-enter that lock.
+      GpuFlightFrame terminal = {};
+      terminal.timestampMs = incident.timestampMs;
+      terminal.lastRenderStage = GpuFlightBreadcrumbName(
+          static_cast<GpuFlightBreadcrumb>(
+              s_gpuFlightBreadcrumb.load(std::memory_order_acquire)));
+      terminal.breadcrumbSerial =
+          s_gpuFlightBreadcrumbSerial.load(std::memory_order_acquire);
+      terminal.activeCsmCascade =
+          s_gpuFlightActiveCsmCascade.load(std::memory_order_acquire);
+      terminal.activePointLight =
+          s_gpuFlightActivePointLight.load(std::memory_order_acquire);
+      terminal.activePointFace =
+          s_gpuFlightActivePointFace.load(std::memory_order_acquire);
+      terminal.queueResult = VK_ERROR_DEVICE_LOST;
+      incident.recentFrames.push_back(std::move(terminal));
+      if (incident.recentFrames.size() > 240u)
+        incident.recentFrames.erase(incident.recentFrames.begin());
+    }
+
+    WriteGpuIncidentSnapshot(incident);
+  } catch (...) {
+    // Device-loss handling must remain fail-stop even if incident output is
+    // unavailable or serialization itself fails.
+  }
 }
 
 void ResetGpuFlightCsmWork() noexcept {

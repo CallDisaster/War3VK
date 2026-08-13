@@ -14,6 +14,7 @@
 #include "../core/war3_memory.h"
 #include "../../d3d9_war3_debug.h"
 #include "../../util/util_env.h"
+#include "../../../util/util_small_vector.h"
 
 #include <algorithm>
 #include <array>
@@ -1078,9 +1079,9 @@ bool TryResolveResourceOwnerWorldPose(const ShadowRenderableRecord& renderable,
   outRuntimeModelPtr = nullptr;
   outPose = {};
 
-  model::ShadowModelResourceRecord runtimeOwner = {};
+  model::ShadowRuntimeModelOwnerBinding runtimeOwner = {};
   auto& resourceCache = model::ShadowModelResourceCache::instance();
-  if (resourceCache.findRuntimeModelOwner(
+  if (resourceCache.findRuntimeModelOwnerBinding(
           renderable.runtimeGeosetPtr, renderable.runtimeGeosetDataPtr,
           renderable.geosetIndex, renderable.modelResourcePtr, runtimeOwner) &&
       runtimeOwner.runtimeModelPtr != nullptr &&
@@ -1106,8 +1107,8 @@ void* TryResolveDirectModelResourceFromRuntimeModel(void* runtimeModelPtr) {
 
   auto& resourceCache = model::ShadowModelResourceCache::instance();
 
-  model::ShadowModelResourceRecord runtimeResource = {};
-  if (resourceCache.findRuntimeModelResource(runtimeModelPtr, runtimeResource) &&
+  model::ShadowRuntimeModelOwnerBinding runtimeResource = {};
+  if (resourceCache.findRuntimeModelBinding(runtimeModelPtr, runtimeResource) &&
       runtimeResource.modelResourcePtr != nullptr) {
     if (void* directModelResourcePtr =
             resourceCache.resolveDirectModelResourcePtr(
@@ -1324,13 +1325,12 @@ void CollectRenderableRuntimeModelRoots(const ShadowRenderableRecord& renderable
                                         std::vector<void*>& outRuntimeModels) {
   outRuntimeModels.clear();
 
-  model::ShadowModelResourceRecord runtimeOwner = {};
+  model::ShadowRuntimeModelOwnerBinding runtimeOwner = {};
   auto& resourceCache = model::ShadowModelResourceCache::instance();
-  if (resourceCache.findRuntimeModelOwner(renderable.runtimeGeosetPtr,
-                                          renderable.runtimeGeosetDataPtr,
-                                          renderable.geosetIndex,
-                                          renderable.modelResourcePtr,
-                                          runtimeOwner)) {
+  if (resourceCache.findRuntimeModelOwnerBinding(
+          renderable.runtimeGeosetPtr, renderable.runtimeGeosetDataPtr,
+          renderable.geosetIndex, renderable.modelResourcePtr,
+          runtimeOwner)) {
     AppendDistinctRuntimeModelPtrTrusted(outRuntimeModels,
                                          runtimeOwner.runtimeModelPtr);
   }
@@ -1497,8 +1497,15 @@ struct MeshLayerBindingContract {
   }
 };
 
+enum class MeshLayerBindingResolveExtent : uint8_t {
+  MaterialSignature,
+  Full,
+};
+
 bool TryResolveMeshLayerBindingContract(const ShadowRenderableRecord& renderable,
-                                        MeshLayerBindingContract& out);
+                                        MeshLayerBindingContract& out,
+                                        MeshLayerBindingResolveExtent extent =
+                                            MeshLayerBindingResolveExtent::Full);
 
 ShadowAlphaMode ResolveShadowAlphaMode(
     const ShadowRenderableRecord& renderable,
@@ -1584,7 +1591,9 @@ ShadowMaterialSignature BuildShadowMaterialSignatureForRenderable(
     const ShadowRenderableRecord& renderable) {
   MeshLayerBindingContract layerContract = {};
   const bool hasLayerContract =
-      TryResolveMeshLayerBindingContract(renderable, layerContract);
+      TryResolveMeshLayerBindingContract(
+          renderable, layerContract,
+          MeshLayerBindingResolveExtent::MaterialSignature);
   return BuildShadowMaterialSignature(renderable,
                                       hasLayerContract ? &layerContract : nullptr);
 }
@@ -1594,7 +1603,9 @@ bool InspectShadowMaterialBindingForRenderable(
     ShadowMaterialBindingDiagnostics& out) {
   out = {};
   MeshLayerBindingContract layerContract = {};
-  if (!TryResolveMeshLayerBindingContract(renderable, layerContract))
+  if (!TryResolveMeshLayerBindingContract(
+          renderable, layerContract,
+          MeshLayerBindingResolveExtent::MaterialSignature))
     return false;
 
   out.resolved = true;
@@ -1626,6 +1637,9 @@ struct DynamicAuxStreamCandidate {
   int auxEntryIndex = -1;
 };
 
+using DynamicAuxStreamCandidates =
+    small_vector<DynamicAuxStreamCandidate, 16u>;
+
 template <size_t N>
 std::array<uint32_t, 10> MakeDynamicAuxStrideHints(
     const std::array<uint32_t, N>& seeds) {
@@ -1653,7 +1667,7 @@ std::array<uint32_t, 10> MakeDynamicAuxStrideHints(
   return hints;
 }
 
-void AppendDynamicAuxCandidate(std::vector<DynamicAuxStreamCandidate>& candidates,
+void AppendDynamicAuxCandidate(DynamicAuxStreamCandidates& candidates,
                                const void* ptr,
                                const std::array<uint32_t, 10>& strides,
                                bool usesPrimaryStream,
@@ -1740,11 +1754,10 @@ bool TryReadAuxStreamSample(uintptr_t rawPtr, uint32_t sampleIndex,
   return true;
 }
 
-std::vector<DynamicAuxStreamCandidate> CollectDynamicAuxStreamCandidates(
+DynamicAuxStreamCandidates CollectDynamicAuxStreamCandidates(
     const ShadowRenderableRecord& renderable,
     const MeshLayerBindingContract* layerContract) {
-  std::vector<DynamicAuxStreamCandidate> candidates;
-  candidates.reserve(12u);
+  DynamicAuxStreamCandidates candidates;
 
   if (renderable.meshData == nullptr ||
       ShouldSkipLegacyMeshDataDecode(renderable))
@@ -1893,7 +1906,8 @@ std::vector<DynamicAuxStreamCandidate> CollectDynamicAuxStreamCandidates(
 }
 
 bool TryResolveMeshLayerBindingContract(const ShadowRenderableRecord& renderable,
-                                        MeshLayerBindingContract& out) {
+                                        MeshLayerBindingContract& out,
+                                        MeshLayerBindingResolveExtent extent) {
   out = {};
 
   if (renderable.queueKind != render::VisibleRenderableQueueKind::MainQueue ||
@@ -2045,6 +2059,14 @@ bool TryResolveMeshLayerBindingContract(const ShadowRenderableRecord& renderable
   dxvk::war3::SafeReadU32Fast(dispatchPtr,
                               dxvk::war3::MeshLayerDispatchRecordOffsets::StageMode1,
                               out.stageMode1);
+
+  // Material identity ends at the canonical layer/dispatch record. Resolving
+  // the auxiliary stream table is substantially more expensive (and may walk
+  // multiple guarded game-memory ranges), while none of those stream pointers
+  // or snapshots participate in BuildShadowMaterialSignature. Full geometry
+  // consumers still use the default Full extent below.
+  if (extent == MeshLayerBindingResolveExtent::MaterialSignature)
+    return true;
 
   void* auxTable = nullptr;
   if (!dxvk::war3::SafeReadPtrFast(renderable.meshData,
@@ -2381,7 +2403,7 @@ bool TryAugmentRenderableSemanticRecovery(ShadowRenderableRecord& renderable) {
     changed = true;
   }
 
-  model::ShadowModelResourceRecord runtimeOwnerResource = {};
+  model::ShadowRuntimeModelOwnerBinding runtimeOwnerResource = {};
   auto& resourceCache = model::ShadowModelResourceCache::instance();
   const bool needsRuntimeOwnerResource =
       (renderable.runtimeModelPtr == nullptr ||
@@ -2389,7 +2411,7 @@ bool TryAugmentRenderableSemanticRecovery(ShadowRenderableRecord& renderable) {
       (renderable.runtimeGeosetPtr != nullptr ||
        renderable.runtimeGeosetDataPtr != nullptr);
   if (needsRuntimeOwnerResource &&
-      resourceCache.findRuntimeModelOwner(
+      resourceCache.findRuntimeModelOwnerBinding(
           renderable.runtimeGeosetPtr, renderable.runtimeGeosetDataPtr,
           renderable.geosetIndex, renderable.modelResourcePtr,
           runtimeOwnerResource) &&
@@ -2752,13 +2774,12 @@ bool TryResolveBestPoseForRenderable(const ShadowRenderableRecord& renderable,
     if (!hit &&
         (renderable.runtimeGeosetPtr != nullptr ||
          renderable.runtimeGeosetDataPtr != nullptr)) {
-      model::ShadowModelResourceRecord runtimeOwner = {};
+      model::ShadowRuntimeModelOwnerBinding runtimeOwner = {};
       auto& resourceCache = model::ShadowModelResourceCache::instance();
-      if (resourceCache.findRuntimeModelOwner(renderable.runtimeGeosetPtr,
-                                              renderable.runtimeGeosetDataPtr,
-                                              renderable.geosetIndex,
-                                              renderable.modelResourcePtr,
-                                              runtimeOwner) &&
+      if (resourceCache.findRuntimeModelOwnerBinding(
+              renderable.runtimeGeosetPtr, renderable.runtimeGeosetDataPtr,
+              renderable.geosetIndex, renderable.modelResourcePtr,
+              runtimeOwner) &&
           runtimeOwner.runtimeModelPtr != nullptr &&
           TryResolvePoseByRuntimeModelSnapshotOnly(
               poses, runtimeOwner.runtimeModelPtr, candidate)) {
@@ -3722,13 +3743,12 @@ bool TryResolveAttachmentRigidRecord(
       ioStats->attachmentRigidMatchByRootRuntimeGeoset++;
     return true;
   }
-  model::ShadowModelResourceRecord runtimeOwner = {};
+  model::ShadowRuntimeModelOwnerBinding runtimeOwner = {};
   auto& resourceCache = model::ShadowModelResourceCache::instance();
-  if (resourceCache.findRuntimeModelOwner(renderable.runtimeGeosetPtr,
-                                          renderable.runtimeGeosetDataPtr,
-                                          renderable.geosetIndex,
-                                          renderable.modelResourcePtr,
-                                          runtimeOwner) &&
+  if (resourceCache.findRuntimeModelOwnerBinding(
+          renderable.runtimeGeosetPtr, renderable.runtimeGeosetDataPtr,
+          renderable.geosetIndex, renderable.modelResourcePtr,
+          runtimeOwner) &&
       runtimeOwner.runtimeModelPtr != nullptr &&
       TryResolveAttachmentFromRuntimeOwnerHint(runtimeOwner.runtimeModelPtr,
                                                attachments, outRecord)) {
@@ -3866,8 +3886,8 @@ bool MightResolveAttachmentRigidRecord(
       attachments.findByHandle(renderable.jHandle, probe))
     return true;
 
-  model::ShadowModelResourceRecord runtimeOwner = {};
-  if (model::ShadowModelResourceCache::instance().findRuntimeModelOwner(
+  model::ShadowRuntimeModelOwnerBinding runtimeOwner = {};
+  if (model::ShadowModelResourceCache::instance().findRuntimeModelOwnerBinding(
           renderable.runtimeGeosetPtr, renderable.runtimeGeosetDataPtr,
           renderable.geosetIndex, renderable.modelResourcePtr, runtimeOwner) &&
       runtimeOwner.runtimeModelPtr != nullptr &&
@@ -4842,6 +4862,10 @@ struct PendingCompactRemapNode {
   uint32_t depth = 0u;
 };
 
+using CompactRemapSpanTables = small_vector<CompactRemapSpanTable, 32u>;
+using PendingCompactRemapNodes = small_vector<PendingCompactRemapNode, 32u>;
+using StagePresetBaseBiasCandidates = small_vector<uint32_t, 4u>;
+
 constexpr uint32_t kMaxCompactRemapDepth = 4u;
 constexpr uint32_t kMaxCompactRemapCandidates = 32u;
 constexpr uint32_t kMaxCompactRemapInlineScan = 0x60u;
@@ -4894,10 +4918,10 @@ int ScoreCompactRemapTableForExplicitBlend(
   return score;
 }
 
-std::vector<CompactRemapSpanTable> MakePrioritizedCompactRemapTables(
-    const std::vector<CompactRemapSpanTable>& remapTables,
+CompactRemapSpanTables MakePrioritizedCompactRemapTables(
+    const CompactRemapSpanTables& remapTables,
     const MeshLayerBindingContract* layerContract) {
-  std::vector<CompactRemapSpanTable> prioritized = remapTables;
+  CompactRemapSpanTables prioritized = remapTables;
   std::stable_sort(
       prioritized.begin(), prioritized.end(),
       [&](const CompactRemapSpanTable& a, const CompactRemapSpanTable& b) {
@@ -4907,9 +4931,9 @@ std::vector<CompactRemapSpanTable> MakePrioritizedCompactRemapTables(
   return prioritized;
 }
 
-std::vector<uint32_t> CollectStagePresetBaseBiasCandidates(
+StagePresetBaseBiasCandidates CollectStagePresetBaseBiasCandidates(
     const MeshLayerBindingContract* layerContract, uint32_t posePaletteLimit) {
-  std::vector<uint32_t> out;
+  StagePresetBaseBiasCandidates out;
   if (layerContract == nullptr || posePaletteLimit == 0u)
     return out;
 
@@ -4954,12 +4978,10 @@ void SortCompactSlots(std::array<uint8_t, 4>& slots, uint32_t count) {
   }
 }
 
-std::vector<CompactRemapSpanTable> CollectCompactRemapSpanTables(
+CompactRemapSpanTables CollectCompactRemapSpanTables(
     const MeshLayerBindingContract* layerContract) {
-  std::vector<CompactRemapSpanTable> out;
-  out.reserve(16u);
-  std::vector<PendingCompactRemapNode> pending;
-  pending.reserve(24u);
+  CompactRemapSpanTables out;
+  PendingCompactRemapNodes pending;
 
   auto appendUnique = [&](const CompactRemapSpanTable& candidate) {
     if (candidate.table == nullptr || candidate.span < 2u)
@@ -5430,7 +5452,7 @@ bool TryBuildOrderedTupleSlotsWithSpanRemapWindowAndBaseBias(
 }
 
 bool TryBuildPackedTupleKeyWithAnySpanRemap(
-    const uint8_t raw[4], const std::vector<CompactRemapSpanTable>& remapTables,
+    const uint8_t raw[4], const CompactRemapSpanTables& remapTables,
     uint32_t posePaletteLimit, uint32_t maxExpectedGroupSize,
     std::array<uint8_t, 4>& outSlots, uint32_t& outCount) {
   for (const auto& remap : remapTables) {
@@ -5444,7 +5466,7 @@ bool TryBuildPackedTupleKeyWithAnySpanRemap(
 }
 
 bool TryBuildPackedTupleKeyWithAnySpanRemapAndBaseBias(
-    const uint8_t raw[4], const std::vector<CompactRemapSpanTable>& remapTables,
+    const uint8_t raw[4], const CompactRemapSpanTables& remapTables,
     uint32_t baseBias, uint32_t posePaletteLimit,
     uint32_t maxExpectedGroupSize, std::array<uint8_t, 4>& outSlots,
     uint32_t& outCount) {
@@ -5461,7 +5483,7 @@ bool TryBuildPackedTupleKeyWithAnySpanRemapAndBaseBias(
 }
 
 bool TryBuildOrderedTupleSlotsWithAnySpanRemap(
-    const uint8_t raw[4], const std::vector<CompactRemapSpanTable>& remapTables,
+    const uint8_t raw[4], const CompactRemapSpanTables& remapTables,
     uint32_t posePaletteLimit, uint32_t maxExpectedGroupSize,
     std::array<uint8_t, 4>& outSlots, uint32_t& outCount) {
   for (const auto& remap : remapTables) {
@@ -5475,7 +5497,7 @@ bool TryBuildOrderedTupleSlotsWithAnySpanRemap(
 }
 
 bool TryBuildOrderedTupleSlotsWithAnySpanRemapAndBaseBias(
-    const uint8_t raw[4], const std::vector<CompactRemapSpanTable>& remapTables,
+    const uint8_t raw[4], const CompactRemapSpanTables& remapTables,
     uint32_t baseBias, uint32_t posePaletteLimit,
     uint32_t maxExpectedGroupSize, std::array<uint8_t, 4>& outSlots,
     uint32_t& outCount) {
@@ -5733,7 +5755,7 @@ bool TryResolveMeshDynamicPackedRuntimeGroups(
   const auto remapTables = MakePrioritizedCompactRemapTables(
       CollectCompactRemapSpanTables(layerContract), layerContract);
   const bool hasRemapTable = !remapTables.empty();
-  std::vector<uint32_t> stagePresetBaseBiases = {0u};
+  StagePresetBaseBiasCandidates stagePresetBaseBiases = {0u};
   for (uint32_t baseBias :
        CollectStagePresetBaseBiasCandidates(layerContract, posePaletteLimit)) {
     stagePresetBaseBiases.push_back(baseBias);
@@ -5934,9 +5956,20 @@ bool TryResolveMeshDynamicPackedRuntimeGroups(
 bool TryResolveMeshDynamicExplicitBlendSkinning(
     const ShadowRenderableRecord& renderable, uint32_t vertexCount,
     uint32_t posePaletteLimit, uint32_t maxExpectedGroupSize,
-    const ShadowPoseRecord& pose, const MeshLayerBindingContract* layerContract,
+    ShadowMatrixPaletteView posePalette,
+    bool materializeRuntimeGroupPalette,
+    const MeshLayerBindingContract* layerContract,
     ExplicitBlendSkinResult& outResult, ShadowResolveStats* ioStats = nullptr) {
+  auto weightsScratch = std::move(outResult.weights);
+  auto indicesScratch = std::move(outResult.indices);
+  auto paletteScratch = std::move(outResult.runtimeGroupPalette);
   outResult = {};
+  weightsScratch.clear();
+  indicesScratch.clear();
+  paletteScratch.clear();
+  outResult.weights = std::move(weightsScratch);
+  outResult.indices = std::move(indicesScratch);
+  outResult.runtimeGroupPalette = std::move(paletteScratch);
 
   if (ioStats != nullptr)
     ioStats->explicitBlendAttempts++;
@@ -5945,7 +5978,7 @@ bool TryResolveMeshDynamicExplicitBlendSkinning(
       ShouldSkipLegacyMeshDataDecode(renderable) ||
       layerContract == nullptr ||
       vertexCount == 0u || vertexCount > 200000u || posePaletteLimit == 0u ||
-      pose.matrixPalette.empty() || layerContract->auxStreamPtr0 == 0u ||
+      posePalette.empty() || layerContract->auxStreamPtr0 == 0u ||
       !layerContract->hasAuxStream0) {
     return false;
   }
@@ -5969,7 +6002,7 @@ bool TryResolveMeshDynamicExplicitBlendSkinning(
   const bool hasRemapTable = !remapTables.empty();
   if (hasRemapTable && ioStats != nullptr)
     ioStats->explicitBlendAttemptWithSpanRemapTable++;
-  std::vector<uint32_t> stagePresetBaseBiases = {0u};
+  StagePresetBaseBiasCandidates stagePresetBaseBiases = {0u};
   for (uint32_t baseBias :
        CollectStagePresetBaseBiasCandidates(layerContract, posePaletteLimit)) {
     stagePresetBaseBiases.push_back(baseBias);
@@ -6233,7 +6266,7 @@ bool TryResolveMeshDynamicExplicitBlendSkinning(
   }
 
   if (!valid || explicitBlendCount == 0u ||
-      maxGroupSlot >= pose.matrixPalette.size()) {
+      maxGroupSlot >= posePalette.size) {
     if (ioStats != nullptr)
       ioStats->explicitBlendFinalDecodeMiss++;
     if (SemanticCoreTraceEnabled()) {
@@ -6247,15 +6280,16 @@ bool TryResolveMeshDynamicExplicitBlendSkinning(
           "offset=%u\n",
           renderable.runtimeModelPtr, renderable.meshData,
           renderable.geosetIndex, valid ? 1 : 0, explicitBlendCount,
-          maxGroupSlot, pose.matrixPalette.size(), bestStride, bestOffset);
+          maxGroupSlot, size_t(posePalette.size), bestStride, bestOffset);
       }
     }
     return false;
   }
 
-  outResult.runtimeGroupPalette.assign(
-      pose.matrixPalette.begin(),
-      pose.matrixPalette.begin() + size_t(maxGroupSlot + 1u));
+  if (materializeRuntimeGroupPalette) {
+    outResult.runtimeGroupPalette.assign(
+        posePalette.data, posePalette.data + size_t(maxGroupSlot + 1u));
+  }
   outResult.maxGroupSlot = maxGroupSlot;
   outResult.dynamicHash = bit::fnv1a_iter(
       bit::fnv1a_iter(
@@ -6381,7 +6415,9 @@ bool TryConvertUpperLayerResolvedItem(
   outPacket.pose = ConvertPoseRecord(src.pose, frameSerial);
   MeshLayerBindingContract layerContract = {};
   const bool hasLayerContract =
-      TryResolveMeshLayerBindingContract(outPacket.renderable, layerContract);
+      TryResolveMeshLayerBindingContract(
+          outPacket.renderable, layerContract,
+          MeshLayerBindingResolveExtent::MaterialSignature);
   outPacket.material = BuildShadowMaterialSignature(
       outPacket.renderable, hasLayerContract ? &layerContract : nullptr);
   outPacket.path =
@@ -6970,19 +7006,35 @@ bool TryResolveExplicitBlendSkinningForRenderable(
     uint32_t vertexCount,
     uint32_t posePaletteLimit,
     uint32_t maxExpectedGroupSize,
-    const ShadowPoseRecord& pose,
+    ShadowMatrixPaletteView posePalette,
+    bool materializeRuntimeGroupPalette,
     ShadowExplicitBlendSkinningResult& outResult,
     ShadowResolveStats* ioStats) {
-  outResult = {};
+  ExplicitBlendSkinResult internal = {};
+  internal.weights = std::move(outResult.weights);
+  internal.indices = std::move(outResult.indices);
+  internal.runtimeGroupPalette = std::move(outResult.runtimeGroupPalette);
+  ResetShadowExplicitBlendSkinningResultPreserveScratch(outResult);
+  const auto restoreScratch = [&]() {
+    outResult.weights = std::move(internal.weights);
+    outResult.indices = std::move(internal.indices);
+    outResult.runtimeGroupPalette = std::move(internal.runtimeGroupPalette);
+    outResult.weights.clear();
+    outResult.indices.clear();
+    outResult.runtimeGroupPalette.clear();
+  };
 
   MeshLayerBindingContract layerContract = {};
-  if (!TryResolveMeshLayerBindingContract(renderable, layerContract))
+  if (!TryResolveMeshLayerBindingContract(renderable, layerContract)) {
+    restoreScratch();
     return false;
+  }
 
-  ExplicitBlendSkinResult internal = {};
   if (!TryResolveMeshDynamicExplicitBlendSkinning(
           renderable, vertexCount, posePaletteLimit, maxExpectedGroupSize,
-          pose, &layerContract, internal, ioStats)) {
+          posePalette, materializeRuntimeGroupPalette, &layerContract,
+          internal, ioStats)) {
+    restoreScratch();
     return false;
   }
 
@@ -8393,11 +8445,14 @@ bool ShadowRendererCore::resolveRecord(const ShadowRenderableRecord& record,
           return false;
         }
         ExplicitBlendSkinResult explicitBlendRescue = {};
+        const ShadowMatrixPaletteView explicitPosePalette = {
+            pose.matrixPalette.data(), uint32_t(pose.matrixPalette.size())};
         if (resolvedVertexCountEarly != 0u && hasLayerContract &&
             TryResolveMeshDynamicExplicitBlendSkinning(
                 resolvedRenderable, resolvedVertexCountEarly,
                 uint32_t((std::min)(pose.matrixPalette.size(), size_t(256u))),
-                maxExpectedGroupSize, pose, &layerContract,
+                maxExpectedGroupSize, explicitPosePalette,
+                true, &layerContract,
                 explicitBlendRescue, &ioStats)) {
           outPacket.resource.ownedVertexBlendWeights =
               std::move(explicitBlendRescue.weights);

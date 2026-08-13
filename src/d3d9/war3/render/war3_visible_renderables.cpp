@@ -1057,12 +1057,10 @@ void ResolveGeosetMetadata(VisibleRenderableRecord &record) {
 
 bool ResolveRuntimeOwnerFromGeosetBinding(VisibleRenderableRecord& record) {
   auto& resourceCache = model::ShadowModelResourceCache::instance();
-  model::ShadowModelResourceRecord runtimeOwner = {};
-  if (!resourceCache.findRuntimeModelOwner(record.runtimeGeosetPtr,
-                                           record.runtimeGeosetDataPtr,
-                                           record.geosetIndex,
-                                           record.modelResourcePtr,
-                                           runtimeOwner)) {
+  model::ShadowRuntimeModelOwnerBinding runtimeOwner = {};
+  if (!resourceCache.findRuntimeModelOwnerBinding(
+          record.runtimeGeosetPtr, record.runtimeGeosetDataPtr,
+          record.geosetIndex, record.modelResourcePtr, runtimeOwner)) {
     return false;
   }
 
@@ -1255,7 +1253,7 @@ void ResolveModelMetadata(const RenderObjectIdentitySnapshot &identity,
     outModelResourcePtr =
         TryReadDirectModelResourceFromRuntimeModel(outRuntimeModelPtr);
 
-  model::ShadowModelResourceRecord runtimeResourceRecord = {};
+  model::ShadowRuntimeModelOwnerBinding runtimeResourceRecord = {};
   auto& resourceCache = model::ShadowModelResourceCache::instance();
   auto backfillRuntimeResourceCache = [&]() {
     if (outModelResourcePtr != nullptr) {
@@ -1264,10 +1262,10 @@ void ResolveModelMetadata(const RenderObjectIdentitySnapshot &identity,
     }
 
     if (outRuntimeModelPtr != nullptr) {
-      model::ShadowModelResourceRecord existingRuntimeRecord = {};
+      model::ShadowRuntimeModelOwnerBinding existingRuntimeRecord = {};
       const bool hasExistingRuntimeRecord =
-          resourceCache.findRuntimeModelResource(outRuntimeModelPtr,
-                                                 existingRuntimeRecord);
+          resourceCache.findRuntimeModelBinding(outRuntimeModelPtr,
+                                                existingRuntimeRecord);
       const bool needsRuntimeBackfill =
           !hasExistingRuntimeRecord ||
           (existingRuntimeRecord.modelResourcePtr == nullptr &&
@@ -1280,10 +1278,10 @@ void ResolveModelMetadata(const RenderObjectIdentitySnapshot &identity,
     }
 
     if (outModelResourcePtr != nullptr) {
-      model::ShadowModelResourceRecord existingModelRecord = {};
+      model::ShadowRuntimeModelOwnerBinding existingModelRecord = {};
       const bool hasExistingModelRecord =
-          resourceCache.findModelResource(outModelResourcePtr,
-                                          existingModelRecord);
+          resourceCache.findModelBinding(outModelResourcePtr,
+                                         existingModelRecord);
       const bool needsModelBackfill =
           !hasExistingModelRecord ||
           (existingModelRecord.modelKey == 0u && outModelKey != 0u);
@@ -1294,8 +1292,8 @@ void ResolveModelMetadata(const RenderObjectIdentitySnapshot &identity,
   };
 
   if (outRuntimeModelPtr != nullptr &&
-      resourceCache.findRuntimeModelResource(outRuntimeModelPtr,
-                                             runtimeResourceRecord)) {
+      resourceCache.findRuntimeModelBinding(outRuntimeModelPtr,
+                                            runtimeResourceRecord)) {
     if (outModelResourcePtr == nullptr)
       outModelResourcePtr = runtimeResourceRecord.modelResourcePtr;
     if (outModelKey == 0u)
@@ -2981,6 +2979,186 @@ bool VisibleRenderableRegistry::queryByRenderablePartAndLayer(
   return false;
 }
 
+void VisibleRenderablePartLayerQueryCache::reset() noexcept {
+  ++m_generation;
+  if (m_generation == 0u) {
+    m_entries = {};
+    ++m_generation;
+  }
+}
+
+const VisibleRenderableRecord* VisibleRenderablePartLayerQueryCache::queryPtr(
+    const VisibleRenderableRegistry& registry,
+    void* renderablePart, uint32_t layerIndex) noexcept {
+  if (renderablePart == nullptr)
+    return nullptr;
+
+  uint64_t hash = bit::fnv1a_init();
+  hash = bit::fnv1a_iter(
+      hash, uint64_t(reinterpret_cast<uintptr_t>(renderablePart)));
+  hash = bit::fnv1a_iter(hash, layerIndex);
+  Entry& entry = m_entries[size_t(hash) & (kEntryCount - 1u)];
+  if (entry.generation == m_generation &&
+      entry.renderablePart == renderablePart &&
+      entry.layerIndex == layerIndex) {
+    return entry.found ? &entry.record : nullptr;
+  }
+
+  entry.record = {};
+  const bool found = registry.queryByRenderablePartAndLayer(
+      renderablePart, layerIndex, entry.record);
+  entry.renderablePart = renderablePart;
+  entry.layerIndex = layerIndex;
+  entry.generation = m_generation;
+  entry.found = found;
+  return found ? &entry.record : nullptr;
+}
+
+bool VisibleRenderablePartLayerQueryCache::query(
+    const VisibleRenderableRegistry& registry,
+    void* renderablePart, uint32_t layerIndex,
+    VisibleRenderableRecord& out) noexcept {
+  out = {};
+  const VisibleRenderableRecord* record =
+      queryPtr(registry, renderablePart, layerIndex);
+  if (record != nullptr)
+    out = *record;
+  return record != nullptr;
+}
+
+bool VisibleRenderableRegistry::queryFirstForDirectPacket(
+    const CurrentDrawContractRecord& record,
+    VisibleRenderableRecord& out) const {
+  out = {};
+  const Snapshot& snap = snapshotForThread();
+
+  // Preserve the canonical lookup order. An exact part/layer match is already
+  // the strongest identity available here; only the weaker payload/scene
+  // fallbacks need the current-draw slice compatibility gate.
+  if (record.renderablePart != nullptr) {
+    const uint64_t partLayerKey =
+        VisibleRenderablePartLayerKey(record.renderablePart,
+                                      record.layerIndex);
+    const auto layerIt = snap.byRenderablePartLayer.find(partLayerKey);
+    if (layerIt != snap.byRenderablePartLayer.end() &&
+        layerIt->second < snap.records.size()) {
+      out = snap.records[layerIt->second];
+      m_shadowManifestVisibleLookupPartLayerHitCount.fetch_add(
+          1u, std::memory_order_relaxed);
+      return true;
+    }
+
+    const auto countIt =
+        snap.renderablePartRecordCount.find(record.renderablePart);
+    const auto partIt = snap.byRenderablePart.find(record.renderablePart);
+    if (countIt != snap.renderablePartRecordCount.end() &&
+        countIt->second == 1u && partIt != snap.byRenderablePart.end() &&
+        partIt->second < snap.records.size()) {
+      out = snap.records[partIt->second];
+      m_shadowManifestVisibleLookupSingleFallbackCount.fetch_add(
+          1u, std::memory_order_relaxed);
+      return true;
+    }
+
+    if constexpr (dxvk::war3::internal::
+                      kWar3RuntimeConfigDeferSemanticVisibleIndexBuild) {
+      const VisibleRenderableRecord* transparentFallback = nullptr;
+      const VisibleRenderableRecord* solePartRecord = nullptr;
+      uint32_t partRecordCount = 0u;
+      for (const auto& candidate : snap.records) {
+        if (candidate.renderablePart != record.renderablePart)
+          continue;
+        ++partRecordCount;
+        solePartRecord = &candidate;
+        if (candidate.layerIndex == record.layerIndex) {
+          if (candidate.queueKind == VisibleRenderableQueueKind::MainQueue) {
+            out = candidate;
+            m_shadowManifestVisibleLookupPartLayerHitCount.fetch_add(
+                1u, std::memory_order_relaxed);
+            return true;
+          }
+          if (transparentFallback == nullptr)
+            transparentFallback = &candidate;
+        }
+      }
+
+      if (transparentFallback != nullptr) {
+        out = *transparentFallback;
+        m_shadowManifestVisibleLookupPartLayerHitCount.fetch_add(
+            1u, std::memory_order_relaxed);
+        return true;
+      }
+      if (partRecordCount == 1u && solePartRecord != nullptr) {
+        out = *solePartRecord;
+        m_shadowManifestVisibleLookupSingleFallbackCount.fetch_add(
+            1u, std::memory_order_relaxed);
+        return true;
+      }
+    }
+  }
+
+  const auto matchesCurrentDrawSlice =
+      [&record](const VisibleRenderableRecord& candidate) {
+        if (candidate.layerIndex != record.layerIndex)
+          return false;
+        if (record.renderablePart != nullptr &&
+            candidate.renderablePart != nullptr &&
+            record.renderablePart != candidate.renderablePart)
+          return false;
+        if (record.sceneNode != nullptr && candidate.sceneNode != nullptr &&
+            record.sceneNode != candidate.sceneNode)
+          return false;
+        return true;
+      };
+
+  if (record.renderablePart != nullptr) {
+    const auto payloadIt = snap.byPayload.find(record.renderablePart);
+    if (payloadIt != snap.byPayload.end() &&
+        payloadIt->second < snap.records.size()) {
+      const auto& candidate = snap.records[payloadIt->second];
+      if (matchesCurrentDrawSlice(candidate)) {
+        out = candidate;
+        return true;
+      }
+    } else if constexpr (dxvk::war3::internal::
+                             kWar3RuntimeConfigDeferSemanticVisibleIndexBuild) {
+      for (const auto& candidate : snap.records) {
+        if (candidate.payload == record.renderablePart &&
+            matchesCurrentDrawSlice(candidate)) {
+          out = candidate;
+          return true;
+        }
+      }
+    }
+  }
+
+  if (record.sceneNode != nullptr) {
+    const auto sceneIt = snap.bySceneNode.find(record.sceneNode);
+    if (sceneIt != snap.bySceneNode.end() &&
+        sceneIt->second < snap.records.size()) {
+      const auto& candidate = snap.records[sceneIt->second];
+      if (matchesCurrentDrawSlice(candidate)) {
+        out = candidate;
+        return true;
+      }
+    } else if constexpr (dxvk::war3::internal::
+                             kWar3RuntimeConfigDeferSemanticVisibleIndexBuild) {
+      for (const auto& candidate : snap.records) {
+        if ((candidate.sceneNode == record.sceneNode ||
+             candidate.identity.sceneNode == record.sceneNode) &&
+            matchesCurrentDrawSlice(candidate)) {
+          out = candidate;
+          return true;
+        }
+      }
+    }
+  }
+
+  m_shadowManifestVisibleLookupMissCount.fetch_add(
+      1u, std::memory_order_relaxed);
+  return false;
+}
+
 bool VisibleRenderableRegistry::queryByWorldObjectEntry(
     void *worldObjectEntry, VisibleRenderableRecord &out) const {
   out = {};
@@ -3085,6 +3263,14 @@ bool VisibleRenderableRegistry::queryByRuntimeModel(
 void VisibleRenderableRegistry::refreshShadowManifestFromCurrentDraw(
     const std::vector<CurrentDrawContractRecord>& records,
     uint64_t frameNumber) {
+  static const std::vector<CurrentDrawContractRecord> s_emptyRecords;
+  refreshShadowManifestFromCurrentDraw(records, s_emptyRecords, frameNumber);
+}
+
+void VisibleRenderableRegistry::refreshShadowManifestFromCurrentDraw(
+    const std::vector<CurrentDrawContractRecord>& firstRecords,
+    const std::vector<CurrentDrawContractRecord>& secondRecords,
+    uint64_t frameNumber) {
   if (m_shadowManifestMapEpoch == 0u) {
     clearShadowManifest();
     return;
@@ -3097,13 +3283,26 @@ void VisibleRenderableRegistry::refreshShadowManifestFromCurrentDraw(
   summary.poseFreshGenerationVerifierMismatchCount =
       m_shadowManifestSummary.poseFreshGenerationVerifierMismatchCount;
 
-  std::unordered_map<uint64_t, uint64_t> firstSliceByPartAnchor;
-  std::unordered_set<uint64_t> multiSlicePartAnchors;
+  // Multi-slice membership is diagnostic-only, but the old pair of local
+  // unordered containers allocated buckets and nodes on every manifest
+  // refresh. Keep a render-thread scratch of exact anchor/slice pairs instead:
+  // sorting and scanning the scalar values preserves the count while making
+  // steady-state refresh allocation-free.
+  static thread_local std::vector<std::pair<uint64_t, uint64_t>>
+      s_sliceKeysByPartAnchor;
+  auto& sliceKeysByPartAnchor = s_sliceKeysByPartAnchor;
+  sliceKeysByPartAnchor.clear();
   bool hasPoseFreshObject = false;
   const Snapshot& visibleSnapshot = snapshotForThread();
   (void)visibleSnapshot;  // 保留 snapshotForThread() 调用以维持内部快照确认
-  firstSliceByPartAnchor.reserve(records.size());
-  multiSlicePartAnchors.reserve(records.size() / 2u + 1u);
+  const size_t recordCount = firstRecords.size() + secondRecords.size();
+  sliceKeysByPartAnchor.reserve(recordCount);
+  const auto forEachRecord = [&](const auto& callback) {
+    for (const auto& record : firstRecords)
+      callback(record);
+    for (const auto& record : secondRecords)
+      callback(record);
+  };
 
   // Generation 0 is reserved for "never marked".  A refresh receives a new
   // generation even when frameNumber is unchanged, so repeated same-frame
@@ -3124,14 +3323,14 @@ void VisibleRenderableRegistry::refreshShadowManifestFromCurrentDraw(
   if (War3SemanticShadowManifestPoseGenerationVerifierEnabled()) {
     poseFreshVerifierObjects =
         std::make_unique<std::unordered_set<uint64_t>>();
-    poseFreshVerifierObjects->reserve(records.size());
-    for (const auto& record : records) {
+    poseFreshVerifierObjects->reserve(recordCount);
+    forEachRecord([&](const CurrentDrawContractRecord& record) {
       if (record.fromGrace)
-        continue;
+        return;
       const uint64_t objectKey = ShadowManifestObjectKey(record);
       if (objectKey != 0u)
         poseFreshVerifierObjects->insert(objectKey);
-    }
+    });
   }
 
   // Phase 7.26：runtimeModelPtr 只在 pose restore/pose 诊断开启时才会被后续
@@ -3148,14 +3347,14 @@ void VisibleRenderableRegistry::refreshShadowManifestFromCurrentDraw(
     return ResolveRuntimeModelForCurrentDrawRecord(visibleSnapshot, record);
   };
 
-  for (const auto& record : records) {
+  forEachRecord([&](const CurrentDrawContractRecord& record) {
     // Grace can fill a one-frame producer hole, but it must never become a
     // fresh Manifest observation or extend structure/pose/slice lifetime.
     if (record.fromGrace)
-      continue;
+      return;
     const uint64_t objectKey = ShadowManifestObjectKey(record);
     if (objectKey == 0u)
-      continue;
+      return;
     hasPoseFreshObject = true;
 
     auto objectIt = m_shadowManifestObjects.find(objectKey);
@@ -3185,7 +3384,7 @@ void VisibleRenderableRegistry::refreshShadowManifestFromCurrentDraw(
 
     const uint64_t partKey = ShadowManifestPartKey(record, objectKey);
     if (partKey == 0u)
-      continue;
+      return;
 
     auto partIt = m_shadowManifestParts.find(partKey);
     if (partIt == m_shadowManifestParts.end()) {
@@ -3262,11 +3461,25 @@ void VisibleRenderableRegistry::refreshShadowManifestFromCurrentDraw(
         ShadowManifestPartAnchorKey(record, objectKey);
     if (partAnchorKey != 0u) {
       const uint64_t sliceKey = ShadowManifestSliceKey(record);
-      const auto inserted =
-          firstSliceByPartAnchor.emplace(partAnchorKey, sliceKey);
-      if (!inserted.second && inserted.first->second != sliceKey)
-        multiSlicePartAnchors.insert(partAnchorKey);
+      sliceKeysByPartAnchor.emplace_back(partAnchorKey, sliceKey);
     }
+  });
+
+  std::sort(sliceKeysByPartAnchor.begin(), sliceKeysByPartAnchor.end());
+  uint64_t multiSlicePartCount = 0u;
+  for (size_t begin = 0u; begin < sliceKeysByPartAnchor.size();) {
+    size_t end = begin + 1u;
+    bool hasDifferentSlice = false;
+    while (end < sliceKeysByPartAnchor.size() &&
+           sliceKeysByPartAnchor[end].first ==
+               sliceKeysByPartAnchor[begin].first) {
+      hasDifferentSlice = hasDifferentSlice ||
+          sliceKeysByPartAnchor[end].second !=
+              sliceKeysByPartAnchor[begin].second;
+      ++end;
+    }
+    multiSlicePartCount += hasDifferentSlice ? 1u : 0u;
+    begin = end;
   }
 
   for (auto it = m_shadowManifestObjects.begin();
@@ -3370,7 +3583,7 @@ void VisibleRenderableRegistry::refreshShadowManifestFromCurrentDraw(
     }
   }
 
-  summary.multiSlicePartCount = multiSlicePartAnchors.size();
+  summary.multiSlicePartCount = multiSlicePartCount;
   summary.visibleLookupPartLayerHitCount =
       m_shadowManifestVisibleLookupPartLayerHitCount.load(
           std::memory_order_relaxed);

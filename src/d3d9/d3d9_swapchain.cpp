@@ -335,6 +335,13 @@ namespace dxvk {
     TraceWar3Present(traceOrdinal, "lock-acquired", this);
     deviceLockScope = war3::War3PerfMonitor::ScopedCpuScope{};
 
+    if (m_parent->CheckVulkanDeviceLostFailStop(
+            "D3D9SwapChain.Present.Entry")) {
+      TraceWar3Present(traceOrdinal, "vk-device-lost-fail-stop", this,
+                       D3DERR_DEVICEREMOVED);
+      return D3DERR_DEVICEREMOVED;
+    }
+
     TraceWar3Present(traceOrdinal, "frame-end-begin", this);
     if (!War3UseFpsUnlockOnlyMode() &&
         dxvk::war3::runtime::IsWar3RuntimeModuleEnabled(
@@ -519,6 +526,10 @@ namespace dxvk {
       TraceWar3Present(traceOrdinal, "present-image-begin", this);
       PresentImage(presentInterval);
       TraceWar3Present(traceOrdinal, "present-image-end", this);
+
+      if (m_parent->CheckVulkanDeviceLostFailStop(
+              "D3D9SwapChain.PresentImage"))
+        return D3DERR_DEVICEREMOVED;
       
       if (!War3UseFpsUnlockOnlyMode() &&
           dxvk::war3::runtime::IsWar3RuntimeModuleEnabled(
@@ -539,6 +550,9 @@ namespace dxvk {
               dxvk::war3::runtime::War3RuntimeModule::HookUi))
         war3::War3Imgui::get().endFrame();
 #ifdef _WIN32
+      if (m_parent->CheckVulkanDeviceLostFailStop(
+              "D3D9SwapChain.Present.Exception"))
+        return D3DERR_DEVICEREMOVED;
       return PresentImageGDI(m_window);
 #else
       return D3DERR_DEVICEREMOVED;
@@ -550,6 +564,13 @@ namespace dxvk {
   #define DCX_USESTYLE 0x00010000
 
   HRESULT D3D9SwapChainEx::PresentImageGDI(HWND Window) {
+    // GDI is a partial-copy compatibility path, not a recovery mechanism for
+    // a lost Vulkan logical device. Calling EndFrame/Flush here would enqueue
+    // more work and could hide the fatal result behind S_OK.
+    if (m_parent->CheckVulkanDeviceLostFailStop(
+            "D3D9SwapChain.PresentImageGDI"))
+      return D3DERR_DEVICEREMOVED;
+
     m_parent->EndFrame(nullptr);
     m_parent->Flush();
 

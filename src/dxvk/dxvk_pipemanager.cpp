@@ -21,6 +21,10 @@ namespace dxvk {
           DxvkShaderPipelineLibrary*      library,
           DxvkPipelinePriority            priority) {
     std::unique_lock lock(m_lock);
+
+    if (m_device->getDeviceStatus() == VK_ERROR_DEVICE_LOST)
+      return;
+
     this->startWorkers();
 
     m_tasksTotal += 1;
@@ -35,6 +39,10 @@ namespace dxvk {
     const DxvkGraphicsPipelineStateInfo&  state,
           DxvkPipelinePriority            priority) {
     std::unique_lock lock(m_lock);
+
+    if (m_device->getDeviceStatus() == VK_ERROR_DEVICE_LOST)
+      return;
+
     this->startWorkers();
 
     pipeline->acquirePipeline();
@@ -154,6 +162,14 @@ namespace dxvk {
         // more important in this case.
         if (!m_workersRunning)
           break;
+      }
+
+      if (m_device->getDeviceStatus() == VK_ERROR_DEVICE_LOST) {
+        if (entry.graphicsPipeline)
+          entry.graphicsPipeline->releasePipeline();
+
+        m_tasksCompleted += 1;
+        continue;
       }
 
       if (entry.pipelineLibrary) {

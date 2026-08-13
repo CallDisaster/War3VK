@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <utility>
 
 namespace dxvk {
@@ -39,7 +40,9 @@ uint64_t War3ComputeShadowMatrixUploadKey(
   hash = bit::fnv1a_iter(hash, input.scene.shadowStats.dynamicPoseSignature);
 
   for (uint32_t i = 0; i < paletteCount; ++i)
-    hash = bit::fnv1a_iter(hash, input.scene.shadowPalettes[i].hash);
+    hash = bit::fnv1a_iter(
+        bit::fnv1a_iter(hash, input.scene.shadowPalettes[i].hash),
+        input.scene.shadowPalettes[i].worldMatrices.size());
 
   for (uint32_t i = 0; i < casterCount; ++i) {
     const auto& draw =
@@ -171,6 +174,7 @@ void War3ShadowReceiverPass::ensureVolumeSunShadowResources(
 
   m_volumeSunShadowMap =
       m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+  m_volumeSunShadowLayout.reset();
 
   VkComponentMapping mapping = {
       VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
@@ -223,7 +227,7 @@ bool War3ShadowReceiverPass::GetVolumetricPointShadowSnapshot(
   }
 
   const Rc<DxvkSampler> pointShadowSampler =
-      m_shadowSampler ? m_shadowSampler : m_shadowSamplerActive;
+      m_shadowSampler;
   if (!pointShadowSampler || !m_pointShadowCubeView)
     return false;
 
@@ -266,8 +270,6 @@ bool War3ShadowReceiverPass::GetVolumetricPointShadowSnapshot(
 }
 
 uint32_t War3ShadowReceiverPass::GetShadowSamplerIndex() const {
-  if (m_shadowSamplerActive)
-    return m_shadowSamplerActive->getDescriptor().samplerIndex;
   if (m_shadowSampler)
     return m_shadowSampler->getDescriptor().samplerIndex;
   if (m_samplerLinear)
@@ -304,6 +306,7 @@ void War3ShadowReceiverPass::ensureCopyResources(VkExtent3D extent,
 
   m_colorCopy =
       m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+  m_colorCopyLayout.reset();
 
   DxvkImageViewKey viewInfo;
   viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
@@ -377,6 +380,7 @@ void War3ShadowReceiverPass::ensureDepthCopyResources(VkExtent3D extent,
   m_depthCopyView = std::move(newDepthCopyView);
   m_depthCopyView2D = std::move(newDepthCopyView2D);
   m_depthCopy = std::move(newDepthCopy);
+  m_depthCopyLayout.reset();
   m_cachedDepthExtent = extent;
   m_cachedDepthFormat = format;
 }
@@ -410,11 +414,13 @@ void War3ShadowReceiverPass::ensureMotionVectorResources(VkExtent3D extent) {
 
   m_motionVectorImage =
       m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+  m_motionVectorLayout.reset();
 
   DxvkImageViewKey viewInfo = {};
   viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
   viewInfo.format = info.format;
-  viewInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+  viewInfo.usage =
+      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
   viewInfo.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
   viewInfo.aspects = VK_IMAGE_ASPECT_COLOR_BIT;
   viewInfo.mipIndex = 0;
@@ -469,11 +475,13 @@ void War3ShadowReceiverPass::ensureShadowTaaResources(VkExtent3D extent) {
 
     m_shadowCurrent =
         m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    m_shadowCurrentLayout.reset();
 
     DxvkImageViewKey viewInfo = {};
     viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
     viewInfo.format = info.format;
-    viewInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+    viewInfo.usage =
+        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     viewInfo.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     viewInfo.aspects = VK_IMAGE_ASPECT_COLOR_BIT;
     viewInfo.mipIndex = 0;
@@ -508,6 +516,7 @@ void War3ShadowReceiverPass::ensureShadowTaaResources(VkExtent3D extent) {
 
     m_shadowHistory[i] =
         m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    m_shadowHistoryLayouts[i].reset();
 
     VkComponentMapping mapping = {
         VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
@@ -570,7 +579,11 @@ void War3ShadowReceiverPass::ensureOutlineMaskResources(VkExtent3D extent) {
   DxvkImageViewKey viewInfo = {};
   viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
   viewInfo.format = VK_FORMAT_R8_UNORM;
-  viewInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+  // The exact same view is first bound as an MRT color attachment and then
+  // sampled by the edge pass. Restricting it to SAMPLED makes the attachment
+  // use invalid even though the underlying image advertises both usages.
+  viewInfo.usage =
+      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
   viewInfo.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
   viewInfo.aspects = VK_IMAGE_ASPECT_COLOR_BIT;
   viewInfo.mipIndex = 0;
@@ -581,6 +594,10 @@ void War3ShadowReceiverPass::ensureOutlineMaskResources(VkExtent3D extent) {
 
   m_outlineMaskVisibleView = m_outlineMaskVisible->createView(viewInfo);
   m_outlineMaskAllView = m_outlineMaskAll->createView(viewInfo);
+  // Vulkan images are born UNDEFINED. DxvkImageViewKey::layout is descriptor
+  // metadata, not a query for the image's current layout.
+  m_outlineMaskLayoutState =
+      war3::render::War3OutlineMaskLayoutState::Undefined;
 }
 
 bool War3ShadowReceiverPass::ensureShadowResources(uint32_t cascadeCount,
@@ -834,6 +851,8 @@ bool War3ShadowReceiverPass::ensureShadowResources(uint32_t cascadeCount,
             candidate.shadowCasterMaskSampleView);
   std::swap(m_shadowCasterMaskLayerViews,
             candidate.shadowCasterMaskLayerViews);
+  m_shadowMapLayout.reset();
+  m_shadowCasterMaskLayout.reset();
 
   m_shadowMapResolution = candidateResolution;
   m_shadowMapLayers = cascadeCount;
@@ -971,9 +990,13 @@ DxvkResourceBufferInfo War3ShadowReceiverPass::ensureShadowMatrixBuffer(
     dst[0] = Matrix4();
   } else {
     for (uint32_t i = 0; i < paletteCount; i++) {
-      std::memcpy(dst + VkDeviceSize(i) * 256u,
-                  input.scene.shadowPalettes[i].worldMatrices.data(),
-                  sizeof(Matrix4) * 256u);
+      const auto& palette = input.scene.shadowPalettes[i];
+      dxvk::war3::render::War3ExpandShadowPaletteForUpload(
+          dst + VkDeviceSize(i) *
+                    dxvk::war3::render::kWar3ShadowPaletteMatrixCapacity,
+          palette.worldMatrices.data(),
+          dxvk::war3::render::War3BoundShadowPaletteMatrixCount(
+              palette.worldMatrices.size()));
     }
 
     for (uint32_t i = 0; i < casterCount; i++) {
@@ -1021,9 +1044,10 @@ void War3ShadowReceiverPass::ensurePointShadowNeutralResources() {
   info.extent = VkExtent3D{1u, 1u, 1u};
   info.numLayers = 6u;
   info.mipLevels = 1u;
-  info.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
-  info.stages = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-  info.access = VK_ACCESS_SHADER_READ_BIT;
+  info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  info.stages =
+      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+  info.access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
   info.tiling = VK_IMAGE_TILING_OPTIMAL;
   info.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
   info.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
@@ -1031,7 +1055,7 @@ void War3ShadowReceiverPass::ensurePointShadowNeutralResources() {
 
   m_pointShadowNeutralCube =
       m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-  m_pointShadowNeutralReady = false;
+  m_pointShadowNeutralLayout.reset();
 
   DxvkImageViewKey viewInfo;
   viewInfo.viewType = VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
@@ -1080,6 +1104,7 @@ void War3ShadowReceiverPass::ensurePointShadowResources(
                 VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
   info.access =
+      VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
       VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
   info.tiling = VK_IMAGE_TILING_OPTIMAL;
   info.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
@@ -1129,7 +1154,12 @@ void War3ShadowReceiverPass::ensurePointShadowResources(
   m_pointShadowFaceViews = newFaceViews;
   m_pointShadowResolution = resolution;
   m_pointShadowCapacityLights = capacityLights;
-  m_pointShadowCubeLayoutInitialized = false;
+  for (auto& layout : m_pointShadowFaceLayouts)
+    layout.reset();
+  m_pointShadowResourceGeneration =
+      m_pointShadowResourceGeneration == std::numeric_limits<uint64_t>::max()
+          ? 0u
+          : m_pointShadowResourceGeneration + 1u;
   // A recreated image contains no valid face data. Keeping the old validity
   // mask would let a low face-budget update sample untouched faces from the
   // new (empty) cube as if they were temporal history.
@@ -1149,7 +1179,10 @@ void War3ShadowReceiverPass::copyColor(const Rc<DxvkCommandList> &ctx,
   if (!m_colorCopy)
     return;
 
-  const VkImageLayout srcLayout = dstView->getLayout();
+  const VkImageSubresourceRange srcSubresources =
+      dstView->imageSubresources();
+  const VkImageLayout srcLayout =
+      dstView->image()->queryLayout(srcSubresources);
 
   // Transition src to TRANSFER_SRC, dst copy to TRANSFER_DST
   VkImageMemoryBarrier2 barriers[2] = {};
@@ -1163,21 +1196,23 @@ void War3ShadowReceiverPass::copyColor(const Rc<DxvkCommandList> &ctx,
   barriers[0].oldLayout = srcLayout;
   barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
   barriers[0].image = dstView->image()->handle();
-  barriers[0].subresourceRange = dstView->imageSubresources();
+  barriers[0].subresourceRange = srcSubresources;
 
-  barriers[1].srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-  barriers[1].srcAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-  barriers[1].dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-  barriers[1].dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-  barriers[1].oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-  barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-  barriers[1].image = m_colorCopy->handle();
-  barriers[1].subresourceRange = m_colorCopyView->imageSubresources();
+  const VkImageSubresourceRange dstSubresources =
+      m_colorCopyView->imageSubresources();
+  const auto dstWriteTransition = m_colorCopyLayout.plan(
+      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+      VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+      VK_ACCESS_2_TRANSFER_WRITE_BIT);
+  barriers[1] = war3::render::MakeWar3OwnedImageBarrier(
+      dstWriteTransition, m_colorCopy->handle(), dstSubresources);
 
   VkDependencyInfo depInfo = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
   depInfo.imageMemoryBarrierCount = 2;
   depInfo.pImageMemoryBarriers = barriers;
   ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &depInfo);
+  war3::render::CommitWar3OwnedImageLayout(
+      m_colorCopyLayout, dstWriteTransition, *m_colorCopy, dstSubresources);
 
   VkImageCopy2 copyRegion = {VK_STRUCTURE_TYPE_IMAGE_COPY_2};
   copyRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -1204,14 +1239,16 @@ void War3ShadowReceiverPass::copyColor(const Rc<DxvkCommandList> &ctx,
   barriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
   barriers[0].newLayout = srcLayout;
 
-  barriers[1].srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-  barriers[1].srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-  barriers[1].dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-  barriers[1].dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-  barriers[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-  barriers[1].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  const auto dstReadTransition = m_colorCopyLayout.plan(
+      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+      VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+      VK_ACCESS_2_SHADER_READ_BIT);
+  barriers[1] = war3::render::MakeWar3OwnedImageBarrier(
+      dstReadTransition, m_colorCopy->handle(), dstSubresources);
 
   ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &depInfo);
+  war3::render::CommitWar3OwnedImageLayout(
+      m_colorCopyLayout, dstReadTransition, *m_colorCopy, dstSubresources);
 
   ctx->track(dstView->image(), DxvkAccess::Read);
   ctx->track(m_colorCopy, DxvkAccess::Write);
@@ -1222,7 +1259,10 @@ void War3ShadowReceiverPass::copyDepth(const Rc<DxvkCommandList> &ctx,
   if (!m_depthCopy || !m_depthCopyView || !srcDepthView)
     return;
 
-  const VkImageLayout srcLayout = srcDepthView->getLayout();
+  const VkImageSubresourceRange srcSubresources =
+      srcDepthView->imageSubresources();
+  const VkImageLayout srcLayout =
+      srcDepthView->image()->queryLayout(srcSubresources);
 
   // Transition src depth to TRANSFER_SRC, dst copy to TRANSFER_DST
   VkImageMemoryBarrier2 barriers[2] = {};
@@ -1237,22 +1277,23 @@ void War3ShadowReceiverPass::copyDepth(const Rc<DxvkCommandList> &ctx,
   barriers[0].oldLayout = srcLayout;
   barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
   barriers[0].image = srcDepthView->image()->handle();
-  barriers[0].subresourceRange = srcDepthView->imageSubresources();
+  barriers[0].subresourceRange = srcSubresources;
 
-  barriers[1].srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
-                             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-  barriers[1].srcAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-  barriers[1].dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-  barriers[1].dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-  barriers[1].oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-  barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-  barriers[1].image = m_depthCopy->handle();
-  barriers[1].subresourceRange = m_depthCopyView->imageSubresources();
+  const VkImageSubresourceRange dstSubresources =
+      m_depthCopyView->imageSubresources();
+  const auto dstWriteTransition = m_depthCopyLayout.plan(
+      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+      VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+      VK_ACCESS_2_TRANSFER_WRITE_BIT);
+  barriers[1] = war3::render::MakeWar3OwnedImageBarrier(
+      dstWriteTransition, m_depthCopy->handle(), dstSubresources);
 
   VkDependencyInfo depInfo = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
   depInfo.imageMemoryBarrierCount = 2;
   depInfo.pImageMemoryBarriers = barriers;
   ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &depInfo);
+  war3::render::CommitWar3OwnedImageLayout(
+      m_depthCopyLayout, dstWriteTransition, *m_depthCopy, dstSubresources);
 
   VkImageCopy2 copyRegion = {VK_STRUCTURE_TYPE_IMAGE_COPY_2};
   copyRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
@@ -1281,15 +1322,17 @@ void War3ShadowReceiverPass::copyDepth(const Rc<DxvkCommandList> &ctx,
   barriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
   barriers[0].newLayout = srcLayout;
 
-  barriers[1].srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-  barriers[1].srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-  barriers[1].dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
-                             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-  barriers[1].dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-  barriers[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-  barriers[1].newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+  const auto dstReadTransition = m_depthCopyLayout.plan(
+      VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+      VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+      VK_ACCESS_2_SHADER_READ_BIT);
+  barriers[1] = war3::render::MakeWar3OwnedImageBarrier(
+      dstReadTransition, m_depthCopy->handle(), dstSubresources);
 
   ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &depInfo);
+  war3::render::CommitWar3OwnedImageLayout(
+      m_depthCopyLayout, dstReadTransition, *m_depthCopy, dstSubresources);
 
   ctx->track(srcDepthView->image(), DxvkAccess::Read);
   ctx->track(m_depthCopy, DxvkAccess::Write);

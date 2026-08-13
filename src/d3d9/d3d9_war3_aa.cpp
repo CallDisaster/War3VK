@@ -58,6 +58,8 @@ namespace dxvk {
         bool UploadLookupTexture(const Rc<DxvkCommandList>& ctx,
                                  const Rc<DxvkDevice>& device,
                                  const Rc<DxvkImage>& image,
+                                 war3::render::War3OwnedImageLayoutState&
+                                     layoutState,
                                  VkExtent3D extent,
                                  const void* data,
                                  size_t dataSize,
@@ -83,20 +85,23 @@ namespace dxvk {
             std::memcpy(uploadBuffer->mapPtr(0), data, dataSize);
             auto uploadSlice = uploadBuffer->getSliceInfo();
 
-            VkImageMemoryBarrier2 barrier = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
-            barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            barrier.dstStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
-            barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            barrier.newLayout = image->pickLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            const auto writeTransition = layoutState.plan(
+                image->pickLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
+                VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                VK_ACCESS_2_TRANSFER_WRITE_BIT);
+            const auto subresources = image->getAvailableSubresources();
+            VkImageMemoryBarrier2 barrier =
+                war3::render::MakeWar3OwnedImageBarrier(
+                    writeTransition, image->handle(), subresources);
             barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            barrier.image = image->handle();
-            barrier.subresourceRange = image->getAvailableSubresources();
 
             VkDependencyInfo depInfo = { VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
             depInfo.imageMemoryBarrierCount = 1;
             depInfo.pImageMemoryBarriers = &barrier;
             ctx->cmdPipelineBarrier(DxvkCmdBuffer::InitBuffer, &depInfo);
+            war3::render::CommitWar3OwnedImageLayout(
+                layoutState, writeTransition, *image, subresources);
 
             VkBufferImageCopy2 imageRegion = { VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2 };
             imageRegion.bufferOffset = uploadSlice.offset;
@@ -112,21 +117,23 @@ namespace dxvk {
             imageCopy.pRegions = &imageRegion;
             ctx->cmdCopyBufferToImage(DxvkCmdBuffer::InitBuffer, &imageCopy);
 
-            barrier = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
-            barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            barrier.srcStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
-            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-            barrier.dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-            barrier.oldLayout = image->pickLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-            barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            const auto readTransition = layoutState.plan(
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                VK_ACCESS_2_SHADER_READ_BIT);
+            barrier = war3::render::MakeWar3OwnedImageBarrier(
+                readTransition, image->handle(), subresources);
             barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            barrier.image = image->handle();
-            barrier.subresourceRange = image->getAvailableSubresources();
             depInfo.imageMemoryBarrierCount = 1;
             depInfo.pImageMemoryBarriers = &barrier;
             ctx->cmdPipelineBarrier(DxvkCmdBuffer::InitBuffer, &depInfo);
+            war3::render::CommitWar3OwnedImageLayout(
+                layoutState, readTransition, *image, subresources);
 
+            // The copy command stores a raw VkBuffer handle. Keep the upload
+            // allocation alive until this command list has completed on the GPU.
+            ctx->track(uploadBuffer, DxvkAccess::Read);
             ctx->track(image, DxvkAccess::Write);
             return true;
         }
@@ -259,9 +266,14 @@ namespace dxvk {
         // Run selected AA algorithm
         if (aaSettings.mode == War3AAMode::FXAA) {
             runFxaa(ctx, input.colorView, aaSettings);
-        } else {
+        } else if (m_lookupTablesCreated) {
             // SMAA (any quality level)
             runSmaa(ctx, input.colorView, aaSettings);
+        } else {
+            // Lookup-table publication is transactional. A failed candidate
+            // remains unpublished and this frame uses the already-created FXAA
+            // path. ensureSmaaResources will retry on a later frame.
+            runFxaa(ctx, input.colorView, aaSettings);
         }
 
         // Debug: Log every frame AA execution (only once)
@@ -299,6 +311,7 @@ namespace dxvk {
         colorInfo.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
         m_colorCopy = m_device->createImage(colorInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        m_colorCopyLayout.reset();
 
         VkComponentMapping mapping = {
             VK_COMPONENT_SWIZZLE_IDENTITY,
@@ -362,6 +375,7 @@ namespace dxvk {
             edgesInfo.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
             m_edgesTex = m_device->createImage(edgesInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            m_edgesLayout.reset();
 
             DxvkImageViewKey edgesViewKey = { };
             edgesViewKey.viewType = VK_IMAGE_VIEW_TYPE_2D;
@@ -397,6 +411,7 @@ namespace dxvk {
             blendInfo.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
             m_blendTex = m_device->createImage(blendInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            m_blendLayout.reset();
 
             DxvkImageViewKey blendViewKey = { };
             blendViewKey.viewType = VK_IMAGE_VIEW_TYPE_2D;
@@ -413,16 +428,25 @@ namespace dxvk {
         }
     }
 
-    void War3AAPass::createSmaaLookupTextures(const Rc<DxvkCommandList>& ctx) {
+    bool War3AAPass::createSmaaLookupTextures(const Rc<DxvkCommandList>& ctx) {
         if (!ctx) {
             Logger::err("War3AAPass: SMAA lookup upload skipped (null command list)");
-            return;
+            return false;
         }
         VkComponentMapping mapping = {
             VK_COMPONENT_SWIZZLE_IDENTITY,
             VK_COMPONENT_SWIZZLE_IDENTITY,
             VK_COMPONENT_SWIZZLE_IDENTITY,
             VK_COMPONENT_SWIZZLE_IDENTITY };
+
+        Rc<DxvkImage> candidateAreaTex;
+        Rc<DxvkImageView> candidateAreaView;
+        war3::render::War3OwnedImageLayoutState candidateAreaLayout;
+        Rc<DxvkImage> candidateSearchTex;
+        Rc<DxvkImageView> candidateSearchView;
+        war3::render::War3OwnedImageLayoutState candidateSearchLayout;
+        bool areaUploaded = false;
+        bool searchUploaded = false;
 
         // Area texture: 160x560, RG8
         {
@@ -440,7 +464,9 @@ namespace dxvk {
             areaInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
             areaInfo.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-            m_areaTex = m_device->createImage(areaInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            candidateAreaTex = m_device->createImage(
+                areaInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            candidateAreaLayout.reset();
 
             DxvkImageViewKey areaViewKey = { };
             areaViewKey.viewType = VK_IMAGE_VIEW_TYPE_2D;
@@ -453,7 +479,7 @@ namespace dxvk {
             areaViewKey.layerIndex = 0;
             areaViewKey.layerCount = 1;
             areaViewKey.packedSwizzle = DxvkImageViewKey::packSwizzle(mapping);
-            m_areaView = m_areaTex->createView(areaViewKey);
+            candidateAreaView = candidateAreaTex->createView(areaViewKey);
 
             if (!dxvk::smaa::areaTexSize ||
                 dxvk::smaa::areaTexWidth != 160 ||
@@ -462,10 +488,14 @@ namespace dxvk {
             } else {
                 const VkExtent3D areaExtent = { uint32_t(dxvk::smaa::areaTexWidth),
                                                 uint32_t(dxvk::smaa::areaTexHeight), 1u };
-                if (!UploadLookupTexture(ctx, m_device, m_areaTex, areaExtent,
+                areaUploaded = UploadLookupTexture(
+                                         ctx, m_device, candidateAreaTex,
+                                         candidateAreaLayout,
+                                         areaExtent,
                                          dxvk::smaa::areaTexBytes,
                                          dxvk::smaa::areaTexSize,
-                                         "War3SmaaAreaUpload")) {
+                                         "War3SmaaAreaUpload");
+                if (!areaUploaded) {
                     Logger::err("War3AAPass: SMAA area texture upload failed");
                 }
             }
@@ -487,7 +517,9 @@ namespace dxvk {
             searchInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
             searchInfo.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-            m_searchTex = m_device->createImage(searchInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            candidateSearchTex = m_device->createImage(
+                searchInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            candidateSearchLayout.reset();
 
             DxvkImageViewKey searchViewKey = { };
             searchViewKey.viewType = VK_IMAGE_VIEW_TYPE_2D;
@@ -500,7 +532,7 @@ namespace dxvk {
             searchViewKey.layerIndex = 0;
             searchViewKey.layerCount = 1;
             searchViewKey.packedSwizzle = DxvkImageViewKey::packSwizzle(mapping);
-            m_searchView = m_searchTex->createView(searchViewKey);
+            candidateSearchView = candidateSearchTex->createView(searchViewKey);
 
             if (!dxvk::smaa::searchTexSize ||
                 dxvk::smaa::searchTexWidth != 64 ||
@@ -509,17 +541,34 @@ namespace dxvk {
             } else {
                 const VkExtent3D searchExtent = { uint32_t(dxvk::smaa::searchTexWidth),
                                                   uint32_t(dxvk::smaa::searchTexHeight), 1u };
-                if (!UploadLookupTexture(ctx, m_device, m_searchTex, searchExtent,
+                searchUploaded = UploadLookupTexture(
+                                         ctx, m_device, candidateSearchTex,
+                                         candidateSearchLayout, searchExtent,
                                          dxvk::smaa::searchTexBytes,
                                          dxvk::smaa::searchTexSize,
-                                         "War3SmaaSearchUpload")) {
+                                         "War3SmaaSearchUpload");
+                if (!searchUploaded) {
                     Logger::err("War3AAPass: SMAA search texture upload failed");
                 }
             }
         }
 
+        if (!areaUploaded || !searchUploaded || !candidateAreaTex ||
+            !candidateAreaView || !candidateSearchTex || !candidateSearchView) {
+            Logger::err(
+                "War3AAPass: SMAA lookup candidate rejected; using FXAA and retrying");
+            return false;
+        }
+
+        m_areaTex = std::move(candidateAreaTex);
+        m_areaView = std::move(candidateAreaView);
+        m_areaLayout = candidateAreaLayout;
+        m_searchTex = std::move(candidateSearchTex);
+        m_searchView = std::move(candidateSearchView);
+        m_searchLayout = candidateSearchLayout;
         m_lookupTablesCreated = true;
         WAR3_RENDER_LOG("DXVK War3AAPass: SMAA lookup textures created\n");
+        return true;
     }
 
     void War3AAPass::createFxaaPipeline(VkFormat format) {
@@ -620,7 +669,10 @@ namespace dxvk {
         if (!m_colorCopy || !m_colorCopyView || !srcView)
             return;
 
-        const VkImageLayout srcLayout = srcView->getLayout();
+        const VkImageSubresourceRange srcSubresources =
+            srcView->imageSubresources();
+        const VkImageLayout srcLayout =
+            srcView->image()->queryLayout(srcSubresources);
 
         // Transition src to TRANSFER_SRC, dst copy to TRANSFER_DST
         VkImageMemoryBarrier2 barriers[2] = { };
@@ -634,21 +686,24 @@ namespace dxvk {
         barriers[0].oldLayout     = srcLayout;
         barriers[0].newLayout     = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
         barriers[0].image         = srcView->image()->handle();
-        barriers[0].subresourceRange = srcView->imageSubresources();
+        barriers[0].subresourceRange = srcSubresources;
 
-        barriers[1].srcStageMask  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-        barriers[1].srcAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-        barriers[1].dstStageMask  = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-        barriers[1].dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        barriers[1].oldLayout     = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        barriers[1].newLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        barriers[1].image         = m_colorCopy->handle();
-        barriers[1].subresourceRange = m_colorCopyView->imageSubresources();
+        const VkImageSubresourceRange dstSubresources =
+            m_colorCopyView->imageSubresources();
+        const auto dstWriteTransition = m_colorCopyLayout.plan(
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+            VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        barriers[1] = war3::render::MakeWar3OwnedImageBarrier(
+            dstWriteTransition, m_colorCopy->handle(), dstSubresources);
 
         VkDependencyInfo depInfo = { VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
         depInfo.imageMemoryBarrierCount = 2;
         depInfo.pImageMemoryBarriers = barriers;
         ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &depInfo);
+        war3::render::CommitWar3OwnedImageLayout(
+            m_colorCopyLayout, dstWriteTransition, *m_colorCopy,
+            dstSubresources);
 
         VkExtent3D srcExtent = srcView->image()->info().extent;
         VkExtent3D dstExtent = m_colorCopy->info().extent;
@@ -683,14 +738,17 @@ namespace dxvk {
         barriers[0].oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
         barriers[0].newLayout     = srcLayout;
 
-        barriers[1].srcStageMask  = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-        barriers[1].srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        barriers[1].dstStageMask  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-        barriers[1].dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-        barriers[1].oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        barriers[1].newLayout     = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        const auto dstReadTransition = m_colorCopyLayout.plan(
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            VK_ACCESS_2_SHADER_READ_BIT);
+        barriers[1] = war3::render::MakeWar3OwnedImageBarrier(
+            dstReadTransition, m_colorCopy->handle(), dstSubresources);
 
         ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &depInfo);
+        war3::render::CommitWar3OwnedImageLayout(
+            m_colorCopyLayout, dstReadTransition, *m_colorCopy,
+            dstSubresources);
 
         ctx->track(srcView->image(), DxvkAccess::Read);
         ctx->track(m_colorCopy, DxvkAccess::Write);
@@ -711,10 +769,13 @@ namespace dxvk {
         dstToAttach.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
         dstToAttach.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
         dstToAttach.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-        dstToAttach.oldLayout = dstView->getLayout();
+        const auto dstSubresources = dstView->imageSubresources();
+        const VkImageLayout dstOriginalLayout =
+            dstView->image()->queryLayout(dstSubresources);
+        dstToAttach.oldLayout = dstOriginalLayout;
         dstToAttach.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         dstToAttach.image = dstView->image()->handle();
-        dstToAttach.subresourceRange = dstView->imageSubresources();
+        dstToAttach.subresourceRange = dstSubresources;
 
         VkDependencyInfo depInfo = { VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
         depInfo.imageMemoryBarrierCount = 1;
@@ -775,9 +836,9 @@ namespace dxvk {
         dstToOriginal.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
         dstToOriginal.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
         dstToOriginal.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        dstToOriginal.newLayout = dstView->getLayout();
+        dstToOriginal.newLayout = dstOriginalLayout;
         dstToOriginal.image = dstView->image()->handle();
-        dstToOriginal.subresourceRange = dstView->imageSubresources();
+        dstToOriginal.subresourceRange = dstSubresources;
 
         VkDependencyInfo depInfo2 = { VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
         depInfo2.imageMemoryBarrierCount = 1;
@@ -797,7 +858,9 @@ namespace dxvk {
             createSmaaPipelines(m_cachedFormat);
 
         VkExtent3D extent = dstView->image()->info().extent;
-        const VkImageLayout dstOriginalLayout = dstView->getLayout();
+        const auto dstSubresources = dstView->imageSubresources();
+        const VkImageLayout dstOriginalLayout =
+            dstView->image()->queryLayout(dstSubresources);
 
         // 允许 ImGui 参数实时生效，避免被固定档位覆盖
         float threshold = std::clamp(settings.smaaThreshold, 0.01f, 0.5f);
@@ -823,20 +886,21 @@ namespace dxvk {
         // Pass 1: Edge Detection
         {
             // Transition edges texture to attachment
-            VkImageMemoryBarrier2 edgesToAttach = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
-            edgesToAttach.srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-            edgesToAttach.srcAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-            edgesToAttach.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-            edgesToAttach.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-            edgesToAttach.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            edgesToAttach.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-            edgesToAttach.image = m_edgesTex->handle();
-            edgesToAttach.subresourceRange = m_edgesView->imageSubresources();
+            const auto subresources = m_edgesView->imageSubresources();
+            const auto attachTransition = m_edgesLayout.plan(
+                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+            VkImageMemoryBarrier2 edgesToAttach =
+                war3::render::MakeWar3OwnedImageBarrier(
+                    attachTransition, m_edgesTex->handle(), subresources);
 
             VkDependencyInfo depInfo = { VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
             depInfo.imageMemoryBarrierCount = 1;
             depInfo.pImageMemoryBarriers = &edgesToAttach;
             ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &depInfo);
+            war3::render::CommitWar3OwnedImageLayout(
+                m_edgesLayout, attachTransition, *m_edgesTex, subresources);
 
             VkRenderingAttachmentInfo colorAttachment = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
             colorAttachment.imageView = m_edgesView->handle();
@@ -879,38 +943,39 @@ namespace dxvk {
             ctx->cmdEndRendering();
 
             // Transition edges to readable
-            VkImageMemoryBarrier2 edgesToRead = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
-            edgesToRead.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-            edgesToRead.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-            edgesToRead.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-            edgesToRead.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-            edgesToRead.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-            edgesToRead.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-            edgesToRead.image = m_edgesTex->handle();
-            edgesToRead.subresourceRange = m_edgesView->imageSubresources();
+            const auto readTransition = m_edgesLayout.plan(
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                VK_ACCESS_2_SHADER_READ_BIT);
+            VkImageMemoryBarrier2 edgesToRead =
+                war3::render::MakeWar3OwnedImageBarrier(
+                    readTransition, m_edgesTex->handle(), subresources);
 
             VkDependencyInfo depInfo2 = { VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
             depInfo2.imageMemoryBarrierCount = 1;
             depInfo2.pImageMemoryBarriers = &edgesToRead;
             ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &depInfo2);
+            war3::render::CommitWar3OwnedImageLayout(
+                m_edgesLayout, readTransition, *m_edgesTex, subresources);
         }
 
         // Pass 2: Blend Weight Calculation
         {
-            VkImageMemoryBarrier2 blendToAttach = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
-            blendToAttach.srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-            blendToAttach.srcAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-            blendToAttach.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-            blendToAttach.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-            blendToAttach.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            blendToAttach.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-            blendToAttach.image = m_blendTex->handle();
-            blendToAttach.subresourceRange = m_blendView->imageSubresources();
+            const auto subresources = m_blendView->imageSubresources();
+            const auto attachTransition = m_blendLayout.plan(
+                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+            VkImageMemoryBarrier2 blendToAttach =
+                war3::render::MakeWar3OwnedImageBarrier(
+                    attachTransition, m_blendTex->handle(), subresources);
 
             VkDependencyInfo depInfo = { VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
             depInfo.imageMemoryBarrierCount = 1;
             depInfo.pImageMemoryBarriers = &blendToAttach;
             ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &depInfo);
+            war3::render::CommitWar3OwnedImageLayout(
+                m_blendLayout, attachTransition, *m_blendTex, subresources);
 
             VkRenderingAttachmentInfo colorAttachment = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
             colorAttachment.imageView = m_blendView->handle();
@@ -962,20 +1027,20 @@ namespace dxvk {
             ctx->cmdEndRendering();
 
             // Transition blend to readable
-            VkImageMemoryBarrier2 blendToRead = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
-            blendToRead.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-            blendToRead.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-            blendToRead.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-            blendToRead.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-            blendToRead.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-            blendToRead.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-            blendToRead.image = m_blendTex->handle();
-            blendToRead.subresourceRange = m_blendView->imageSubresources();
+            const auto readTransition = m_blendLayout.plan(
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                VK_ACCESS_2_SHADER_READ_BIT);
+            VkImageMemoryBarrier2 blendToRead =
+                war3::render::MakeWar3OwnedImageBarrier(
+                    readTransition, m_blendTex->handle(), subresources);
 
             VkDependencyInfo depInfo2 = { VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
             depInfo2.imageMemoryBarrierCount = 1;
             depInfo2.pImageMemoryBarriers = &blendToRead;
             ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &depInfo2);
+            war3::render::CommitWar3OwnedImageLayout(
+                m_blendLayout, readTransition, *m_blendTex, subresources);
         }
 
         // Pass 3: Neighborhood Blending

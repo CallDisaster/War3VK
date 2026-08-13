@@ -49,7 +49,6 @@ globals
     constant integer WARVK_FEATURE_MATH_CURVE = 8192
     constant integer WARVK_FEATURE_POLYLINE_CURVE = 16384
     constant integer WARVK_FEATURE_LOCAL_FOG = 32768
-
     // 体积光后端。LEGACY 是当前发布兼容路径；FROXEL_* 为 2.0 候选。
     constant integer WARVK_VOLUMETRIC_BACKEND_LEGACY = 0
     constant integer WARVK_VOLUMETRIC_BACKEND_FROXEL_MEDIUM = 1

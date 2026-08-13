@@ -3,6 +3,8 @@
 #include "../util/rc/util_rc.h"
 #include "../util/rc/util_rc_ptr.h"
 
+#include <atomic>
+
 #define VK_USE_PLATFORM_WIN32_KHR 1
 #include <vulkan/vulkan.h>
 
@@ -171,6 +173,29 @@ namespace dxvk::vk {
   
   
   /**
+   * \brief Direct Vulkan device-loss provenance
+   *
+   * This state belongs to the shared DeviceFn lifetime domain so objects that
+   * only own DeviceFn can safely preserve a direct driver result without a
+   * back-reference to DxvkDevice.
+   */
+  struct DeviceLossState {
+    void notifyDeviceErrorFromDriverResult(VkResult status) noexcept {
+      if (status == VK_ERROR_DEVICE_LOST)
+        m_driverDeviceLossObserved.store(true, std::memory_order_release);
+    }
+
+    bool driverDeviceLossObserved() const noexcept {
+      return m_driverDeviceLossObserved.load(std::memory_order_acquire);
+    }
+
+  private:
+
+    std::atomic<bool> m_driverDeviceLossObserved = { false };
+  };
+
+
+  /**
    * \brief Vulkan device functions
    * 
    * Vulkan functions for a specific Vulkan device.
@@ -179,6 +204,20 @@ namespace dxvk::vk {
   struct DeviceFn : DeviceLoader {
     DeviceFn(const Rc<InstanceLoader>& library, bool owned, VkDevice device);
     ~DeviceFn();
+
+    void notifyDeviceErrorFromDriverResult(VkResult status) noexcept {
+      m_deviceLossState.notifyDeviceErrorFromDriverResult(status);
+    }
+
+    bool driverDeviceLossObserved() const noexcept {
+      return m_deviceLossState.driverDeviceLossObserved();
+    }
+
+  private:
+
+    DeviceLossState m_deviceLossState;
+
+  public:
     
     VULKAN_FN(vkDestroyDevice);
     VULKAN_FN(vkGetDeviceQueue);
@@ -271,6 +310,11 @@ namespace dxvk::vk {
     VULKAN_FN(vkGetSemaphoreCounterValue);
     VULKAN_FN(vkSignalSemaphore);
     VULKAN_FN(vkWaitSemaphores);
+
+    #ifdef VK_EXT_device_fault
+    VULKAN_FN(vkGetDeviceFaultInfoEXT);
+    #endif
+
     VULKAN_FN(vkCmdBindPipeline);
     VULKAN_FN(vkCmdSetViewport);
     VULKAN_FN(vkCmdSetScissor);

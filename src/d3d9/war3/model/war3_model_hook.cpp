@@ -5,6 +5,7 @@
 #include "war3_model_resource_cache.h"
 #include "war3_model_registry.h"
 #include "war3_direct_pose_cache.h"
+#include "war3_palette_pack.h"
 
 #include "../../d3d9_war3_debug.h"
 #include "../../d3d9_war3_hook.h"
@@ -9017,12 +9018,9 @@ std::atomic<uint64_t> g_queryBlendedPaletteBestEffortHitCount{0u};
 //   - BestEffort 版本：保留旧宽松行为，**仅供诊断**，不应参与 ready 仲裁。
 //
 // 调用端必须检查 `outPalette.size() == expectedCount`，否则视为 miss。
-bool QueryBlendedPaletteBySlotIndexExact(uint32_t slotIndex,
-                                         uint32_t expectedCount,
-                                         uint32_t expectedFrameTag,
-                                         void* outPaletteVec) {
-  auto& outPalette = *reinterpret_cast<std::vector<Matrix4>*>(outPaletteVec);
-  outPalette.clear();
+bool ValidateBlendedPaletteBySlotIndexExact(uint32_t slotIndex,
+                                            uint32_t expectedCount,
+                                            uint32_t expectedFrameTag) {
   if (expectedCount == 0u || expectedCount > 256u)
     return false;
   if (slotIndex + expectedCount > kSlotBlendedPaletteCacheSize) {
@@ -9030,14 +9028,12 @@ bool QueryBlendedPaletteBySlotIndexExact(uint32_t slotIndex,
         1u, std::memory_order_relaxed);
     return false;
   }
-  outPalette.reserve(expectedCount);
   for (uint32_t i = 0u; i < expectedCount; ++i) {
     const uint32_t s = slotIndex + i;
     const auto& entry = s_slotBlendedPaletteCache[s];
     if (!entry.valid) {
       g_queryBlendedPaletteRejectedInvalidEntryCount.fetch_add(
           1u, std::memory_order_relaxed);
-      outPalette.clear();
       return false;
     }
     // Phase 7.35 路径 1：原先只允许差 1 帧，但相机移动时骨骼计算 0x12E600
@@ -9052,13 +9048,26 @@ bool QueryBlendedPaletteBySlotIndexExact(uint32_t slotIndex,
       if (delta > 2u) {
         g_queryBlendedPaletteRejectedFrameTagMismatchCount.fetch_add(
             1u, std::memory_order_relaxed);
-        outPalette.clear();
         return false;
       }
     }
-    outPalette.push_back(entry.matrix);
   }
-  // 最终完整性复查：任何 partial 情形统一判 fail。
+  return true;
+}
+
+bool QueryBlendedPaletteBySlotIndexExact(uint32_t slotIndex,
+                                         uint32_t expectedCount,
+                                         uint32_t expectedFrameTag,
+                                         void* outPaletteVec) {
+  auto& outPalette = *reinterpret_cast<std::vector<Matrix4>*>(outPaletteVec);
+  outPalette.clear();
+  if (!ValidateBlendedPaletteBySlotIndexExact(
+          slotIndex, expectedCount, expectedFrameTag)) {
+    return false;
+  }
+  outPalette.reserve(expectedCount);
+  for (uint32_t i = 0u; i < expectedCount; ++i)
+    outPalette.push_back(s_slotBlendedPaletteCache[slotIndex + i].matrix);
   if (outPalette.size() != expectedCount) {
     g_queryBlendedPaletteRejectedShortResultCount.fetch_add(
         1u, std::memory_order_relaxed);
@@ -9067,6 +9076,36 @@ bool QueryBlendedPaletteBySlotIndexExact(uint32_t slotIndex,
   }
   g_queryBlendedPaletteExactHitCount.fetch_add(1u, std::memory_order_relaxed);
   return true;
+}
+
+bool CopyBlendedPaletteBytesBySlotIndexExact(
+    uint32_t slotIndex, uint32_t expectedCount, uint32_t expectedFrameTag,
+    void* outPaletteBytes, size_t outPaletteByteCapacity) {
+  if (outPaletteBytes == nullptr || expectedCount == 0u ||
+      expectedCount > 256u ||
+      outPaletteByteCapacity <
+          size_t(expectedCount) * kWar3PackedPaletteMatrixBytes) {
+    return false;
+  }
+  // Validate the complete range before touching destination. A late invalid
+  // slot or frame-tag mismatch must not partially overwrite the caller's last
+  // complete snapshot.
+  if (!ValidateBlendedPaletteBySlotIndexExact(
+          slotIndex, expectedCount, expectedFrameTag)) {
+    return false;
+  }
+  auto* destination = reinterpret_cast<uint8_t*>(outPaletteBytes);
+  for (uint32_t i = 0u; i < expectedCount; ++i) {
+    PackWar3PaletteMatrix3x4(
+        s_slotBlendedPaletteCache[slotIndex + i].matrix,
+        destination + size_t(i) * kWar3PackedPaletteMatrixBytes);
+  }
+  g_queryBlendedPaletteExactHitCount.fetch_add(1u, std::memory_order_relaxed);
+  return true;
+}
+
+uint64_t QueryBlendedPaletteExactHitCount() noexcept {
+  return g_queryBlendedPaletteExactHitCount.load(std::memory_order_relaxed);
 }
 
 // Phase 7.34：诊断用的 best-effort 查询，允许 partial 返回。

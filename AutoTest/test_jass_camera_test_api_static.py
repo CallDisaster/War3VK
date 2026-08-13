@@ -149,11 +149,16 @@ class JassCameraTestApiStaticTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn('"life_and_death_tdr": {', runner)
         self.assertIn("def run_life_and_death_tdr_scenario(", runner)
-        self.assertIn("ISOLATED_DESKTOP_QUARANTINED = True", runner)
+        self.assertIn(
+            "ISOLATED_DESKTOP_NONINTERACTIVE_ONLY = True", runner
+        )
         self.assertIn('"useIsolatedDesktop": False', runner)
         self.assertIn("use_isolated_desktop: bool = False", runner)
-        self.assertIn("life_and_death_tdr 禁止隔离桌面启动", runner)
-        self.assertIn('"isolatedDesktopQuarantined": True', runner)
+        self.assertNotIn("life_and_death_tdr 禁止隔离桌面启动", runner)
+        self.assertNotIn('"isolatedDesktopQuarantined": True', runner)
+        self.assertIn("def _post_war3_client_click_message(", runner)
+        self.assertIn('"ISOLATED_DESKTOP_NOT_HIDDEN"', runner)
+        self.assertIn('"dialogDismissedVerified"] = False', runner)
         self.assertIn('"camera.world_bounds"', runner)
         self.assertIn('"camera.pan_to"', runner)
         self.assertIn("for row, y in enumerate(ys)", runner)
@@ -164,6 +169,7 @@ class JassCameraTestApiStaticTests(unittest.TestCase):
         self.assertIn('"visibility.full_map", {"enabled": False}', runner)
         self.assertIn("_runtime_status_device_lost(status)", runner)
         self.assertIn("startup_input_actions", runner)
+        self.assertIn("startup_input_actions=startup_input_actions", runner)
         self.assertIn('{"type": "key", "vk": 0x20, "holdMs": 80}', runner)
         self.assertIn('"code": "AUTOTEST_SESSION_REQUIRED"', runner)
         self.assertIn('"mode": "default-visible"', runner)
@@ -181,6 +187,30 @@ class JassCameraTestApiStaticTests(unittest.TestCase):
         self.assertIn("SetGpuFlightAutoTestContext", api)
         self.assertIn("screenshot_count: int = 12", runner)
         self.assertIn("birth_hold_sec: int = 120", runner)
+        self.assertIn("strict_external_graphics_hooks: bool = True", runner)
+        self.assertIn(
+            "_wait_for_process_module_snapshot(pid, timeout_sec=5.0)",
+            runner,
+        )
+        self.assertIn("def _snapshot_process_modules_psapi(", runner)
+        self.assertIn("def _snapshot_process_modules_psapi_handle(", runner)
+        self.assertIn("def snapshot_modules(self)", runner)
+        self.assertIn("STATE.retained_native_process.snapshot_modules()", runner)
+        self.assertIn("EnumProcessModulesEx", runner)
+        self.assertIn("GetModuleFileNameExW", runner)
+        self.assertIn("_external_graphics_hook_evidence(loaded_modules)", runner)
+        self.assertIn('"graphics-hook32.dll"', runner)
+        self.assertIn('"reshade32.dll"', runner)
+        self.assertIn(
+            'failure_reason = "external graphics hook contamination"',
+            runner,
+        )
+        self.assertLess(
+            runner.index(
+                'failure_reason = "external graphics hook contamination"'
+            ),
+            runner.index('pid, w3, "camera.snapshot"'),
+        )
         self.assertIn('"phase": "birth-hold"', runner)
         self.assertIn("war3 process exited during birth hold", runner)
         self.assertIn("def capture_aligned_screenshot(", runner)

@@ -10,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -52,6 +53,13 @@ struct ShadowGeosetResourceRecord {
 
   uint32_t vertexGroupCount = 0;
   std::vector<uint8_t> vertexGroupIndices;
+  // Derived once when immutable payload is published. DirectGrouped consumes
+  // the same geoset for every instance and must not rescan this array per draw.
+  uint32_t maxVertexGroupSlot = 0u;
+  // Word-wise FNV state used by CurrentDrawGroupSlotSummary before metadata is
+  // mixed in. It is valid only with the immutable generation above and is
+  // consumed only after an exact byte comparison with the current draw stream.
+  uint64_t vertexGroupSlotWordHash = 0u;
 
   uint32_t uvLayerCount = 0;
   std::vector<ShadowGeosetUvLayerRecord> uvLayers;
@@ -64,6 +72,7 @@ struct ShadowGeosetResourceRecord {
 
   uint32_t matrixGroupCount = 0;
   std::vector<uint32_t> matrixGroupSizes;
+  uint32_t maxMatrixGroupSize = 0u;
 
   uint32_t matrixIndexCount = 0;
   std::vector<uint32_t> matrixIndices;
@@ -173,6 +182,20 @@ struct ShadowGeosetResourceStamp {
       ShadowGeosetImmutableCaptureStatus::NotAttempted;
 };
 
+// Scalar projection used by manifest identity hydration.  It deliberately
+// carries no geometry arrays: readiness remains proven against the canonical
+// immutable cache publication while callers copy only the identity fields
+// they actually consume.
+struct ShadowReadyGeosetBinding {
+  void* geosetPtr = nullptr;
+  void* geosetDataPtr = nullptr;
+  void* modelResourcePtr = nullptr;
+  uint64_t modelKey = 0u;
+  uint32_t geosetIndex = kInvalidShadowGeosetIndex;
+};
+
+static_assert(std::is_trivially_copyable_v<ShadowReadyGeosetBinding>);
+
 struct ShadowModelResourceRecord {
   void *runtimeModelPtr = nullptr;
   void *modelResourcePtr = nullptr;
@@ -186,6 +209,29 @@ struct ShadowModelResourceRecord {
 
   bool readyForShadowConsumer() const { return readyGeosetCount != 0; }
 };
+
+// Hot-path owner lookups need identity, not the model's geoset pointer arrays.
+// Keep this projection trivially copyable so DirectGrouped and manifest
+// hydration can resolve an owner without cloning the full model record.
+struct ShadowRuntimeModelOwnerBinding {
+  void* runtimeModelPtr = nullptr;
+  void* modelResourcePtr = nullptr;
+  uint64_t modelKey = 0u;
+  uint32_t geosetCount = 0u;
+};
+
+static_assert(std::is_trivially_copyable_v<ShadowRuntimeModelOwnerBinding>);
+
+// ResourceStore alias binding only consumes these three scalar fields.  A
+// dedicated snapshot prevents that hot path from cloning the full model
+// record and its geoset pointer vectors merely to enumerate alias slots.
+struct ShadowModelAliasSnapshotRecord {
+  void* runtimeModelPtr = nullptr;
+  void* modelResourcePtr = nullptr;
+  uint32_t geosetCount = 0u;
+};
+
+static_assert(std::is_trivially_copyable_v<ShadowModelAliasSnapshotRecord>);
 
 // 基于 capacity 的账本刻意排除 unordered_map 的节点和桶开销。这里只统计重复
 // Game.dll 模型数据的自有载荷数组，采集时无需再次复制这些数组。
@@ -204,6 +250,11 @@ struct ShadowModelResourceMemorySnapshot {
   uint64_t matrixGroupsCapacityBytes = 0;
   uint64_t matrixIndicesCapacityBytes = 0;
   uint64_t modelPointerCapacityBytes = 0;
+};
+
+struct ShadowResourceStoreCapacityHint {
+  size_t geosetRecordUpperBound = 0u;
+  size_t runtimeAliasUpperBound = 0u;
 };
 
 class ShadowModelResourceCache {
@@ -238,6 +289,10 @@ public:
   bool findGeosetByPtr(void *geosetPtr, ShadowGeosetResourceRecord &out) const;
   bool findGeosetByData(void *geosetDataPtr,
                         ShadowGeosetResourceRecord &out) const;
+  bool findReadyGeosetBindingByPtr(
+      void* geosetPtr, ShadowReadyGeosetBinding& out) const;
+  bool findReadyGeosetBindingByData(
+      void* geosetDataPtr, ShadowReadyGeosetBinding& out) const;
   ShadowGeosetResourceSnapshot findGeosetSnapshotByData(
       void* geosetDataPtr) const;
   bool findGeosetStampByData(void* geosetDataPtr,
@@ -257,6 +312,17 @@ public:
   bool findRuntimeModelOwnerIndexed(void* runtimeGeosetPtr,
                                     void* runtimeGeosetDataPtr,
                                     ShadowModelResourceRecord& out) const;
+  bool findRuntimeModelOwnerBinding(
+      void* runtimeGeosetPtr, void* runtimeGeosetDataPtr,
+      uint32_t geosetIndex, void* modelResourcePtr,
+      ShadowRuntimeModelOwnerBinding& out) const;
+  bool findRuntimeModelOwnerBindingIndexed(
+      void* runtimeGeosetPtr, void* runtimeGeosetDataPtr,
+      ShadowRuntimeModelOwnerBinding& out) const;
+  bool findModelBinding(void* modelResourcePtr,
+                        ShadowRuntimeModelOwnerBinding& out) const;
+  bool findRuntimeModelBinding(
+      void* runtimeModelPtr, ShadowRuntimeModelOwnerBinding& out) const;
   bool findModelResource(void *modelResourcePtr,
                          ShadowModelResourceRecord &out) const;
   bool findRuntimeModelResource(void *runtimeModelPtr,
@@ -265,12 +331,68 @@ public:
   void* resolveDirectModelResourcePtr(void* modelResourceOrHandlePtr) const;
 
   std::vector<ShadowGeosetResourceRecord> snapshotGeosets() const;
+  // Invokes fn(payload, alias) once for every record represented by
+  // snapshotGeosets, but without cloning payload vectors into an intermediate
+  // container. References are valid only for the duration of the callback;
+  // callbacks must not re-enter this cache while the shared lock is held.
+  template <typename Fn>
+  void forEachGeosetContractSource(Fn&& fn) const {
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
+    for (const auto& it : m_byGeoset) {
+      const ShadowGeosetResourceRecord& alias = it.second;
+      if (alias.readyForShadowConsumer() &&
+          alias.geosetDataPtr != nullptr) {
+        const auto canonical = m_byGeosetData.find(alias.geosetDataPtr);
+        if (canonical != m_byGeosetData.end() &&
+            canonical->second != nullptr) {
+          fn(*canonical->second, &alias);
+          continue;
+        }
+      }
+      fn(alias, nullptr);
+    }
+    for (const auto& it : m_byGeosetData) {
+      if (it.second == nullptr)
+        continue;
+      const ShadowGeosetResourceRecord& record = *it.second;
+      if (record.geosetPtr != nullptr &&
+          m_byGeoset.find(record.geosetPtr) != m_byGeoset.end()) {
+        continue;
+      }
+      fn(record, nullptr);
+    }
+  }
   std::vector<ShadowModelResourceRecord> snapshotModels() const;
   std::vector<ShadowModelResourceRecord> snapshotRuntimeModels() const;
+  std::vector<ShadowModelAliasSnapshotRecord> snapshotModelAliases() const;
+  std::vector<ShadowModelAliasSnapshotRecord>
+  snapshotRuntimeModelAliases() const;
+  // ResourceStore hydration consumes aliases immediately and never re-enters
+  // this cache. Enumerate the same model-resource-then-runtime-model sequence
+  // under one shared lock, avoiding two temporary vector allocations on every
+  // resource-store rebuild. Callback references are value projections and are
+  // valid only for the duration of the call.
+  template <typename Fn>
+  void forEachResourceStoreAlias(Fn&& fn) const {
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
+    for (const auto& entry : m_byModelResource) {
+      const auto& record = entry.second;
+      fn(ShadowModelAliasSnapshotRecord{
+          record.runtimeModelPtr, record.modelResourcePtr,
+          record.geosetCount});
+    }
+    for (const auto& entry : m_byRuntimeModel) {
+      const auto& record = entry.second;
+      fn(ShadowModelAliasSnapshotRecord{
+          record.runtimeModelPtr, record.modelResourcePtr,
+          record.geosetCount});
+    }
+  }
   size_t geosetRecordCount() const;
   size_t readyGeosetCount() const;
   size_t modelResourceCount() const;
   size_t runtimeModelRecordCount() const;
+  ShadowResourceStoreCapacityHint resourceStoreCapacityHint() const;
   ShadowModelResourceMemorySnapshot memorySnapshot() const;
   uint64_t frameNumber() const;
   uint64_t revision() const;

@@ -68,10 +68,12 @@ DEFAULT_BENCHMARK_REFRESH = 59
 AUTOTEST_BACKGROUND_THROTTLE_ENV = "DXVK_WAR3_AUTOTEST_DISABLE_BACKGROUND_THROTTLE"
 AUTOTEST_GAME_PAUSE_ENV = "DXVK_WAR3_AUTOTEST_DISABLE_GAME_PAUSE"
 AUTOTEST_INTERNAL_TEST_API_ENV = "DXVK_WAR3_INTERNAL_TEST_API"
-# Win32 Desktop-object launches are quarantined on the current test machine.
-# The display stack can blank the interactive desktop while War3 remains alive
-# on the non-input desktop, which makes an unattended test unsafe for the user.
-ISOLATED_DESKTOP_QUARANTINED = True
+AUTOTEST_DISABLE_OBS_VULKAN_CAPTURE_ENV = "DISABLE_VULKAN_OBS_CAPTURE"
+# Isolated desktop launches are non-interactive by contract.  AutoTest may
+# create a process on another Win32 desktop, but it must never switch the
+# session's input desktop or inject keyboard/mouse input into that desktop.
+# Scenario control must use the named pipe/JASS bridge and framebuffer capture.
+ISOLATED_DESKTOP_NONINTERACTIVE_ONLY = True
 WAR3_VIDEO_REG_KEY = r"Software\Blizzard Entertainment\Warcraft III\Video"
 WAR3_INSTALL_REG_KEY = r"Software\Blizzard Entertainment\Warcraft III"
 YDWE_LAUNCHER_MODE_DIRECT = "direct"
@@ -84,7 +86,6 @@ DESKTOP_READOBJECTS = 0x0001
 DESKTOP_CREATEWINDOW = 0x0002
 DESKTOP_ENUMERATE = 0x0040
 DESKTOP_WRITEOBJECTS = 0x0080
-DESKTOP_SWITCHDESKTOP = 0x0100
 CREATE_UNICODE_ENVIRONMENT = 0x00000400
 CREATE_NEW_CONSOLE = 0x00000010
 GENERIC_READ = 0x80000000
@@ -348,6 +349,13 @@ class RetainedNativeProcessWitness:
 
     def to_dict(self) -> Dict[str, Any]:
         return self.snapshot()
+
+    def snapshot_modules(self) -> List[Dict[str, Any]]:
+        """Enumerate modules through the already-owned launch HANDLE."""
+        with self._lock:
+            if self._closed or self._handle <= 0:
+                return []
+            return _snapshot_process_modules_psapi_handle(self._handle)
 
     def _binding_exact(
         self, pid: int, creation_epoch_ms: int, canonical_exe_path: str,
@@ -1401,8 +1409,63 @@ def _desktop_access_mask() -> int:
         | DESKTOP_CREATEWINDOW
         | DESKTOP_ENUMERATE
         | DESKTOP_WRITEOBJECTS
-        | DESKTOP_SWITCHDESKTOP
     )
+
+
+def _desktop_name_from_handle(handle: Any) -> str:
+    handle_value = _native_handle_value(handle)
+    if handle_value <= 0:
+        return ""
+    user32 = ctypes.windll.user32
+    user32.GetUserObjectInformationW.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    user32.GetUserObjectInformationW.restype = wintypes.BOOL
+    needed = wintypes.DWORD(0)
+    UOI_NAME = 2
+    user32.GetUserObjectInformationW(
+        wintypes.HANDLE(handle_value), UOI_NAME, None, 0, ctypes.byref(needed)
+    )
+    if int(needed.value) <= 0:
+        return ""
+    wchar_count = max(
+        2,
+        (int(needed.value) + ctypes.sizeof(ctypes.c_wchar) - 1)
+        // ctypes.sizeof(ctypes.c_wchar),
+    )
+    buffer = ctypes.create_unicode_buffer(wchar_count)
+    if not user32.GetUserObjectInformationW(
+        wintypes.HANDLE(handle_value),
+        UOI_NAME,
+        ctypes.cast(buffer, wintypes.LPVOID),
+        wintypes.DWORD(ctypes.sizeof(buffer)),
+        ctypes.byref(needed),
+    ):
+        return ""
+    return str(buffer.value or "")
+
+
+def _query_input_desktop_name() -> str:
+    user32 = ctypes.windll.user32
+    user32.OpenInputDesktop.argtypes = [
+        wintypes.DWORD,
+        wintypes.BOOL,
+        wintypes.DWORD,
+    ]
+    user32.OpenInputDesktop.restype = wintypes.HANDLE
+    user32.CloseDesktop.argtypes = [wintypes.HANDLE]
+    user32.CloseDesktop.restype = wintypes.BOOL
+    handle = user32.OpenInputDesktop(0, False, DESKTOP_READOBJECTS)
+    if not handle:
+        return ""
+    try:
+        return _desktop_name_from_handle(handle)
+    finally:
+        user32.CloseDesktop(wintypes.HANDLE(handle))
 
 
 def _create_isolated_desktop(name: str) -> Dict[str, Any]:
@@ -1410,16 +1473,23 @@ def _create_isolated_desktop(name: str) -> Dict[str, Any]:
     if not desktop_name:
         desktop_name = f"War3AutoTest_{_now_compact()}"
 
-    if ISOLATED_DESKTOP_QUARANTINED:
+    input_desktop_before = _query_input_desktop_name()
+    if not input_desktop_before:
         return {
             "ok": False,
             "stage": "preflight",
-            "error": (
-                "隔离桌面启动已被安全隔离：当前显示栈可能令交互桌面黑屏，"
-                "同时把 War3 留在非输入桌面。请使用可见桌面或 attach-only。"
-            ),
+            "error": "无法证明当前输入桌面身份，拒绝创建隔离桌面",
             "name": desktop_name,
-            "quarantined": True,
+            "code": "INPUT_DESKTOP_IDENTITY_UNAVAILABLE",
+        }
+    if desktop_name.casefold() == input_desktop_before.casefold():
+        return {
+            "ok": False,
+            "stage": "preflight",
+            "error": "隔离桌面名称不得等于当前输入桌面",
+            "name": desktop_name,
+            "inputDesktop": input_desktop_before,
+            "code": "ISOLATED_DESKTOP_NAME_COLLISION",
         }
 
     result: Dict[str, Any] = {}
@@ -1478,6 +1548,21 @@ def _create_isolated_desktop(name: str) -> Dict[str, Any]:
         }
     if not result.get("ok"):
         return {"ok": False, "error": result.get("error", "CreateDesktopW 失败"), "name": desktop_name}
+    input_desktop_after = _query_input_desktop_name()
+    if input_desktop_after != input_desktop_before:
+        _close_desktop_handle(int(result.get("handle", 0) or 0))
+        return {
+            "ok": False,
+            "stage": "post-create-witness",
+            "error": "创建隔离桌面期间输入桌面发生变化，已关闭隔离桌面",
+            "name": desktop_name,
+            "inputDesktopBefore": input_desktop_before,
+            "inputDesktopAfter": input_desktop_after,
+            "code": "INPUT_DESKTOP_CHANGED",
+        }
+    result["inputDesktopBefore"] = input_desktop_before
+    result["inputDesktopAfter"] = input_desktop_after
+    result["nonInteractiveOnly"] = True
     return result
 
 
@@ -1499,6 +1584,22 @@ def _launch_process_on_desktop(
     env: Dict[str, str],
     desktop_name: str,
 ) -> Dict[str, Any]:
+    input_desktop_before = _query_input_desktop_name()
+    if not input_desktop_before:
+        return {
+            "ok": False,
+            "error": "无法证明当前输入桌面身份，拒绝后台进程启动",
+            "desktop": desktop_name,
+            "code": "INPUT_DESKTOP_IDENTITY_UNAVAILABLE",
+        }
+    if str(desktop_name or "").casefold() == input_desktop_before.casefold():
+        return {
+            "ok": False,
+            "error": "目标桌面与当前输入桌面相同，拒绝隔离启动",
+            "desktop": desktop_name,
+            "inputDesktop": input_desktop_before,
+            "code": "ISOLATED_DESKTOP_NAME_COLLISION",
+        }
     kernel32 = ctypes.windll.kernel32
     kernel32.CreateProcessW.argtypes = [
         wintypes.LPCWSTR,
@@ -1547,6 +1648,21 @@ def _launch_process_on_desktop(
     pid = int(proc_info.dwProcessId)
     if proc_info.hThread:
         kernel32.CloseHandle(proc_info.hThread)
+    input_desktop_after = _query_input_desktop_name()
+    if input_desktop_after != input_desktop_before:
+        cleanup = _terminate_and_close_owned_create_process_handle(
+            proc_info.hProcess,
+        )
+        return {
+            "ok": False,
+            "error": "隔离进程创建期间输入桌面发生变化，已终止该进程",
+            "pid": pid,
+            "desktop": desktop_name,
+            "inputDesktopBefore": input_desktop_before,
+            "inputDesktopAfter": input_desktop_after,
+            "cleanup": cleanup,
+            "code": "INPUT_DESKTOP_CHANGED",
+        }
     witness, witness_acquisition = _adopt_native_process_witness(
         proc_info.hProcess,
         pid,
@@ -1572,6 +1688,9 @@ def _launch_process_on_desktop(
         "ok": True,
         "pid": pid,
         "desktop": desktop_name,
+        "inputDesktopBefore": input_desktop_before,
+        "inputDesktopAfter": input_desktop_after,
+        "nonInteractiveOnly": True,
         "nativeProcessWitness": witness.snapshot(),
         "nativeProcessWitnessAcquisition": witness_acquisition,
         # Internal-only ownership transfer to launch_war3_test. This object is
@@ -1944,6 +2063,147 @@ def _snapshot_process_modules(pid: int) -> List[Dict[str, Any]]:
     finally:
         kernel32.CloseHandle(snapshot)
     return rows
+
+
+def _snapshot_process_modules_psapi_handle(
+    process_handle: int,
+) -> List[Dict[str, Any]]:
+    """Read a WOW64 module list through an already-owned process HANDLE."""
+    LIST_MODULES_ALL = 0x03
+    capacity = 2048
+    psapi = ctypes.WinDLL("psapi", use_last_error=True)
+    psapi.EnumProcessModulesEx.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.HMODULE),
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.DWORD,
+    ]
+    psapi.EnumProcessModulesEx.restype = wintypes.BOOL
+    psapi.GetModuleFileNameExW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.HMODULE,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+    ]
+    psapi.GetModuleFileNameExW.restype = wintypes.DWORD
+    handle = wintypes.HANDLE(int(process_handle))
+    if not handle:
+        return []
+    rows: List[Dict[str, Any]] = []
+    modules = (wintypes.HMODULE * capacity)()
+    needed = wintypes.DWORD(0)
+    if not psapi.EnumProcessModulesEx(
+        handle,
+        modules,
+        ctypes.sizeof(modules),
+        ctypes.byref(needed),
+        LIST_MODULES_ALL,
+    ):
+        return []
+    count = min(
+        capacity,
+        int(needed.value) // ctypes.sizeof(wintypes.HMODULE),
+    )
+    for index in range(count):
+        path_buffer = ctypes.create_unicode_buffer(32768)
+        length = int(psapi.GetModuleFileNameExW(
+            handle,
+            modules[index],
+            path_buffer,
+            len(path_buffer),
+        ))
+        if length <= 0:
+            continue
+        path = str(path_buffer.value)
+        rows.append({
+            "name": Path(path).name,
+            "path": path,
+            "size": 0,
+            "enumerationBackend": "psapi-owned-process-handle",
+        })
+    return rows
+
+
+def _snapshot_process_modules_psapi(pid: int) -> List[Dict[str, Any]]:
+    """Open a read-only process handle and use the shared PSAPI backend."""
+    PROCESS_QUERY_INFORMATION = 0x0400
+    PROCESS_VM_READ = 0x0010
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    handle = kernel32.OpenProcess(
+        PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+        False,
+        int(pid),
+    )
+    if not handle:
+        return []
+    try:
+        return _snapshot_process_modules_psapi_handle(
+            int(ctypes.cast(handle, ctypes.c_void_p).value or 0)
+        )
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _wait_for_process_module_snapshot(
+    pid: int,
+    timeout_sec: float = 5.0,
+) -> List[Dict[str, Any]]:
+    """Retry Toolhelp's documented transient empty/ERROR_BAD_LENGTH window."""
+    deadline = time.monotonic() + max(0.0, float(timeout_sec))
+    while True:
+        rows = _snapshot_process_modules(int(pid))
+        if not rows:
+            rows = _snapshot_process_modules_psapi(int(pid))
+        if (
+            not rows
+            and int(STATE.war3_pid or 0) == int(pid)
+            and STATE.retained_native_process is not None
+        ):
+            rows = STATE.retained_native_process.snapshot_modules()
+        if rows or time.monotonic() >= deadline or not _pid_alive(int(pid)):
+            return rows
+        time.sleep(0.1)
+
+
+_STRICT_STABILITY_EXTERNAL_GRAPHICS_HOOKS = frozenset(
+    {
+        "graphics-hook32.dll",
+        "graphics-hook64.dll",
+        "reshade32.dll",
+        "reshade64.dll",
+    }
+)
+
+
+def _external_graphics_hook_evidence(
+    modules: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Return bounded evidence for injected graphics hooks.
+
+    Stability runs must not attribute a third-party capture/injection crash to
+    WarVK.  This helper is observational only: it never stops an overlay or
+    changes global capture settings.
+    """
+    evidence: List[Dict[str, Any]] = []
+    for row in modules:
+        name = str(row.get("name", "") or "").strip()
+        if name.casefold() not in _STRICT_STABILITY_EXTERNAL_GRAPHICS_HOOKS:
+            continue
+        path = Path(str(row.get("path", "") or ""))
+        evidence.append(
+            {
+                "name": name,
+                "path": str(path),
+                "size": int(row.get("size", 0) or 0),
+                "sha256": sha256_file(path) if path.is_file() else "",
+            }
+        )
+    return evidence
 
 
 def _wait_for_ydwe_runtime_modules(
@@ -2888,6 +3148,13 @@ def _launch_suite_map_until_ready(
             require_game_started_for_fallback=bool(
                 ready_require_game_started_for_fallback
             ),
+            # Isolated sessions cannot receive normal foreground input. Keep
+            # acknowledging a completed loading screen with HWND-scoped
+            # PostMessage pulses while the control plane proves that JASS is
+            # ready but the game session has not started. This never switches
+            # the input desktop and cannot target the user's foreground app.
+            auto_continue_loading=bool(launch.get("useIsolatedDesktop", False)),
+            continue_key="SPACE",
         )
         row["ready"] = ready
         if ready.get("ok"):
@@ -2903,6 +3170,21 @@ def _launch_suite_map_until_ready(
                 "attempts": attempts,
             }
 
+        # Preserve the actual isolated frame before terminating a launch that
+        # failed to reach the game loop. Without this, a menu/loading-screen
+        # timeout is indistinguishable from a renderer or map failure.
+        row["readyFailureScreenshot"] = capture_war3_screenshot(
+            output_path=str(
+                ARTIFACT_ROOT
+                / "ready_failures"
+                / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{pid}.png"
+            ),
+            pid=pid,
+            war3_dir=str(launch.get("instanceRoot", war3_dir)),
+            prefer_internal=True,
+            timeout_sec=8,
+            fallback_to_window_capture=False,
+        )
         stop = stop_war3(
             pid=pid,
             graceful_wait_sec=3,
@@ -3007,11 +3289,106 @@ def _extract_shadow_cull_observe_summary(data: Dict[str, Any]) -> Dict[str, Any]
     it only exposes the most recent frame and can miss a one-frame mismatch.
     """
 
+    # Current perf reports place the per-frame shadow counters in the bounded
+    # runtime summary. Older reports and synthetic contract fixtures exported
+    # them at the top level. Accept both schemas, preferring the current nested
+    # snapshot so an obsolete top-level zero cannot hide a live Observe run.
+    runtime_summary = data.get("shadowRuntimeV2Summary", {})
+    if not isinstance(runtime_summary, dict):
+        runtime_summary = {}
+    shadow_budget = data.get("shadowBudgetSummary", {})
+    if not isinstance(shadow_budget, dict):
+        shadow_budget = {}
+    if not runtime_summary:
+        runtime_summary = shadow_budget
+
     def _integer(name: str) -> int:
         try:
+            if name in runtime_summary:
+                return int(runtime_summary.get(name, 0) or 0)
             return int(data.get(name, 0) or 0)
         except (TypeError, ValueError):
             return 0
+
+    reject_reason_names = (
+        "none",
+        "unknownProvenance",
+        "diagnosticOnly",
+        "animatedConservativeOnly",
+        "sourceGenerationUnknown",
+        "frameGenerationUnknown",
+        "frameGenerationStale",
+        "identityUnproven",
+        "dynamicOrSkinned",
+        "animatedAttachment",
+        "nonFiniteBounds",
+        "invalidRadius",
+    )
+
+    def _reject_histogram(name: str) -> Dict[str, int]:
+        value = runtime_summary.get(name)
+        if not isinstance(value, list):
+            value = shadow_budget.get(name, data.get(name, []))
+        if not isinstance(value, list):
+            value = []
+        result: Dict[str, int] = {}
+        for index, reason in enumerate(reject_reason_names):
+            try:
+                result[reason] = int(value[index] or 0)
+            except (IndexError, TypeError, ValueError):
+                result[reason] = 0
+        return result
+
+    producer_stage_names = (
+        "s1Attempts",
+        "fallbackAttempts",
+        "exactRanges",
+        "missingExactRanges",
+        "upSourceAttempts",
+        "mappedSourceAttempts",
+        "noSource",
+        "spanAccepted",
+        "spanRejected",
+        "spanNullBase",
+        "spanNotCpuReadable",
+        "spanMissingOwner",
+        "spanMissingGeneration",
+        "spanRange",
+        "spanAddressOverflow",
+        "computeSuccess",
+        "computeFailure",
+        "validSphere",
+        "invalidSphere",
+        "publishedExact",
+        "domainCacheLookups",
+        "domainCacheHits",
+        "domainCacheMisses",
+        "domainCacheCollisionMisses",
+        "domainCacheStores",
+        "domainCacheEvictions",
+        "hintComparable",
+        "hintExact",
+        "hintConservativeSuperset",
+        "hintUnderCoverage",
+        "hintInvalid",
+        "hintRangeAccepted",
+        "hintRangeRejected",
+    )
+
+    def _terrain_producer_histogram() -> Dict[str, int]:
+        name = "semanticSceneTerrainBoundsProducerHistogram"
+        value = runtime_summary.get(name)
+        if not isinstance(value, list):
+            value = shadow_budget.get(name, data.get(name, []))
+        if not isinstance(value, list):
+            value = []
+        result: Dict[str, int] = {}
+        for index, stage in enumerate(producer_stage_names):
+            try:
+                result[stage] = int(value[index] or 0)
+            except (IndexError, TypeError, ValueError):
+                result[stage] = 0
+        return result
 
     frame_count = _integer("frameCount")
     terrain_candidates = _integer(
@@ -3026,9 +3403,6 @@ def _extract_shadow_cull_observe_summary(data: Dict[str, Any]) -> Dict[str, Any]
     )
     terrain_far_tests = max(0, terrain_candidates * 2)
 
-    shadow_budget = data.get("shadowBudgetSummary", {})
-    if not isinstance(shadow_budget, dict):
-        shadow_budget = {}
     frames_incomplete = int(shadow_budget.get("framesIncomplete", 0) or 0)
     frames_budget_exceeded = int(
         shadow_budget.get("framesBudgetExceeded", 0) or 0
@@ -3074,12 +3448,16 @@ def _extract_shadow_cull_observe_summary(data: Dict[str, Any]) -> Dict[str, Any]
         "frameCount": frame_count,
         "terrain": {
             "mode": terrain_mode,
+            "producer": _terrain_producer_histogram(),
             "candidateCount": terrain_candidates,
             "proofAcceptedCount": _integer(
                 "semanticSceneTerrainBoundsProofAcceptedCount"
             ),
             "failVisibleCount": _integer(
                 "semanticSceneTerrainBoundsFailVisibleCount"
+            ),
+            "rejectReasons": _reject_histogram(
+                "semanticSceneTerrainBoundsRejectReasonHistogram"
             ),
             "wouldCullCount": terrain_would_cull,
             "appliedCullCount": terrain_applied,
@@ -3109,6 +3487,9 @@ def _extract_shadow_cull_observe_summary(data: Dict[str, Any]) -> Dict[str, Any]
             ),
             "failVisibleCount": _integer(
                 "semanticSceneObjectBoundsFailVisibleCount"
+            ),
+            "rejectReasons": _reject_histogram(
+                "semanticSceneObjectBoundsRejectReasonHistogram"
             ),
             "wouldCullCount": _integer(
                 "semanticSceneObjectBoundsWouldCullCount"
@@ -4082,6 +4463,231 @@ def _post_window_syscommand(pid: int, command: int) -> Dict[str, Any]:
     }
 
 
+def _post_war3_virtual_key_message(
+    pid: int,
+    vk: int,
+    hold_ms: int = 45,
+    repeat: int = 1,
+) -> Dict[str, Any]:
+    """Post a bounded key message to the exact War3 HWND without activation."""
+    target_pid = int(pid)
+    hwnd = _wait_for_main_window_hwnd(
+        target_pid, timeout_sec=8.0, require_visible=True
+    )
+    if not hwnd:
+        return {"ok": False, "error": f"未找到可见主窗口: pid={target_pid}"}
+
+    registered = SESSION_REGISTRY.get(pid=target_pid)
+    desktop_name = (
+        str(registered.desktop_name or "")
+        if registered is not None
+        else str(STATE.desktop_name or "")
+    )
+    desktop_mode = (
+        str(registered.desktop_mode or "default")
+        if registered is not None
+        else str(STATE.desktop_mode or "default")
+    ).strip().lower()
+    input_desktop_before = _query_input_desktop_name()
+    if desktop_mode == "isolated" and (
+        not desktop_name
+        or not input_desktop_before
+        or desktop_name.casefold() == input_desktop_before.casefold()
+    ):
+        return {
+            "ok": False,
+            "pid": target_pid,
+            "code": "ISOLATED_DESKTOP_NOT_HIDDEN",
+            "desktop": desktop_name,
+            "inputDesktopBefore": input_desktop_before,
+        }
+
+    user32 = ctypes.windll.user32
+    virtual_key = int(vk)
+    WM_KEYDOWN = 0x0100
+    WM_KEYUP = 0x0101
+    scan = int(user32.MapVirtualKeyW(virtual_key, 0)) & 0xFF
+    lparam_down = 1 | (scan << 16)
+    lparam_up = 1 | (scan << 16) | (1 << 30) | (1 << 31)
+    posts: List[Dict[str, Any]] = []
+    ok_all = True
+    for _ in range(max(1, int(repeat))):
+        down_ok = bool(user32.PostMessageW(
+            ctypes.c_void_p(hwnd),
+            WM_KEYDOWN,
+            ctypes.c_void_p(virtual_key),
+            ctypes.c_void_p(lparam_down),
+        ))
+        time.sleep(max(0.0, float(hold_ms) / 1000.0))
+        up_ok = bool(user32.PostMessageW(
+            ctypes.c_void_p(hwnd),
+            WM_KEYUP,
+            ctypes.c_void_p(virtual_key),
+            ctypes.c_void_p(lparam_up),
+        ))
+        posts.append({"down": down_ok, "up": up_ok})
+        ok_all = ok_all and down_ok and up_ok
+        time.sleep(0.02)
+    input_desktop_after = _query_input_desktop_name()
+    input_desktop_stable = bool(
+        input_desktop_before
+        and input_desktop_after == input_desktop_before
+    )
+    return {
+        "ok": bool(ok_all and input_desktop_stable),
+        "pid": target_pid,
+        "hwnd": int(hwnd),
+        "vk": virtual_key,
+        "scan": scan,
+        "holdMs": int(hold_ms),
+        "repeat": max(1, int(repeat)),
+        "posts": posts,
+        "mode": (
+            "isolated-window-message"
+            if desktop_mode == "isolated"
+            else "default-window-message"
+        ),
+        "desktop": desktop_name,
+        "inputDesktopBefore": input_desktop_before,
+        "inputDesktopAfter": input_desktop_after,
+        "inputDesktopStable": input_desktop_stable,
+        "foregroundChanged": False,
+        "window": _query_window_info_by_hwnd(hwnd, pid=target_pid),
+    }
+
+
+def _post_war3_client_click_message(
+    pid: int,
+    x: int,
+    y: int,
+    button: str = "left",
+    hold_ms: int = 45,
+    count: int = 1,
+) -> Dict[str, Any]:
+    """Post a bounded client click to the exact AutoTest-owned War3 HWND."""
+    target_pid = int(pid)
+    registered = SESSION_REGISTRY.get(pid=target_pid)
+    state_owned = bool(
+        int(STATE.war3_pid or 0) == target_pid
+        and _state_owned_process_alive(target_pid) is True
+    )
+    if registered is None and not state_owned:
+        return {
+            "ok": False,
+            "pid": target_pid,
+            "code": "AUTOTEST_SESSION_REQUIRED",
+            "error": "窗口点击只允许用于精确绑定的 AutoTest War3 会话",
+        }
+
+    hwnd = _wait_for_main_window_hwnd(
+        target_pid, timeout_sec=8.0, require_visible=True
+    )
+    if not hwnd:
+        return {"ok": False, "error": f"未找到可见主窗口: pid={target_pid}"}
+
+    desktop_name = (
+        str(registered.desktop_name or "")
+        if registered is not None
+        else str(STATE.desktop_name or "")
+    )
+    desktop_mode = (
+        str(registered.desktop_mode or "default")
+        if registered is not None
+        else str(STATE.desktop_mode or "default")
+    ).strip().lower()
+    input_desktop_before = _query_input_desktop_name()
+    if desktop_mode == "isolated" and (
+        not desktop_name
+        or not input_desktop_before
+        or desktop_name.casefold() == input_desktop_before.casefold()
+    ):
+        return {
+            "ok": False,
+            "pid": target_pid,
+            "code": "ISOLATED_DESKTOP_NOT_HIDDEN",
+            "desktop": desktop_name,
+            "inputDesktopBefore": input_desktop_before,
+        }
+
+    window = _query_window_info_by_hwnd(hwnd, pid=target_pid)
+    client = dict(window.get("clientRect", {}) or {})
+    client_width = max(1, int(client.get("width", 0) or 0))
+    client_height = max(1, int(client.get("height", 0) or 0))
+    client_x = max(0, min(int(x), client_width - 1))
+    client_y = max(0, min(int(y), client_height - 1))
+    button_name = str(button or "left").strip().lower()
+    if button_name == "left":
+        down_message, up_message, down_state = 0x0201, 0x0202, 0x0001
+    elif button_name == "right":
+        down_message, up_message, down_state = 0x0204, 0x0205, 0x0002
+    else:
+        return {
+            "ok": False,
+            "pid": target_pid,
+            "code": "AUTOTEST_MOUSE_BUTTON_INVALID",
+            "button": button_name,
+        }
+
+    user32 = ctypes.windll.user32
+    move_message = 0x0200
+    packed_position = (client_x & 0xFFFF) | ((client_y & 0xFFFF) << 16)
+    posts: List[Dict[str, Any]] = []
+    ok_all = True
+    click_count = max(1, min(int(count), 4))
+    hold_seconds = max(0.02, min(float(hold_ms) / 1000.0, 2.0))
+    for _ in range(click_count):
+        move_ok = bool(user32.PostMessageW(
+            ctypes.c_void_p(hwnd),
+            move_message,
+            ctypes.c_void_p(0),
+            ctypes.c_void_p(packed_position),
+        ))
+        down_ok = bool(user32.PostMessageW(
+            ctypes.c_void_p(hwnd),
+            down_message,
+            ctypes.c_void_p(down_state),
+            ctypes.c_void_p(packed_position),
+        ))
+        time.sleep(hold_seconds)
+        up_ok = bool(user32.PostMessageW(
+            ctypes.c_void_p(hwnd),
+            up_message,
+            ctypes.c_void_p(0),
+            ctypes.c_void_p(packed_position),
+        ))
+        posts.append({"move": move_ok, "down": down_ok, "up": up_ok})
+        ok_all = ok_all and move_ok and down_ok and up_ok
+        time.sleep(0.02)
+
+    input_desktop_after = _query_input_desktop_name()
+    input_desktop_stable = bool(
+        input_desktop_before
+        and input_desktop_after == input_desktop_before
+    )
+    return {
+        "ok": bool(ok_all and input_desktop_stable),
+        "pid": target_pid,
+        "hwnd": int(hwnd),
+        "x": client_x,
+        "y": client_y,
+        "button": button_name,
+        "holdMs": int(hold_ms),
+        "count": click_count,
+        "posts": posts,
+        "mode": (
+            "isolated-window-message"
+            if desktop_mode == "isolated"
+            else "default-window-message"
+        ),
+        "desktop": desktop_name,
+        "inputDesktopBefore": input_desktop_before,
+        "inputDesktopAfter": input_desktop_after,
+        "inputDesktopStable": input_desktop_stable,
+        "foregroundChanged": False,
+        "window": window,
+    }
+
+
 def _post_war3_key_pulse(
     pid: int,
     key: str = "RIGHT",
@@ -4090,10 +4696,16 @@ def _post_war3_key_pulse(
     foreground: bool = False,
 ) -> Dict[str, Any]:
     """Send a small keyboard pulse to the War3 window without requiring camera internals."""
-    hwnd = _wait_for_main_window_hwnd(pid, timeout_sec=8.0, require_visible=True)
-    if not hwnd:
-        return {"ok": False, "error": f"未找到可见主窗口: pid={pid}"}
-
+    registered = SESSION_REGISTRY.get(pid=int(pid))
+    desktop_mode = (
+        str(registered.desktop_mode or "default")
+        if registered is not None
+        else (
+            str(STATE.desktop_mode or "default")
+            if int(STATE.war3_pid or 0) == int(pid)
+            else "default"
+        )
+    ).strip().lower()
     key_name = str(key or "RIGHT").strip().upper()
     vk_map = {
         "SPACE": 0x20,
@@ -4141,13 +4753,21 @@ def _post_war3_key_pulse(
             "supported": sorted(vk_map.keys()),
         }
 
+    if desktop_mode == "isolated":
+        result = _post_war3_virtual_key_message(
+            pid=int(pid),
+            vk=vk,
+            hold_ms=hold_ms,
+            repeat=repeat,
+        )
+        result["key"] = key_name
+        result["foreground"] = False
+        return result
+
     user32 = ctypes.windll.user32
 
-    # War3 1.27a 的“按下任意键以继续”由 DirectInput/键盘状态读取，
-    # WM_KEYDOWN/WM_KEYUP 只足以驱动部分窗口消息路径。目标位于隔离
-    # Win32 Desktop 时，在同一 Desktop 内启动一次性 keybd_event helper；
-    # 这不会切换作者当前桌面，也不需要把 War3 窗口带到前台桌面。
-    registered = SESSION_REGISTRY.get(pid=int(pid))
+    # The historical helper remains available only to a verified input
+    # desktop. Hidden desktops returned through the HWND-only branch above.
     desktop_name = ""
     if registered is not None:
         desktop_name = str(registered.desktop_name or "")
@@ -4361,6 +4981,61 @@ def _run_war3_input_plan(
             })
         else:
             return {"ok": False, "error": f"action[{index}] type 不支持: {kind}"}
+
+    if desktop_mode == "isolated":
+        deadline = time.monotonic() + max(2.0, float(timeout_sec))
+        results: List[Dict[str, Any]] = []
+        for action in normalized:
+            if time.monotonic() >= deadline:
+                return {
+                    "ok": False,
+                    "pid": target_pid,
+                    "code": "ISOLATED_DESKTOP_INPUT_TIMEOUT",
+                    "actions": results,
+                }
+            if action["type"] == "sleep":
+                time.sleep(min(
+                    float(action["ms"]) / 1000.0,
+                    max(0.0, deadline - time.monotonic()),
+                ))
+                results.append({"type": "sleep", "ok": True, "ms": action["ms"]})
+                continue
+            if action["type"] == "click":
+                pulse = _post_war3_client_click_message(
+                    pid=target_pid,
+                    x=int(action["x"]),
+                    y=int(action["y"]),
+                    button=str(action["button"]),
+                    hold_ms=int(action["holdMs"]),
+                    count=int(action["count"]),
+                )
+            else:
+                pulse = _post_war3_virtual_key_message(
+                    pid=target_pid,
+                    vk=int(action["vk"]),
+                    hold_ms=int(action["holdMs"]),
+                    repeat=1,
+                )
+            results.append({"type": action["type"], **pulse})
+            if not pulse.get("ok"):
+                return {
+                    "ok": False,
+                    "pid": target_pid,
+                    "desktopMode": desktop_mode,
+                    "desktop": desktop_name,
+                    "code": "ISOLATED_DESKTOP_WINDOW_MESSAGE_FAILED",
+                    "actions": results,
+                }
+        return {
+            "ok": True,
+            "pid": target_pid,
+            "desktopMode": desktop_mode,
+            "desktop": desktop_name,
+            "mode": "isolated-window-message-plan",
+            "actionCount": len(normalized),
+            "actions": results,
+            "foregroundChanged": False,
+        }
 
     helper_script = Path(__file__).with_name("send_input_plan_same_desktop.ps1")
     powershell_exe = (
@@ -5466,6 +6141,89 @@ def _deploy_d3d9(build_dll: Path, war3_dir: Path) -> Dict[str, Any]:
         "target": str(dst),
         "old": old_info,
         "new": new_info,
+    }
+
+
+def _backup_scenario_d3d9(war3_dir: Path, artifact_dir: Path) -> Dict[str, Any]:
+    """Snapshot the exact deployed DLL before an owned scenario mutates it."""
+    target = (war3_dir / "d3d9.dll").resolve(strict=False)
+    result: Dict[str, Any] = {
+        "ok": True,
+        "target": str(target),
+        "originalExisted": target.is_file(),
+    }
+    if not target.is_file():
+        return result
+    backup = artifact_dir / "deployment_backup" / "d3d9.dll"
+    backup.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(target, backup)
+    source_sha = sha256_file(target)
+    backup_sha = sha256_file(backup)
+    if source_sha != backup_sha:
+        return {
+            **result,
+            "ok": False,
+            "error": "d3d9 deployment backup SHA-256 mismatch",
+            "sourceSha256": source_sha,
+            "backupSha256": backup_sha,
+        }
+    result.update(
+        {
+            "backup": str(backup),
+            "sha256": backup_sha,
+            "size": backup.stat().st_size,
+        }
+    )
+    return result
+
+
+def _restore_scenario_d3d9(
+    backup: Dict[str, Any], expected_deploy_target: str = ""
+) -> Dict[str, Any]:
+    """Restore an owned scenario's DLL after its retained process has stopped."""
+    if not backup:
+        return {"ok": True, "skipped": True, "reason": "no deployment backup"}
+    if not backup.get("ok"):
+        return {"ok": False, "error": "deployment backup was not valid"}
+    target = Path(str(backup.get("target", ""))).resolve(strict=False)
+    if expected_deploy_target:
+        deployed = Path(expected_deploy_target).resolve(strict=False)
+        if deployed != target:
+            return {
+                "ok": False,
+                "error": "refusing to restore a different deployment target",
+                "backupTarget": str(target),
+                "deployedTarget": str(deployed),
+            }
+    if not bool(backup.get("originalExisted", False)):
+        if target.exists():
+            target.unlink()
+        return {"ok": True, "target": str(target), "restoredMissing": True}
+
+    source = Path(str(backup.get("backup", "")))
+    expected_sha = str(backup.get("sha256", ""))
+    if not source.is_file() or not expected_sha:
+        return {"ok": False, "error": "deployment backup file is missing"}
+    if sha256_file(source) != expected_sha:
+        return {"ok": False, "error": "deployment backup changed before restore"}
+
+    restore_tmp = target.with_name(
+        f".{target.name}.autotest-restore-{os.getpid()}.tmp"
+    )
+    try:
+        shutil.copy2(source, restore_tmp)
+        if sha256_file(restore_tmp) != expected_sha:
+            return {"ok": False, "error": "temporary restore SHA-256 mismatch"}
+        os.replace(restore_tmp, target)
+    finally:
+        if restore_tmp.exists():
+            restore_tmp.unlink()
+    restored_sha = sha256_file(target)
+    return {
+        "ok": restored_sha == expected_sha,
+        "target": str(target),
+        "sha256": restored_sha,
+        "expectedSha256": expected_sha,
     }
 
 
@@ -6635,6 +7393,11 @@ def launch_war3_test(
     extra_env.setdefault(AUTOTEST_BACKGROUND_THROTTLE_ENV, "1")
     extra_env.setdefault(AUTOTEST_GAME_PAUSE_ENV, "1")
     extra_env.setdefault(AUTOTEST_INTERNAL_TEST_API_ENV, "1")
+    # OBS installs VK_LAYER_OBS_HOOK as a system-wide implicit Vulkan layer,
+    # so graphics-hook32.dll can be loaded even when no OBS process is alive.
+    # Scope the documented layer opt-out to the AutoTest-owned child only;
+    # never change the registry or disable unrelated overlays globally.
+    extra_env.setdefault(AUTOTEST_DISABLE_OBS_VULKAN_CAPTURE_ENV, "1")
     # 高频 SpriteFrame/runtime-matrix pose hooks are no longer the default
     # semantic palette producer. The production path samples Blizzard's
     # already-evaluated CModel palette from the visible contract; tests that
@@ -7251,6 +8014,32 @@ def wait_for_game_ready(
                 time.sleep(0.2)
                 continue
             break
+        # The control plane is created only after War3 reaches the renderer/JASS
+        # bootstrap.  A protected map may wait for a local acknowledgement
+        # before that point, so requiring the pipe before posting the key makes
+        # isolated startup circular.  Keep this strictly HWND-scoped: the
+        # helper verifies the owned PID and that the target desktop is not the
+        # current input desktop, and never foregrounds or switches desktops.
+        now = time.time()
+        can_continue_without_pipe = (
+            auto_continue_loading
+            and target_alive()
+            and (now - pipe_wait_t0) >= 10.0
+            and (last_continue_at <= 0.0 or
+                 (now - last_continue_at) >= max(5, int(continue_interval_sec)))
+        )
+        if can_continue_without_pipe:
+            pulse = _post_war3_key_pulse(
+                target_pid,
+                key=continue_key,
+                hold_ms=55,
+                repeat=1,
+                foreground=False,
+            )
+            pulse["elapsedSec"] = round(now - pipe_wait_t0, 3)
+            pulse["controlPlaneReady"] = False
+            continue_pulses.append(pulse)
+            last_continue_at = now
         if not target_alive():
             break
         time.sleep(0.2)
@@ -9233,18 +10022,10 @@ def run_life_and_death_tdr_scenario(
     attach_pid: int = 0,
     screenshot_count: int = 12,
     birth_hold_sec: int = 120,
+    strict_external_graphics_hooks: bool = True,
+    acknowledge_difficulty_dialog: bool = True,
 ) -> Dict[str, Any]:
     """冷启动或连接“生与死”，以低视角巡航并在首次 GPU 故障时止损。"""
-    if bool(use_isolated_desktop):
-        return {
-            "ok": False,
-            "stage": "preflight",
-            "error": (
-                "life_and_death_tdr 禁止隔离桌面启动；"
-                "请使用默认可见桌面或 attach_pid 连接用户手动启动的 War3。"
-            ),
-            "isolatedDesktopQuarantined": True,
-        }
     w3 = Path(war3_dir)
     source_map = Path(map_path)
     if not source_map.is_file():
@@ -9263,6 +10044,11 @@ def run_life_and_death_tdr_scenario(
     user_env.setdefault("DXVK_WAR3_RUNTIME_BENCHMARK", "1")
     user_env.setdefault("DXVK_WAR3_RUNTIME_BENCHMARK_WARMUP_SEC", "1")
     user_env.setdefault("DXVK_WAR3_RUNTIME_BENCHMARK_SAMPLE_SEC", str(duration))
+    # Development observer builds classify the exact Stage11 allocation debt
+    # that can make an otherwise complete CSM fail closed under a camera sweep.
+    # Release builds compile this observer out, and this setting never enables
+    # direct-source binding, culling Consume, or any other rendering route.
+    user_env.setdefault("DXVK_WAR3_STAGE11_ALLOC_OBSERVER", "1")
     # Dedicated high-pressure runs collect proof before any Consume default is
     # considered. Observe recomputes the canonical decision and records
     # mismatches; sampled phase breakdown gives proportional hotspot evidence
@@ -9288,7 +10074,46 @@ def run_life_and_death_tdr_scenario(
     }
 
     owned_process = int(attach_pid) <= 0
+    deployment_backup: Dict[str, Any] = {}
+    deployment_restore: Dict[str, Any] = {}
+    if owned_process and bool(deploy_d3d9_before_launch):
+        try:
+            deployment_backup = _backup_scenario_d3d9(w3, artifact_dir)
+        except Exception as exc:
+            deployment_backup = {"ok": False, "error": str(exc)}
+        if not deployment_backup.get("ok"):
+            early_result = {
+                "ok": False,
+                "stage": "deployment-backup",
+                "sourceMap": str(source_map),
+                "sourceMapSha256": sha256_file(source_map),
+                "deploymentBackup": deployment_backup,
+                "artifactDir": str(artifact_dir),
+            }
+            early_path = artifact_dir / "life_and_death_tdr_result.json"
+            early_path.write_text(
+                json.dumps(early_result, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            early_result["resultPath"] = str(early_path)
+            return early_result
     if owned_process:
+        # A hidden desktop is deliberately non-interactive.  Direct -loadfile
+        # maps that reach the game loop need no keyboard acknowledgement, and
+        # all later camera/visibility control goes through the named pipe/JASS
+        # bridge.  Visible-desktop compatibility keeps the historical bounded
+        # key plan for maps with an acknowledgement screen.
+        startup_input_actions = [
+                {"type": "sleep", "ms": 10000},
+                {"type": "key", "vk": 0x20, "holdMs": 80},
+                {"type": "sleep", "ms": 8000},
+                {"type": "key", "vk": 0x20, "holdMs": 80},
+                {"type": "sleep", "ms": 8000},
+                {"type": "key", "vk": 0x20, "holdMs": 80},
+                {"type": "sleep", "ms": 8000},
+                {"type": "key", "vk": 0x20, "holdMs": 80},
+                {"type": "sleep", "ms": 1200},
+            ]
         start = _launch_suite_map_until_ready(
             war3_dir=war3_dir,
             requested_map_path=str(source_map),
@@ -9316,17 +10141,7 @@ def run_life_and_death_tdr_scenario(
                 "env_overrides_json": json.dumps(user_env, ensure_ascii=False),
                 "extra_args": "",
             },
-            startup_input_actions=[
-                {"type": "sleep", "ms": 10000},
-                {"type": "key", "vk": 0x20, "holdMs": 80},
-                {"type": "sleep", "ms": 8000},
-                {"type": "key", "vk": 0x20, "holdMs": 80},
-                {"type": "sleep", "ms": 8000},
-                {"type": "key", "vk": 0x20, "holdMs": 80},
-                {"type": "sleep", "ms": 8000},
-                {"type": "key", "vk": 0x20, "holdMs": 80},
-                {"type": "sleep", "ms": 1200},
-            ],
+            startup_input_actions=startup_input_actions,
         )
     else:
         pid = int(attach_pid)
@@ -9340,12 +10155,32 @@ def run_life_and_death_tdr_scenario(
             ),
         }
     if not start.get("ok"):
+        if owned_process and deployment_backup:
+            start_pid = int(start.get("pid", 0) or 0)
+            if start_pid > 0 and _pid_alive(start_pid):
+                stop_war3(
+                    pid=start_pid,
+                    graceful_wait_sec=2,
+                    force=True,
+                    avoid_foreground_switch=True,
+                )
+            if start_pid <= 0 or not _pid_alive(start_pid):
+                deploy_target = str(
+                    dict(start.get("launch", {}) or {})
+                    .get("deploy", {})
+                    .get("target", "")
+                )
+                deployment_restore = _restore_scenario_d3d9(
+                    deployment_backup, deploy_target
+                )
         early_result = {
             "ok": False,
             "stage": str(start.get("stage", "ready")),
             "sourceMap": str(source_map),
             "sourceMapSha256": sha256_file(source_map),
             "start": start,
+            "deploymentBackup": deployment_backup,
+            "deploymentRestore": deployment_restore,
             "artifactDir": str(artifact_dir),
         }
         early_path = artifact_dir / "life_and_death_tdr_result.json"
@@ -9360,17 +10195,29 @@ def run_life_and_death_tdr_scenario(
     instance_root = Path(str(launch.get("instanceRoot", war3_dir)))
     if instance_root not in incident_roots:
         incident_roots.append(instance_root)
+    loaded_modules = _wait_for_process_module_snapshot(pid, timeout_sec=5.0)
+    external_graphics_hooks = _external_graphics_hook_evidence(loaded_modules)
     camera_before: Dict[str, Any] = {}
     bounds: Dict[str, Any] = {}
     visibility_enable: Dict[str, Any] = {}
     visibility_restore: Dict[str, Any] = {}
     camera_restore: Dict[str, Any] = {}
+    difficulty_acknowledgement: Dict[str, Any] = {
+        "ok": True,
+        "skipped": True,
+        "reason": "difficulty acknowledgement not requested",
+    }
     samples: List[Dict[str, Any]] = []
     waypoint_rows: List[Dict[str, Any]] = []
     screenshot_rows: List[Dict[str, Any]] = []
     failure_reason = ""
     stop_result: Dict[str, Any] = {}
     started_at = time.monotonic()
+    if bool(strict_external_graphics_hooks):
+        if not loaded_modules:
+            failure_reason = "strict module enumeration failed"
+        elif external_graphics_hooks:
+            failure_reason = "external graphics hook contamination"
     screenshot_interval = (
         float(duration) / float(max(1, requested_screenshot_count - 1))
         if requested_screenshot_count > 1
@@ -9410,17 +10257,58 @@ def run_life_and_death_tdr_scenario(
         )
 
     try:
-        camera_before = _invoke_internal_test_request(
-            pid, w3, "camera.snapshot", {}, timeout_sec=4.0
-        )
-        bounds = _invoke_internal_test_request(
-            pid, w3, "camera.world_bounds", {}, timeout_sec=4.0
-        )
-        if requested_screenshot_count > 0:
-            capture_aligned_screenshot("initial", -1)
-        if not camera_before.get("ok") or not bounds.get("ok"):
-            failure_reason = "internal camera preflight failed"
-        else:
+        if (
+            not failure_reason
+            and owned_process
+            and bool(use_isolated_desktop)
+            and bool(acknowledge_difficulty_dialog)
+        ):
+            # This scenario targets a known map whose first difficulty button
+            # is centred near the upper quarter of the client.  The click is a
+            # bounded HWND PostMessage to the exact AutoTest-owned process; it
+            # never moves the system cursor or changes the input desktop.
+            window = _query_window_info_by_hwnd(
+                _wait_for_main_window_hwnd(pid, timeout_sec=8.0, require_visible=True),
+                pid=pid,
+            )
+            client = dict(window.get("clientRect", {}) or {})
+            client_width = max(1, int(client.get("width", 0) or 0))
+            client_height = max(1, int(client.get("height", 0) or 0))
+            difficulty_acknowledgement = _run_war3_input_plan(
+                pid=pid,
+                actions=[
+                    {"type": "sleep", "ms": 1200},
+                    {
+                        "type": "click",
+                        "x": int(round(float(client_width - 1) * 0.5)),
+                        "y": int(round(float(client_height - 1) * 0.24)),
+                        "button": "left",
+                        "holdMs": 60,
+                        "count": 1,
+                    },
+                    {"type": "sleep", "ms": 1000},
+                ],
+                timeout_sec=8.0,
+            )
+            difficulty_acknowledgement["dialogDismissedVerified"] = False
+            difficulty_acknowledgement["verificationNote"] = (
+                "PostMessage acceptance is not proof that a DirectInput/JASS "
+                "dialog consumed the click; internal screenshots remain authoritative"
+            )
+            if not difficulty_acknowledgement.get("ok"):
+                failure_reason = "isolated difficulty acknowledgement failed"
+        if not failure_reason:
+            camera_before = _invoke_internal_test_request(
+                pid, w3, "camera.snapshot", {}, timeout_sec=4.0
+            )
+            bounds = _invoke_internal_test_request(
+                pid, w3, "camera.world_bounds", {}, timeout_sec=4.0
+            )
+            if requested_screenshot_count > 0:
+                capture_aligned_screenshot("initial", -1)
+            if not camera_before.get("ok") or not bounds.get("ok"):
+                failure_reason = "internal camera preflight failed"
+        if not failure_reason:
             next_sample = time.monotonic()
             birth_deadline = min(
                 started_at + float(requested_birth_hold_sec),
@@ -9652,6 +10540,19 @@ def run_life_and_death_tdr_scenario(
                 force=True,
                 avoid_foreground_switch=True,
             )
+            if _pid_alive(pid):
+                deployment_restore = {
+                    "ok": False,
+                    "error": "owned War3 process still alive; DLL restore refused",
+                    "pid": pid,
+                }
+            elif deployment_backup:
+                deploy_target = str(
+                    dict(launch.get("deploy", {}) or {}).get("target", "")
+                )
+                deployment_restore = _restore_scenario_d3d9(
+                    deployment_backup, deploy_target
+                )
         else:
             stop_result = {
                 "ok": True,
@@ -9674,7 +10575,8 @@ def run_life_and_death_tdr_scenario(
         or "device lost" in failure_reason.lower()
         or "process exited" in failure_reason.lower()
     )
-    route_ok = not failure_reason and not device_lost
+    restore_ok = not deployment_restore or bool(deployment_restore.get("ok"))
+    route_ok = not failure_reason and not device_lost and restore_ok
     result = {
         "ok": route_ok,
         "stage": (
@@ -9690,6 +10592,12 @@ def run_life_and_death_tdr_scenario(
         "sourceMap": str(source_map),
         "sourceMapSha256": sha256_file(source_map),
         "start": start,
+        "deploymentBackup": deployment_backup,
+        "deploymentRestore": deployment_restore,
+        "strictExternalGraphicsHooks": bool(strict_external_graphics_hooks),
+        "loadedModules": loaded_modules,
+        "externalGraphicsHooks": external_graphics_hooks,
+        "difficultyAcknowledgement": difficulty_acknowledgement,
         "cameraBefore": camera_before,
         "worldBounds": bounds,
         "visibilityEnable": visibility_enable,

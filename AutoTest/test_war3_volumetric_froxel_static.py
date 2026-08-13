@@ -353,16 +353,12 @@ class War3VolumetricFroxelStaticTests(unittest.TestCase):
             "effectToRead.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL",
             self.cpp,
         )
-        self.assertIn(
-            "VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |\n"
-            "                             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT",
-            self.cpp,
+        shader_read_stages = (
+            r"VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT\s*\|\s*"
+            r"VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT"
         )
-        self.assertIn(
-            "VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |\n"
-            "                          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT",
-            self.shadow,
-        )
+        self.assertRegex(self.cpp, shader_read_stages)
+        self.assertRegex(self.shadow, shader_read_stages)
 
     def test_public_backend_switch_is_bounded(self):
         self.assertIn('"volumetric.setBackend"', self.japi)

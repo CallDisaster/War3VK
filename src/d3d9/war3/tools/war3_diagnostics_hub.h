@@ -5,6 +5,8 @@
 #include <string>
 #include <vector>
 
+#include "../../../dxvk/dxvk_device_fault.h"
+
 namespace dxvk::war3::tools {
 
 enum class GpuFlightBreadcrumb : uint32_t {
@@ -78,6 +80,33 @@ struct GpuFlightFrame {
   uint64_t csmValidationRejectCount = 0u;
   uint64_t csmPartialPreventedCount = 0u;
   uint64_t csmFirstCompleteLatencyFrames = 0u;
+  uint64_t producerSealFrameSerial = 0u;
+  uint64_t producerSealMapEpoch = 0u;
+  uint64_t producerSealDeviceEpoch = 0u;
+  uint64_t producerRequiredCasterOmissionCount = 0u;
+  uint64_t producerExactBudgetDeferredUniqueCasterCount = 0u;
+  uint64_t producerPositionAllocBudgetCount = 0u;
+  uint64_t producerUvAllocBudgetCount = 0u;
+  uint64_t producerIndexAllocBudgetCount = 0u;
+  uint64_t producerAllocationFailureCount = 0u;
+  uint64_t producerFallbackByteBudgetCount = 0u;
+  uint64_t producerArenaAdmissionCount = 0u;
+  uint64_t producerFreezeFailureCount = 0u;
+  uint64_t producerSoftPriorityBudgetCount = 0u;
+  uint64_t producerCompletenessReasonMask = 0u;
+  uint64_t producerCompletenessSealed = 0u;
+  uint64_t producerCompletenessCounterOverflow = 0u;
+  uint64_t drawTimeVBCacheStaticLiveBytes = 0u;
+  uint64_t drawTimeVBCacheStaticProtectedBytes = 0u;
+  uint64_t drawTimeVBCacheStaticOverCapBytes = 0u;
+  uint64_t drawTimeVBCacheStaticOverCapFrameCount = 0u;
+  uint64_t drawTimeVBCacheStaticEvictedBytes = 0u;
+  uint64_t drawTimeVBCacheStaticEvictedEntryCount = 0u;
+  uint64_t drawTimeVBCacheIndexedUnknownRangeFallbackCount = 0u;
+  uint64_t drawTimeGenerationBackedPositionReuseCount = 0u;
+  uint64_t drawTimeGenerationBackedUvReuseCount = 0u;
+  uint64_t drawTimeGenerationBackedIndexReuseCount = 0u;
+  uint64_t drawTimeGenerationBackedCopyBytesSaved = 0u;
   std::array<uint32_t, 4u> csmCascadeDrawCount = {};
   std::array<uint64_t, 4u> csmCascadeTriangleCount = {};
   uint32_t pointShadowLightCount = 0u;
@@ -100,6 +129,11 @@ struct GpuFlightFrame {
   uint64_t arenaUsedBytes = 0u;
   uint64_t arenaFrameUsedDeltaBytes = 0u;
   uint64_t arenaResidentBytes = 0u;
+  uint64_t arenaResidentLimitBytes = 0u;
+  uint64_t arenaMemoryAvailableBytes = 0u;
+  uint64_t arenaBudgetGrowthRejectCount = 0u;
+  uint32_t arenaMemoryBudgetSupported = 0u;
+  uint32_t arenaMemoryBudgetTrusted = 0u;
   uint64_t arenaGeneration = 0u;
   uint64_t arenaQuarantineCount = 0u;
   uint64_t arenaQuarantinedRetireSerial = 0u;
@@ -115,6 +149,21 @@ struct GpuFlightFrame {
   uint64_t arenaExactIndexTrimAcceptedCount = 0u;
   uint64_t arenaExactIndexTrimRejectedCount = 0u;
   uint64_t arenaExactIndexTrimBytesSaved = 0u;
+  uint64_t arenaCoherentUpTrimObservedCount = 0u;
+  uint64_t arenaCoherentUpTrimEligibleCount = 0u;
+  uint64_t arenaCoherentUpTrimWouldSaveBytes = 0u;
+  uint64_t arenaCoherentUpTrimConsumedCount = 0u;
+  uint64_t arenaCoherentUpTrimConsumedBytesSaved = 0u;
+  uint64_t arenaCoherentRealTrimObservedCount = 0u;
+  uint64_t arenaCoherentRealTrimEligibleCount = 0u;
+  uint64_t arenaCoherentRealTrimWouldSaveBytes = 0u;
+  uint64_t arenaCoherentRealTrimConsumedCount = 0u;
+  uint64_t arenaCoherentRealTrimConsumedBytesSaved = 0u;
+  uint64_t arenaCurrentUpPositionReplayObservedCount = 0u;
+  uint64_t arenaCurrentUpPositionReplayEligibleCount = 0u;
+  uint64_t arenaCurrentUpPositionReplayWouldAvoidBytes = 0u;
+  uint64_t arenaCurrentUpPositionReplayConsumedCount = 0u;
+  uint64_t arenaCurrentUpPositionReplayAvoidedBytes = 0u;
   uint64_t exactIndexDomainScannedBytes = 0u;
   uint64_t exactIndexDomainNonHostCachedScanCount = 0u;
   uint64_t exactIndexDomainNonHostCachedScannedBytes = 0u;
@@ -137,6 +186,9 @@ void SetGpuFlightBreadcrumb(
     uint32_t csmCascade = 0xFFFFFFFFu,
     uint32_t pointLight = 0xFFFFFFFFu,
     uint32_t pointFace = 0xFFFFFFFFu) noexcept;
+void NotifyGpuDeviceLostFailStop(
+    const char* origin,
+    const ::dxvk::DxvkDeviceFaultSnapshot& deviceFault) noexcept;
 void ResetGpuFlightCsmWork() noexcept;
 void SetGpuFlightCsmCascadeWork(
     uint32_t cascade, uint32_t drawCount, uint64_t triangleCount) noexcept;
@@ -156,9 +208,12 @@ void ClearGpuFlightAutoTestContext() noexcept;
 
 struct GpuIncidentSnapshot {
   uint64_t timestampMs = 0u;
+  uint64_t deviceLossBaseTimestampMs = 0u;
   std::string reason;
+  std::string firstErrorOrigin;
   int64_t queueResult = 0;
   uint64_t stalledMilliseconds = 0u;
+  ::dxvk::DxvkDeviceFaultSnapshot deviceFault = {};
   std::vector<GpuFlightFrame> recentFrames;
 };
 
@@ -596,6 +651,33 @@ struct War3RuntimeStatusShadowSnapshot {
   uint64_t semanticSceneReplayDrawsCount = 0;
   uint64_t semanticSceneShadowMapDrawnCasters = 0;
   uint64_t semanticSceneShadowMapCascadeCulledCount = 0;
+  uint64_t producerSealFrameSerial = 0;
+  uint64_t producerSealMapEpoch = 0;
+  uint64_t producerSealDeviceEpoch = 0;
+  uint64_t producerRequiredCasterOmissionCount = 0;
+  uint64_t producerExactBudgetDeferredUniqueCasterCount = 0;
+  uint64_t producerPositionAllocBudgetCount = 0;
+  uint64_t producerUvAllocBudgetCount = 0;
+  uint64_t producerIndexAllocBudgetCount = 0;
+  uint64_t producerAllocationFailureCount = 0;
+  uint64_t producerFallbackByteBudgetCount = 0;
+  uint64_t producerArenaAdmissionCount = 0;
+  uint64_t producerFreezeFailureCount = 0;
+  uint64_t producerSoftPriorityBudgetCount = 0;
+  uint64_t producerCompletenessReasonMask = 0;
+  uint64_t producerCompletenessSealed = 0;
+  uint64_t producerCompletenessCounterOverflow = 0;
+  uint64_t drawTimeVBCacheStaticLiveBytes = 0;
+  uint64_t drawTimeVBCacheStaticProtectedBytes = 0;
+  uint64_t drawTimeVBCacheStaticOverCapBytes = 0;
+  uint64_t drawTimeVBCacheStaticOverCapFrameCount = 0;
+  uint64_t drawTimeVBCacheStaticEvictedBytes = 0;
+  uint64_t drawTimeVBCacheStaticEvictedEntryCount = 0;
+  uint64_t drawTimeVBCacheIndexedUnknownRangeFallbackCount = 0;
+  uint64_t drawTimeGenerationBackedPositionReuseCount = 0;
+  uint64_t drawTimeGenerationBackedUvReuseCount = 0;
+  uint64_t drawTimeGenerationBackedIndexReuseCount = 0;
+  uint64_t drawTimeGenerationBackedCopyBytesSaved = 0;
   uint64_t semanticSceneTerrainBoundsCullMode = 0;
   uint64_t semanticSceneTerrainBoundsCandidateCount = 0;
   uint64_t semanticSceneTerrainBoundsProofAcceptedCount = 0;
@@ -735,6 +817,19 @@ struct War3RuntimeStatusShadowSnapshot {
   uint64_t shadowArenaUsedBytes = 0;
   uint64_t shadowArenaResidentBytes = 0;
   uint64_t shadowArenaResidentLimitBytes = 0;
+  uint64_t shadowArenaFixedResidentLimitBytes = 0;
+  uint64_t shadowArenaMemoryHeapSizeBytes = 0;
+  uint64_t shadowArenaMemoryBudgetBytes = 0;
+  uint64_t shadowArenaMemoryAllocatedBytes = 0;
+  uint64_t shadowArenaMemoryAvailableBytes = 0;
+  uint64_t shadowArenaProportionalLimitBytes = 0;
+  uint64_t shadowArenaReserveLimitBytes = 0;
+  uint64_t shadowArenaBudgetRefreshCount = 0;
+  uint64_t shadowArenaBudgetGrowthRejectCount = 0;
+  uint64_t shadowArenaBudgetSnapshotFrameSerial = 0;
+  uint64_t shadowArenaPrimaryHeapIndex = 0xFFFFFFFFu;
+  uint64_t shadowArenaMemoryBudgetSupported = 0;
+  uint64_t shadowArenaMemoryBudgetTrusted = 0;
   uint64_t shadowArenaGeneration = 0;
   uint64_t shadowArenaQuarantineCount = 0;
   uint64_t shadowArenaLastQuarantinedGeneration = 0;
@@ -760,6 +855,21 @@ struct War3RuntimeStatusShadowSnapshot {
   uint64_t shadowArenaExactIndexTrimAcceptedCount = 0;
   uint64_t shadowArenaExactIndexTrimRejectedCount = 0;
   uint64_t shadowArenaExactIndexTrimBytesSaved = 0;
+  uint64_t shadowArenaCoherentUpTrimObservedCount = 0;
+  uint64_t shadowArenaCoherentUpTrimEligibleCount = 0;
+  uint64_t shadowArenaCoherentUpTrimWouldSaveBytes = 0;
+  uint64_t shadowArenaCoherentUpTrimConsumedCount = 0;
+  uint64_t shadowArenaCoherentUpTrimConsumedBytesSaved = 0;
+  uint64_t shadowArenaCoherentRealTrimObservedCount = 0;
+  uint64_t shadowArenaCoherentRealTrimEligibleCount = 0;
+  uint64_t shadowArenaCoherentRealTrimWouldSaveBytes = 0;
+  uint64_t shadowArenaCoherentRealTrimConsumedCount = 0;
+  uint64_t shadowArenaCoherentRealTrimConsumedBytesSaved = 0;
+  uint64_t shadowArenaCurrentUpPositionReplayObservedCount = 0;
+  uint64_t shadowArenaCurrentUpPositionReplayEligibleCount = 0;
+  uint64_t shadowArenaCurrentUpPositionReplayWouldAvoidBytes = 0;
+  uint64_t shadowArenaCurrentUpPositionReplayConsumedCount = 0;
+  uint64_t shadowArenaCurrentUpPositionReplayAvoidedBytes = 0;
   uint64_t shadowArenaFrameIncomplete = 0;
   uint64_t shadowCpuSpanAcceptedCount = 0;
   uint64_t shadowCpuSpanRejectedCount = 0;

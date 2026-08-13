@@ -626,6 +626,16 @@ namespace dxvk {
     }
 
     /**
+     * \brief Queries backing memory heap index
+     *
+     * May be invalid for imported or foreign resources.
+     * \returns Vulkan memory heap index, or \c ~0u when unknown
+     */
+    uint32_t getMemoryHeapIndex() const {
+      return m_type ? m_type->properties.heapIndex : ~0u;
+    }
+
+    /**
      * \brief Creates buffer view
      *
      * \param [in] key View properties

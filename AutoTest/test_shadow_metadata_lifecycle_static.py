@@ -77,7 +77,7 @@ class ShadowMetadataLifecycleStaticTests(unittest.TestCase):
             self.assertIn(contract, capture_block, contract)
         self.assertNotIn("vbCacheLayerIndex = 0", capture_block)
         producer = DEVICE.index(
-            "uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer()"
+            "uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer("
         )
         producer_end = DEVICE.index("War3ShadowCasterDraw draw = {};", producer)
         producer_block = DEVICE[producer:producer_end]
@@ -103,7 +103,8 @@ class ShadowMetadataLifecycleStaticTests(unittest.TestCase):
     def test_stage11_exact_owner_precedes_and_suppresses_grouped_fallback(self) -> None:
         direct_only = DEVICE.index("if (War3SemanticDirectOnlyRuntime())")
         exact_call = DEVICE.index(
-            "War3TryPopulateDrawTimeSemanticProducer();", direct_only
+            "War3TryPopulateDrawTimeSemanticProducer(\n"
+            "          exactSubmittedManifestRecords);", direct_only
         )
         grouped_call = DEVICE.index(
             "War3TryPopulateDirectCurrentDrawGrouped(", exact_call
@@ -112,7 +113,7 @@ class ShadowMetadataLifecycleStaticTests(unittest.TestCase):
         self.assertIn("uint64_t exactOwnerFrameSerial = 0u;", DEVICE_H)
 
         producer = DEVICE.index(
-            "uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer()"
+            "uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer("
         )
         producer_end = DEVICE.index(
             "bool D3D9DeviceEx::War3DrainShadowCasterTombstones()", producer
@@ -155,7 +156,7 @@ class ShadowMetadataLifecycleStaticTests(unittest.TestCase):
     def test_exact_submission_refreshes_manifest_selection_and_core_without_lease(self) -> None:
         self.assertIn("uint64_t exactSubmittedFrameSerial = 0u;", DEVICE_H)
         producer = DEVICE.index(
-            "uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer()"
+            "uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer("
         )
         producer_end = DEVICE.index(
             "bool D3D9DeviceEx::War3DrainShadowCasterTombstones()", producer
@@ -180,23 +181,45 @@ class ShadowMetadataLifecycleStaticTests(unittest.TestCase):
         grouped_block = DEVICE[grouped:grouped_end]
         exact_records = grouped_block.index("exactSubmittedManifestRecords")
         manifest_publish = grouped_block.index(
-            "publishShadowManifestSummary(shadowEligibleManifestRecords)"
+            "publishShadowManifestSummary(exactSubmittedManifestRecords,"
         )
         self.assertLess(exact_records, manifest_publish)
         for contract in (
-            "for (const auto& [cacheKey, entry] : m_war3DrawTimeVBCache)",
-            "entry.exactSubmittedFrameSerial",
-            "exactRecord.producerFreshThisFrame = true",
-            "ShadowProducerKind::DrawTimeGeometry",
-            "shadowEligibleManifestRecords.insert(",
             "for (const auto& exactRecord : exactSubmittedManifestRecords)",
-            "currentPartKeys.insert(partKey)",
+            "currentPartKeys.push_back(partKey)",
+            "std::sort(currentPartKeys.begin(), currentPartKeys.end())",
+            "std::unique(currentPartKeys.begin(), currentPartKeys.end())",
             "eligibleRecordCount == 0u && exactSubmittedManifestRecords.empty()",
             "drawTimeSemanticProducerLifecycleMergedCount++",
-            "liveSubmittedCorePartsByObject[selectionKey].push_back(",
+            "appendLiveSubmittedCorePart(selectionKey, manifestPartKey)",
             "exactCorePartCount",
         ):
             self.assertIn(contract, grouped_block, contract)
+        self.assertIn(
+            "exactSubmittedManifestRecords,\n"
+            "                               shadowEligibleManifestRecords",
+            grouped_block,
+        )
+        self.assertNotIn(
+            "shadowEligibleManifestRecords.insert(", grouped_block
+        )
+        for producer_contract in (
+            "const auto& activeDrawTimeRecords =",
+            "const bool useActiveDrawTimeLedger =",
+            "auto nextDrawTimeEntry =",
+            "m_war3DrawTimeVBCache.find(activeRecord.key)",
+            "auto cacheIt = m_war3DrawTimeVBCache.begin()",
+            "while (nextDrawTimeEntry(cacheKeyPtr, entryPtr))",
+            "entry.exactSubmittedFrameSerial",
+            "exactRecord.producerFreshThisFrame = true",
+            "ShadowProducerKind::DrawTimeGeometry",
+            "appendExactSubmittedManifestRecord(",
+        ):
+            self.assertIn(producer_contract, producer_block, producer_contract)
+        self.assertNotIn(
+            "for (const auto& [cacheKey, entry] : m_war3DrawTimeVBCache)",
+            grouped_block,
+        )
 
         merge = grouped_block.index(
             "The exact producer already published these casters"
@@ -229,7 +252,7 @@ class ShadowMetadataLifecycleStaticTests(unittest.TestCase):
 
     def test_static_world_cards_use_exact_native_owner_not_unit_skinning(self) -> None:
         producer = DEVICE.index(
-            "uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer()"
+            "uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer("
         )
         producer_end = DEVICE.index(
             "bool D3D9DeviceEx::War3DrainShadowCasterTombstones()", producer
@@ -264,7 +287,7 @@ class ShadowMetadataLifecycleStaticTests(unittest.TestCase):
 
     def test_buildings_use_exact_current_frame_owner(self) -> None:
         producer = DEVICE.index(
-            "uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer()"
+            "uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer("
         )
         producer_end = DEVICE.index(
             "bool D3D9DeviceEx::War3DrainShadowCasterTombstones()", producer
@@ -374,7 +397,7 @@ class ShadowMetadataLifecycleStaticTests(unittest.TestCase):
         refresh_block = DEVICE[refresh:refresh_end]
         proof = refresh_block.index("producerPaletteCurrentFrameProven")
         apply_palette = refresh_block.index(
-            "leased.packet.runtimeGroupPalette =", proof
+            "installLeaseLivePalette(", proof
         )
         proof_block = refresh_block[proof:apply_palette]
         for contract in (
@@ -388,6 +411,10 @@ class ShadowMetadataLifecycleStaticTests(unittest.TestCase):
             "return false;",
         ):
             self.assertIn(contract, proof_block, contract)
+        helper = DEVICE[
+            DEVICE.index("const auto installLeaseLivePalette =") : refresh
+        ]
+        self.assertIn("leased.packet.runtimeGroupPalette =", helper)
 
     def test_unsafe_drawtime_consumers_still_require_legacy_master(self) -> None:
         self.assertIn(
@@ -399,13 +426,14 @@ class ShadowMetadataLifecycleStaticTests(unittest.TestCase):
             DEVICE,
         )
         self.assertIn(
-            "if (!War3DrawTimeVBCacheRuntime() ||\n"
-            "        !War3SemanticDrawTimePrebuildBypassRuntime()",
+            "const bool drawTimePrebuildBypassEnabled =\n"
+            "      War3DrawTimeVBCacheRuntime() &&\n"
+            "      War3SemanticDrawTimePrebuildBypassRuntime() &&\n"
+            "      War3SemanticDrawTimeFastAppendRuntime();",
             DEVICE,
         )
         self.assertIn(
-            "if (!War3DrawTimeVBCacheRuntime() ||\n"
-            "        !War3SemanticDrawTimeFastAppendRuntime())",
+            "if (!drawTimePrebuildBypassEnabled)",
             DEVICE,
         )
 
@@ -432,11 +460,20 @@ class ShadowMetadataLifecycleStaticTests(unittest.TestCase):
             self.assertEqual(MONITOR.count(f'\\"{field}\\"'), 2, field)
 
     def test_stage11_capture_precedes_semantic_early_return(self) -> None:
+        bridge_gate = DEVICE.index(
+            "const bool runShadowMetadataBridge = !indexed"
+        )
         capture = DEVICE.index(
-            "const bool metadataRejectedBlocker = War3CaptureShadowDrawMetadata("
+            "metadataRejectedBlocker = War3CaptureShadowDrawMetadata(",
+            bridge_gate,
         )
         early_gate = DEVICE.index("earlySemanticSceneUnitLikeCandidate", capture)
         early_return = DEVICE.index("return;", early_gate)
+        self.assertLess(bridge_gate, capture)
+        self.assertIn(
+            "if (runShadowMetadataBridge) {",
+            DEVICE[bridge_gate:capture],
+        )
         self.assertLess(capture, early_gate)
         self.assertLess(capture, early_return)
 

@@ -62,8 +62,14 @@ namespace dxvk {
   
   
   DxvkInstance::~DxvkInstance() {
+    if (m_addressBindingMessenger)
+      m_vki->vkDestroyDebugUtilsMessengerEXT(m_vki->instance(),
+        m_addressBindingMessenger, nullptr);
+
     if (m_messenger)
       m_vki->vkDestroyDebugUtilsMessengerEXT(m_vki->instance(), m_messenger, nullptr);
+
+    GetDxvkDeviceAddressBindingTracker().resetForInstance(false);
 
     wsi::quit();
   }
@@ -176,11 +182,12 @@ namespace dxvk {
     else if (debugEnv == "capture" || m_options.enableDebugUtils || capture)
       m_debugFlags.set(DxvkDebugFlag::Capture);
 
-    if (m_debugFlags.isClear()) {
+    if (m_debugFlags.isClear() && !DxvkDeviceAddressBindingBuildEnabled) {
       // Disable any usage of the extension altogether
       m_extensionInfo.extDebugUtils.specVersion = 0u;
     } else {
-      Logger::warn("Debug Utils are enabled. May affect performance.");
+      if (!m_debugFlags.isClear())
+        Logger::warn("Debug Utils are enabled. May affect performance.");
 
       if (m_debugFlags.test(DxvkDebugFlag::Validation)) {
         const char* debugLayer = "VK_LAYER_KHRONOS_validation";
@@ -262,6 +269,8 @@ namespace dxvk {
     // Create the Vulkan instance loader
     m_vki = new vk::InstanceFn(m_vkl, !args.instance, instance);
 
+    GetDxvkDeviceAddressBindingTracker().resetForInstance(false);
+
     if (m_debugFlags.test(DxvkDebugFlag::Validation)) {
       VkDebugUtilsMessengerCreateInfoEXT messengerInfo = { VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT };
       messengerInfo.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT
@@ -273,6 +282,26 @@ namespace dxvk {
 
       if (m_vki->vkCreateDebugUtilsMessengerEXT(m_vki->instance(), &messengerInfo, nullptr, &m_messenger))
         Logger::err("DxvkInstance::createInstance: Failed to create debug messenger, proceeding without.");
+    }
+
+    if (DxvkDeviceAddressBindingBuildEnabled &&
+        m_extensionInfo.extDebugUtils.specVersion) {
+      VkDebugUtilsMessengerCreateInfoEXT messengerInfo = {
+        VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT };
+      messengerInfo.messageSeverity =
+        VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT;
+      messengerInfo.messageType =
+        VK_DEBUG_UTILS_MESSAGE_TYPE_DEVICE_ADDRESS_BINDING_BIT_EXT;
+      messengerInfo.pfnUserCallback = &addressBindingCallback;
+      messengerInfo.pUserData = &GetDxvkDeviceAddressBindingTracker();
+
+      const VkResult result = m_vki->vkCreateDebugUtilsMessengerEXT(
+        m_vki->instance(), &messengerInfo, nullptr,
+        &m_addressBindingMessenger);
+      GetDxvkDeviceAddressBindingTracker().resetForInstance(
+        result == VK_SUCCESS && m_addressBindingMessenger != VK_NULL_HANDLE);
+      if (result != VK_SUCCESS)
+        Logger::warn("DXVK: Device address binding messenger unavailable.");
     }
 
     // Write back debug flags
@@ -421,6 +450,37 @@ namespace dxvk {
     str << pCallbackData->pMessage;
 
     Logger::log(logLevel, str.str());
+    return VK_FALSE;
+  }
+
+
+  VkBool32 VKAPI_CALL DxvkInstance::addressBindingCallback(
+          VkDebugUtilsMessageSeverityFlagBitsEXT  messageSeverity,
+          VkDebugUtilsMessageTypeFlagsEXT         messageTypes,
+    const VkDebugUtilsMessengerCallbackDataEXT*   pCallbackData,
+          void*                                   pUserData) {
+    if (messageSeverity != VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT ||
+        !(messageTypes &
+          VK_DEBUG_UTILS_MESSAGE_TYPE_DEVICE_ADDRESS_BINDING_BIT_EXT) ||
+        !pCallbackData || !pUserData)
+      return VK_FALSE;
+
+    const VkBaseInStructure* current =
+      reinterpret_cast<const VkBaseInStructure*>(pCallbackData->pNext);
+    while (current && current->sType !=
+           VK_STRUCTURE_TYPE_DEVICE_ADDRESS_BINDING_CALLBACK_DATA_EXT)
+      current = current->pNext;
+    if (!current)
+      return VK_FALSE;
+
+    const auto* binding = reinterpret_cast<
+      const VkDeviceAddressBindingCallbackDataEXT*>(current);
+    const VkDebugUtilsObjectNameInfoEXT* object =
+      pCallbackData->objectCount && pCallbackData->pObjects
+        ? &pCallbackData->pObjects[0]
+        : nullptr;
+    static_cast<DxvkDeviceAddressBindingTracker*>(pUserData)->record(
+      *binding, object);
     return VK_FALSE;
   }
 

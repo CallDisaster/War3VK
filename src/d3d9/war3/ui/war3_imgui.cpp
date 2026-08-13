@@ -1076,6 +1076,14 @@ void War3Imgui::drawDebugWindow() {
       const bool loaded = (info.flags & war3shader::PACK_FLAG_LOADED) != 0;
       const bool enabled = (info.flags & war3shader::PACK_FLAG_ENABLED) != 0;
       const bool hasError = (info.flags & war3shader::PACK_FLAG_HAS_ERROR) != 0;
+      const bool rawShaderPackEnabled =
+          war3shader::IsRawShaderPackLoadingEnabled();
+
+      if (!rawShaderPackEnabled) {
+        ImGui::TextWrapped(
+            "发布构建已禁用原始 SPIR-V ShaderPack；仅显式开发构建可用。");
+      }
+      ImGui::BeginDisabled(!rawShaderPackEnabled);
 
       ImGui::InputText("Pack Path", s_packPath, sizeof(s_packPath));
       if (ImGui::Button("加载")) {
@@ -1140,6 +1148,7 @@ void War3Imgui::drawDebugWindow() {
         }
         ImGui::TreePop();
       }
+      ImGui::EndDisabled();
     }
 
     if (ImGui::CollapsingHeader("渲染统计 (Render Stats)")) {

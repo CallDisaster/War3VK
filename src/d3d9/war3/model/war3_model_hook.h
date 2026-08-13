@@ -4,6 +4,7 @@
 #include "../render/war3_current_draw_contract.h"
 
 #include <cstdint>
+#include <cstddef>
 
 namespace dxvk {
 struct Matrix4;
@@ -461,6 +462,19 @@ bool QueryBlendedPaletteBySlotIndexExact(uint32_t slotIndex,
                                          uint32_t expectedCount,
                                          uint32_t expectedFrameTag,
                                          void* outPaletteVec);
+
+// Same exact slot/frame contract as QueryBlendedPaletteBySlotIndexExact, but
+// writes War3's packed 3x4 byte representation directly. The complete range
+// is validated first, so a failed query leaves the destination untouched.
+bool CopyBlendedPaletteBytesBySlotIndexExact(uint32_t slotIndex,
+                                             uint32_t expectedCount,
+                                             uint32_t expectedFrameTag,
+                                             void* outPaletteBytes,
+                                             size_t outPaletteByteCapacity);
+
+// Canonical cumulative successful Exact-query count. CurrentDraw diagnostics
+// borrow this value instead of issuing a second 64-bit atomic RMW per publish.
+uint64_t QueryBlendedPaletteExactHitCount() noexcept;
 
 // Phase 7.34：诊断用 best-effort 查询，允许 partial。
 // **不应用于 Ready palette 仲裁**，仅在 counter / 调试日志中使用。

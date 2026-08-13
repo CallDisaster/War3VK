@@ -3,6 +3,7 @@
 
 #include "dxvk_adapter.h"
 #include "dxvk_device.h"
+#include "dxvk_device_address_binding.h"
 #include "dxvk_instance.h"
 
 namespace dxvk {
@@ -236,10 +237,18 @@ namespace dxvk {
     deviceInfo.pEnabledFeatures = &features->features;
 
     VkDevice device = VK_NULL_HANDLE;
+
+    // Address-binding notifications may be emitted while vkCreateDevice is
+    // executing, before a DxvkDevice owner exists. Open the fixed callback
+    // tracker only for the feature that is actually being enabled.
+    GetDxvkDeviceAddressBindingTracker().setDeviceFeatureEnabled(
+      m_capabilities.getFeatures().extDeviceAddressBindingReport.reportAddressBinding == VK_TRUE);
     VkResult vr = vk->vkCreateDevice(m_handle, &deviceInfo, nullptr, &device);
 
-    if (vr)
+    if (vr) {
+      GetDxvkDeviceAddressBindingTracker().setDeviceFeatureEnabled(false);
       throw DxvkError(str::format("Failed to create Vulkan device: ", vr));
+    }
 
     Rc<vk::DeviceFn> vkd = new vk::DeviceFn(vk, true, device);
 

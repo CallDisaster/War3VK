@@ -106,6 +106,7 @@ namespace dxvk {
       m_vkd->device(), &waitInfo, ~0ull);
 
     if (vr != VK_SUCCESS) {
+      m_vkd->notifyDeviceErrorFromDriverResult(vr);
       Logger::err(str::format("Failed to wait for semaphore: ", vr));
     }
   }
@@ -128,6 +129,7 @@ namespace dxvk {
       VkResult vr = m_vkd->vkGetSemaphoreCounterValue(m_vkd->device(), m_semaphore, &value);
 
       if (vr != VK_SUCCESS) {
+        m_vkd->notifyDeviceErrorFromDriverResult(vr);
         Logger::err(str::format("Failed to query semaphore value: ", vr));
         return;
       }
@@ -158,6 +160,7 @@ namespace dxvk {
         m_vkd->device(), &waitInfo, 10'000'000ull);
 
       if (vr != VK_SUCCESS && vr != VK_TIMEOUT) {
+        m_vkd->notifyDeviceErrorFromDriverResult(vr);
         Logger::err(str::format("Failed to wait for semaphore: ", vr));
         return;
       }
@@ -168,6 +171,7 @@ namespace dxvk {
     uint64_t value = 0;
     VkResult vr = m_vkd->vkGetSemaphoreCounterValue(m_vkd->device(), m_semaphore, &value);
     if (vr != VK_SUCCESS) {
+      m_vkd->notifyDeviceErrorFromDriverResult(vr);
       Logger::err(str::format("Failed to query semaphore value: ", vr));
     }
     return value;
