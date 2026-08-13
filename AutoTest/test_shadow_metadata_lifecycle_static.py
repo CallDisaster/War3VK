@@ -415,13 +415,14 @@ class ShadowMetadataLifecycleStaticTests(unittest.TestCase):
             DEVICE,
         )
         self.assertIn(
-            "if (!War3DrawTimeVBCacheRuntime() ||\n"
-            "        !War3SemanticDrawTimePrebuildBypassRuntime()",
+            "const bool drawTimePrebuildBypassEnabled =\n"
+            "      War3DrawTimeVBCacheRuntime() &&\n"
+            "      War3SemanticDrawTimePrebuildBypassRuntime() &&\n"
+            "      War3SemanticDrawTimeFastAppendRuntime();",
             DEVICE,
         )
         self.assertIn(
-            "if (!War3DrawTimeVBCacheRuntime() ||\n"
-            "        !War3SemanticDrawTimeFastAppendRuntime())",
+            "if (!drawTimePrebuildBypassEnabled)",
             DEVICE,
         )
 

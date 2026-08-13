@@ -27480,12 +27480,14 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
         return manifestRecord;
       };
 
+  const bool drawTimePrebuildBypassEnabled =
+      War3DrawTimeVBCacheRuntime() &&
+      War3SemanticDrawTimePrebuildBypassRuntime() &&
+      War3SemanticDrawTimeFastAppendRuntime();
   auto tryBuildDrawTimePrebuildBypassEligible =
       [&](const dxvk::war3::render::CurrentDrawContractRecord& record,
           EligibleRecord& eligible) {
-    if (!War3DrawTimeVBCacheRuntime() ||
-        !War3SemanticDrawTimePrebuildBypassRuntime() ||
-        !War3SemanticDrawTimeFastAppendRuntime()) {
+    if (!drawTimePrebuildBypassEnabled) {
       return false;
     }
 
