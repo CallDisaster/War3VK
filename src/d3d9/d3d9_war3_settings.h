@@ -233,6 +233,17 @@ struct War3BloomSettings {
   bool acesToneMap = false;
 };
 
+// Legacy remains available as an explicit compatibility backend. Volumetric
+// Lighting 2.0 now enters the bounded High tier by default so enabling the
+// feature cannot silently keep executing the old fragment ray march. The tier
+// controls a bounded XY tile footprint and logarithmic Z slice count, not an
+// unbounded author-supplied dispatch size.
+enum class War3VolumetricQuality : uint32_t {
+  LegacyRayMarch = 0u,
+  FroxelMedium = 1u,
+  FroxelHigh = 2u,
+};
+
 struct War3VolumetricLightSettings {
   // CSM 对齐的体积光。默认关闭；开启后以受光雾/缺光雾的真实差值为主。
   // 关闭时 Run() 在入口即返回，不申请资源、不拷贝 depth/color。
@@ -241,6 +252,14 @@ struct War3VolumetricLightSettings {
   // density：世界空间散射密度；sampleCount 受执行层预算硬限制，避免
   // 低机位/高分辨率时的全屏 ray-march 触发 GPU TDR。
   bool enabled = false;
+  War3VolumetricQuality quality = War3VolumetricQuality::FroxelHigh;
+  // Froxel history is readable only across consecutive frames in the same
+  // map/device epoch and common radial grid specification. Camera motion is
+  // handled by world-space reprojection; scene depth never redefines a column.
+  bool froxelTemporalEnabled = true;
+  float froxelHistoryWeight = 0.88f;
+  float froxelVarianceGamma = 1.50f;
+  float froxelReactiveScale = 1.25f;
   // soft-clip + composite headroom 防冲白。weight<=1 只通过少加散射形成
   // 物理阴影；weight>1 启用温和柱可读性（地表端积分后不再依赖激进 peak）。
   // 默认可读档：先保证区间正确，再谈强度；勿再靠拉满 intensity 补柱。
@@ -261,9 +280,15 @@ struct War3VolumetricLightSettings {
   int sampleCount = 16;
   // TDR 合同硬下限 divisor=4；俯视靠地表端区间 + 温和可读性，不靠降 divisor。
   uint32_t resolutionDivisor = 4;
-  // 地表端 [L-D,L] 下 D=sunDistance*maxRayDistance；1400 覆盖常见 RTS 射线尾。
+  // Legacy ray-march distance. Froxel uses its own camera-stable common range
+  // below so a low-pitch surface cannot slide the near end of the volume.
   float sunDistance = 1400.0f;
   float froxelNear = 20.0f;
+  // Common radial grid end. The grid is camera-stable and must cover the full
+  // verified low-pitch Warcraft view rather than sliding a fixed tail window
+  // with the first surface. The dedicated near volume-sun layer preserves
+  // local shadow precision inside this wider domain.
+  float froxelFar = 10000.0f;
   // Independent gate for the homogeneous/global medium. Turning this off
   // preserves authored local fog volumes and their sun/point-light scattering.
   // Keep density as an authored value so toggling the gate does not destroy it.
@@ -302,17 +327,20 @@ struct War3VolumetricLightSettings {
   // snapshot 无效时是否回退到相机 CSM（过渡期默认 true）。
   bool volumeSunShadowFallbackToCsm = true;
   // 远级 volume cascade 水平半径（War3 世界单位）。
-  float volumeSunOrthoRadius = 3400.0f;
+  float volumeSunOrthoRadius = 10000.0f;
   // 近级半径 = far * volumeSunNearRadiusScale（固定比例，仍不随 pitch 变）。
   float volumeSunNearRadiusScale = 0.42f;
   // 向太阳侧 caster 深度余量；大于历史 C2/C3 的 384 以覆盖高空单位柱体。
   float volumeSunDepthExtension = 640.0f;
   float volumeSunDepthMargin = 96.0f;
-  // 双层 depth 分辨率；1536 在近级约 4.2 units/texel。
+  // 双层 depth 分辨率；far 级覆盖统一 Froxel 远端，near 级保留局部精度。
   uint32_t volumeSunResolution = 1536;
   // 体积专用 soft compare 半径（shader 内 3x3 footprint）。
   float volumeSunSoftRadius = 1.85f;
-  float volumeSunReceiverBias = 0.0075f;
+  // Receiver bias in War3 world units. The producer converts it to normalized
+  // light depth using the far ortho span, so widening the volume coverage does
+  // not turn a small acne guard into a large caster-to-column gap.
+  float volumeSunReceiverBias = 2.0f;
   // 双级 cascade（近锐/远盖）；false 时退回单层远级。
   bool volumeSunDualCascade = true;
 };

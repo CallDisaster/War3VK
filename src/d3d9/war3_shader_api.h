@@ -648,6 +648,9 @@ WAR3_SHADER_API bool SetVolumetricHeightFogEnabled(bool enabled);
 WAR3_SHADER_API bool SetVolumetricHeightFog(
     float baseHeight, float falloff, float strength);
 WAR3_SHADER_API bool SetVolumetricResolutionDivisor(uint32_t divisor);
+// 0=legacy ray march, 1=froxel medium, 2=froxel high. Values outside the
+// bounded public enum are rejected rather than silently mapped.
+WAR3_SHADER_API bool SetVolumetricBackend(uint32_t quality);
 WAR3_SHADER_API bool SetOutlineEnabled(bool enabled);
 WAR3_SHADER_API bool SetOutlineWidth(float widthPx);
 WAR3_SHADER_API bool SetOutlineColor(float r, float g, float b, float a);

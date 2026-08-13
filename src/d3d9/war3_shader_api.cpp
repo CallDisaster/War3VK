@@ -989,6 +989,18 @@ WAR3_SHADER_API bool SetVolumetricResolutionDivisor(uint32_t divisor) {
     return true;
 }
 
+WAR3_SHADER_API bool SetVolumetricBackend(uint32_t quality) {
+    if (quality > static_cast<uint32_t>(
+            dxvk::War3VolumetricQuality::FroxelHigh))
+        return false;
+    auto settings = GetMutableSettings();
+    if (!settings)
+        return false;
+    settings->postFx.volumetricLight.quality =
+        static_cast<dxvk::War3VolumetricQuality>(quality);
+    return true;
+}
+
 WAR3_SHADER_API bool SetOutlineEnabled(bool enabled) {
     auto settings = GetMutableSettings();
     if (!settings)

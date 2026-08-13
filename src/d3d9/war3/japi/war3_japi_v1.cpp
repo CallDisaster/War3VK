@@ -89,6 +89,7 @@ enum class CommandId : uint16_t {
   VolumetricSetDensity,
   VolumetricSetScattering,
   VolumetricSetQuality,
+  VolumetricSetBackend,
   VolumetricFogSetEnabled,
   VolumetricFogSetSettings,
   LocalFogCreateSphere,
@@ -178,7 +179,7 @@ struct CommandSpec {
   bool backendRequired;
 };
 
-constexpr std::array<CommandSpec, 105> kCommands = {{
+constexpr std::array<CommandSpec, 106> kCommands = {{
     {CommandId::SystemVersion, "system.version", Carrier::LocalizedString, "", 0u, false},
     {CommandId::SystemProtocolVersion, "system.protocolVersion", Carrier::Hotkey, "", 0u, false},
     {CommandId::SystemLastErrorCode, "system.lastErrorCode", Carrier::Hotkey, "", 0u, false},
@@ -206,6 +207,7 @@ constexpr std::array<CommandSpec, 105> kCommands = {{
     {CommandId::VolumetricSetDensity, "volumetric.setDensity", Carrier::Preloader, "r", kFeatureVolumetric, true},
     {CommandId::VolumetricSetScattering, "volumetric.setScattering", Carrier::Preloader, "rr", kFeatureVolumetric, true},
     {CommandId::VolumetricSetQuality, "volumetric.setQuality", Carrier::Preloader, "ir", kFeatureVolumetric, true},
+    {CommandId::VolumetricSetBackend, "volumetric.setBackend", Carrier::Preloader, "i", kFeatureVolumetric, true},
     {CommandId::VolumetricFogSetEnabled, "volumetricFog.setEnabled", Carrier::Preloader, "b", kFeatureVolumetric, true},
     {CommandId::VolumetricFogSetSettings, "volumetricFog.setSettings", Carrier::Preloader, "rrr", kFeatureVolumetric, true},
     {CommandId::LocalFogCreateSphere, "localFog.createSphere", Carrier::Hotkey, "rrrrrr", kFeatureLocalFog, true},
@@ -1223,8 +1225,19 @@ Reply DispatchBackend(const ParsedRequest& request) {
         return BackendRejected();
       settings->postFx.volumetricLight.sampleCount = a[0].integer;
       settings->postFx.volumetricLight.sunDistance = a[1].real;
+      // The public max-distance argument predates the Froxel backend. Preserve
+      // its legacy ray-march meaning. Froxel uses the independently bounded
+      // camera-stable domain; old maps commonly pass 1200-1800 and must not
+      // silently reintroduce a pitch-dependent short grid.
+      settings->postFx.volumetricLight.froxelFar = 10000.0f;
       settings->postFx.volumetricLight.maxRayDistance = 1.0f;
       return SuccessVoid();
+    case CommandId::VolumetricSetBackend:
+      if (a[0].integer < 0 || a[0].integer > 2)
+        return BackendRejected();
+      return war3shader::SetVolumetricBackend(
+          static_cast<uint32_t>(a[0].integer))
+          ? SuccessVoid() : BackendRejected();
     case CommandId::VolumetricFogSetEnabled:
       return war3shader::SetVolumetricHeightFogEnabled(a[0].boolean)
           ? SuccessVoid() : BackendRejected();

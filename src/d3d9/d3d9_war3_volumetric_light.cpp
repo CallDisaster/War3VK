@@ -14,6 +14,9 @@
 
 #include <war3_fullscreen_vert.h>
 #include <war3_volumetric_composite.h>
+#include <war3_volumetric_froxel_inject.h>
+#include <war3_volumetric_froxel_integrate.h>
+#include <war3_volumetric_froxel_temporal.h>
 #include <war3_volumetric_light.h>
 
 #include <algorithm>
@@ -47,6 +50,30 @@ constexpr uint64_t kVolumetricRaySegmentBudget = 4'000'000ull;
 // independently bounded so eight authored volumes cannot silently multiply the
 // original watchdog contract into an unbounded fragment loop.
 constexpr uint64_t kVolumetricFogSegmentTestBudget = 96'000'000ull;
+// High keeps the lighting field coarse enough for bounded injection, while the
+// final ray integration is intentionally evaluated at a finer 2D resolution.
+// At 3840x2160 this admits 240x135x128 = 4,147,200 cells (~31.7 MiB/image in
+// RGBA16F). Three ping-pong/current images remain below the 128 MiB quality
+// budget and avoid coupling the depth terminator to a 16x16 screen tile.
+constexpr uint64_t kVolumetricFroxelCellBudget = 4'500'000ull;
+// Bound the expensive directional shadow interval traversal independently of
+// the 3D grid build. High requests quarter-resolution integration at ordinary
+// Warcraft resolutions, but automatically falls back to eighth resolution at
+// 4K so the worst-case DDA contract stays below this fixed watchdog budget.
+constexpr uint64_t kVolumetricFroxelTraversalWorkBudget = 350'000'000ull;
+constexpr uint32_t kVolumetricFroxelMediumTileSize = 32u;
+constexpr uint32_t kVolumetricFroxelMediumDepth = 64u;
+constexpr uint32_t kVolumetricFroxelHighTileSize = 16u;
+constexpr uint32_t kVolumetricFroxelHighDepth = 128u;
+// The 3D grid and the integrated 2D effect have different jobs. Grid XY stores
+// slowly varying medium/light data; the effect target owns first-surface depth
+// termination and therefore needs substantially finer screen coverage near a
+// giant caster silhouette. Reusing the grid tile as the effect divisor caused
+// 16x16/32x32 depth blocks to erase the column as camera pitch decreased.
+constexpr uint32_t kVolumetricFroxelMediumEffectDivisor = 8u;
+constexpr uint32_t kVolumetricFroxelHighEffectDivisor = 4u;
+constexpr uint32_t kVolumetricFroxelMediumTraversalSteps = 1024u;
+constexpr uint32_t kVolumetricFroxelHighTraversalSteps = 2048u;
 
 struct VolumetricLightPushConstants {
   uint32_t colorSampler;
@@ -131,12 +158,57 @@ struct VolumetricCompositePushConstants {
   uint32_t pad1;
   Vector4 rtSize;
 };
+
+struct VolumetricFroxelInjectPushConstants {
+  uint32_t samplePhase;
+  uint32_t flags;
+  uint32_t gridDepth;
+  uint32_t pad;
+  Vector4 grid;
+  Vector4 params0;
+  Vector4 params1;
+  Vector4 sunColorScale;
+};
+
+struct VolumetricFroxelTemporalPushConstants {
+  uint32_t sampler;
+  uint32_t historyValid;
+  uint32_t gridDepth;
+  uint32_t flags;
+  Matrix4 previousViewProj;
+  Vector4 grid;
+  Vector4 previousCameraPos;
+  Vector4 params;
+};
+
+struct VolumetricFroxelIntegratePushConstants {
+  uint32_t sampler;
+  uint32_t depthSampler;
+  uint32_t flags;
+  uint32_t gridDepth;
+  Vector4 grid;
+  Vector4 viewport;
+  Vector4 viewportZ;
+  Vector4 params;
+  uint32_t shadowSampler;
+  uint32_t maxTraversalSteps;
+  uint32_t pad0;
+  uint32_t pad1;
+  Vector4 sunColorScale;
+  Vector4 sunParams;
+};
 static_assert(sizeof(VolumetricPointLightUniform) == 800u,
               "VolumetricPointLightUniform GLSL ABI drift");
 static_assert(sizeof(VolumetricFogVolumeUniform) == 528u,
               "VolumetricFogVolumeUniform GLSL ABI drift");
 static_assert(sizeof(VolumetricCompositePushConstants) == 32u,
               "VolumetricCompositePushConstants GLSL ABI drift");
+static_assert(sizeof(VolumetricFroxelInjectPushConstants) == 80u,
+              "VolumetricFroxelInjectPushConstants GLSL ABI drift");
+static_assert(sizeof(VolumetricFroxelTemporalPushConstants) == 128u,
+              "VolumetricFroxelTemporalPushConstants GLSL ABI drift");
+static_assert(sizeof(VolumetricFroxelIntegratePushConstants) == 128u,
+              "VolumetricFroxelIntegratePushConstants GLSL ABI drift");
 
 VkImageSubresourceLayers toLayers(const VkImageSubresourceRange& range) {
   VkImageSubresourceLayers layers = {};
@@ -278,10 +350,17 @@ VolumetricPointSelection SelectVolumetricPointLights(
       settings.maxPointLights, kVolumetricMaxPointLights);
   const uint32_t available = std::min<uint32_t>(
       snapshot.count, War3PointLightFrameSnapshot::kMaxLights);
-  const double maxWorldDistance = std::max(
-      double(clampFinite(settings.sunDistance, 100.0f, 6000.0f, 1200.0f)) *
-          double(clampFinite(settings.maxRayDistance, 0.05f, 2.0f, 0.68f)),
-      25.0);
+  const bool froxel =
+      settings.quality == War3VolumetricQuality::FroxelMedium ||
+      settings.quality == War3VolumetricQuality::FroxelHigh;
+  const double maxWorldDistance = froxel
+      ? double(clampFinite(settings.froxelFar, 1000.0f, 10000.0f, 10000.0f))
+      : std::max(
+            double(clampFinite(settings.sunDistance, 100.0f, 6000.0f,
+                               1200.0f)) *
+                double(clampFinite(settings.maxRayDistance, 0.05f, 2.0f,
+                                   0.68f)),
+            25.0);
 
   struct Candidate {
     uint32_t sourceIndex = 0u;
@@ -387,6 +466,18 @@ War3VolumetricLightPass::War3VolumetricLightPass(D3D9DeviceEx* device)
 
   m_layout = createPipelineLayout();
   m_compositeLayout = createCompositePipelineLayout();
+  m_froxelInjectLayout = createFroxelInjectLayout();
+  m_froxelTemporalLayout = createFroxelTemporalLayout();
+  m_froxelIntegrateLayout = createFroxelIntegrateLayout();
+  m_froxelInjectPipeline = m_device->createBuiltInComputePipeline(
+      m_froxelInjectLayout,
+      util::DxvkBuiltInShaderStage(war3_volumetric_froxel_inject, nullptr));
+  m_froxelTemporalPipeline = m_device->createBuiltInComputePipeline(
+      m_froxelTemporalLayout,
+      util::DxvkBuiltInShaderStage(war3_volumetric_froxel_temporal, nullptr));
+  m_froxelIntegratePipeline = m_device->createBuiltInComputePipeline(
+      m_froxelIntegrateLayout,
+      util::DxvkBuiltInShaderStage(war3_volumetric_froxel_integrate, nullptr));
 
   // CSM 数据 UBO：每帧由体积光 pass 读取 shadow pass 快照后更新。
   DxvkBufferCreateInfo uboInfo = {};
@@ -394,7 +485,8 @@ War3VolumetricLightPass::War3VolumetricLightPass(D3D9DeviceEx* device)
   uboInfo.usage =
       VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
   uboInfo.stages =
-      VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+      VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
   uboInfo.access = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_UNIFORM_READ_BIT;
   uboInfo.debugName = "War3VolumetricCsmUBO";
 
@@ -403,7 +495,8 @@ War3VolumetricLightPass::War3VolumetricLightPass(D3D9DeviceEx* device)
   lightInfo.usage =
       VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
   lightInfo.stages =
-      VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+      VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
   lightInfo.access = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_UNIFORM_READ_BIT;
   lightInfo.debugName = "War3VolumetricPointLightUBO";
 
@@ -412,7 +505,8 @@ War3VolumetricLightPass::War3VolumetricLightPass(D3D9DeviceEx* device)
   fogVolumeInfo.usage =
       VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
   fogVolumeInfo.stages =
-      VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+      VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
   fogVolumeInfo.access =
       VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_UNIFORM_READ_BIT;
   fogVolumeInfo.debugName = "War3VolumetricFogVolumeUBO";
@@ -433,6 +527,12 @@ War3VolumetricLightPass::War3VolumetricLightPass(D3D9DeviceEx* device)
 
 War3VolumetricLightPass::~War3VolumetricLightPass() {
   auto vk = m_device->vkd();
+  if (m_froxelInjectPipeline != VK_NULL_HANDLE)
+    vk->vkDestroyPipeline(vk->device(), m_froxelInjectPipeline, nullptr);
+  if (m_froxelTemporalPipeline != VK_NULL_HANDLE)
+    vk->vkDestroyPipeline(vk->device(), m_froxelTemporalPipeline, nullptr);
+  if (m_froxelIntegratePipeline != VK_NULL_HANDLE)
+    vk->vkDestroyPipeline(vk->device(), m_froxelIntegratePipeline, nullptr);
   for (auto& kv : m_pipelines) {
     if (kv.second != VK_NULL_HANDLE)
       vk->vkDestroyPipeline(vk->device(), kv.second, nullptr);
@@ -486,6 +586,66 @@ War3VolumetricLightPass::createCompositePipelineLayout() const {
       bindings.data());
 }
 
+const DxvkPipelineLayout*
+War3VolumetricLightPass::createFroxelInjectLayout() const {
+  std::array<DxvkDescriptorSetLayoutBinding, 6> bindings = {
+      DxvkDescriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1,
+                                     VK_SHADER_STAGE_COMPUTE_BIT),
+      DxvkDescriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
+                                     VK_SHADER_STAGE_COMPUTE_BIT),
+      DxvkDescriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
+                                     VK_SHADER_STAGE_COMPUTE_BIT),
+      DxvkDescriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
+                                     VK_SHADER_STAGE_COMPUTE_BIT),
+      DxvkDescriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
+                                     VK_SHADER_STAGE_COMPUTE_BIT),
+      DxvkDescriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
+                                     VK_SHADER_STAGE_COMPUTE_BIT),
+  };
+  return m_device->createBuiltInPipelineLayout(
+      DxvkPipelineLayoutFlag::UsesSamplerHeap, VK_SHADER_STAGE_COMPUTE_BIT,
+      sizeof(VolumetricFroxelInjectPushConstants), bindings.size(),
+      bindings.data());
+}
+
+const DxvkPipelineLayout*
+War3VolumetricLightPass::createFroxelTemporalLayout() const {
+  std::array<DxvkDescriptorSetLayoutBinding, 4> bindings = {
+      DxvkDescriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
+                                     VK_SHADER_STAGE_COMPUTE_BIT),
+      DxvkDescriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
+                                     VK_SHADER_STAGE_COMPUTE_BIT),
+      DxvkDescriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1,
+                                     VK_SHADER_STAGE_COMPUTE_BIT),
+      DxvkDescriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
+                                     VK_SHADER_STAGE_COMPUTE_BIT),
+  };
+  return m_device->createBuiltInPipelineLayout(
+      DxvkPipelineLayoutFlag::UsesSamplerHeap, VK_SHADER_STAGE_COMPUTE_BIT,
+      sizeof(VolumetricFroxelTemporalPushConstants), bindings.size(),
+      bindings.data());
+}
+
+const DxvkPipelineLayout*
+War3VolumetricLightPass::createFroxelIntegrateLayout() const {
+  std::array<DxvkDescriptorSetLayoutBinding, 5> bindings = {
+      DxvkDescriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
+                                     VK_SHADER_STAGE_COMPUTE_BIT),
+      DxvkDescriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
+                                     VK_SHADER_STAGE_COMPUTE_BIT),
+      DxvkDescriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1,
+                                     VK_SHADER_STAGE_COMPUTE_BIT),
+      DxvkDescriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
+                                     VK_SHADER_STAGE_COMPUTE_BIT),
+      DxvkDescriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
+                                     VK_SHADER_STAGE_COMPUTE_BIT),
+  };
+  return m_device->createBuiltInPipelineLayout(
+      DxvkPipelineLayoutFlag::UsesSamplerHeap, VK_SHADER_STAGE_COMPUTE_BIT,
+      sizeof(VolumetricFroxelIntegratePushConstants), bindings.size(),
+      bindings.data());
+}
+
 VkPipeline War3VolumetricLightPass::getPipeline(const PipelineKey& key) {
   auto it = m_pipelines.find(key);
   if (it != m_pipelines.end())
@@ -531,7 +691,8 @@ VkPipeline War3VolumetricLightPass::createCompositePipeline(
 void War3VolumetricLightPass::ensureResources(VkExtent3D extent,
                                                VkFormat colorFormat,
                                                VkFormat depthFormat,
-                                               uint32_t resolutionDivisor) {
+                                               uint32_t resolutionDivisor,
+                                               bool storageEffect) {
   if (!m_colorCopy || m_cachedExtent.width != extent.width ||
       m_cachedExtent.height != extent.height || m_cachedFormat != colorFormat) {
     m_cachedExtent = extent;
@@ -621,7 +782,7 @@ void War3VolumetricLightPass::ensureResources(VkExtent3D extent,
 
   const uint32_t divisor = std::clamp<uint32_t>(
       resolutionDivisor, kVolumetricLocalRoiResolutionDivisor,
-      kVolumetricMaxResolutionDivisor);
+      kVolumetricFroxelMediumTileSize);
   VkExtent3D effectExtent = {
       std::max<uint32_t>(1u, (extent.width + divisor - 1u) / divisor),
       std::max<uint32_t>(1u, (extent.height + divisor - 1u) / divisor),
@@ -629,9 +790,11 @@ void War3VolumetricLightPass::ensureResources(VkExtent3D extent,
   constexpr VkFormat effectFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
   if (!m_effectImage || m_cachedEffectExtent.width != effectExtent.width ||
       m_cachedEffectExtent.height != effectExtent.height ||
-      m_cachedEffectFormat != effectFormat) {
+      m_cachedEffectFormat != effectFormat ||
+      m_effectStorageEnabled != storageEffect) {
     m_cachedEffectExtent = effectExtent;
     m_cachedEffectFormat = effectFormat;
+    m_effectStorageEnabled = storageEffect;
 
     DxvkImageCreateInfo info = {};
     info.type = VK_IMAGE_TYPE_2D;
@@ -643,10 +806,16 @@ void War3VolumetricLightPass::ensureResources(VkExtent3D extent,
     info.mipLevels = 1;
     info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
                  VK_IMAGE_USAGE_SAMPLED_BIT;
+    if (storageEffect)
+      info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
     info.stages = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
                   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    if (storageEffect)
+      info.stages |= VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
     info.access = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
                   VK_ACCESS_SHADER_READ_BIT;
+    if (storageEffect)
+      info.access |= VK_ACCESS_SHADER_WRITE_BIT;
     info.tiling = VK_IMAGE_TILING_OPTIMAL;
     info.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
@@ -671,7 +840,101 @@ void War3VolumetricLightPass::ensureResources(VkExtent3D extent,
     viewInfo.packedSwizzle = DxvkImageViewKey::packSwizzle(mapping);
 
     m_effectView = m_effectImage->createView(viewInfo);
+
+    m_effectStorageView = nullptr;
+    if (storageEffect) {
+      viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+      viewInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+      viewInfo.layout = VK_IMAGE_LAYOUT_GENERAL;
+      m_effectStorageView = m_effectImage->createView(viewInfo);
+    }
   }
+}
+
+void War3VolumetricLightPass::invalidateFroxelHistory() {
+  m_froxelHistoryValid = false;
+  m_froxelHistoryFrameSerial = 0u;
+  m_froxelHistoryMapEpoch = 0u;
+  m_froxelHistoryDeviceEpoch = 0u;
+  m_froxelHistoryNear = 0.0f;
+  m_froxelHistoryFar = 0.0f;
+}
+
+bool War3VolumetricLightPass::ensureFroxelResources(
+    VkExtent3D fullExtent, War3VolumetricQuality quality) {
+  const bool high = quality == War3VolumetricQuality::FroxelHigh;
+  if (!high && quality != War3VolumetricQuality::FroxelMedium)
+    return false;
+  const uint32_t tileSize = high ? kVolumetricFroxelHighTileSize
+                                 : kVolumetricFroxelMediumTileSize;
+  const uint32_t depth = high ? kVolumetricFroxelHighDepth
+                              : kVolumetricFroxelMediumDepth;
+  const VkExtent3D grid = {
+      std::max(1u, (fullExtent.width + tileSize - 1u) / tileSize),
+      std::max(1u, (fullExtent.height + tileSize - 1u) / tileSize), depth};
+  const uint64_t cellCount = uint64_t(grid.width) * uint64_t(grid.height) *
+                             uint64_t(grid.depth);
+  if (cellCount == 0u || cellCount > kVolumetricFroxelCellBudget)
+    return false;
+  const uint32_t max3dDimension =
+      m_device->properties().core.properties.limits.maxImageDimension3D;
+  if (grid.width > max3dDimension || grid.height > max3dDimension ||
+      grid.depth > max3dDimension)
+    return false;
+  constexpr VkFormatFeatureFlags2 requiredFeatures =
+      VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
+      VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT;
+  if ((m_device->getFormatFeatures(VK_FORMAT_R16G16B16A16_SFLOAT).optimal &
+       requiredFeatures) != requiredFeatures)
+    return false;
+
+  if (m_froxelCurrentImage && m_froxelGridExtent.width == grid.width &&
+      m_froxelGridExtent.height == grid.height &&
+      m_froxelGridExtent.depth == grid.depth &&
+      m_froxelResourceQuality == quality)
+    return true;
+
+  DxvkImageCreateInfo info = {};
+  info.type = VK_IMAGE_TYPE_3D;
+  info.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+  info.flags = 0;
+  info.sampleCount = VK_SAMPLE_COUNT_1_BIT;
+  info.extent = grid;
+  info.numLayers = 1u;
+  info.mipLevels = 1u;
+  info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+  info.stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+  info.access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+  info.tiling = VK_IMAGE_TILING_OPTIMAL;
+  info.layout = VK_IMAGE_LAYOUT_GENERAL;
+  info.debugName = "War3VolumetricFroxel";
+
+  DxvkImageViewKey viewInfo = {};
+  viewInfo.viewType = VK_IMAGE_VIEW_TYPE_3D;
+  viewInfo.format = info.format;
+  viewInfo.usage = info.usage;
+  viewInfo.layout = VK_IMAGE_LAYOUT_GENERAL;
+  viewInfo.aspects = VK_IMAGE_ASPECT_COLOR_BIT;
+  viewInfo.mipIndex = 0u;
+  viewInfo.mipCount = 1u;
+  viewInfo.layerIndex = 0u;
+  viewInfo.layerCount = 1u;
+
+  m_froxelCurrentImage =
+      m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+  m_froxelCurrentView = m_froxelCurrentImage->createView(viewInfo);
+  for (uint32_t i = 0u; i < m_froxelHistoryImages.size(); ++i) {
+    m_froxelHistoryImages[i] =
+        m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    m_froxelHistoryViews[i] =
+        m_froxelHistoryImages[i]->createView(viewInfo);
+  }
+  m_froxelGridExtent = grid;
+  m_froxelResourceQuality = quality;
+  m_froxelHistoryIndex = 0u;
+  invalidateFroxelHistory();
+  return m_froxelCurrentView && m_froxelHistoryViews[0] &&
+         m_froxelHistoryViews[1];
 }
 
 void War3VolumetricLightPass::ensurePointShadowFallbackResources(
@@ -751,7 +1014,8 @@ void War3VolumetricLightPass::ensurePointShadowFallbackResources(
       VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
   toRead.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
   toRead.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-  toRead.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+  toRead.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
   toRead.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
   toRead.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
   toRead.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -782,7 +1046,8 @@ void War3VolumetricLightPass::copyColor(const Rc<DxvkCommandList>& ctx,
   barriers[0].image = srcView->image()->handle();
   barriers[0].subresourceRange = srcView->imageSubresources();
 
-  barriers[1].srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+  barriers[1].srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
   barriers[1].srcAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
   barriers[1].dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
   barriers[1].dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
@@ -820,7 +1085,8 @@ void War3VolumetricLightPass::copyColor(const Rc<DxvkCommandList>& ctx,
 
   barriers[1].srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
   barriers[1].srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-  barriers[1].dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+  barriers[1].dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
   barriers[1].dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
   barriers[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
   barriers[1].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -852,7 +1118,8 @@ void War3VolumetricLightPass::copyDepth(const Rc<DxvkCommandList>& ctx,
   barriers[0].image = srcView->image()->handle();
   barriers[0].subresourceRange = srcView->imageSubresources();
 
-  barriers[1].srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+  barriers[1].srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
   barriers[1].srcAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
   barriers[1].dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
   barriers[1].dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
@@ -890,7 +1157,8 @@ void War3VolumetricLightPass::copyDepth(const Rc<DxvkCommandList>& ctx,
 
   barriers[1].srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
   barriers[1].srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-  barriers[1].dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+  barriers[1].dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
   barriers[1].dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
   barriers[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
   barriers[1].newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
@@ -1202,7 +1470,7 @@ bool War3VolumetricLightPass::drawVolumetricLight(
   csmUbo.worldUp = worldUp;
 
   const float receiverBias = useVolumeSunPrimary
-      ? clampFinite(volumeSun.receiverBias, 0.0f, 0.05f, 0.006f)
+      ? clampFinite(volumeSun.receiverBias, 0.0f, 0.01f, 0.0001f)
       : clampFinite(input.settings->shadows.receiverBias, 0.0f, 0.05f, 0.004f);
   const float invShadowRes =
       1.0f / float(std::max<uint32_t>(shadowResolution, 1u));
@@ -1363,7 +1631,8 @@ bool War3VolumetricLightPass::drawVolumetricLight(
   for (auto &barrier : bufferBarriers) {
     barrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
     barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-    barrier.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    barrier.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
     barrier.dstAccessMask = VK_ACCESS_2_UNIFORM_READ_BIT;
   }
   ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &depInfo);
@@ -1496,6 +1765,314 @@ bool War3VolumetricLightPass::drawVolumetricLight(
       clampFinite(settings.unshadowedScattering, 0.0f, 1.0f, 0.22f));
   pc.rtSize = Vector4(float(effectExtent.width), float(effectExtent.height),
                       farClearRaw, rawDepthQuantum);
+
+  // Volumetric Lighting 2.0. Run owns the independent effect-resolution and
+  // traversal budgets. A storage-capable effect view is therefore the exact
+  // admission proof; do not recompute a fixed divisor here because High can
+  // conservatively degrade from 1/4 to 1/8 at very large render targets.
+  const bool wantsFroxel =
+      settings.quality == War3VolumetricQuality::FroxelMedium ||
+      settings.quality == War3VolumetricQuality::FroxelHigh;
+  const VkExtent3D fullExtent = m_colorCopy->info().extent;
+  const bool froxelExtentAdmitted = wantsFroxel && m_effectStorageView;
+
+  if (froxelExtentAdmitted &&
+      ensureFroxelResources(fullExtent, settings.quality) &&
+      m_froxelInjectLayout && m_froxelTemporalLayout &&
+      m_froxelIntegrateLayout &&
+      m_froxelInjectPipeline != VK_NULL_HANDLE &&
+      m_froxelTemporalPipeline != VK_NULL_HANDLE &&
+      m_froxelIntegratePipeline != VK_NULL_HANDLE &&
+      m_effectStorageView) {
+    // Every XY column shares this exact radial distribution. Scene depth is
+    // only an integration terminator; it must never slide or rescale the grid.
+    const float froxelFar = clampFinite(
+        settings.froxelFar, 1000.0f, 10000.0f, 10000.0f);
+    const float froxelNear = std::clamp(
+        clampFinite(settings.froxelNear, 0.1f, 500.0f, 20.0f), 0.1f,
+        std::max(0.1f, froxelFar - 1.0f));
+
+    // A single conservative compute dependency covers ping-pong reuse:
+    // previous temporal/integration reads complete before current and history
+    // targets are overwritten. All 3D images stay in GENERAL.
+    VkMemoryBarrier2 computeReuse = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    computeReuse.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    computeReuse.srcAccessMask = VK_ACCESS_2_SHADER_READ_BIT |
+                                 VK_ACCESS_2_SHADER_WRITE_BIT;
+    computeReuse.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    computeReuse.dstAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
+    VkDependencyInfo computeReuseInfo = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    computeReuseInfo.memoryBarrierCount = 1u;
+    computeReuseInfo.pMemoryBarriers = &computeReuse;
+    ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &computeReuseInfo);
+
+    std::array<DxvkDescriptorWrite, 6> injectDescriptors = {};
+    injectDescriptors[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    injectDescriptors[0].descriptor = m_froxelCurrentView->getDescriptor();
+    injectDescriptors[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    injectDescriptors[1].descriptor = shadowMapView->getDescriptor();
+    injectDescriptors[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    injectDescriptors[2].buffer = csmInfo;
+    injectDescriptors[3].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    injectDescriptors[3].buffer = lightInfo;
+    injectDescriptors[4].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    injectDescriptors[4].descriptor = pointShadowSampleView->getDescriptor();
+    injectDescriptors[5].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    injectDescriptors[5].buffer = fogVolumeInfo;
+
+    VolumetricFroxelInjectPushConstants injectPc = {};
+    injectPc.samplePhase = static_cast<uint32_t>(input.frameSerial & 7u);
+    injectPc.flags = pc.flags;
+    injectPc.gridDepth = m_froxelGridExtent.depth;
+    injectPc.grid = Vector4(float(m_froxelGridExtent.width),
+                            float(m_froxelGridExtent.height), froxelNear,
+                            froxelFar);
+    const float decayN = std::clamp(
+        (clampFinite(settings.decay, 0.70f, 0.999f, 0.95f) - 0.70f) /
+            0.299f,
+        0.0f, 1.0f);
+    injectPc.params0 = Vector4(
+        clampFinite(settings.intensity, 0.0f, 4.0f, 0.0f),
+        0.72f + (0.96f - 0.72f) * decayN,
+        settings.globalMediumEnabled
+            ? clampFinite(settings.density, 0.0f, 2.0f, 0.0f)
+            : 0.0f,
+        clampFinite(settings.weight, 0.0f, 3.0f, 1.0f));
+    injectPc.params1 = Vector4(
+        shadowStrengthScale,
+        settings.quality == War3VolumetricQuality::FroxelHigh ? 4.0f : 2.0f,
+        clampFinite(settings.weight, 0.0f, 3.0f, 1.0f), 0.0f);
+    injectPc.sunColorScale = pc.sunColorScale;
+
+    ctx->cmdBindPipeline(DxvkCmdBuffer::ExecBuffer,
+                         VK_PIPELINE_BIND_POINT_COMPUTE,
+                         m_froxelInjectPipeline);
+    ctx->bindResources(DxvkCmdBuffer::ExecBuffer, m_froxelInjectLayout,
+                       injectDescriptors.size(), injectDescriptors.data(),
+                       sizeof(injectPc), &injectPc);
+    ctx->cmdDispatch(DxvkCmdBuffer::ExecBuffer,
+                     (m_froxelGridExtent.width + 3u) / 4u,
+                     (m_froxelGridExtent.height + 3u) / 4u,
+                     (m_froxelGridExtent.depth + 3u) / 4u);
+
+    VkMemoryBarrier2 injectionReady = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    injectionReady.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    injectionReady.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
+    injectionReady.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    injectionReady.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
+    VkDependencyInfo injectionReadyInfo = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    injectionReadyInfo.memoryBarrierCount = 1u;
+    injectionReadyInfo.pMemoryBarriers = &injectionReady;
+    ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &injectionReadyInfo);
+
+    const float cameraDeltaX = cameraPos.x - m_froxelHistoryCameraPos.x;
+    const float cameraDeltaY = cameraPos.y - m_froxelHistoryCameraPos.y;
+    const float cameraDeltaZ = cameraPos.z - m_froxelHistoryCameraPos.z;
+    const float cameraDelta = std::sqrt(cameraDeltaX * cameraDeltaX +
+                                        cameraDeltaY * cameraDeltaY +
+                                        cameraDeltaZ * cameraDeltaZ);
+    const bool consecutiveFrame = input.frameSerial != 0u &&
+        m_froxelHistoryFrameSerial != 0u &&
+        input.frameSerial == m_froxelHistoryFrameSerial + 1u;
+    const bool sameDistribution =
+        std::abs(froxelNear - m_froxelHistoryNear) <= 1.0e-3f &&
+        std::abs(froxelFar - m_froxelHistoryFar) <=
+            std::max(1.0e-3f, froxelFar * 1.0e-5f);
+    const float historyCameraLimit = std::min(512.0f, froxelFar * 0.10f);
+    const bool historyReadable = settings.froxelTemporalEnabled &&
+        m_froxelHistoryValid && input.mapEpoch != 0u &&
+        input.deviceEpoch != 0u && input.mapEpoch == m_froxelHistoryMapEpoch &&
+        input.deviceEpoch == m_froxelHistoryDeviceEpoch && consecutiveFrame &&
+        sameDistribution && std::isfinite(cameraDelta) &&
+        cameraDelta <= historyCameraLimit;
+    const uint32_t historyReadIndex = m_froxelHistoryIndex;
+    const uint32_t historyWriteIndex = (historyReadIndex + 1u) % 2u;
+
+    std::array<DxvkDescriptorWrite, 4> temporalDescriptors = {};
+    temporalDescriptors[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    temporalDescriptors[0].descriptor = m_froxelCurrentView->getDescriptor();
+    temporalDescriptors[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    temporalDescriptors[1].descriptor =
+        m_froxelHistoryViews[historyReadIndex]->getDescriptor();
+    temporalDescriptors[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    temporalDescriptors[2].descriptor =
+        m_froxelHistoryViews[historyWriteIndex]->getDescriptor();
+    temporalDescriptors[3].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    temporalDescriptors[3].buffer = csmInfo;
+
+    VolumetricFroxelTemporalPushConstants temporalPc = {};
+    temporalPc.sampler = m_linearSampler->getDescriptor().samplerIndex;
+    temporalPc.historyValid = historyReadable ? 1u : 0u;
+    temporalPc.gridDepth = m_froxelGridExtent.depth;
+    temporalPc.flags = pc.flags;
+    temporalPc.previousViewProj = historyReadable
+        ? m_froxelHistoryViewProj
+        : input.scene.worldCamera.viewProj;
+    temporalPc.grid = injectPc.grid;
+    temporalPc.previousCameraPos = historyReadable
+        ? m_froxelHistoryCameraPos
+        : cameraPos;
+    temporalPc.params = Vector4(
+        clampFinite(settings.froxelHistoryWeight, 0.0f, 0.98f, 0.88f),
+        clampFinite(settings.froxelVarianceGamma, 0.5f, 4.0f, 1.5f),
+        clampFinite(settings.froxelReactiveScale, 0.0f, 4.0f, 1.25f), 0.0f);
+
+    ctx->cmdBindPipeline(DxvkCmdBuffer::ExecBuffer,
+                         VK_PIPELINE_BIND_POINT_COMPUTE,
+                         m_froxelTemporalPipeline);
+    ctx->bindResources(DxvkCmdBuffer::ExecBuffer, m_froxelTemporalLayout,
+                       temporalDescriptors.size(), temporalDescriptors.data(),
+                       sizeof(temporalPc), &temporalPc);
+    ctx->cmdDispatch(DxvkCmdBuffer::ExecBuffer,
+                     (m_froxelGridExtent.width + 3u) / 4u,
+                     (m_froxelGridExtent.height + 3u) / 4u,
+                     (m_froxelGridExtent.depth + 3u) / 4u);
+
+    VkMemoryBarrier2 temporalReady = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    temporalReady.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    temporalReady.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
+    temporalReady.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    temporalReady.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
+    VkDependencyInfo temporalReadyInfo = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    temporalReadyInfo.memoryBarrierCount = 1u;
+    temporalReadyInfo.pMemoryBarriers = &temporalReady;
+    ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &temporalReadyInfo);
+
+    VkImageMemoryBarrier2 effectToWrite = {
+        VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    effectToWrite.srcStageMask =
+        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    effectToWrite.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    effectToWrite.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    effectToWrite.dstAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
+    effectToWrite.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    effectToWrite.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    effectToWrite.image = m_effectImage->handle();
+    effectToWrite.subresourceRange = m_effectView->imageSubresources();
+    VkDependencyInfo effectToWriteInfo = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    effectToWriteInfo.imageMemoryBarrierCount = 1u;
+    effectToWriteInfo.pImageMemoryBarriers = &effectToWrite;
+    ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &effectToWriteInfo);
+
+    std::array<DxvkDescriptorWrite, 5> integrateDescriptors = {};
+    integrateDescriptors[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    integrateDescriptors[0].descriptor =
+        m_froxelHistoryViews[historyWriteIndex]->getDescriptor();
+    integrateDescriptors[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    integrateDescriptors[1].descriptor = m_depthCopyView->getDescriptor();
+    integrateDescriptors[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    integrateDescriptors[2].descriptor = m_effectStorageView->getDescriptor();
+    integrateDescriptors[3].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    integrateDescriptors[3].buffer = csmInfo;
+    integrateDescriptors[4].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    integrateDescriptors[4].descriptor = shadowMapView->getDescriptor();
+
+    VolumetricFroxelIntegratePushConstants integratePc = {};
+    integratePc.sampler = m_linearSampler->getDescriptor().samplerIndex;
+    integratePc.depthSampler = m_linearSampler->getDescriptor().samplerIndex;
+    integratePc.flags = pc.flags;
+    integratePc.gridDepth = m_froxelGridExtent.depth;
+    integratePc.grid = injectPc.grid;
+    integratePc.viewport = pc.viewport;
+    integratePc.viewportZ = Vector4(pc.viewportZ.x, pc.viewportZ.y,
+                                    farClearRaw, rawDepthQuantum);
+    integratePc.params = Vector4(
+        float(effectExtent.width), float(effectExtent.height),
+        clampFinite(settings.extinctionStrength, 0.0f, 1.0f, 0.05f),
+        injectPc.params0.y);
+    integratePc.shadowSampler = pc.shadowSampler;
+    // One budget is shared by the entire camera ray, not restarted for every
+    // Z slice. The shader walks actual shadow-map texel/depth-crossing
+    // intervals and only enters a bounded dense fallback after this budget.
+    // Low-pitch rays can cross hundreds of volume-sun texels before reaching
+    // the caster column. The previous 128/256 cap exhausted early and silently
+    // fell back to one midpoint per Z slice, recreating the stacked-caster
+    // artifact and making the column shrink as its interval moved farther down
+    // the ray. The integration shader now consumes this budget directly while
+    // accumulating texel/depth-crossing sub-intervals.
+    integratePc.maxTraversalSteps =
+        settings.quality == War3VolumetricQuality::FroxelHigh
+            ? kVolumetricFroxelHighTraversalSteps
+            : kVolumetricFroxelMediumTraversalSteps;
+    integratePc.sunColorScale = Vector4(
+        pc.sunColorScale.x, pc.sunColorScale.y, pc.sunColorScale.z,
+        pc.sunColorScale.w * injectPc.params0.x);
+    integratePc.sunParams = Vector4(
+        clampFinite((settings.skyThreshold - 0.55f) * 0.50f, 0.0f, 0.22f,
+                    0.08f),
+        shadowStrengthScale,
+        settings.requireCsmSnapshot
+            ? 0.0f
+            : clampFinite(settings.unshadowedScattering, 0.0f, 1.0f, 0.03f),
+        clampFinite(settings.weight, 0.0f, 3.0f, 1.0f));
+
+    ctx->cmdBindPipeline(DxvkCmdBuffer::ExecBuffer,
+                         VK_PIPELINE_BIND_POINT_COMPUTE,
+                         m_froxelIntegratePipeline);
+    ctx->bindResources(DxvkCmdBuffer::ExecBuffer, m_froxelIntegrateLayout,
+                       integrateDescriptors.size(), integrateDescriptors.data(),
+                       sizeof(integratePc), &integratePc);
+    ctx->cmdDispatch(DxvkCmdBuffer::ExecBuffer,
+                     (effectExtent.width + 7u) / 8u,
+                     (effectExtent.height + 7u) / 8u, 1u);
+
+    VkImageMemoryBarrier2 effectToRead = effectToWrite;
+    effectToRead.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    effectToRead.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
+    effectToRead.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    effectToRead.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
+    effectToRead.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    effectToRead.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    effectToWriteInfo.pImageMemoryBarriers = &effectToRead;
+    ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &effectToWriteInfo);
+
+    m_froxelHistoryIndex = historyWriteIndex;
+    m_froxelHistoryValid = settings.froxelTemporalEnabled &&
+        input.frameSerial != 0u && input.mapEpoch != 0u &&
+        input.deviceEpoch != 0u;
+    m_froxelHistoryFrameSerial = input.frameSerial;
+    m_froxelHistoryMapEpoch = input.mapEpoch;
+    m_froxelHistoryDeviceEpoch = input.deviceEpoch;
+    m_froxelHistoryNear = froxelNear;
+    m_froxelHistoryFar = froxelFar;
+    m_froxelHistoryViewProj = input.scene.worldCamera.viewProj;
+    m_froxelHistoryCameraPos = cameraPos;
+
+    ctx->track(m_froxelCurrentImage, DxvkAccess::Write);
+    ctx->track(m_froxelHistoryImages[historyReadIndex], DxvkAccess::Read);
+    ctx->track(m_froxelHistoryImages[historyWriteIndex], DxvkAccess::Write);
+    ctx->track(m_effectImage, DxvkAccess::Write);
+    ctx->track(m_depthCopy, DxvkAccess::Read);
+    ctx->track(shadowMapView->image(), DxvkAccess::Read);
+    ctx->track(pointShadowSampleView->image(), DxvkAccess::Read);
+    ctx->track(m_csmUniformBuffers[uboSlot], DxvkAccess::Write);
+    ctx->track(m_lightBuffers[uboSlot], DxvkAccess::Write);
+    ctx->track(m_fogVolumeBuffers[uboSlot], DxvkAccess::Write);
+    ctx->track(m_linearSampler);
+    ctx->track(pointShadowSampler);
+
+    static uint32_t s_froxelSubmitLogs = 0u;
+    if (s_froxelSubmitLogs++ < 16u ||
+        (s_froxelSubmitLogs % 240u) == 0u) {
+      WAR3_RENDER_LOG(
+          "DXVK War3Volumetric: froxel submitted backend=%u grid=%ux%ux%u "
+          "effect=%ux%u commonNear=%.1f commonFar=%.1f history=%d volumeSun=%d "
+          "cascades=%u shadowSteps=%u points=%u pointShadows=%u "
+          "fogVolumes=%u\n",
+          static_cast<uint32_t>(settings.quality),
+          m_froxelGridExtent.width, m_froxelGridExtent.height,
+          m_froxelGridExtent.depth, effectExtent.width, effectExtent.height,
+          double(froxelNear), double(froxelFar),
+          historyReadable ? 1 : 0, csmUbo.volumeSunParams.x > 0.5f ? 1 : 0,
+          static_cast<uint32_t>(std::max(csmUbo.params.z, 0.0f)),
+          integratePc.maxTraversalSteps, lightUbo.count,
+          lightUbo.pointShadowedLightCount, fogVolumeUbo.count);
+    }
+    return true;
+  }
+
+  if (!wantsFroxel)
+    invalidateFroxelHistory();
 
   ctx->cmdBeginRendering(&renderInfo);
   ctx->cmdBindPipeline(DxvkCmdBuffer::ExecBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -1640,6 +2217,19 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
     return;
 
   const auto& settings = input.settings->postFx.volumetricLight;
+  const uint32_t activeBackend = static_cast<uint32_t>(settings.quality);
+  static int32_t s_lastLoggedBackend = -1;
+  if (s_lastLoggedBackend != static_cast<int32_t>(activeBackend)) {
+    s_lastLoggedBackend = static_cast<int32_t>(activeBackend);
+    WAR3_RENDER_LOG(
+        "DXVK War3Volumetric: active backend=%u (%s)\n",
+        activeBackend,
+        settings.quality == War3VolumetricQuality::FroxelHigh
+            ? "froxel-high"
+            : settings.quality == War3VolumetricQuality::FroxelMedium
+            ? "froxel-medium"
+            : "legacy-raymarch");
+  }
   const float safeIntensity = finiteOr(settings.intensity, 0.0f);
   const float safeDensity =
       clampFinite(settings.density, 0.0f, 2.0f, 0.0f);
@@ -1785,9 +2375,33 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
     }
   }
 
-  uint32_t resolutionDivisor = std::clamp<uint32_t>(
-      settings.resolutionDivisor, kVolumetricMinResolutionDivisor,
-      kVolumetricMaxResolutionDivisor);
+  const bool froxelRequested =
+      settings.quality == War3VolumetricQuality::FroxelMedium ||
+      settings.quality == War3VolumetricQuality::FroxelHigh;
+  constexpr VkFormatFeatureFlags2 requiredFroxelFormatFeatures =
+      VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
+      VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
+      VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT;
+  const VkFormatFeatureFlags2 froxelFormatFeatures =
+      m_device->getFormatFeatures(VK_FORMAT_R16G16B16A16_SFLOAT).optimal;
+  bool froxelAdmitted = froxelRequested &&
+      (froxelFormatFeatures & requiredFroxelFormatFeatures) ==
+          requiredFroxelFormatFeatures;
+  if (froxelRequested && !froxelAdmitted) {
+    static bool s_loggedUnsupportedFroxelFormat = false;
+    if (!std::exchange(s_loggedUnsupportedFroxelFormat, true)) {
+      WAR3_RENDER_LOG(
+          "DXVK War3Volumetric: RGBA16F sampled/storage/attachment format "
+          "unsupported; falling back to legacy raymarch\n");
+    }
+  }
+  uint32_t resolutionDivisor = froxelAdmitted
+      ? (settings.quality == War3VolumetricQuality::FroxelHigh
+             ? kVolumetricFroxelHighEffectDivisor
+             : kVolumetricFroxelMediumEffectDivisor)
+      : std::clamp<uint32_t>(settings.resolutionDivisor,
+                             kVolumetricMinResolutionDivisor,
+                             kVolumetricMaxResolutionDivisor);
   const auto effectExtentForDivisor = [&](uint32_t divisor) {
     return VkExtent3D{
         static_cast<uint32_t>(std::max<uint64_t>(
@@ -1796,6 +2410,21 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
             1u, (uint64_t(extent.height) + divisor - 1u) / divisor)),
         1u};
   };
+
+  if (froxelAdmitted) {
+    const uint64_t maxTraversalSteps =
+        settings.quality == War3VolumetricQuality::FroxelHigh
+            ? kVolumetricFroxelHighTraversalSteps
+            : kVolumetricFroxelMediumTraversalSteps;
+    VkExtent3D candidate = effectExtentForDivisor(resolutionDivisor);
+    while (resolutionDivisor < kVolumetricMaxResolutionDivisor &&
+           uint64_t(candidate.width) * uint64_t(candidate.height) >
+               kVolumetricFroxelTraversalWorkBudget / maxTraversalSteps) {
+      resolutionDivisor = std::min(
+          kVolumetricMaxResolutionDivisor, resolutionDivisor * 2u);
+      candidate = effectExtentForDivisor(resolutionDivisor);
+    }
+  }
   VkExtent3D effectExtent = {};
   const auto minimumRaySegments = [](const VkExtent3D& value) {
     return uint64_t(value.width) * uint64_t(value.height) *
@@ -1816,7 +2445,7 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
   // quarter-resolution full-screen path instead of trading away longitudinal
   // samples for spatial resolution.
   bool useLocalHalfResRoi = false;
-  if (!hasConfiguredGlobalMedium && hasLocalMedium) {
+  if (!froxelAdmitted && !hasConfiguredGlobalMedium && hasLocalMedium) {
     war3::render::War3ImageRegion localRegion = {};
     for (uint32_t i = 0u; i < fogVolumes.count; ++i) {
       localRegion = UnionRegion(
@@ -1849,7 +2478,53 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
     }
   }
 
-  if (!useLocalHalfResRoi) {
+  if (froxelAdmitted) {
+    effectExtent = effectExtentForDivisor(resolutionDivisor);
+    const uint64_t maxTraversalSteps =
+        settings.quality == War3VolumetricQuality::FroxelHigh
+            ? kVolumetricFroxelHighTraversalSteps
+            : kVolumetricFroxelMediumTraversalSteps;
+    const uint64_t traversalWork = uint64_t(effectExtent.width) *
+        uint64_t(effectExtent.height) * maxTraversalSteps;
+    const uint32_t froxelTile =
+        settings.quality == War3VolumetricQuality::FroxelHigh
+            ? kVolumetricFroxelHighTileSize
+            : kVolumetricFroxelMediumTileSize;
+    const uint32_t froxelDepth =
+        settings.quality == War3VolumetricQuality::FroxelHigh
+            ? kVolumetricFroxelHighDepth
+            : kVolumetricFroxelMediumDepth;
+    const uint32_t froxelWidth = std::max(
+        1u, (extent.width + froxelTile - 1u) / froxelTile);
+    const uint32_t froxelHeight = std::max(
+        1u, (extent.height + froxelTile - 1u) / froxelTile);
+    const uint64_t froxelCells = uint64_t(froxelWidth) *
+        uint64_t(froxelHeight) * uint64_t(froxelDepth);
+    const uint32_t max3dDimension =
+        m_device->properties().core.properties.limits.maxImageDimension3D;
+    if (froxelCells == 0u || froxelCells > kVolumetricFroxelCellBudget ||
+        traversalWork > kVolumetricFroxelTraversalWorkBudget ||
+        froxelWidth > max3dDimension ||
+        froxelHeight > max3dDimension ||
+        froxelDepth > max3dDimension) {
+      static uint32_t s_froxelBudgetFallbackLogs = 0u;
+      if (s_froxelBudgetFallbackLogs++ < 8u ||
+          (s_froxelBudgetFallbackLogs % 240u) == 0u) {
+        WAR3_RENDER_LOG(
+            "DXVK War3Volumetric: froxel grid/effect rejected by "
+            "cell/traversal/dimension budget; "
+            "falling back to legacy raymarch\n");
+      }
+      resolutionDivisor = std::clamp<uint32_t>(
+          settings.resolutionDivisor, kVolumetricMinResolutionDivisor,
+          kVolumetricMaxResolutionDivisor);
+      effectExtent = effectExtentForDivisor(resolutionDivisor);
+      froxelAdmitted = false;
+    }
+  }
+  if (froxelAdmitted) {
+    effectScissor = FullRect(effectExtent);
+  } else if (!useLocalHalfResRoi) {
     effectExtent = effectExtentForDivisor(resolutionDivisor);
     while ((minimumRaySegments(effectExtent) > kVolumetricRaySegmentBudget ||
             minimumFogSegmentTests(effectExtent) >
@@ -1868,7 +2543,7 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
   }
 
   ensureResources(extent, colorInfo.format, depthInfo.format,
-                  resolutionDivisor);
+                  resolutionDivisor, froxelAdmitted);
 
   copyColor(ctx, input.colorView);
   copyDepth(ctx, input.depthView);

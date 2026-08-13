@@ -910,6 +910,21 @@ void War3Imgui::drawDebugWindow() {
         if (ImGui::TreeNode("体积光")) {
           ImGui::Checkbox("启用体积光",
                           &settings.postFx.volumetricLight.enabled);
+          int volumetricBackend = static_cast<int>(
+              settings.postFx.volumetricLight.quality);
+          const char* volumetricBackends[] = {
+              "兼容 RayMarch", "Froxel Medium", "Froxel High"};
+          if (ImGui::Combo("体积后端", &volumetricBackend,
+                           volumetricBackends,
+                           IM_ARRAYSIZE(volumetricBackends))) {
+            settings.postFx.volumetricLight.quality =
+                static_cast<War3VolumetricQuality>(volumetricBackend);
+          }
+          if (volumetricBackend > 0) {
+            ImGui::Checkbox("Froxel 时域重建",
+                            &settings.postFx.volumetricLight
+                                 .froxelTemporalEnabled);
+          }
           ImGui::Checkbox("需要 CSM 快照",
                           &settings.postFx.volumetricLight.requireCsmSnapshot);
           ImGui::Checkbox("叠加点光散射",
@@ -942,6 +957,9 @@ void War3Imgui::drawDebugWindow() {
           ImGui::SliderFloat("最大距离",
                              &settings.postFx.volumetricLight.sunDistance,
                              100.0f, 6000.0f, "%.0f");
+          ImGui::SliderFloat("Froxel统一远端",
+                             &settings.postFx.volumetricLight.froxelFar,
+                             1000.0f, 10000.0f, "%.0f");
           ImGui::SliderFloat("近处衰减",
                              &settings.postFx.volumetricLight.fadeNear, 0.0f,
                              0.95f, "%.2f");

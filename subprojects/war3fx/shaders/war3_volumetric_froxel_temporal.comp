@@ -1,0 +1,156 @@
+#version 460
+
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+layout(set = 0, binding = 0) uniform sampler s_samplers[];
+layout(set = 1, binding = 0) uniform texture3D s_current;
+layout(set = 1, binding = 1) uniform texture3D s_history;
+layout(set = 1, binding = 2, rgba16f) writeonly uniform image3D s_output;
+
+layout(set = 1, binding = 3, scalar, row_major)
+uniform CsmData {
+  mat4 u_view;
+  mat4 u_invViewProj;
+  mat4 u_lightViewProj[4];
+  vec4 u_splitFar;
+  vec4 u_params;
+  vec4 u_params2;
+  vec4 u_sunDir;
+  vec4 u_cameraPos;
+  vec4 u_worldUp;
+  vec4 u_volumeSunParams;
+} csm;
+
+layout(push_constant, scalar, row_major)
+uniform push_block {
+  uint p_sampler;
+  uint p_historyValid;
+  uint p_gridDepth;
+  uint p_flags;
+  mat4 p_previousViewProj;
+  vec4 p_grid;              // width, height, nearDistance, farDistance
+  vec4 p_previousCameraPos;
+  vec4 p_params;            // historyWeight, varianceGamma, reactiveScale, unused
+} pc;
+
+bool finiteFloat(float v) {
+  return !isnan(v) && !isinf(v);
+}
+
+bool finiteVec4(vec4 v) {
+  return !any(isnan(v)) && !any(isinf(v));
+}
+
+float sliceBoundary(float slice) {
+  float n = max(pc.p_grid.z, 0.1);
+  float f = max(pc.p_grid.w, n + 1.0);
+  return n * exp(log(f / n) * clamp(
+    slice / float(pc.p_gridDepth), 0.0, 1.0));
+}
+
+bool reconstructCenter(ivec3 cell, out vec3 worldPos) {
+  vec2 uv = (vec2(cell.xy) + vec2(0.5)) / max(pc.p_grid.xy, vec2(1.0));
+  bool farIsOne = (pc.p_flags & 0x20u) != 0u;
+  float farDepth = farIsOne ? 0.999 : 0.001;
+  vec4 clip = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0,
+                   farDepth, 1.0);
+  vec4 farWorldH = clip * csm.u_invViewProj;
+  if (!finiteVec4(farWorldH) || abs(farWorldH.w) <= 1.0e-6)
+    return false;
+  vec3 ray = farWorldH.xyz / farWorldH.w - csm.u_cameraPos.xyz;
+  float rayLength = length(ray);
+  if (!finiteFloat(rayLength) || rayLength <= 1.0e-5)
+    return false;
+  float z0 = sliceBoundary(float(cell.z));
+  float z1 = sliceBoundary(float(cell.z + 1));
+  worldPos = csm.u_cameraPos.xyz + ray / rayLength *
+             sqrt(max(z0 * z1, 0.0));
+  return finiteVec4(vec4(worldPos, 1.0));
+}
+
+vec4 fetchCurrent(ivec3 cell, ivec3 gridSize) {
+  return texelFetch(
+    sampler3D(s_current, s_samplers[nonuniformEXT(pc.p_sampler)]),
+    clamp(cell, ivec3(0), gridSize - ivec3(1)), 0);
+}
+
+void main() {
+  ivec3 cell = ivec3(gl_GlobalInvocationID.xyz);
+  ivec3 gridSize = ivec3(int(pc.p_grid.x + 0.5),
+                         int(pc.p_grid.y + 0.5), int(pc.p_gridDepth));
+  if (any(greaterThanEqual(cell, gridSize)))
+    return;
+
+  vec4 current = fetchCurrent(cell, gridSize);
+  if (!finiteVec4(current))
+    current = vec4(0.0);
+  if (pc.p_historyValid == 0u) {
+    imageStore(s_output, cell, max(current, vec4(0.0)));
+    return;
+  }
+
+  vec3 worldPos;
+  if (!reconstructCenter(cell, worldPos)) {
+    imageStore(s_output, cell, max(current, vec4(0.0)));
+    return;
+  }
+  vec4 previousClip = vec4(worldPos, 1.0) * pc.p_previousViewProj;
+  if (!finiteVec4(previousClip) || abs(previousClip.w) <= 1.0e-6) {
+    imageStore(s_output, cell, max(current, vec4(0.0)));
+    return;
+  }
+  vec3 previousNdc = previousClip.xyz / previousClip.w;
+  vec2 previousUv = vec2(previousNdc.x * 0.5 + 0.5,
+                         0.5 - previousNdc.y * 0.5);
+  float previousDistance = length(worldPos - pc.p_previousCameraPos.xyz);
+  float n = max(pc.p_grid.z, 0.1);
+  float f = max(pc.p_grid.w, n + 1.0);
+  float previousSlice = log(max(previousDistance, n) / n) / log(f / n);
+  if (!finiteFloat(previousSlice) || previousUv.x <= 0.0 ||
+      previousUv.y <= 0.0 || previousUv.x >= 1.0 || previousUv.y >= 1.0 ||
+      previousSlice <= 0.0 || previousSlice >= 1.0 ||
+      previousNdc.z < 0.0 || previousNdc.z > 1.0) {
+    imageStore(s_output, cell, max(current, vec4(0.0)));
+    return;
+  }
+
+  vec4 history = textureLod(
+    sampler3D(s_history, s_samplers[nonuniformEXT(pc.p_sampler)]),
+    vec3(previousUv, previousSlice), 0.0);
+  if (!finiteVec4(history)) {
+    imageStore(s_output, cell, max(current, vec4(0.0)));
+    return;
+  }
+
+  const ivec3 offsets[7] = ivec3[7](
+    ivec3(0, 0, 0), ivec3(1, 0, 0), ivec3(-1, 0, 0),
+    ivec3(0, 1, 0), ivec3(0, -1, 0), ivec3(0, 0, 1),
+    ivec3(0, 0, -1));
+  vec4 mean = vec4(0.0);
+  vec4 secondMoment = vec4(0.0);
+  for (int i = 0; i < 7; ++i) {
+    vec4 sampleValue = max(fetchCurrent(cell + offsets[i], gridSize), vec4(0.0));
+    mean += sampleValue;
+    secondMoment += sampleValue * sampleValue;
+  }
+  mean /= 7.0;
+  secondMoment /= 7.0;
+  vec4 sigma = sqrt(max(secondMoment - mean * mean, vec4(0.0)));
+  float gamma = clamp(pc.p_params.y, 0.5, 4.0);
+  vec4 clippedHistory = clamp(history, max(mean - gamma * sigma, vec4(0.0)),
+                              mean + gamma * sigma);
+
+  vec4 disagreement = abs(current - clippedHistory) /
+    max(max(current, clippedHistory), vec4(1.0e-5));
+  float radianceDisagreement =
+    max(max(disagreement.r, disagreement.g), disagreement.b);
+  float reactive = clamp(
+    max(radianceDisagreement, disagreement.a) *
+      max(pc.p_params.z, 0.0), 0.0, 1.0);
+  float historyWeight = clamp(pc.p_params.x, 0.0, 0.98) * (1.0 - reactive);
+  vec4 result = mix(current, clippedHistory, historyWeight);
+  imageStore(s_output, cell, max(result, vec4(0.0)));
+}

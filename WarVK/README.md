@@ -60,6 +60,7 @@ YDWE 菜单按功能拆分为 WarVK 系统/诊断、太阳与阴影、光照时�
 
 ```jass
 call WarVKSetVolumetricEnabled(true)
+call WarVKSetVolumetricBackend(WARVK_VOLUMETRIC_BACKEND_FROXEL_HIGH)
 call WarVKSetGlobalVolumetricMediumEnabled(true)
 call WarVKSetVolumetricDensity(0.80)
 call WarVKSetVolumetricScattering(1.50, 0.95)
@@ -72,6 +73,9 @@ call WarVKSetGlobalVolumetricFog(0.00, 0.0012, 0.35)
 `WarVKSetGlobalVolumetricMediumEnabled` 控制均匀的全局介质；关闭它不会销毁 density 参数，也不会
 关闭局部体积。`WarVKSetGlobalVolumetricFogEnabled` 只控制全局介质的高度分布：高度雾开关不会
 自动开启体积光通道，关闭高度雾也不会关闭太阳光和点光在均匀介质中的散射。
+`WarVKSetVolumetricBackend` 的 0 档保留旧 RayMarch，1/2 档分别启用 Froxel Medium/High；
+当前候选默认使用 Froxel High，把介质、太阳/点光阴影注入三维网格并做时域重建；如需兼容旧效果，
+作者仍可显式选择 0 档。该默认值仍需随稳定小版本候选完成玩家前台视觉与性能验收。
 局部雾和全局雾共用同一套太阳/CSM、点光/cube shadow 与散射设置。要得到周围空气清澈、只在
 指定区域出现介质的效果，应关闭全局介质：
 
@@ -79,6 +83,7 @@ call WarVKSetGlobalVolumetricFog(0.00, 0.0012, 0.35)
 local integer fogId
 
 call WarVKSetVolumetricEnabled(true)
+call WarVKSetVolumetricBackend(WARVK_VOLUMETRIC_BACKEND_FROXEL_HIGH)
 call WarVKSetGlobalVolumetricMediumEnabled(false)
 call WarVKSetVolumetricScattering(2.10, 0.96)
 call WarVKSetVolumetricQuality(16, 1800.00)

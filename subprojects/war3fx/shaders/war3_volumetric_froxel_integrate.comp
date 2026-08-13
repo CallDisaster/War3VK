@@ -1,0 +1,627 @@
+#version 460
+
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler s_samplers[];
+layout(set = 1, binding = 0) uniform texture3D s_volume;
+layout(set = 1, binding = 1) uniform texture2DArray s_depth;
+layout(set = 1, binding = 2, rgba16f) writeonly uniform image2D s_effect;
+layout(set = 1, binding = 4) uniform texture2DArray s_shadow;
+
+layout(set = 1, binding = 3, scalar, row_major)
+uniform CsmData {
+  mat4 u_view;
+  mat4 u_invViewProj;
+  mat4 u_lightViewProj[4];
+  vec4 u_splitFar;
+  vec4 u_params;
+  vec4 u_params2;
+  vec4 u_sunDir;
+  vec4 u_cameraPos;
+  vec4 u_worldUp;
+  vec4 u_volumeSunParams;
+} csm;
+
+layout(push_constant, scalar)
+uniform push_block {
+  uint p_sampler;
+  uint p_depthSampler;
+  uint p_flags;
+  uint p_gridDepth;
+  vec4 p_grid;       // width, height, nearDistance, farDistance
+  vec4 p_viewport;   // x, y, width, height
+  vec4 p_viewportZ;  // minZ, maxZ, farClearRaw, rawDepthQuantum
+  vec4 p_params;     // effectWidth, effectHeight, extinctionStrength, albedo
+  uint p_shadowSampler;
+  uint p_maxTraversalSteps;
+  uint p_pad0;
+  uint p_pad1;
+  vec4 p_sunColorScale; // rgb radiance, w intensity
+  vec4 p_sunParams;     // anisotropy, shadowStrength, fallback, contrast
+} pc;
+
+bool finiteFloat(float v) {
+  return !isnan(v) && !isinf(v);
+}
+
+bool finiteVec4(vec4 v) {
+  return !any(isnan(v)) && !any(isinf(v));
+}
+
+bool finiteVec3(vec3 v) {
+  return !any(isnan(v)) && !any(isinf(v));
+}
+
+bool reconstructRayAndLimit(vec2 uvOut, out vec3 rayDir,
+                            out float distanceLimit) {
+  float nearDistance = max(pc.p_grid.z, 0.1);
+  float farDistance = max(pc.p_grid.w, nearDistance + 1.0);
+  distanceLimit = farDistance;
+  ivec2 fullSize = textureSize(
+    sampler2DArray(s_depth,
+      s_samplers[nonuniformEXT(pc.p_depthSampler)]), 0).xy;
+  if (any(lessThanEqual(fullSize, ivec2(0))))
+    return false;
+
+  // Match the legacy volumetric and shadow-receiver pixel contract exactly.
+  // The effect image covers the complete render target, while the 3D camera
+  // projection is defined by the active D3D9 viewport. Treating uvOut as a
+  // viewport-local coordinate stretched the world ray/depth guide whenever
+  // the viewport did not cover the whole backing image, which made the column
+  // move or disappear as camera pitch changed.
+  vec2 fullPixelD3D = uvOut * vec2(fullSize) - vec2(0.5);
+  vec2 viewportMin = pc.p_viewport.xy;
+  vec2 viewportSize = max(pc.p_viewport.zw, vec2(1.0));
+  if (fullPixelD3D.x < viewportMin.x ||
+      fullPixelD3D.y < viewportMin.y ||
+      fullPixelD3D.x >= viewportMin.x + viewportSize.x ||
+      fullPixelD3D.y >= viewportMin.y + viewportSize.y)
+    return false;
+
+  ivec2 viewportMinI = ivec2(viewportMin);
+  ivec2 viewportMaxI = ivec2(viewportMin + viewportSize) - ivec2(1);
+  ivec2 fullPixel = clamp(
+    ivec2(floor(fullPixelD3D + vec2(0.5))), viewportMinI, viewportMaxI);
+  fullPixel = clamp(fullPixel, ivec2(0), fullSize - ivec2(1));
+  vec2 uvLocal = (vec2(fullPixel) - viewportMin) / viewportSize;
+
+  float rawDepth = texelFetch(
+    sampler2DArray(s_depth,
+      s_samplers[nonuniformEXT(pc.p_depthSampler)]),
+    ivec3(fullPixel, 0), 0).r;
+  float minZ = pc.p_viewportZ.x;
+  float maxZ = pc.p_viewportZ.y;
+  float delta = maxZ - minZ;
+  float quantum = max(pc.p_viewportZ.w, 1.0e-7);
+  if (!finiteFloat(rawDepth) || !finiteFloat(delta) || abs(delta) <= 1.0e-6)
+    return false;
+
+  bool farIsOne = (pc.p_flags & 0x20u) != 0u;
+  float farDepth = farIsOne ? 0.999 : 0.001;
+  vec4 farClip = vec4(uvLocal.x * 2.0 - 1.0,
+                      1.0 - uvLocal.y * 2.0, farDepth, 1.0);
+  vec4 farWorldH = farClip * csm.u_invViewProj;
+  if (!finiteVec4(farWorldH) || abs(farWorldH.w) <= 1.0e-6)
+    return false;
+  rayDir = farWorldH.xyz / farWorldH.w - csm.u_cameraPos.xyz;
+  float rayLength = length(rayDir);
+  if (!finiteFloat(rayLength) || rayLength <= 1.0e-5)
+    return false;
+  rayDir /= rayLength;
+
+  if (abs(rawDepth - pc.p_viewportZ.z) > max(0.5 * quantum, 1.0e-7)) {
+    float depthN = clamp((rawDepth - minZ) / delta, 0.0, 1.0);
+    vec4 clip = vec4(uvLocal.x * 2.0 - 1.0,
+                     1.0 - uvLocal.y * 2.0, depthN, 1.0);
+    vec4 worldH = clip * csm.u_invViewProj;
+    if (!finiteVec4(worldH) || abs(worldH.w) <= 1.0e-6)
+      return false;
+    float surfaceDistance = length(
+      worldH.xyz / worldH.w - csm.u_cameraPos.xyz);
+    if (!finiteFloat(surfaceDistance) || surfaceDistance <= nearDistance)
+      return false;
+    distanceLimit = min(surfaceDistance, farDistance);
+  }
+  return distanceLimit > nearDistance;
+}
+
+float sliceBoundary(float slice) {
+  float intervalStart = max(pc.p_grid.z, 0.1);
+  float intervalEnd = max(pc.p_grid.w, intervalStart + 1.0);
+  float t = clamp(slice / float(pc.p_gridDepth), 0.0, 1.0);
+  return intervalStart * exp(log(intervalEnd / intervalStart) * t);
+}
+
+float hgPhaseNormalized(float mu, float g) {
+  float gg = g * g;
+  float denom = max(1.0 + gg - 2.0 * g * mu, 1.0e-3);
+  float hg = (1.0 - gg) / (12.5663706 * pow(denom, 1.5));
+  return hg / 0.07957747;
+}
+
+int selectCameraCascade(vec3 rayDir, float distance) {
+  int cascadeCount = clamp(int(csm.u_params.z + 0.5), 0, 4);
+  if (cascadeCount <= 0)
+    return -1;
+  vec3 worldPos = csm.u_cameraPos.xyz + rayDir * distance;
+  float viewDepth = abs((vec4(worldPos, 1.0) * csm.u_view).z);
+  for (int cascade = 0; cascade < cascadeCount; ++cascade) {
+    if (viewDepth <= csm.u_splitFar[cascade])
+      return cascade;
+  }
+  return cascadeCount - 1;
+}
+
+bool projectShadow(int cascade, vec3 rayDir, float distance,
+                   ivec3 extent, out vec2 filterCoord,
+                   out float referenceDepth) {
+  vec3 worldPos = csm.u_cameraPos.xyz + rayDir * distance;
+  vec4 lightClip = vec4(worldPos, 1.0) * csm.u_lightViewProj[cascade];
+  if (!finiteVec4(lightClip) || abs(lightClip.w) <= 1.0e-6)
+    return false;
+  vec3 ndc = lightClip.xyz / lightClip.w;
+  if (!finiteVec3(ndc) || ndc.z < 0.0 || ndc.z > 1.0)
+    return false;
+  vec2 shadowUv = ndc.xy * 0.5 + 0.5;
+  shadowUv.y = 1.0 - shadowUv.y;
+  if ((pc.p_flags & 0x1u) != 0u)
+    shadowUv.x = 1.0 - shadowUv.x;
+  if ((pc.p_flags & 0x2u) != 0u)
+    shadowUv.y = 1.0 - shadowUv.y;
+  if (any(lessThanEqual(shadowUv, vec2(0.0))) ||
+      any(greaterThanEqual(shadowUv, vec2(1.0))))
+    return false;
+  filterCoord = shadowUv * vec2(extent.xy);
+  referenceDepth = ndc.z - max(csm.u_params.x, 0.0);
+  return finiteVec3(vec3(filterCoord, referenceDepth));
+}
+
+bool selectSegmentCascade(vec3 rayDir, float distance0, float distance1,
+                          ivec3 extent, out int cascade,
+                          out vec2 coord0, out vec2 coord1,
+                          out float reference0, out float reference1) {
+  int cascadeCount = clamp(int(csm.u_params.z + 0.5), 0, 4);
+  cascade = -1;
+  if (cascadeCount <= 0)
+    return false;
+
+  // Volume-sun layer order is 0=near, 1=far. Prefer the sharper near layer
+  // only when the complete segment is inside its convex ortho domain; otherwise
+  // use the far layer. The previous path always selected the last layer and
+  // discarded most of the dual-cascade precision around large casters.
+  if (csm.u_volumeSunParams.x > 0.5) {
+    int candidates[2] = int[2](0, max(cascadeCount - 1, 0));
+    int candidateCount = cascadeCount > 1 ? 2 : 1;
+    for (int i = 0; i < candidateCount; ++i) {
+      int candidate = candidates[i];
+      if (projectShadow(candidate, rayDir, distance0, extent, coord0,
+                        reference0) &&
+          projectShadow(candidate, rayDir, distance1, extent, coord1,
+                        reference1)) {
+        cascade = candidate;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  int candidate = selectCameraCascade(rayDir, 0.5 * (distance0 + distance1));
+  if (candidate < 0 || candidate >= cascadeCount)
+    return false;
+  if (projectShadow(candidate, rayDir, distance0, extent, coord0, reference0) &&
+      projectShadow(candidate, rayDir, distance1, extent, coord1, reference1)) {
+    cascade = candidate;
+    return true;
+  }
+
+  // A slice can straddle a camera-CSM coverage boundary. Search farther layers
+  // before accepting the fail-soft visibility.
+  for (int fallback = candidate + 1; fallback < cascadeCount; ++fallback) {
+    if (projectShadow(fallback, rayDir, distance0, extent, coord0, reference0) &&
+        projectShadow(fallback, rayDir, distance1, extent, coord1, reference1)) {
+      cascade = fallback;
+      return true;
+    }
+  }
+  return false;
+}
+
+float nextTexelBoundary(float coord, float slope) {
+  if (abs(slope) <= 1.0e-8)
+    return 1.0e30;
+  float boundary = slope > 0.0
+    ? floor(coord + 1.0e-5) + 1.0
+    : ceil(coord - 1.0e-5) - 1.0;
+  return max((boundary - coord) / slope, 1.0e-5);
+}
+
+float opticalIntegral(float sigmaT, float distance) {
+  if (distance <= 0.0)
+    return 0.0;
+  if (sigmaT <= 1.0e-8)
+    return distance;
+  return (1.0 - exp(-sigmaT * distance)) / sigmaT;
+}
+
+float weightedLitIntegral(float reference0, float reference1,
+                          float storedDepth, float sigmaT,
+                          float intervalLength) {
+  bool lit0 = reference0 <= storedDepth;
+  bool lit1 = reference1 <= storedDepth;
+  if (lit0 == lit1)
+    return lit0 ? opticalIntegral(sigmaT, intervalLength) : 0.0;
+
+  float denominator = reference1 - reference0;
+  if (abs(denominator) <= 1.0e-8)
+    return lit0 ? opticalIntegral(sigmaT, intervalLength) : 0.0;
+  float crossing = clamp((storedDepth - reference0) / denominator, 0.0, 1.0);
+  float crossingDistance = crossing * intervalLength;
+  if (lit0)
+    return opticalIntegral(sigmaT, crossingDistance);
+
+  // Shadow then light: subtract the front optical interval from the complete
+  // interval while preserving the transmittance measured from its start.
+  float total = opticalIntegral(sigmaT, intervalLength);
+  float front = opticalIntegral(sigmaT, crossingDistance);
+  if (sigmaT <= 1.0e-8)
+    return max(total - front, 0.0);
+  return max(total - front, 0.0);
+}
+
+float intervalVisibility(int cascade, vec2 midpointCoord,
+                         float reference0, float reference1,
+                         float sigmaT, float intervalLength,
+                         ivec3 extent, float shadowStrength,
+                         float contrast,
+                         out float physicalVisibility) {
+  float totalIntegral = opticalIntegral(sigmaT, intervalLength);
+  if (totalIntegral <= 1.0e-8) {
+    physicalVisibility = 1.0;
+    return 1.0;
+  }
+
+  // A caster silhouette crosses shadow-map texels laterally; it is not a
+  // receiver-depth transition. The previous conditional filter therefore
+  // left most silhouette intervals as one binary texel and made a moving
+  // column jump a full shadow texel at a time. Gather the LINEAR 2x2 footprint
+  // on every valid interval and filter the four *comparison integrals* (PCF),
+  // never the stored depths. GLSL defines gather order as
+  // (i0,j1), (i1,j1), (i1,j0), (i0,j0).
+  vec2 shadowUv = clamp(
+    midpointCoord / max(vec2(extent.xy), vec2(1.0)),
+    vec2(0.0), vec2(1.0));
+  vec4 stored = textureGather(
+    sampler2DArray(s_shadow,
+      s_samplers[nonuniformEXT(pc.p_shadowSampler)]),
+    vec3(shadowUv, float(cascade)), 0);
+  stored = vec4(
+    finiteFloat(stored.x) ? stored.x : 1.0,
+    finiteFloat(stored.y) ? stored.y : 1.0,
+    finiteFloat(stored.z) ? stored.z : 1.0,
+    finiteFloat(stored.w) ? stored.w : 1.0);
+
+  vec2 footprintFraction = fract(midpointCoord - vec2(0.5));
+  // Preserve the authored zero-to-one PCF control without increasing the
+  // gather footprint: zero resolves to nearest comparison, one (and the
+  // volume-sun default >1) resolves to continuous bilinear coverage.
+  float pcfBlend = clamp(csm.u_params.w, 0.0, 1.0);
+  footprintFraction = mix(
+    step(vec2(0.5), footprintFraction), footprintFraction, pcfBlend);
+  vec4 weights = vec4(
+    (1.0 - footprintFraction.x) * footprintFraction.y,
+    footprintFraction.x * footprintFraction.y,
+    footprintFraction.x * (1.0 - footprintFraction.y),
+    (1.0 - footprintFraction.x) * (1.0 - footprintFraction.y));
+  vec4 comparisonIntegrals = vec4(
+    weightedLitIntegral(reference0, reference1, stored.x,
+                        sigmaT, intervalLength),
+    weightedLitIntegral(reference0, reference1, stored.y,
+                        sigmaT, intervalLength),
+    weightedLitIntegral(reference0, reference1, stored.z,
+                        sigmaT, intervalLength),
+    weightedLitIntegral(reference0, reference1, stored.w,
+                        sigmaT, intervalLength));
+  float litIntegral = dot(weights, comparisonIntegrals);
+
+  float rawVisibility = clamp(litIntegral / totalIntegral, 0.0, 1.0);
+  // Keep the authored contrast out of the physical evidence channel. Only the
+  // real CSM result and shadow-strength control may authorize base attenuation;
+  // contrast remains a presentation control for directional scattering.
+  physicalVisibility = mix(1.0, rawVisibility, shadowStrength);
+  return mix(1.0, pow(rawVisibility, contrast), shadowStrength);
+}
+
+void recordShadowEvidence(float intervalLength, float sigmaT,
+                          float physicalVisibility, float transmittance,
+                          inout float shadowReferenceIntegral,
+                          inout float shadowPhysicalIntegral,
+                          inout float shadowEvidenceOptical,
+                          inout float peakShadowOcclusion) {
+  if (intervalLength <= 1.0e-6 || sigmaT <= 1.0e-8 ||
+      transmittance <= 1.0e-5)
+    return;
+
+  float visibility = clamp(physicalVisibility, 0.0, 1.0);
+  // Weight the path ratio by the same Beer-Lambert scattering support used by
+  // the integrator. opticalIntegral alone is length-like and would over-weight
+  // a long, very thin medium when sigmaT differs between local volumes.
+  float support = transmittance * sigmaT *
+                  opticalIntegral(sigmaT, intervalLength);
+  shadowReferenceIntegral += support;
+  shadowPhysicalIntegral += support * visibility;
+
+  // Evidence is accumulated only after selectSegmentCascade proved that this
+  // interval belongs to a valid CSM projection. Missing coverage and authored
+  // fallback therefore cannot manufacture a detached dark column.
+  float visibilityLoss = 1.0 - visibility;
+  shadowEvidenceOptical += sigmaT * intervalLength * visibilityLoss;
+  peakShadowOcclusion = max(peakShadowOcclusion, visibilityLoss);
+}
+
+void accumulateInterval(float intervalLength, vec3 localSource,
+                        float sigmaT, vec3 sunSource,
+                        float visibility, inout vec3 scattering,
+                        inout float transmittance) {
+  if (intervalLength <= 1.0e-6 || transmittance <= 1.0e-5)
+    return;
+  float segmentT = exp(-sigmaT * intervalLength);
+  float integral = opticalIntegral(sigmaT, intervalLength);
+  vec3 source = max(localSource, vec3(0.0)) +
+                max(sunSource, vec3(0.0)) * clamp(visibility, 0.0, 1.0);
+  scattering += transmittance * source * integral;
+  transmittance *= segmentT;
+}
+
+void integrateFallback(vec3 rayDir, float distance0, float distance1,
+                       vec3 localSource, float sigmaT, vec3 sunSource,
+                       float fallback, float shadowStrength, float contrast,
+                       ivec3 extent, inout vec3 scattering,
+                       inout float transmittance,
+                       inout float shadowReferenceIntegral,
+                       inout float shadowPhysicalIntegral,
+                       inout float shadowEvidenceOptical,
+                       inout float peakShadowOcclusion) {
+  float lengthTotal = max(distance1 - distance0, 0.0);
+  if (lengthTotal <= 1.0e-6)
+    return;
+  // Keep the degraded path spatially dense, but anchor every interval to one
+  // camera-ray lattice. Dividing each Froxel slice independently reset the
+  // sample phase 64/128 times and could project one displaced caster outline
+  // per slice after the texel-DDA budget was exhausted.
+  const float fallbackStep = 32.0;
+  float anchor = max(pc.p_grid.z, 0.1);
+  float a = distance0;
+  for (int i = 0; i < 64 && a < distance1; ++i) {
+    float phase = (a - anchor) / fallbackStep;
+    float nextBoundary =
+      anchor + (floor(phase + 1.0e-5) + 1.0) * fallbackStep;
+    float b = min(distance1, max(a + 1.0e-3, nextBoundary));
+    int cascade = -1;
+    vec2 coord0;
+    vec2 coord1;
+    float reference0;
+    float reference1;
+    float visibility = fallback;
+    float physicalVisibility = 1.0;
+    if (selectSegmentCascade(rayDir, a, b, extent, cascade, coord0, coord1,
+                             reference0, reference1)) {
+      visibility = intervalVisibility(
+        cascade, 0.5 * (coord0 + coord1), reference0, reference1,
+        sigmaT, b - a, extent, shadowStrength, contrast,
+        physicalVisibility);
+      recordShadowEvidence(
+        b - a, sigmaT, physicalVisibility, transmittance,
+        shadowReferenceIntegral, shadowPhysicalIntegral,
+        shadowEvidenceOptical, peakShadowOcclusion);
+    }
+    accumulateInterval(b - a, localSource, sigmaT, sunSource, visibility,
+                       scattering, transmittance);
+    a = b;
+  }
+}
+
+void integrateShadowedSlice(vec3 rayDir, float distance0, float distance1,
+                            vec3 localSource, float sigmaT, vec3 sunSource,
+                            float fallback, float shadowStrength,
+                            float contrast, ivec3 extent,
+                            inout uint traversalStepsRemaining,
+                            inout vec3 scattering,
+                            inout float transmittance,
+                            inout float shadowReferenceIntegral,
+                            inout float shadowPhysicalIntegral,
+                            inout float shadowEvidenceOptical,
+                            inout float peakShadowOcclusion) {
+  if (distance1 <= distance0 || transmittance <= 1.0e-5)
+    return;
+
+  int cascade = -1;
+  vec2 coord0;
+  vec2 coord1;
+  float reference0;
+  float reference1;
+  if (!selectSegmentCascade(rayDir, distance0, distance1, extent, cascade,
+                            coord0, coord1, reference0, reference1)) {
+    accumulateInterval(distance1 - distance0, localSource, sigmaT, sunSource,
+                       fallback, scattering, transmittance);
+    return;
+  }
+
+  float segmentLength = distance1 - distance0;
+  vec2 coordSlope = (coord1 - coord0) / max(segmentLength, 1.0e-6);
+  float referenceSlope = (reference1 - reference0) /
+                         max(segmentLength, 1.0e-6);
+  float current = distance0;
+
+  while (current < distance1 && traversalStepsRemaining > 0u &&
+         transmittance > 1.0e-5) {
+    float relative = current - distance0;
+    vec2 coord = coord0 + coordSlope * relative;
+    float dx = nextTexelBoundary(coord.x, coordSlope.x);
+    float dy = nextTexelBoundary(coord.y, coordSlope.y);
+    float nextDistance = min(distance1, current + min(dx, dy));
+    if (nextDistance <= current + 1.0e-5)
+      nextDistance = min(distance1, current + 1.0e-3);
+
+    float refA = reference0 + referenceSlope * (current - distance0);
+    float refB = reference0 + referenceSlope * (nextDistance - distance0);
+    float midpoint = 0.5 * (current + nextDistance);
+    vec2 midpointCoord = coord0 + coordSlope * (midpoint - distance0);
+    float physicalVisibility;
+    float visibility = intervalVisibility(
+      cascade, midpointCoord, refA, refB, sigmaT,
+      nextDistance - current, extent, shadowStrength, contrast,
+      physicalVisibility);
+    recordShadowEvidence(
+      nextDistance - current, sigmaT, physicalVisibility, transmittance,
+      shadowReferenceIntegral, shadowPhysicalIntegral,
+      shadowEvidenceOptical, peakShadowOcclusion);
+    accumulateInterval(nextDistance - current, localSource, sigmaT, sunSource,
+                       visibility, scattering, transmittance);
+    current = nextDistance;
+    traversalStepsRemaining -= 1u;
+  }
+
+  if (current < distance1 && transmittance > 1.0e-5) {
+    integrateFallback(rayDir, current, distance1, localSource, sigmaT,
+                      sunSource, fallback, shadowStrength, contrast, extent,
+                      scattering, transmittance, shadowReferenceIntegral,
+                      shadowPhysicalIntegral, shadowEvidenceOptical,
+                      peakShadowOcclusion);
+  }
+}
+
+void main() {
+  ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+  ivec2 effectSize = ivec2(int(pc.p_params.x + 0.5),
+                           int(pc.p_params.y + 0.5));
+  if (any(greaterThanEqual(pixel, effectSize)))
+    return;
+  vec2 uv = (vec2(pixel) + vec2(0.5)) / max(vec2(effectSize), vec2(1.0));
+  vec3 rayDir;
+  float distanceLimit;
+  if (!reconstructRayAndLimit(uv, rayDir, distanceLimit)) {
+    imageStore(s_effect, pixel, vec4(0.0, 0.0, 0.0, 1.0));
+    return;
+  }
+
+  vec3 sunDirection = normalize(csm.u_sunDir.xyz);
+  if ((pc.p_flags & 0x4u) != 0u)
+    sunDirection = -sunDirection;
+  vec3 sunRadiance = max(pc.p_sunColorScale.rgb, vec3(0.0)) *
+                     max(pc.p_sunColorScale.w, 0.0);
+  float phase = hgPhaseNormalized(dot(sunDirection, -rayDir),
+                                  clamp(pc.p_sunParams.x, 0.0, 0.35));
+  float shadowStrength = clamp(pc.p_sunParams.y, 0.0, 1.0);
+  float contrast = clamp(pc.p_sunParams.w, 0.25, 3.0);
+  float albedo = clamp(pc.p_params.w, 0.0, 0.999);
+  uint traversalStepsRemaining = clamp(pc.p_maxTraversalSteps, 1u, 4096u);
+
+  ivec3 shadowExtent = textureSize(
+    sampler2DArray(s_shadow,
+      s_samplers[nonuniformEXT(pc.p_shadowSampler)]), 0);
+  float fallback = clamp(pc.p_sunParams.z, 0.0, 1.0);
+
+  vec3 scattering = vec3(0.0);
+  float transmittance = 1.0;
+  float shadowReferenceIntegral = 0.0;
+  float shadowPhysicalIntegral = 0.0;
+  float shadowEvidenceOptical = 0.0;
+  float peakShadowOcclusion = 0.0;
+  for (uint z = 0u; z < pc.p_gridDepth; ++z) {
+    float z0 = sliceBoundary(float(z));
+    if (z0 >= distanceLimit)
+      break;
+    float z1 = min(sliceBoundary(float(z + 1u)), distanceLimit);
+    float ds = max(z1 - z0, 0.0);
+    if (ds <= 1.0e-5)
+      continue;
+    vec4 cell = textureLod(
+      sampler3D(s_volume, s_samplers[nonuniformEXT(pc.p_sampler)]),
+      vec3(uv, (float(z) + 0.5) / float(pc.p_gridDepth)), 0.0);
+    if (!finiteVec4(cell))
+      continue;
+    float sigmaT = clamp(cell.a, 0.0, 0.01);
+    if (sigmaT <= 1.0e-8)
+      continue;
+
+    vec3 localSource = max(cell.rgb, vec3(0.0));
+    vec3 sunSource = sunRadiance * phase * sigmaT * albedo;
+    if (any(lessThanEqual(shadowExtent, ivec3(0)))) {
+      accumulateInterval(ds, localSource, sigmaT, sunSource, fallback,
+                         scattering, transmittance);
+    } else {
+      integrateShadowedSlice(
+        rayDir, z0, z1, localSource, sigmaT, sunSource, fallback,
+        shadowStrength, contrast, shadowExtent, traversalStepsRemaining,
+        scattering, transmittance, shadowReferenceIntegral,
+        shadowPhysicalIntegral, shadowEvidenceOptical,
+        peakShadowOcclusion);
+    }
+    if (transmittance <= 1.0e-4)
+      break;
+  }
+
+  float extinctionStrength = clamp(pc.p_params.z, 0.0, 1.0);
+  float compositeT = mix(1.0, transmittance, extinctionStrength);
+
+  // Froxel scattering alone can make a true shadow column nearly disappear in
+  // deliberately clear air. Reuse the legacy path's bounded readability
+  // contract: whole-path physical contrast plus optically supported local CSM
+  // evidence. No valid shadow interval means no additional attenuation.
+  float resolvedColumnOcclusion = 0.0;
+  if (shadowReferenceIntegral > 1.0e-7) {
+    float physicalRatio = clamp(
+      shadowPhysicalIntegral / shadowReferenceIntegral, 0.0, 1.0);
+    float pathOcclusion = 1.0 - physicalRatio;
+    float shadowEvidenceGate = smoothstep(
+      0.00035, 0.0060, shadowEvidenceOptical);
+    bool volumeSun = csm.u_volumeSunParams.x > 0.5;
+    float localEvidenceScale = volumeSun ? 0.74 : 0.68;
+    float physicalOcclusion = max(
+      pathOcclusion,
+      clamp(peakShadowOcclusion, 0.0, 1.0) *
+        shadowEvidenceGate * localEvidenceScale);
+    float contrastControl = clamp(contrast, 0.0, 2.5);
+    float resolvedOcclusion;
+    if (contrastControl <= 1.0) {
+      resolvedOcclusion = physicalOcclusion * contrastControl;
+    } else {
+      float targetExponent = volumeSun ? 0.50 : 0.55;
+      float readabilityMix = clamp(
+        (contrastControl - 1.0) / 1.5, 0.0, 1.0);
+      float readabilityExponent = mix(
+        1.0, targetExponent, readabilityMix);
+      resolvedOcclusion = pow(
+        max(physicalOcclusion, 0.0), max(readabilityExponent, 0.28));
+    }
+    resolvedColumnOcclusion = clamp(resolvedOcclusion, 0.0, 1.0);
+  }
+
+  float columnEvidenceGate = smoothstep(
+    0.00035, 0.0060, shadowEvidenceOptical);
+  float sunRadiancePeak = max(
+    max(sunRadiance.r, sunRadiance.g), sunRadiance.b);
+  float columnSourceGate = smoothstep(0.004, 0.040, sunRadiancePeak);
+  float columnReadabilityMix = clamp(
+    (contrast - 1.0) / 1.5, 0.0, 1.0);
+  float attenScale = 0.62;
+  if (csm.u_volumeSunParams.x > 0.5)
+    attenScale *= 1.05;
+  float maxColumnAtten = 0.24;
+  float columnReadabilityAttenuation = min(
+    resolvedColumnOcclusion * 0.55 * attenScale * columnEvidenceGate *
+      columnSourceGate * columnReadabilityMix,
+    maxColumnAtten);
+  compositeT = clamp(
+    compositeT * (1.0 - columnReadabilityAttenuation),
+    exp(-2.0), 1.0);
+
+  if (!finiteVec4(vec4(scattering, compositeT)))
+    imageStore(s_effect, pixel, vec4(0.0, 0.0, 0.0, 1.0));
+  else
+    imageStore(s_effect, pixel,
+               vec4(max(scattering, vec3(0.0)), clamp(compositeT, 0.0, 1.0)));
+}

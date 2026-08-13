@@ -268,13 +268,22 @@ type = real
 [WarVKSetVolumetricQuality]
 title = "设置体积光质量"
 description = "设置步数 ${stepCount} 与最大距离 ${maxDistance}。"
-comment = "stepCount 范围4..16；maxDistance 范围1..50000，单位为世界坐标。"
+comment = "stepCount 范围4..16，仅控制兼容 RayMarch；maxDistance 范围1..50000，单位为世界坐标，两种后端都会使用。"
 category = "TC_WarVKVolumetricLight"
 script = "WarVKSetVolumetricQuality"
 [[.args]]
 type = integer
 [[.args]]
 type = real
+
+[WarVKSetVolumetricBackend]
+title = "设置体积光后端"
+description = "设置体积光后端 ${backend}。"
+comment = "0=兼容 RayMarch；1=Froxel Medium；2=Froxel High（时空重建）。当前候选默认使用2，作者可显式选择0兼容旧效果。"
+category = "TC_WarVKVolumetricLight"
+script = "WarVKSetVolumetricBackend"
+[[.args]]
+type = integer
 
 [WarVKSetGlobalVolumetricFogEnabled]
 title = "启用全局高度雾"

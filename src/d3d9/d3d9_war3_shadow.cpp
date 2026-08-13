@@ -1,6 +1,7 @@
 #include "d3d9_war3_shadow.h"
 #include "d3d9_shader.h"
 #include "d3d9_war3_debug.h"
+#include "d3d9_war3_fog_volume.h"
 #include "war3/core/war3_internal_test_config.h"
 #include "war3/core/war3_runtime_profile.h"
 #include "war3/gpu_skin/war3_gpu_skin_compute.h"
@@ -3189,8 +3190,8 @@ bool War3ShadowReceiverPass::renderVolumeSunShadow(
 
   const float radiusFar = std::clamp(
       std::isfinite(vol.volumeSunOrthoRadius) ? vol.volumeSunOrthoRadius
-                                              : 3400.0f,
-      256.0f, 8000.0f);
+                                              : 10000.0f,
+      256.0f, 10000.0f);
   const float nearScale = std::clamp(
       std::isfinite(vol.volumeSunNearRadiusScale) ? vol.volumeSunNearRadiusScale
                                                   : 0.42f,
@@ -3225,11 +3226,21 @@ bool War3ShadowReceiverPass::renderVolumeSunShadow(
       std::clamp(std::isfinite(vol.volumeSunSoftRadius) ? vol.volumeSunSoftRadius
                                                         : 1.85f,
                  0.5f, 4.0f);
-  m_volumeSunReceiverBias =
-      std::clamp(std::isfinite(vol.volumeSunReceiverBias)
-                     ? vol.volumeSunReceiverBias
-                     : 0.0075f,
-                 0.0001f, 0.05f);
+  // volumeSunReceiverBias is authored in world units. The shadow compare uses
+  // normalized light depth, so applying the old 0.0075 value directly scaled
+  // the detachment with the ortho depth range (about 70 world units in the
+  // near layer and 150+ in the far layer at the current 10k coverage). Anchor
+  // the conversion to the far layer: both layers then stay conservatively
+  // below the requested world-space gap, independent of camera pitch.
+  const float receiverBiasWorld = std::clamp(
+      std::isfinite(vol.volumeSunReceiverBias)
+          ? vol.volumeSunReceiverBias
+          : 2.0f,
+      0.0f, 8.0f);
+  const float farDepthSpan = std::max(
+      orthoFar.maxZ - orthoFar.minZ, 1.0f);
+  m_volumeSunReceiverBias = std::clamp(
+      receiverBiasWorld / farDepthSpan, 0.0f, 0.01f);
 
   // 临时把 renderShadowMap 目标换成体积太阳 1/2 层 ortho。
   // 表面 CSM 成员在函数返回前必须完整恢复。
@@ -3655,7 +3666,8 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
   // 2) Transition shadow map to depth attachment layout for rendering
   {
     VkImageMemoryBarrier2 toDepth = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
-    toDepth.srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    toDepth.srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
     toDepth.srcAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
     toDepth.dstStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
                            VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
@@ -3862,7 +3874,8 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
     toRead.srcStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
                           VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
     toRead.srcAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    toRead.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    toRead.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
     toRead.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
     toRead.oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
     toRead.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
@@ -5092,7 +5105,8 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
                           VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
     toRead.srcAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
                            VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    toRead.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    toRead.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
     toRead.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
     toRead.oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
     toRead.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
@@ -7459,7 +7473,8 @@ void War3ShadowReceiverPass::renderPointShadow(
         VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
     initRead.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
     initRead.srcAccessMask = 0u;
-    initRead.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    initRead.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
     initRead.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
     initRead.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     initRead.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
@@ -7482,7 +7497,8 @@ void War3ShadowReceiverPass::renderPointShadow(
   bool pointShadowDynamicRenderingActive = false;
   try {
     VkImageMemoryBarrier2 toWrite = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
-    toWrite.srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    toWrite.srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
     toWrite.srcAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
     toWrite.dstStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
                            VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
@@ -7813,7 +7829,8 @@ void War3ShadowReceiverPass::renderPointShadow(
                           VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
     toRead.srcAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
                            VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    toRead.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    toRead.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
     toRead.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
     toRead.oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
     toRead.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
@@ -7858,7 +7875,8 @@ void War3ShadowReceiverPass::renderPointShadow(
       restoreRead.srcAccessMask =
           VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
           VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-      restoreRead.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+      restoreRead.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
       restoreRead.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
       restoreRead.oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
       restoreRead.newLayout =
@@ -9471,21 +9489,14 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
   }
 
   m_csmConfig = mutableSettings.shadows.csm;
-  // The ordinary surface CSM remains bit-for-bit unchanged while volumetrics
-  // are disabled. When the volume consumer is active, reserve a fixed
-  // toward-sun slice in C2/C3 so an upstream tree/building is not clipped out
-  // merely because the receiver frustum is farther from the camera. This is
-  // deliberately bounded: the previous symmetric +3000 expansion destroyed
-  // useful normalized-depth precision and made surface shadows shimmer.
+  // Surface CSM precision is independent from the optional volumetric
+  // consumer. Volumetric sunlight has a dedicated ortho shadow map with its
+  // own depth extension below; toggling the effect must never enlarge the
+  // surface CSM projection or remove small receiver detail.
   if (!std::isfinite(m_csmConfig.farCasterDepthExtension))
     m_csmConfig.farCasterDepthExtension = 0.0f;
   m_csmConfig.farCasterDepthExtension =
       std::clamp(m_csmConfig.farCasterDepthExtension, 0.0f, 384.0f);
-  if (mutableSettings.postFx.enabled &&
-      mutableSettings.postFx.volumetricLight.enabled) {
-    m_csmConfig.farCasterDepthExtension =
-        (std::max)(m_csmConfig.farCasterDepthExtension, 384.0f);
-  }
   // Diagnostic override for separating upstream-caster Z clipping from
   // capture/publication loss. The normal path remains byte-for-byte unchanged
   // when the variable is absent. Values above the production 384-unit volume
@@ -10234,9 +10245,41 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
     const auto& volSettings = mutableSettings.postFx.volumetricLight;
     if (!reuseLastShadowMap && hasCandidateCsm && m_csmData.cascadeCount == 0u)
       m_csmData = newCsm;
+    const float volumeIntensity =
+        std::isfinite(volSettings.intensity) ? volSettings.intensity : 0.0f;
+    const float globalDensity =
+        std::isfinite(volSettings.density) ? volSettings.density : 0.0f;
+    const bool hasGlobalMedium =
+        volSettings.globalMediumEnabled && globalDensity > 1.0e-6f;
+    // HasActiveVolumes is an atomic no-lock probe. The volume pass performs
+    // the authoritative bounded snapshot and visibility selection later.
+    const bool hasLocalMedium =
+        War3FogVolumeManager::Instance().HasActiveVolumes();
+    const float configuredSunIntensity =
+        mutableSettings.sun.enabled && std::isfinite(mutableSettings.sun.intensity)
+        ? std::max(mutableSettings.sun.intensity, 0.0f)
+        : 0.0f;
+    const float minimumSunIntensity =
+        std::isfinite(volSettings.minSunIntensity)
+        ? std::clamp(volSettings.minSunIntensity, 0.0f, 1.0f)
+        : 0.08f;
+    const Vector4 volumeSunColor = input.lighting != nullptr
+        ? input.lighting->sunColor
+        : mutableSettings.sun.color;
+    const float volumeSunColorPeak = std::max({
+        std::isfinite(volumeSunColor.x) ? std::max(volumeSunColor.x, 0.0f) : 0.0f,
+        std::isfinite(volumeSunColor.y) ? std::max(volumeSunColor.y, 0.0f) : 0.0f,
+        std::isfinite(volumeSunColor.z) ? std::max(volumeSunColor.z, 0.0f) : 0.0f});
+    const bool hasEffectiveSun =
+        configuredSunIntensity >= minimumSunIntensity &&
+        configuredSunIntensity * volumeSunColorPeak > 1.0e-6f;
+    const bool hasEffectiveVolumeConsumer =
+        volumeIntensity > 1.0e-6f && volSettings.sampleCount > 0 &&
+        (hasGlobalMedium || hasLocalMedium) && hasEffectiveSun;
     const bool wantVolumeSun =
         mutableSettings.postFx.enabled && volSettings.enabled &&
-        volSettings.volumeSunShadowEnabled && hasCandidateCsm &&
+        volSettings.volumeSunShadowEnabled && hasEffectiveVolumeConsumer &&
+        hasCandidateCsm &&
         m_csmData.cascadeCount > 0u && !replayDraws.empty();
     if (wantVolumeSun) {
       war3::tools::SetGpuFlightBreadcrumb(

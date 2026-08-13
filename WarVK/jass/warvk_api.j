@@ -31,6 +31,7 @@ globals
     constant integer wvkTypedTimeVisualSeconds = 401
     constant integer wvkTypedStatsFramesPerSecond = 402
     constant integer wvkTypedStatsFrameTimeMilliseconds = 403
+
 endglobals
 
 function WVKTypedReady takes nothing returns boolean
@@ -244,6 +245,12 @@ endfunction
 
 function WarVKSetVolumetricQuality takes integer stepCount, real maxDistance returns nothing
     local string payload = "warvk:v1;volumetric.setQuality" + ";i:" + I2S(stepCount) + ";r:" + R2S(maxDistance)
+    call Preloader(payload)
+endfunction
+
+// 0=旧 RayMarch，1=Froxel Medium，2=Froxel High。Froxel 仍需单独开启体积光。
+function WarVKSetVolumetricBackend takes integer backend returns nothing
+    local string payload = "warvk:v1;volumetric.setBackend" + ";i:" + I2S(backend)
     call Preloader(payload)
 endfunction
 

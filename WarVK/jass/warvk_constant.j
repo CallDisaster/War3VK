@@ -50,6 +50,11 @@ globals
     constant integer WARVK_FEATURE_POLYLINE_CURVE = 16384
     constant integer WARVK_FEATURE_LOCAL_FOG = 32768
 
+    // 体积光后端。LEGACY 是当前发布兼容路径；FROXEL_* 为 2.0 候选。
+    constant integer WARVK_VOLUMETRIC_BACKEND_LEGACY = 0
+    constant integer WARVK_VOLUMETRIC_BACKEND_FROXEL_MEDIUM = 1
+    constant integer WARVK_VOLUMETRIC_BACKEND_FROXEL_HIGH = 2
+
     // 渲染光照时钟来源。只影响 WarVK 光照，不修改 Warcraft 玩法时间。
     constant integer WARVK_LIGHTING_CLOCK_GAME_TIME = 0
     constant integer WARVK_LIGHTING_CLOCK_HELD = 1

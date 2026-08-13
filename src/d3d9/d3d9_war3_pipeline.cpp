@@ -737,6 +737,25 @@ namespace dxvk {
                                m_settings.postFx.volumetricLight.sampleCount);
             }
 
+            int backend = -1;
+            if (ParseEnvInt("DXVK_WAR3_VOLUMETRIC_BACKEND", backend)) {
+                backend = std::clamp(backend, 0, 2);
+                m_settings.postFx.volumetricLight.quality =
+                    static_cast<War3VolumetricQuality>(backend);
+                WAR3_RENDER_LOG("DXVK War3Volumetric: backend=%d\n", backend);
+            }
+
+            float froxelFar = 0.0f;
+            if (ParseEnvFloat("DXVK_WAR3_VOLUMETRIC_FROXEL_FAR",
+                              froxelFar)) {
+                m_settings.postFx.volumetricLight.froxelFar =
+                    std::clamp(froxelFar, 1000.0f, 10000.0f);
+                WAR3_RENDER_LOG("DXVK War3Volumetric: froxelFar=%.1f\n",
+                               static_cast<double>(m_settings.postFx
+                                                       .volumetricLight
+                                                       .froxelFar));
+            }
+
             int pointMaxLights = 0;
             if (ParseEnvInt("DXVK_WAR3_VOLUMETRIC_POINT_MAX_LIGHTS",
                             pointMaxLights)) {

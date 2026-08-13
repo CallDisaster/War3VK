@@ -44,6 +44,36 @@ WarVK 是一个面向 **Warcraft III 1.27a** 的 Windows 图形增强项目。�
   并以视角无关 CSM 光学证据替代阴影柱俯仰特判；77/77 静态、21/21 Win32 runnable、DLL 构建及
   no-work 通过，但尚未部署、真实 Catalog 回读或玩家前台物理验收，详见
   `docs/agent-history/2026-08-12-local-volumetric-fog-candidate.md`。
+- 2026-08-13 的 Volumetric Lighting 2.0 候选新增可选 Froxel Medium/High；玩家回归已否决逐列
+  `[L-D,L]` surface-tail 和其后 128/256 步过早回退。当前研究修复使用全屏统一 `[20,10000]`
+  对数 Z、64/128 层，scene depth 只在独立 `1/8`/`1/4` effect 网格终止积分；太阳阴影使用整 ray
+  1024/2048 步 shadow-texel 光学区间，并在耗尽后作有界密集回退。旧 RayMarch 仍为默认；450 万
+  grid-cell 与 3.5 亿主 DDA pixel-step admission 失败会安全回退。78/78 静态、21/21 Win32 runnable、
+  DLL 构建及 no-work 通过；已部署但尚未完成玩家前台视觉/4K 性能门，详见
+  `docs/agent-history/2026-08-13-froxel-full-view-research-fix-candidate.md`。
+- 上述部署候选的玩家回归仍显示低俯角/侧视亮缝、分层及阴影柱收缩。当前未部署修复已将错误的
+  `0.0075` 归一化 volume-sun bias 改为 2 世界单位后按实际光空间跨度归一化，并让预算耗尽
+  fallback 使用贯穿全部 Z slice 的共同采样格点；78/78 静态、DLL 构建及 no-work 通过。独立确认
+  的上游离屏 Caster 提交缺失仍未修改，不能宣称本候选已彻底解决该类消失，详见
+  `docs/agent-history/2026-08-13-volumetric-bias-and-fallback-phase-candidate.md`。
+- 后续运行取证确认该玩家回归实际仍在 backend 0：地图只调用 `SetEnabled(true)`，没有调用
+  `SetBackend`，日志也没有任何 Froxel 提交。当前未部署验收候选默认进入 Froxel High，并新增
+  实际 backend 日志，显式 0/1/2 回退仍保留；78/78 静态、DLL 构建及 no-work 已通过，尚待
+  玩家前台低视角 A/B，详见
+  `docs/agent-history/2026-08-13-froxel-backend-admission-candidate.md`。
+- 玩家已确认 Froxel High 不再复现上述几何错误，但阴影柱对比度几乎不可见。当前未部署候选已把
+  旧路径受真实 CSM 光学证据约束、最大 24% 的可读性衰减移植到 Froxel alpha，不提高全局雾密度；
+  78/78 静态、21/21 Win32 runnable、DLL 构建及 no-work 通过，尚待玩家前台视觉 A/B，详见
+  `docs/agent-history/2026-08-13-froxel-shadow-readability-candidate.md`。
+- 玩家回归确认上述可读性显著改善，但 `1/4` effect 自身强边 range weight 把轮廓放大成大块阶梯。
+  当前未部署候选改为由全分辨率 scene depth 单独引导 RGBA 双线性重建，保护真实几何断层而不锁死
+  低分辨率体积边；78/78 静态、21/21 Win32 runnable、DLL 构建及 no-work 通过，尚待视觉 A/B，
+  详见 `docs/agent-history/2026-08-13-froxel-shadow-edge-aa-candidate.md`。
+- 动态回归仍有整格跳变；根因是 integrator 只在 receiver-depth transition 过滤，Caster 横向
+  silhouette 仍为单 shadow texel 二值判断。当前未部署候选改为每个有效区间一次 2×2 depth gather，
+  对四个深度先解析比较再按亚 texel 覆盖率合并；不增加历史拖影或 DDA 上限；78/78 静态、
+  21/21 Win32 runnable、DLL 构建及 no-work 通过，详见
+  `docs/agent-history/2026-08-13-froxel-dynamic-shadow-comparison-pcf-candidate.md`。
 - 产品、DLL 资源、外部 Shader API 与 JAPI 显示版本已统一为 `1.2.0 Release`；GitHub 源码、
   玩家包、地图作者包及明确排除项见 `docs/RELEASE_1.2.0.md`。
 - 当前候选验证为：474/474 静态测试、15/15 Win32 runnable、真实 YDWE Catalog 35/35 回读与

@@ -42,13 +42,20 @@ namespace dxvk {
 
         const DxvkPipelineLayout* createPipelineLayout() const;
         const DxvkPipelineLayout* createCompositePipelineLayout() const;
+        const DxvkPipelineLayout* createFroxelInjectLayout() const;
+        const DxvkPipelineLayout* createFroxelTemporalLayout() const;
+        const DxvkPipelineLayout* createFroxelIntegrateLayout() const;
         VkPipeline getPipeline(const PipelineKey& key);
         VkPipeline getCompositePipeline(const PipelineKey& key);
         VkPipeline createPipeline(const PipelineKey& key) const;
         VkPipeline createCompositePipeline(const PipelineKey& key) const;
 
         void ensureResources(VkExtent3D extent, VkFormat colorFormat,
-                             VkFormat depthFormat, uint32_t resolutionDivisor);
+                             VkFormat depthFormat, uint32_t resolutionDivisor,
+                             bool storageEffect);
+        bool ensureFroxelResources(VkExtent3D fullExtent,
+                                   War3VolumetricQuality quality);
+        void invalidateFroxelHistory();
         void ensurePointShadowFallbackResources(
             const Rc<DxvkCommandList>& ctx);
         void copyColor(const Rc<DxvkCommandList>& ctx, const Rc<DxvkImageView>& srcView);
@@ -76,6 +83,12 @@ namespace dxvk {
         Rc<DxvkSampler> m_linearSampler;
         const DxvkPipelineLayout* m_layout = nullptr;
         const DxvkPipelineLayout* m_compositeLayout = nullptr;
+        const DxvkPipelineLayout* m_froxelInjectLayout = nullptr;
+        const DxvkPipelineLayout* m_froxelTemporalLayout = nullptr;
+        const DxvkPipelineLayout* m_froxelIntegrateLayout = nullptr;
+        VkPipeline m_froxelInjectPipeline = VK_NULL_HANDLE;
+        VkPipeline m_froxelTemporalPipeline = VK_NULL_HANDLE;
+        VkPipeline m_froxelIntegratePipeline = VK_NULL_HANDLE;
         std::unordered_map<PipelineKey, VkPipeline, DxvkHash, DxvkEq> m_pipelines;
         std::unordered_map<PipelineKey, VkPipeline, DxvkHash, DxvkEq> m_compositePipelines;
 
@@ -91,8 +104,31 @@ namespace dxvk {
 
         Rc<DxvkImage> m_effectImage;
         Rc<DxvkImageView> m_effectView;
+        Rc<DxvkImageView> m_effectStorageView;
         VkExtent3D m_cachedEffectExtent = {0, 0, 1};
         VkFormat m_cachedEffectFormat = VK_FORMAT_UNDEFINED;
+        bool m_effectStorageEnabled = false;
+
+        // Froxel current field and ping-pong stable histories remain in
+        // GENERAL for compute read/write. Rc command-list tracking owns every
+        // in-flight use; CPU history metadata is invalidated by the exact
+        // map/device/frame/grid contract without freeing GPU memory from JASS.
+        Rc<DxvkImage> m_froxelCurrentImage;
+        Rc<DxvkImageView> m_froxelCurrentView;
+        std::array<Rc<DxvkImage>, 2> m_froxelHistoryImages;
+        std::array<Rc<DxvkImageView>, 2> m_froxelHistoryViews;
+        VkExtent3D m_froxelGridExtent = {0u, 0u, 0u};
+        War3VolumetricQuality m_froxelResourceQuality =
+            War3VolumetricQuality::LegacyRayMarch;
+        uint32_t m_froxelHistoryIndex = 0u;
+        bool m_froxelHistoryValid = false;
+        uint64_t m_froxelHistoryFrameSerial = 0u;
+        uint64_t m_froxelHistoryMapEpoch = 0u;
+        uint64_t m_froxelHistoryDeviceEpoch = 0u;
+        float m_froxelHistoryNear = 0.0f;
+        float m_froxelHistoryFar = 0.0f;
+        Matrix4 m_froxelHistoryViewProj = {};
+        Vector4 m_froxelHistoryCameraPos = Vector4(0.0f);
 
         // Legal fail-lit textureCubeArray descriptor for volume-only frames
         // where no exact point-shadow publication is available.

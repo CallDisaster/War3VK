@@ -91,12 +91,12 @@ class WarVKJapiV1IntegratedStaticTests(unittest.TestCase):
             r'"([birds]*)",\s*[^,]+,\s*(true|false)\}',
             self.runtime,
         )
-        self.assertEqual(len(rows), 105)
+        self.assertEqual(len(rows), 106)
         cpp_commands = {
             name: (carrier, signature)
             for name, carrier, signature, _required in rows
         }
-        self.assertEqual(len(cpp_commands), 105)
+        self.assertEqual(len(cpp_commands), 106)
 
         self.assertNotIn("JapiFunc", self.jass)
         self.assertNotRegex(self.jass, r"(?m)^\s*native\s+WarVK")
@@ -359,6 +359,7 @@ class WarVKJapiV1IntegratedStaticTests(unittest.TestCase):
             "volumetric.setDensity",
             "volumetric.setScattering",
             "volumetric.setQuality",
+            "volumetric.setBackend",
             "volumetricFog.setEnabled",
             "volumetricFog.setSettings",
             "localFog.createSphere",

@@ -38,33 +38,6 @@ vec4 fetchEffect(ivec2 pixel, ivec2 effectSize) {
   return finiteVec4(value) ? value : vec4(0.0, 0.0, 0.0, 1.0);
 }
 
-float effectEdgeDistance(vec4 a, vec4 b) {
-  vec3 scatteringA = max(a.rgb, vec3(0.0));
-  vec3 scatteringB = max(b.rgb, vec3(0.0));
-  vec3 difference = abs(scatteringA - scatteringB);
-  float differencePeak = max(max(difference.r, difference.g), difference.b);
-  float signalPeak = max(
-    max(max(scatteringA.r, scatteringA.g), scatteringA.b),
-    max(max(scatteringB.r, scatteringB.g), scatteringB.b));
-  // Relative contrast is the useful edge signal here. A volumetric shadow can
-  // cross perfectly flat terrain, so full-resolution hardware depth alone
-  // cannot distinguish the two sides of the column.
-  float scatteringRelative = differencePeak / max(signalPeak, 1.0e-4);
-  // A true CSM column also carries a bounded base-transmittance reduction.
-  // Include that signal in the bilateral edge metric so a thin column is not
-  // averaged away on flat terrain by the 4x reconstruction. Keep a 2.5%
-  // relative dead zone before amplification: smooth physical extinction stays
-  // bilinear, while the max-quality O=1/64 readability term receives about
-  // 0.13 cross-edge weight and O=1/16 reaches the existing 1/64 safety floor.
-  float transmittanceA = clamp(a.a, exp(-1.0), 1.0);
-  float transmittanceB = clamp(b.a, exp(-1.0), 1.0);
-  float transmittanceRelative = abs(transmittanceA - transmittanceB) /
-    max(max(transmittanceA, transmittanceB), 1.0e-4);
-  float transmittanceEdge =
-    max(transmittanceRelative - 0.025, 0.0) * 16.0;
-  return max(scatteringRelative, transmittanceEdge);
-}
-
 vec4 depthAwareUpsample(vec2 uv, ivec2 fullSize, ivec2 effectSize,
                         float centerDepth) {
   if (all(equal(fullSize, effectSize))) {
@@ -124,33 +97,28 @@ vec4 depthAwareUpsample(vec2 uv, ivec2 fullSize, ivec2 effectSize,
     }
   }
 
-  vec3 sumScattering = vec3(0.0);
-  float sumTransmittance = 0.0;
+  vec4 sumEffect = vec4(0.0);
   float weightSum = 0.0;
   for (int i = 0; i < 4; i++) {
     float relativeDelta = max(deltas[i] - bestDelta, 0.0);
     float depthWeight = exp2(-4.0 * relativeDelta / depthScale);
-    // Preserve a radiance discontinuity even when there is no corresponding
-    // geometry-depth edge. Small gradients still reconstruct bilinearly; a
-    // true lit/shadow boundary receives at most 1/64 cross-edge contribution,
-    // avoiding both column dilution and a completely disconnected block edge.
-    float scatteringDelta = max(
-      effectEdgeDistance(values[i], values[referenceIndex]) - 0.08, 0.0);
-    float scatteringWeight = max(exp2(-7.0 * scatteringDelta), 1.0 / 64.0);
-    float weight = spatial[i] * depthWeight * scatteringWeight;
-    sumScattering += max(values[i].rgb, vec3(0.0)) * weight;
-    // Alpha is resolved radiance transmittance for a neighboring ray, not
-    // another sequential medium segment. Spatial reconstruction therefore
-    // averages T linearly; Beer-Lambert multiplication already happened along
-    // each ray in the effect pass.
-    sumTransmittance += clamp(values[i].a, exp(-1.0), 1.0) * weight;
-    weightSum += weight;
+    float guideWeight = spatial[i] * depthWeight;
+    // RGB scattering and alpha transmittance are the low-resolution solution,
+    // not a range guide for themselves. Using either signal as its own guide
+    // preserved quarter-resolution shadow texels as block staircases. The
+    // independent full-resolution scene depth is the joint-bilateral guide:
+    // geometry discontinuities remain sealed, while volumetric boundaries on
+    // one continuous surface receive bilinear coverage AA.
+    vec4 resolved = vec4(
+      max(values[i].rgb, vec3(0.0)),
+      clamp(values[i].a, exp(-1.0), 1.0));
+    sumEffect += resolved * guideWeight;
+    weightSum += guideWeight;
   }
 
   if (weightSum <= 1e-6)
     return values[bestIndex];
-  return vec4(sumScattering / weightSum,
-              sumTransmittance / weightSum);
+  return sumEffect / weightSum;
 }
 
 void main() {
@@ -174,7 +142,8 @@ void main() {
   // 单次散射合成：先应用 Beer-Lambert T，再将散射映射进当前 LDR
   // headroom。按 headroom 做指数响应等价于每个通道上的 soft shoulder：
   // 小信号近似线性，强信号渐近 1，不会在最大档突然硬截成白片。
-  // 放宽 transmittance 下限以匹配主 pass 的 35% column readability 上限
+  // Transmittance includes physical extinction plus the integrator's bounded
+  // 24% true-CSM column-readability term.
   float transmittance = clamp(effect.a, exp(-1.5), 1.0);
   vec3 scattering = max(effect.rgb, vec3(0.0));
   vec3 attenuatedBase = base.rgb * transmittance;

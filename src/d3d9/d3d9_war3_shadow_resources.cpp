@@ -95,7 +95,7 @@ bool War3ShadowReceiverPass::GetVolumetricSunShadowSnapshot(
   outSnapshot.cascadeCount = 1u;
   outSnapshot.frameSerial = 0u;
   outSnapshot.softRadius = 1.35f;
-  outSnapshot.receiverBias = 0.006f;
+  outSnapshot.receiverBias = 0.0001f;
   outSnapshot.radiusNear = 0.0f;
   outSnapshot.radiusFar = 0.0f;
   if (expectedFrameSerial == 0u ||

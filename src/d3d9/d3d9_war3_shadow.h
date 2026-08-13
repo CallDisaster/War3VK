@@ -81,7 +81,8 @@ namespace dxvk {
       uint32_t cascadeCount = 1u;
       uint64_t frameSerial = 0u;
       float softRadius = 1.35f;
-      float receiverBias = 0.006f;
+      // Normalized light-depth bias produced from the world-space setting.
+      float receiverBias = 0.0001f;
       float radiusNear = 0.0f;
       float radiusFar = 0.0f;
 
@@ -845,7 +846,8 @@ namespace dxvk {
         uint64_t m_volumeSunPublishedFrameSerial = 0u;
         bool m_volumeSunShadowReady = false;
         float m_volumeSunSoftRadius = 1.35f;
-        float m_volumeSunReceiverBias = 0.006f;
+        // Normalized light-depth bias published to volumetric consumers.
+        float m_volumeSunReceiverBias = 0.0001f;
         // renderShadowMap 临时路径：跳过 terrain mask、使用 volume 目标
         bool m_volumeSunRenderPathActive = false;
         
