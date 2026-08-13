@@ -27944,16 +27944,11 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
           dxvk::war3::render::VisibleRenderableQueueKind::Transparent;
     }
     enterBuildRecordPhase(War3BuildEligibleRecordPhase::Manifest);
-    const auto manifestRecord =
+    auto manifestRecord =
         manifestRecordForEligible(record, eligible.packet, eligible.sample);
     eligible.manifestPartLeaseKey =
         dxvk::war3::render::VisibleRenderableRegistry::
             computeShadowManifestPartKey(manifestRecord);
-    // Grace fills a producer hole but must not impersonate fresh visibility.
-    // Preserve the original visibleFrameSerial and part key for one-frame
-    // replay, without refreshing Manifest structure/pose/slice timestamps.
-    if (!eligible.sample.contract.fromGrace)
-      shadowEligibleManifestRecords.push_back(manifestRecord);
     if (bucket != nullptr)
       bucket->eligibleParts++;
     if (bucket != nullptr &&
@@ -27995,6 +27990,13 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
                   manifestRecord,
                   dxvk::war3::render::VisibleRenderableRegistry::
                       computeShadowManifestObjectKey(manifestRecord));
+    // Grace fills a producer hole but must not impersonate fresh visibility.
+    // Preserve the original visibleFrameSerial and part key for one-frame
+    // replay, without refreshing Manifest structure/pose/slice timestamps.
+    // All identity consumers above have finished, so transfer the record's
+    // storage into the publication vector instead of copying the full POD.
+    if (!eligible.sample.contract.fromGrace)
+      shadowEligibleManifestRecords.push_back(std::move(manifestRecord));
     if (!m_war3SemanticDirectPrevSubmittedPartIdentityKeys.empty()) {
       eligible.previouslySubmittedPart =
           std::binary_search(
