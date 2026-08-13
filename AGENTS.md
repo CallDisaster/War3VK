@@ -32,6 +32,12 @@ WarVK 是一个面向 **Warcraft III 1.27a** 的 Windows 图形增强项目。�
 
 ## 当前状态
 
+- 2026-08-14 已把 Froxel/局部体积雾线与阴影生产者 CPU 优化线合并，并修复扩大后的逐帧性能诊断在
+  Warcraft III 32 位地址空间中因超大历史环导致的退出；同图 ABBA 显示主线程 -0.357 ms、
+  DirectGrouped -87.4%、BuildEligible -96.4%，体积光图/Lost Temple 120 秒及“生与死”603 秒
+  隔离长门均无 device lost、GPU 事件或阴影完整性失败。DLL `7305E21A...B9DBDA3` 尚待用户前台
+  视觉与绝对 FPS 验收，详见 `docs/agent-history/2026-08-14-stable-volumetric-performance-integration.md`。
+
 - 当前分支：`codex/stable-optimization-integration-20260814`。原工作树另有用户未提交的外部子模块、
   PlayerCrash 与构建日志；
   保留它们，避免 reset、checkout 或覆盖式操作。
