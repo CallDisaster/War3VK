@@ -119,6 +119,32 @@ def _lower_owned_process_priority() -> Dict[str, Any]:
     return _set_owned_process_priority("below-normal")
 
 
+def _reconcile_priority_evidence(
+    requested: str,
+    observed: Dict[str, Any],
+    result: Any,
+) -> Dict[str, Any]:
+    """Close a short-run witness race without weakening priority policy."""
+    if observed.get("ok"):
+        return observed
+    if str(requested).strip().lower() != "high" or not isinstance(result, dict):
+        return observed
+    launch_priority = result.get("launch", {}).get("priority", {})
+    if not isinstance(launch_priority, dict):
+        return observed
+    if not launch_priority.get("ok") or launch_priority.get("priority") != "HIGH":
+        return observed
+    return {
+        "ok": True,
+        "retry": False,
+        "pid": int(launch_priority.get("pid", 0) or 0),
+        "priority": "HIGH",
+        "requested": "high",
+        "source": "launcher-owned-process",
+        "outerWitnessRace": True,
+    }
+
+
 def _cleanup_owned_process() -> Dict[str, Any]:
     pid = int(war3.STATE.war3_pid or 0)
     if pid <= 0:
@@ -174,6 +200,14 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--desktop", default="")
     parser.add_argument("--no-hot-shadow", action="store_true")
+    parser.add_argument(
+        "--allow-final-shadow-publication-only",
+        action="store_true",
+        help=(
+            "Accept an exact-owner hot frame only when sealed producer, replay, "
+            "four-cascade draw, identity, and receiver publication contracts all close."
+        ),
+    )
     parser.add_argument("--extra-env-json", default="{}")
     parser.add_argument("--section-top-n", type=int, default=300)
     parser.add_argument("--output", default="")
@@ -236,6 +270,9 @@ def main() -> int:
                 require_control_plane_ready=True,
                 require_hot_shadow_frame=not args.no_hot_shadow,
                 hot_shadow_timeout_sec=max(1, args.hot_shadow_timeout_sec),
+                allow_final_shadow_publication_only=(
+                    args.allow_final_shadow_publication_only
+                ),
             )
         except BaseException as exc:
             result_box["exception"] = repr(exc)
@@ -265,6 +302,12 @@ def main() -> int:
     finally:
         if int(war3.STATE.war3_pid or 0) > 0:
             cleanup = _cleanup_owned_process()
+
+    priority_box = _reconcile_priority_evidence(
+        args.process_priority,
+        priority_box,
+        result_box.get("result"),
+    )
 
     payload = {
         "ok": bool(

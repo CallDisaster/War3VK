@@ -8513,6 +8513,101 @@ def _semantic_scene_consumption_status(summary: Dict[str, Any]) -> Dict[str, Any
     }
 
 
+def _final_shadow_publication_status(summary: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate the exact-owner terminal CSM publication contract.
+
+    DirectGrouped is allowed to submit zero packets when the exact Stage11
+    producer already owns every canonical draw.  In that case the renderer's
+    sealed producer contract and the final replay/receiver publication are the
+    authoritative evidence.  Keep this deliberately stricter than a simple
+    non-zero draw-count check so an incomplete or last-good-only frame cannot
+    satisfy the hot-shadow gate.
+    """
+    casters = _shadow_summary_int(summary, "semanticSceneShadowCastersCount")
+    replay = _shadow_summary_int(summary, "semanticSceneReplayDrawsCount")
+    drawn = _shadow_summary_int(summary, "semanticSceneShadowMapDrawnCasters")
+    cascades = _shadow_summary_int(summary, "semanticSceneReceiverCsmCascadeCount")
+    exact_owner_skips = _shadow_summary_int(
+        summary,
+        "drawTimeSemanticProducerOwnedDirectGroupedSkipCount",
+    )
+    producer_failure_fields = (
+        "producerRequiredCasterOmissionCount",
+        "producerCompletenessReasonMask",
+        "producerCompletenessCounterOverflow",
+        "producerExactBudgetDeferredUniqueCasterCount",
+        "producerPositionAllocBudgetCount",
+        "producerUvAllocBudgetCount",
+        "producerIndexAllocBudgetCount",
+        "producerAllocationFailureCount",
+        "producerFallbackByteBudgetCount",
+        "producerArenaAdmissionCount",
+        "producerFreezeFailureCount",
+        "semanticSceneDirectLastRecordCapPartialObjectCount",
+        "semanticSceneDirectLastScanCapPartialObjectCount",
+        "semanticSceneDirectSubmittedPartialObjectCount",
+        "semanticSceneReceiverInputRejectReason",
+        "semanticSceneReceiverRunEarlyReturnReason",
+        "semanticSceneReceiverCsmFallbackToLastGoodCount",
+        "semanticSceneReceiverHoldEmptyReplayCount",
+        "semanticSceneReceiverHoldIdentityChurnCount",
+        "semanticSceneReceiverHoldInvalidCsmCount",
+    )
+    producer_failures = {
+        field: _shadow_summary_int(summary, field)
+        for field in producer_failure_fields
+    }
+    producer_stamp_valid = (
+        _shadow_summary_int(summary, "producerCompletenessSealed") == 1
+        and _shadow_summary_int(summary, "producerSealFrameSerial") > 0
+        and _shadow_summary_int(summary, "producerSealMapEpoch") > 0
+        and _shadow_summary_int(summary, "producerSealDeviceEpoch") > 0
+    )
+    replay_complete = (
+        casters > 0
+        and replay == casters
+        and cascades > 0
+        and cascades <= 4
+        and drawn == replay * cascades
+    )
+    receiver_complete = (
+        _shadow_summary_int(summary, "semanticSceneShadowMapExecutedThisFrame") == 1
+        and _shadow_summary_int(summary, "semanticSceneReceiverSettingsShadowsEnabled") == 1
+        and _shadow_summary_int(summary, "semanticSceneReceiverNeedShadowMap") == 1
+        and _shadow_summary_int(summary, "semanticSceneReceiverInputValid") == 1
+        and _shadow_summary_int(summary, "semanticSceneReceiverHasCompleteShadowMap") == 1
+        and _shadow_summary_int(summary, "semanticSceneReceiverHasUsableDirectionalShadow") == 1
+        and _shadow_summary_int(summary, "semanticSceneReceiverHasSunShadow") == 1
+        and _shadow_summary_int(summary, "semanticSceneReceiverReuseShadowMap") == 0
+        and _shadow_summary_int(summary, "semanticSceneReceiverActiveStrengthMilli") > 0
+    )
+    identity_closed = (
+        _shadow_summary_int(summary, "semanticSceneSubmittedObjectJaccardMilli") == 1000
+        and _shadow_summary_int(summary, "semanticSceneSubmittedPartJaccardMilli") == 1000
+    )
+    complete = (
+        exact_owner_skips > 0
+        and producer_stamp_valid
+        and not any(producer_failures.values())
+        and replay_complete
+        and receiver_complete
+        and identity_closed
+    )
+    return {
+        "finalShadowPublicationComplete": bool(complete),
+        "finalShadowProducerStampValid": bool(producer_stamp_valid),
+        "finalShadowReplayComplete": bool(replay_complete),
+        "finalShadowReceiverComplete": bool(receiver_complete),
+        "finalShadowIdentityClosed": bool(identity_closed),
+        "finalShadowExactOwnerSkipCount": int(exact_owner_skips),
+        "finalShadowCasterCount": int(casters),
+        "finalShadowReplayCount": int(replay),
+        "finalShadowDrawnCount": int(drawn),
+        "finalShadowCascadeCount": int(cascades),
+        "finalShadowProducerFailures": producer_failures,
+    }
+
+
 def _refresh_shadow_runtime_summary_until(
     *,
     pid: int,
@@ -8595,6 +8690,7 @@ def wait_for_hot_shadow_frame(
     allow_scene_pending_if_core_and_currentdraw_ready: bool = False,
     min_semantic_static_world_submitted: int = 0,
     allow_semantic_static_world_only: bool = False,
+    allow_final_shadow_publication_only: bool = False,
 ) -> Dict[str, Any]:
     """等待进入热帧语义阴影状态，而不是只等待 ready 首帧。"""
     target_pid = pid or (STATE.war3_pid or 0)
@@ -8698,6 +8794,8 @@ def wait_for_hot_shadow_frame(
             frame_fresh = bool(latest_summary.get("semanticCoreFrameFresh", False))
             scene_status = _semantic_scene_consumption_status(latest_summary)
             response.update(scene_status)
+            final_shadow_status = _final_shadow_publication_status(latest_summary)
+            response.update(final_shadow_status)
             scene_submitted = _shadow_summary_int(
                 latest_summary,
                 "semanticSceneLastSubmittedDrawCount",
@@ -8829,6 +8927,20 @@ def wait_for_hot_shadow_frame(
                 )
             if strict_ok:
                 response["ok"] = True
+                return response
+            if (
+                bool(allow_final_shadow_publication_only)
+                and final_shadow_status.get("finalShadowPublicationComplete")
+                and manifest_ok
+            ):
+                response["ok"] = True
+                response["finalShadowPublicationOnlyAccepted"] = True
+                response["semanticShadowPhase"] = "exact-owner-final-publication-ok"
+                response["semanticSceneOnlyReason"] = (
+                    "exact Stage11 ownership eliminated DirectGrouped packets, "
+                    "while the sealed producer, replay, four-cascade draw, identity, "
+                    "and receiver publication contracts remained complete"
+                )
                 return response
             if scene_contract_ok:
                 response["ok"] = True
@@ -9107,6 +9219,8 @@ def wait_for_hot_shadow_frame(
     frame_fresh = bool(latest_summary.get("semanticCoreFrameFresh", False))
     scene_status = _semantic_scene_consumption_status(latest_summary)
     response.update(scene_status)
+    final_shadow_status = _final_shadow_publication_status(latest_summary)
+    response.update(final_shadow_status)
     native_draws = _native_execute_success_draw_count(latest_summary)
     response["nativeD3D9BackendEffectiveExecutedDrawCount"] = native_draws
     scene_submitted = _shadow_summary_int(
@@ -9269,6 +9383,21 @@ def wait_for_hot_shadow_frame(
         response["semanticSceneOnlyReason"] = (
             "DXVK semantic scene submitted and consumed draw packets; native "
             "backend counters are not required for this visual validation gate"
+        )
+        response["error"] = ""
+        return response
+    if (
+        bool(allow_final_shadow_publication_only)
+        and final_shadow_status.get("finalShadowPublicationComplete")
+        and manifest_ok
+    ):
+        response["ok"] = True
+        response["finalShadowPublicationOnlyAccepted"] = True
+        response["semanticShadowPhase"] = "exact-owner-final-publication-ok"
+        response["semanticSceneOnlyReason"] = (
+            "exact Stage11 ownership eliminated DirectGrouped packets, while the "
+            "sealed producer, replay, four-cascade draw, identity, and receiver "
+            "publication contracts remained complete"
         )
         response["error"] = ""
         return response
@@ -11887,6 +12016,7 @@ def run_quick_autotest(
     require_control_plane_ready: bool = True,
     require_hot_shadow_frame: bool = False,
     hot_shadow_timeout_sec: int = 60,
+    allow_final_shadow_publication_only: bool = False,
 ) -> Dict[str, Any]:
     """
     一键流程：
@@ -12125,7 +12255,8 @@ def run_quick_autotest(
             post_failure_summary_wait_sec=8
             if attachment_probe
             else 6,
-            prefer_summary_poll=attachment_probe,
+            prefer_summary_poll=attachment_probe
+            or bool(allow_final_shadow_publication_only),
             require_semantic_scene_consumed=scenario_name_norm
             in ("dynamic_shadow_pressure", "low_pressure_static_reuse",
                 "static_world_caster_acceptance",
@@ -12142,6 +12273,9 @@ def run_quick_autotest(
             scenario_name_norm in (
                 "static_world_caster_acceptance",
                 "phase4_world_caster_acceptance",
+            ),
+            allow_final_shadow_publication_only=bool(
+                allow_final_shadow_publication_only
             ),
         )
         if not hot_shadow.get("ok"):
