@@ -43564,11 +43564,14 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         DxvkBufferSlice posSlice;
         uint32_t posStride = 0u;
         D3D9CommonBuffer* posCommon = nullptr;
+        VkDeviceSize posBindingOffset = 0u;
+        bool posCommonNeedsReadback = false;
         Rc<DxvkResourceAllocation> posMappedAllocation = nullptr;
         dxvk::war3::memory::War3CpuReadableBufferSpan posReadableSpan = {};
         const uint8_t* posCanonicalBytes = nullptr;
         VkDeviceSize posCanonicalLength = 0u;
         bool posCanonicalHostCached = false;
+        bool posReadableSpanResolveAttempted = false;
         if (gpuSkinSemanticBacking) {
           posSlice = gpuSkinResolved->lease.slice;
           posStride = gpuSkinResolved->lease.desc.vertexStride;
@@ -43594,30 +43597,12 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           }
           posSlice = m_war3PerDrawUpload.vbSlices[posStream];
           posStride = m_war3PerDrawUpload.vbStrides[posStream];
-          posReadableSpan =
-              dxvk::war3::memory::BuildWar3CpuReadableBufferSpan({
-                  m_war3PerDrawUpload.vbUploadBytes[posStream],
-                  m_war3PerDrawUpload.vbUploadLength[posStream], 0u,
-                  m_war3PerDrawUpload.vbUploadLength[posStream],
-                  m_war3PerDrawUpload.vbSourceResource[posStream],
-                  m_war3PerDrawUpload.vbSourceIdentityGeneration[posStream],
-                  m_war3PerDrawUpload.vbSourceSequence[posStream],
-                  m_war3PerDrawUpload.vbSourceContentGeneration[posStream],
-                  true});
-          if (posReadableSpan) {
-            posCanonicalBytes = posReadableSpan.data;
-            posCanonicalLength = posReadableSpan.length;
-            posCanonicalHostCached =
-                (m_war3PerDrawUpload.storage->getMemoryProperties() &
-                 VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0u;
-          }
         } else {
           auto *vb = m_state.vertexBuffers[posStream].vertexBuffer.ptr();
           if (vb) {
             posCommon = vb->GetCommonBuffer();
             if (posCommon) {
-              const VkDeviceSize bindingOffset =
-                  m_state.vertexBuffers[posStream].offset;
+              posBindingOffset = m_state.vertexBuffers[posStream].offset;
               // Capture precedes PrepareDraw.  A BUFFER/MANAGED resource with
               // pending CPU writes still has the previous generation in REAL.
               // FlushBuffer first copies those bytes into its own immutable
@@ -43632,39 +43617,9 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
               }
               posSlice = posCommon
                   ->GetBufferSlice<D3D9_COMMON_BUFFER_TYPE_REAL>(
-                      bindingOffset);
+                      posBindingOffset);
               posStride = m_state.vertexBuffers[posStream].stride;
-              if (!posCommon->NeedsReadback()) {
-                posMappedAllocation = posCommon->GetMappedSlice();
-                if (posMappedAllocation != nullptr) {
-                  const auto allocationInfo =
-                      posMappedAllocation->getBufferInfo();
-                  const bool hostVisible =
-                      (posMappedAllocation->getMemoryProperties() &
-                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0u;
-                  const bool hostCached =
-                      (posMappedAllocation->getMemoryProperties() &
-                       VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0u;
-                  const uint64_t requestedBytes =
-                      bindingOffset <= allocationInfo.size
-                      ? uint64_t(allocationInfo.size - bindingOffset)
-                      : 0u;
-                  posReadableSpan =
-                      dxvk::war3::memory::BuildWar3CpuReadableBufferSpan({
-                          posMappedAllocation->mapPtr(),
-                          uint64_t(allocationInfo.size), uint64_t(bindingOffset),
-                          requestedBytes,
-                          reinterpret_cast<uintptr_t>(posCommon),
-                          posCommon->War3IdentityGeneration(),
-                          posCommon->War3MapAllocationGeneration(),
-                          posCommon->War3ContentGeneration(), hostVisible});
-                  if (posReadableSpan) {
-                    posCanonicalBytes = posReadableSpan.data;
-                    posCanonicalLength = posReadableSpan.length;
-                    posCanonicalHostCached = hostCached;
-                  }
-                }
-              }
+              posCommonNeedsReadback = posCommon->NeedsReadback();
             }
           }
         }
@@ -43685,6 +43640,68 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           m_war3Scene.shadowStats.drawTimeVBCacheRejectNoSlice++;
           break;
         }
+        // Most Stage11 casters only need the immutable GPU slice. Resolving a
+        // CPU mapping is useful solely for the narrow blocker-marker bounds
+        // check and the separately compiled Package observer, so defer all
+        // allocation/memory-property work until one of those consumers asks.
+        const auto resolvePositionReadableSpan = [&]() -> bool {
+          if (posReadableSpanResolveAttempted)
+            return static_cast<bool>(posReadableSpan);
+          posReadableSpanResolveAttempted = true;
+
+          if (gpuSkinSemanticBacking || gpuSkinSemanticDirectOnly)
+            return false;
+          if (DynamicSysmemVBOs) {
+            posReadableSpan =
+                dxvk::war3::memory::BuildWar3CpuReadableBufferSpan({
+                    m_war3PerDrawUpload.vbUploadBytes[posStream],
+                    m_war3PerDrawUpload.vbUploadLength[posStream], 0u,
+                    m_war3PerDrawUpload.vbUploadLength[posStream],
+                    m_war3PerDrawUpload.vbSourceResource[posStream],
+                    m_war3PerDrawUpload.vbSourceIdentityGeneration[posStream],
+                    m_war3PerDrawUpload.vbSourceSequence[posStream],
+                    m_war3PerDrawUpload.vbSourceContentGeneration[posStream],
+                    true});
+            if (posReadableSpan) {
+              posCanonicalBytes = posReadableSpan.data;
+              posCanonicalLength = posReadableSpan.length;
+              posCanonicalHostCached =
+                  (m_war3PerDrawUpload.storage->getMemoryProperties() &
+                   VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0u;
+            }
+            return static_cast<bool>(posReadableSpan);
+          }
+
+          if (posCommon == nullptr || posCommonNeedsReadback)
+            return false;
+          posMappedAllocation = posCommon->GetMappedSlice();
+          if (posMappedAllocation == nullptr)
+            return false;
+          const auto allocationInfo = posMappedAllocation->getBufferInfo();
+          const VkMemoryPropertyFlags memoryProperties =
+              posMappedAllocation->getMemoryProperties();
+          const bool hostVisible =
+              (memoryProperties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0u;
+          const uint64_t requestedBytes =
+              posBindingOffset <= allocationInfo.size
+              ? uint64_t(allocationInfo.size - posBindingOffset)
+              : 0u;
+          posReadableSpan =
+              dxvk::war3::memory::BuildWar3CpuReadableBufferSpan({
+                  posMappedAllocation->mapPtr(), uint64_t(allocationInfo.size),
+                  uint64_t(posBindingOffset), requestedBytes,
+                  reinterpret_cast<uintptr_t>(posCommon),
+                  posCommon->War3IdentityGeneration(),
+                  posCommon->War3MapAllocationGeneration(),
+                  posCommon->War3ContentGeneration(), hostVisible});
+          if (posReadableSpan) {
+            posCanonicalBytes = posReadableSpan.data;
+            posCanonicalLength = posReadableSpan.length;
+            posCanonicalHostCached =
+                (memoryProperties & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0u;
+          }
+          return static_cast<bool>(posReadableSpan);
+        };
         // Resolve the exact IB before choosing a vertex copy range.  Warcraft
         // III does not consistently keep MinVertexIndex/NumVertices in sync
         // with the indices emitted by animated model geosets, so those D3D9
@@ -43715,6 +43732,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                 PersistentPackageMode::Observe &&
             War3PersistentPackageStage11EvidenceModeRuntime() ==
                 PersistentPackageMode::Observe;
+        if (persistentPackageObserveEnabled)
+          resolvePositionReadableSpan();
         dxvk::war3::memory::War3CpuReadableBufferSpan
             packageObserveIndexReadableSpan = {};
         const uint8_t* packageObserveIndexBytes = nullptr;
@@ -44497,6 +44516,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           if (War3LegacyDrawIsPathBlockerGeometryMarkerCandidate(markerProbe,
                                                                  semantic)) {
             bool boundsReadable = false;
+            resolvePositionReadableSpan();
             if (War3ComputeMappedLocalBoundsFromBytes(
                     posCanonicalBytes, posCanonicalLength, posStride,
                     capturePositionOffset,
