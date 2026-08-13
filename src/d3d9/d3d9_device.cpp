@@ -44626,60 +44626,61 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
 
         drawTimeCaptureTiming.enter(
             War3ShadowDrawTimeCapturePhase::FingerprintAndDedup);
-        // Phase 7.70：同帧去重指纹（仅源数据相关字段）。
-        //
-        // 这里我们已经知道 position 源的 buffer/offset/range。一帧里同一个
-        // renderablePart 常被反复 draw（多 layer / sub-mesh），如果源数据没变，
-        // 之前那次 capture 就把同样的 bytes 拷进了我们自有 buffer。第二次进来
-        // 重新 EmitCs(copyBuffer) 是纯浪费。指纹越严越保守：
-        //   - position 源 buffer 指针、offset、本次 range start/count、stride
-        //   - indexed 标志 + StartVal + CountVal（间接表达 IB 源 range）
-        // 我们在拿到 IB 源 buffer 指针之后，再把 IB 指针折进去做最终指纹比较。
-        const auto fold = [](uint64_t h, uint64_t v) -> uint64_t {
-          // 标准 64-bit splittable mix
-          h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
-          h *= 0x100000001b3ull;
-          return h;
-        };
-        uint64_t captureFingerprint = 0xcbf29ce484222325ull;
-        captureFingerprint = fold(captureFingerprint,
-            reinterpret_cast<uintptr_t>(posSlice.buffer().ptr()));
-        captureFingerprint = fold(captureFingerprint,
-            uint64_t(posSlice.offset()));
-        captureFingerprint = fold(captureFingerprint,
-            uint64_t(posSlice.length()));
-        captureFingerprint = fold(captureFingerprint,
-            uint64_t(uint32_t(vRangeStart)) | (uint64_t(vRangeCount) << 32));
-        captureFingerprint = fold(captureFingerprint,
-            uint64_t(posStride) | (uint64_t(capturePositionOffset) << 32));
-        captureFingerprint = fold(captureFingerprint,
-            indexed ? (uint64_t(StartVal) | (uint64_t(CountVal) << 32))
-                    : (uint64_t(StartVal) | (uint64_t(CountVal) << 32)
-                       | (1ull << 63)));
-        if (indexed) {
-          captureFingerprint = fold(
-              captureFingerprint,
-              reinterpret_cast<uintptr_t>(drawTimeIndexSlice.buffer().ptr()));
-          captureFingerprint = fold(
-              captureFingerprint, uint64_t(drawTimeIndexSlice.offset()) ^
-                  (uint64_t(drawTimeIndexRangeOffset) << 1u));
-          captureFingerprint = fold(
-              captureFingerprint,
-              uint64_t(actualIndexMin) | (uint64_t(actualIndexMax) << 32u));
-          captureFingerprint = fold(
-              captureFingerprint, actualIndexContentHash);
-          captureFingerprint = fold(
-              captureFingerprint,
-              uint64_t(actualIndexDomainKnown ? 1u : 0u) |
-                  (uint64_t(fullVertexDomainFallback ? 1u : 0u) << 1u));
+        // The historical source fingerprint is not a complete position / IB /
+        // UV / topology generation proof. Release therefore compiles both its
+        // arithmetic and its backing-reuse branch out instead of calculating a
+        // value that can only be written to an otherwise unread field. Keep the
+        // source rollback behind the same compile-time correctness freeze; an
+        // observer build must never make this mutating route reachable.
+        uint64_t captureFingerprint = 0u;
+        if constexpr (!dxvk::war3::internal::
+                          kReleaseFreezeExperimentalShadowRoutes) {
+          const auto fold = [](uint64_t h, uint64_t v) -> uint64_t {
+            h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+            h *= 0x100000001b3ull;
+            return h;
+          };
+          captureFingerprint = 0xcbf29ce484222325ull;
+          captureFingerprint = fold(captureFingerprint,
+              reinterpret_cast<uintptr_t>(posSlice.buffer().ptr()));
+          captureFingerprint = fold(captureFingerprint,
+              uint64_t(posSlice.offset()));
+          captureFingerprint = fold(captureFingerprint,
+              uint64_t(posSlice.length()));
+          captureFingerprint = fold(captureFingerprint,
+              uint64_t(uint32_t(vRangeStart)) |
+                  (uint64_t(vRangeCount) << 32));
+          captureFingerprint = fold(captureFingerprint,
+              uint64_t(posStride) |
+                  (uint64_t(capturePositionOffset) << 32));
+          captureFingerprint = fold(captureFingerprint,
+              indexed ? (uint64_t(StartVal) | (uint64_t(CountVal) << 32))
+                      : (uint64_t(StartVal) | (uint64_t(CountVal) << 32)
+                         | (1ull << 63)));
+          if (indexed) {
+            captureFingerprint = fold(
+                captureFingerprint,
+                reinterpret_cast<uintptr_t>(
+                    drawTimeIndexSlice.buffer().ptr()));
+            captureFingerprint = fold(
+                captureFingerprint, uint64_t(drawTimeIndexSlice.offset()) ^
+                    (uint64_t(drawTimeIndexRangeOffset) << 1u));
+            captureFingerprint = fold(
+                captureFingerprint,
+                uint64_t(actualIndexMin) |
+                    (uint64_t(actualIndexMax) << 32u));
+            captureFingerprint = fold(
+                captureFingerprint, actualIndexContentHash);
+            captureFingerprint = fold(
+                captureFingerprint,
+                uint64_t(actualIndexDomainKnown ? 1u : 0u) |
+                    (uint64_t(fullVertexDomainFallback ? 1u : 0u) << 1u));
+          }
         }
-        // Phase 7.70：fast path — 同帧、同源数据指纹命中时只刷新易变状态。
-        //
-        // 易变状态指 capture 时 D3D state 中可能在同一 renderablePart 不同
-        // sub-draw 里发生变化的字段：alphaTestEnabled、alphaBlendEnabled、
-        // alphaRef、diffuseTexture（stage0 SRV）、capturedWorldMatrix。这些
-        // 全部不涉及 GPU copy，开销可忽略。下游消费时谁后写谁生效，符合
-        // 既有“最后一次 draw 决定 caster 状态”的语义。
+
+        // FingerprintAndDedup still owns the single cache lookup used by
+        // CacheRecordSetup. Release preserves its historical same-frame repeat
+        // counter even though the unsafe reuse itself is compiled out.
         auto drawTimeCacheIt = m_war3DrawTimeVBCache.end();
         if (!gpuSkinSemanticBacking) {
           drawTimeCacheIt = m_war3DrawTimeVBCache.find(vbCacheKey);
@@ -44687,102 +44688,102 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
             auto& cached = drawTimeCacheIt->second;
             const bool sameFrame =
                 cached.frameSerial == m_war3ShadowPersistentFrameSerial;
-            const bool fingerprintMatch =
-                cached.lastCaptureFingerprint == captureFingerprint;
-            const bool buffersIntact =
-                !cached.gpuSkinLeaseBacked &&
-                cached.HasCompleteBacking() &&
-                cached.vertexCount == vRangeCount &&
-                cached.positionStride == posStride;
-            // Phase C：静态几何允许跨帧 fingerprint 命中跳过 GPU copy。
-            // 动态单位仍只允许同帧 dedup（姿态可能每帧变，但 ring 源指纹相同
-            // 时不能误复用旧 bytes）。
-            const bool staticCrossFrameReuse =
-                !sameFrame && fingerprintMatch && buffersIntact &&
-                cached.isStaticGeometry &&
-                dxvk::war3::internal::
-                    kShadowDrawTimeVBCacheStaticPersistEnabled;
-            if (War3DrawTimeSourceFingerprintReuseRuntime() &&
-                ((sameFrame && fingerprintMatch && buffersIntact) ||
-                 staticCrossFrameReuse)) {
-              // 刷新一份新的 D3D 状态快照，避免拿陈旧 alpha/纹理。
-              const bool atState =
-                  m_state.renderStates[D3DRS_ALPHATESTENABLE] != FALSE;
-              const bool atFunc =
-                  m_state.renderStates[D3DRS_ALPHAFUNC] != D3DCMP_ALWAYS;
-              cached.alphaTestEnabled = atState && atFunc;
-              cached.alphaBlendEnabled =
-                  m_state.renderStates[D3DRS_ALPHABLENDENABLE] != FALSE;
-              const DWORD alphaRefDword =
-                  cached.alphaTestEnabled
-                      ? m_state.renderStates[D3DRS_ALPHAREF]
-                      : DWORD(128);
-              cached.alphaRef = float(alphaRefDword & 0xFFu) / 255.0f;
-              cached.diffuseTexture = nullptr;
-              if (m_state.textures[0] != nullptr) {
-                auto* commonTex = GetCommonTexture(m_state.textures[0]);
-                if (commonTex)
-                  cached.diffuseTexture = commonTex->GetSampleView(false);
+            if constexpr (!dxvk::war3::internal::
+                              kReleaseFreezeExperimentalShadowRoutes) {
+              const bool fingerprintMatch =
+                  cached.lastCaptureFingerprint == captureFingerprint;
+              const bool buffersIntact =
+                  !cached.gpuSkinLeaseBacked &&
+                  cached.HasCompleteBacking() &&
+                  cached.vertexCount == vRangeCount &&
+                  cached.positionStride == posStride;
+              const bool staticCrossFrameReuse =
+                  !sameFrame && fingerprintMatch && buffersIntact &&
+                  cached.isStaticGeometry &&
+                  dxvk::war3::internal::
+                      kShadowDrawTimeVBCacheStaticPersistEnabled;
+              if (War3DrawTimeSourceFingerprintReuseRuntime() &&
+                  ((sameFrame && fingerprintMatch && buffersIntact) ||
+                   staticCrossFrameReuse)) {
+                // Refresh only inexpensive draw state. This rollback remains
+                // unreachable while the Release correctness freeze is active.
+                const bool atState =
+                    m_state.renderStates[D3DRS_ALPHATESTENABLE] != FALSE;
+                const bool atFunc =
+                    m_state.renderStates[D3DRS_ALPHAFUNC] != D3DCMP_ALWAYS;
+                cached.alphaTestEnabled = atState && atFunc;
+                cached.alphaBlendEnabled =
+                    m_state.renderStates[D3DRS_ALPHABLENDENABLE] != FALSE;
+                const DWORD alphaRefDword =
+                    cached.alphaTestEnabled
+                        ? m_state.renderStates[D3DRS_ALPHAREF]
+                        : DWORD(128);
+                cached.alphaRef = float(alphaRefDword & 0xFFu) / 255.0f;
+                cached.diffuseTexture = nullptr;
+                if (m_state.textures[0] != nullptr) {
+                  auto* commonTex = GetCommonTexture(m_state.textures[0]);
+                  if (commonTex)
+                    cached.diffuseTexture = commonTex->GetSampleView(false);
+                }
+                cached.capturedWorldMatrix =
+                    m_state.transforms[GetTransformIndex(D3DTS_WORLD)];
+                cached.sceneNode = vbCacheContract.sceneNode != nullptr
+                                       ? vbCacheContract.sceneNode
+                                       : semantic.sceneNode;
+                cached.unitPtr = vbCacheContract.unitPtr != nullptr
+                                     ? vbCacheContract.unitPtr
+                                     : semanticUnitPtr;
+                cached.worldObjectEntry =
+                    vbCacheContract.worldObjectEntry != nullptr
+                        ? vbCacheContract.worldObjectEntry
+                        : semantic.worldObjectEntry;
+                cached.producerStage = vbCacheContract.producerStage >= 0
+                                           ? vbCacheContract.producerStage
+                                           : static_cast<int16_t>(stage);
+                if (pathBlockerRawcode != 0u)
+                  cached.rawcode = pathBlockerRawcode;
+                cached.jHandle = vbCacheContract.jHandle != 0u
+                                     ? vbCacheContract.jHandle
+                                     : semanticJHandle;
+                if (vbCacheContract.objectKind !=
+                    dxvk::war3::render::ObjectKind::Unknown) {
+                  cached.objectKind = vbCacheContract.objectKind;
+                } else if (semantic.objectKind !=
+                           dxvk::war3::render::ObjectKind::Unknown) {
+                  cached.objectKind = semantic.objectKind;
+                }
+                cached.pathBlockerGeometryMarker =
+                    cached.pathBlockerGeometryMarker ||
+                    drawTimePathBlockerGeometryMarker;
+                cached.pathBlocker =
+                    cached.pathBlocker || vbCacheContract.pathBlocker ||
+                    semantic.pathBlocker ||
+                    cached.pathBlockerGeometryMarker ||
+                    IsLosBlockerFourCc(cached.rawcode);
+                cached.unitIdentityProven =
+                    exactUnitIdentityProven && !cached.pathBlocker;
+                cached.actualIndexMin = actualIndexMin;
+                cached.actualIndexMax = actualIndexMax;
+                cached.actualIndexDomainKnown = actualIndexDomainKnown;
+                cached.fullVertexDomainFallback = fullVertexDomainFallback;
+                cached.indexHintMismatch = indexHintMismatch;
+                // This incomplete rollback proof never refreshes Package
+                // would-use evidence.
+                cached.persistentPackageCurrentDrawProof = {};
+                cached.frameSerial = m_war3ShadowPersistentFrameSerial;
+                War3ActivateDrawTimeCacheEntry(vbCacheKey, cached);
+                cached.lastAccessFrameSerial =
+                    m_war3ShadowPersistentFrameSerial;
+                if (sameFrame) {
+                  m_war3Scene.shadowStats.drawTimeVBCacheSameFrameDedupHit++;
+                  m_war3Scene.shadowStats
+                      .drawTimeVBCacheSameFrameStateRefresh++;
+                } else {
+                  m_war3Scene.shadowStats
+                      .drawTimeVBCacheSameFrameStateRefresh++;
+                }
+                break;
               }
-              cached.capturedWorldMatrix =
-                  m_state.transforms[GetTransformIndex(D3DTS_WORLD)];
-              cached.sceneNode = vbCacheContract.sceneNode != nullptr
-                                     ? vbCacheContract.sceneNode
-                                     : semantic.sceneNode;
-              cached.unitPtr = vbCacheContract.unitPtr != nullptr
-                                   ? vbCacheContract.unitPtr
-                                   : semanticUnitPtr;
-              cached.worldObjectEntry =
-                  vbCacheContract.worldObjectEntry != nullptr
-                      ? vbCacheContract.worldObjectEntry
-                      : semantic.worldObjectEntry;
-              cached.producerStage = vbCacheContract.producerStage >= 0
-                                         ? vbCacheContract.producerStage
-                                         : static_cast<int16_t>(stage);
-              if (pathBlockerRawcode != 0u)
-                cached.rawcode = pathBlockerRawcode;
-              cached.jHandle = vbCacheContract.jHandle != 0u
-                                   ? vbCacheContract.jHandle
-                                   : semanticJHandle;
-              if (vbCacheContract.objectKind !=
-                  dxvk::war3::render::ObjectKind::Unknown) {
-                cached.objectKind = vbCacheContract.objectKind;
-              } else if (semantic.objectKind !=
-                         dxvk::war3::render::ObjectKind::Unknown) {
-                cached.objectKind = semantic.objectKind;
-              }
-              cached.pathBlockerGeometryMarker =
-                  cached.pathBlockerGeometryMarker ||
-                  drawTimePathBlockerGeometryMarker;
-              cached.pathBlocker =
-                  cached.pathBlocker || vbCacheContract.pathBlocker ||
-                  semantic.pathBlocker ||
-                  cached.pathBlockerGeometryMarker ||
-                  IsLosBlockerFourCc(cached.rawcode);
-              cached.unitIdentityProven =
-                  exactUnitIdentityProven && !cached.pathBlocker;
-              cached.actualIndexMin = actualIndexMin;
-              cached.actualIndexMax = actualIndexMax;
-              cached.actualIndexDomainKnown = actualIndexDomainKnown;
-              cached.fullVertexDomainFallback = fullVertexDomainFallback;
-              cached.indexHintMismatch = indexHintMismatch;
-              // The historical fingerprint rollback is not a complete source
-              // generation proof. Even when explicitly enabled it must never
-              // refresh Package would-use evidence.
-              cached.persistentPackageCurrentDrawProof = {};
-              // 跨帧复用时必须把 frameSerial 刷到本帧，否则 consume/producer
-              // 会因 entryFresh 失败而漏提交。
-              cached.frameSerial = m_war3ShadowPersistentFrameSerial;
-              War3ActivateDrawTimeCacheEntry(vbCacheKey, cached);
-              cached.lastAccessFrameSerial = m_war3ShadowPersistentFrameSerial;
-              if (sameFrame) {
-                m_war3Scene.shadowStats.drawTimeVBCacheSameFrameDedupHit++;
-                m_war3Scene.shadowStats.drawTimeVBCacheSameFrameStateRefresh++;
-              } else {
-                // 复用 cross-frame 统计槽：StateRefresh 语义兼容“只刷状态不 copy”。
-                m_war3Scene.shadowStats.drawTimeVBCacheSameFrameStateRefresh++;
-              }
-              break;
             }
             if (sameFrame) {
               // 同帧但数据指纹不一致：必须重做 GPU copy。记账以便观察是否
@@ -45620,9 +45621,10 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           m_war3Scene.shadowStats.drawTimeVBCacheAlphaBlendStateCaptureCount++;
         if (entry.diffuseTexture != nullptr)
           m_war3Scene.shadowStats.drawTimeVBCacheDiffuseTextureCaptureCount++;
-        // Phase 7.70：记下本次 capture 的源数据指纹。
-        // 同帧后续相同来源的 capture 会命中上方 fast path 并跳过 GPU copy。
-        entry.lastCaptureFingerprint = captureFingerprint;
+        if constexpr (!dxvk::war3::internal::
+                          kReleaseFreezeExperimentalShadowRoutes) {
+          entry.lastCaptureFingerprint = captureFingerprint;
+        }
 
         // 2026-05-30/05-31 问题2 根因修复：标记静态几何 + 记录占用字节用于 LRU。
         //

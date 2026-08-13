@@ -45,13 +45,25 @@ class BridgeRampShadowSafetyTests(unittest.TestCase):
         name = "DXVK_WAR3_DRAWTIME_SOURCE_FINGERPRINT_REUSE"
         self.assertIn(f'"{name}", 0u', self.device)
         self.assertIn(f'"{name}"', self.monitor)
-        reuse = self.device.index(
-            "War3DrawTimeSourceFingerprintReuseRuntime() &&"
+        begin = self.device.index(
+            "War3ShadowDrawTimeCapturePhase::FingerprintAndDedup"
         )
-        break_call = self.device.index("break;", reuse)
-        block = self.device[reuse:break_call]
+        end = self.device.index(
+            "War3ShadowDrawTimeCapturePhase::CacheRecordSetup", begin
+        )
+        block = self.device[begin:end]
+        compile_gate = "if constexpr (!dxvk::war3::internal::"
+        self.assertGreaterEqual(block.count(compile_gate), 2)
+        self.assertIn("War3DrawTimeSourceFingerprintReuseRuntime() &&", block)
         self.assertIn("sameFrame && fingerprintMatch", block)
         self.assertIn("staticCrossFrameReuse", block)
+        self.assertLess(block.index(compile_gate), block.index("const auto fold"))
+        self.assertLess(
+            block.index(compile_gate, block.index("auto drawTimeCacheIt")),
+            block.index("War3DrawTimeSourceFingerprintReuseRuntime() &&"),
+        )
+        self.assertIn("if (sameFrame) {", block)
+        self.assertIn("drawTimeVBCacheSameFrameDedupMiss++", block)
 
     def test_drawtime_snapshot_cache_uses_current_draw_slice_identity(self) -> None:
         self.assertIn("struct War3DrawTimeVBCacheKey", self.header)

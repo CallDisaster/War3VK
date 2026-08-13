@@ -18,7 +18,10 @@ class GenerationBackedCacheContractTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         begin = DEVICE.index("using GenerationBackedStreamProof")
-        end = DEVICE.index("entry.lastCaptureFingerprint = captureFingerprint", begin)
+        end = DEVICE.index(
+            "if (currentDrawPackageMode == PersistentPackageMode::Consume)",
+            begin,
+        )
         cls.capture = DEVICE[begin:end]
 
     def test_value_proof_uses_generations_range_and_epochs(self) -> None:
@@ -89,6 +92,18 @@ class GenerationBackedCacheContractTest(unittest.TestCase):
         self.assertIn("War3DrawTimeSourceFingerprintReuseRuntime", DEVICE)
         self.assertNotIn("lastCaptureFingerprint", PROOF)
         self.assertIn("positionSourceProof", DEVICE_H)
+        fingerprint = DEVICE[
+            DEVICE.index(
+                "War3ShadowDrawTimeCapturePhase::FingerprintAndDedup"
+            ) : DEVICE.index(
+                "War3ShadowDrawTimeCapturePhase::CacheRecordSetup"
+            )
+        ]
+        compile_gate = "if constexpr (!dxvk::war3::internal::"
+        self.assertLess(
+            fingerprint.index(compile_gate), fingerprint.index("const auto fold")
+        )
+        self.assertIn("drawTimeVBCacheSameFrameDedupMiss++", fingerprint)
 
     def test_diagnostics_reach_runtime_and_performance_reports(self) -> None:
         for name in (
