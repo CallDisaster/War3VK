@@ -36,7 +36,7 @@ assert (
 ) in body
 assert "shadowEligibleManifestRecords.clear();" in body
 assert "objectGroups.clear();" in body
-assert "static thread_local std::unordered_set<uint64_t> s_currentPartKeys;" in body
+assert "static thread_local std::vector<uint64_t> s_currentPartKeys;" in body
 assert "auto& currentPartKeys = s_currentPartKeys;" in body
 assert "currentPartKeys.clear();" in body
 assert "static thread_local std::vector<uint64_t> s_leaseKeys;" in body
@@ -51,11 +51,11 @@ assert "originalIndices.resize(eligibleRecordCount);" in body
 assert body.index("RecycleScratchElements(") < body.index(
     "eligibleRecords.reserve("
 )
-assert "ResetShadowDrawPacketPreserveScratch(eligible.packet);" in body
-assert (
-    "ResetCurrentDrawAuthoritativeSamplePreserveScratch(\n"
-    "        eligible.sample);"
-) in body
+acquire = body.split("const auto acquireEligibleRecord", 1)[1].split(
+    "const auto recycleRejectedEligibleRecord", 1
+)[0]
+assert "ResetShadowDrawPacketPreserveScratch" not in acquire
+assert "ResetCurrentDrawAuthoritativeSamplePreserveScratch" not in acquire
 assert body.index("shadowEligibleManifestRecords.clear();") < body.index(
     "shadowEligibleManifestRecords.reserve("
 )

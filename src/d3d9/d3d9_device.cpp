@@ -27652,9 +27652,11 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
   const auto acquireEligibleRecord = [&]() {
     EligibleRecord eligible = dxvk::war3::render::AcquireScratchElement(
         recycledEligibleRecords);
-    dxvk::war3::render::ResetShadowDrawPacketPreserveScratch(eligible.packet);
-    dxvk::war3::render::ResetCurrentDrawAuthoritativeSamplePreserveScratch(
-        eligible.sample);
+    // The canonical packet builder owns the authoritative reset immediately
+    // before it validates this record. Resetting the same packet/sample here
+    // would move their scratch vectors and clear both large objects twice for
+    // every caster. The optional prebuild path replaces both objects with
+    // complete current-frame values before it can report success.
     eligible.sceneNode = nullptr;
     eligible.completenessKey = 0u;
     eligible.recordSelectionKey = 0u;

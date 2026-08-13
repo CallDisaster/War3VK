@@ -31,7 +31,7 @@ assert gate < policy < reset
 
 loop = grouped.index("for (size_t buildIndex = 0u;")
 call = grouped.index("War3TryBuildShadowPacketFromCurrentDrawRecord(", loop)
-finish = grouped.index("packetBuildTiming.finish()", call)
+finish = grouped.index("if (packetBuildTiming.has_value())", call)
 call_body = grouped[call:finish]
 assert "recordsForBuildCanonicalPrefiltered && !useSealedWork" in call_body
 
