@@ -52,4 +52,4 @@ Stage11 静态 Caster 闪烁和 Vulkan device-lost 后的终态处理，并正�
   producer incomplete 或 partial publication。
 - 上述隔离桌面数据只证明稳定性和相对 A/B；最终前台体验以玩家相同地图/相机测试为准。
 
-本文件是发布正文草案。GitHub Release、标签和最终资产需在用户审核后创建。
+完整提交与资产哈希以 GitHub `v1.21.00` Release 页面为准。
