@@ -31,7 +31,7 @@ namespace {
 
 constexpr std::string_view kProtocolPrefix = "warvk:";
 constexpr std::string_view kCanonicalVersion = "v1";
-constexpr std::string_view kApiVersion = "WarVK JAPI 1.2003";
+constexpr std::string_view kApiVersion = "WarVK JAPI 1.21.00";
 constexpr size_t kMaximumMessageBytes = 512u;
 constexpr size_t kMaximumArgumentCount = 16u;
 

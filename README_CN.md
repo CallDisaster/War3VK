@@ -1,4 +1,4 @@
-# WarVK 1.2003
+# WarVK 1.21.00
 
 ![平台](https://img.shields.io/badge/platform-Windows-lightgrey.svg)
 ![Vulkan](https://img.shields.io/badge/Vulkan-1.3+-red)
@@ -6,58 +6,67 @@
 
 [English](README.md) · [更新日志](CHANGELOG.md) · [WarVK JAPI](WarVK/README.md)
 
-WarVK 是面向 Warcraft III 1.27a 的画面增强运行时。它以 DXVK 派生的 D3D9 到 Vulkan 后端为基础，为经典客户端加入现代太阳阴影与点阴影、体积光、后处理、运行时诊断，以及供地图作者使用的 JASS API。
+WarVK 是面向 Warcraft III 1.27a 的画面增强运行时。它以 DXVK 派生的 D3D9 到 Vulkan 后端为基础，为经典客户端加入现代太阳阴影与点阴影、体积光与局部雾、后处理、运行时诊断，以及供地图作者使用的 JASS API。
 
-1.2003 是 1.2 语义化渲染架构的第三个热修复。WarVK 会综合读取 Warcraft 运行时的对象身份、模型、姿态、材质与当帧绘制证据，再构建自己的阴影场景；旧 D3D9 捕获只保留为严格受控的当帧兼容路径，不再被视为唯一数据来源。
+1.21.00 是 1.x 系列的新功能小版本，集中解决阴影生产重复开销、Stage11 静态 Caster 闪烁、Vulkan device-lost 后的终态处理，并正式整合新一代 Froxel 体积光和有界局部雾。
 
 > [!IMPORTANT]
-> 安装前请把 NVIDIA、AMD 或 Intel 显卡驱动更新到最新官方版本。当前运行时实际请求 **Vulkan 1.3**（已完整覆盖 Vulkan 1.2）；只暴露 Vulkan 1.2 而不支持 1.3 的旧驱动不满足本构建要求。
+> 安装前请把 NVIDIA、AMD 或 Intel 显卡驱动更新到最新官方版本。当前运行时请求 **Vulkan 1.3**（完整覆盖 Vulkan 1.2）；只暴露 Vulkan 1.2 而不支持 1.3 的旧驱动不满足本构建要求。
 
 > [!NOTE]
-> WarVK 优先保证画面质量与渲染正确性。4096 CSM、点阴影、体积效果与完整后处理都会产生真实的 CPU/GPU 开销。
+> WarVK 优先保证画面质量与资源生命周期正确性。4096 CSM、点阴影、Froxel 体积效果与完整后处理都会产生真实的 CPU/GPU 开销。
 
-## 1.2003 重点更新
+## 版本编号
 
-### 阴影与光照
+从 1.21.00 开始，版本号按 `1.小版本.修复版本` 使用：
 
-- 太阳光使用四级联阴影，默认稳定锁定 4096 分辨率；只有资源确实无法安全分配时才锁存回退到 2048。
-- 收紧 PCF 半径，缓解旧版本阴影边缘过度模糊的问题。
-- 透明度测试树木、蒙皮单位、刚体、建筑与地形都采用更严格的当帧资源所有权与来源验证。
-- Warcraft Transparent Type0 路径中的建造附件会保留父建筑语义身份，同时捕获子模型真实 draw 与当前矩阵调色板，修复不死族、暗夜精灵建造动画阴影缺失或周期闪烁；该修复没有恢复危险的跨帧 VB/IB 缓存。
-- 路径阻断器、原生建筑静态阴影与旧式单位圆形阴影不再进入 WarVK 阴影场景。
-- 修复 Issue #4 中原生阴影层过滤误伤单位选择圈的问题；选择圈等 UI decal 会保留，旧式单位和建筑阴影仍被精确拒绝。用户实机复测确认选择圈恢复，且未再观察到同一报告中的树木闪烁。
-- 点阴影的全部 PCF tap 统一使用同一精确径向 receiver 深度域，仅在没有可信平面时使用有界斜率回退；用户前台复测确认此前地面和单位上的摩尔纹/连续条带已经修复。
-- 提供可选 TAA v2：包含方差裁剪、reactive feedback、历史状态诊断与单次失效机制。正式版默认仍为 DirectInline。
-- 体积太阳光、体积点光与独立控制的全局高度雾现已接通运行时和作者 API。
+- `1.x` 表示当前大版本架构系列；
+- `1.21` 表示第 21 个功能小版本；
+- 末尾 `00` 表示该小版本的首个稳定发布；后续纯修复依次为 `1.21.01`、`1.21.02`；
+- 下一次带来成组新功能或正式性能路线时进入 `1.22.00`。
 
-### 稳定性与性能
+此前的 `1.2003` 使用旧编号规则。对外 Shader API 数字版本仍为 `1.2.0`，JASS 线协议仍为 `warvk:v1`；本次产品版本升级不要求地图作者迁移已有调用。
 
-- Shadow Arena 改为事务式 bundle：position、blend、UV、IB 要么整份提交，要么整份拒绝，不再产生半份 caster。
-- Arena 代际必须等专用 GPU completion fence 完成后才能回收，禁止按帧号直接覆写仍在途的数据。
-- 统一 map/device epoch 隔离 Manifest、缓存几何、GPU 蒙皮、点阴影任务、TAA 历史与 receiver 发布，避免旧地图资源污染新地图。
-- 最终 CSM/点阴影 replay 在发出 Vulkan draw 前验证 VB/IB 范围、索引域、格式、代际、矩阵与蒙皮输入。
-- 不完整 CSM 不会再“一个 caster 一个 caster”地逐步发布；只有完整的同地图 candidate 才原子生效，否则安全显示为无太阳阴影。
-- 发布构建在编译期关闭旧式 `warvk:cmd` 开发入口；JASS VM 重建不再从 Hook 线程释放渲染资源。
-- 渲染设置通过带锁 mailbox 和不可变帧快照交付；active device/pipeline 不再向外暴露无生命周期保护的裸指针。
-- `Reset`/`ResetEx` 的 device epoch、Arena quarantine、GPU-skin 重绑和 receiver 失效统一由 Present 所有者按顺序提交；失败时保持 fail-closed。
-- 对 write-combined 索引缓冲采用有界批量读取，修复 exact-index 检查引入的明显 CPU 性能回归，同时不恢复危险的跨帧 VB/IB 缓存。
-- Compact WorkTable、联合消费者剔除、Persistent GPU Package、持久点阴影规划器和 CPU 多线程蒙皮合同已经进入受控基础设施阶段；未通过完整门槛的 Consume 路线仍默认关闭。
+## 1.21.00 重点更新
 
-### 地图作者 API
+### 阴影正确性与画质
 
-- WarVK JAPI 已内置在代理 `d3d9.dll` 中，必须在启动 Warcraft III 前完成安装。作者包不再包含地图内 DLL Loader，也不需要额外编译 `war3map.dll`。
-- 对外线协议继续保持 `warvk:v1`。高频纯数值调用可走经过 Game.dll 签名验证的强类型 Hashtable 通道，文本命令继续使用兼容字符串通道。
-- 作者可以创建和移动点光、开启点阴影、控制体积光和全局高度雾，并将 WarVK 光照时钟与 Warcraft 玩法时间解耦。
-- 闪电模板支持贴图、颜色、宽度、动画、分支、公式曲线与上传的点曲线。
-- 有界 MathProgram/Curve 运行时支持 scalar、`vec2`、`vec3` 表达式，可向 JASS 返回实数/整数结果、查询导数与弧长，并驱动连续闪电 Ribbon。
-- YDWE 菜单已按基础、诊断、太阳/CSM、光照时钟、点光、体积光、体积雾、闪电、模板、数学和曲线分类；模式参数提供可点击选择的 Trigger Type，不再要求作者记忆整数。
+- Directional CSM 改为逐 texel 比较后过滤的 compare-first PCF，使用固定对称核、receiver-plane 每 tap 深度修正和跨级联一致的 alpha cutoff，减少树叶、草地与细线阴影的规则爬动和级联轮廓跳变。
+- Stage11 exact producer 保护当前活跃静态工作集，并以显式的 producer completeness 合同原子发布整份阴影；高压场景不再因缓存自我淘汰而周期性出现整批 Caster 阴影撕裂。
+- Warcraft Transparent Type0 建造附件使用子模型当前 draw、精确 VB/IB/UV 与完整矩阵调色板。用户前台复测确认不死族和暗夜精灵建造动画阴影连续。
+- 点阴影统一径向 receiver 深度域并修正 bias；用户前台复测确认此前地面和单位上的摩尔纹/连续条带不再复现。
+- replay 在录制 Vulkan 命令前重新解析逻辑 buffer binding；资源 defrag/relocation 后不会继续绑定 capture-time 的旧物理 `VkBuffer`。
+- CSM 深度、矩阵、资源 generation 和 receiver 参数作为完整 publication 一起生效；验证不完整时不会发布半份阴影。
+
+### 体积光与局部雾
+
+- 新增有界局部体积雾：最多 8 个 Sphere、Box 或 Cylinder 区域，可与全局介质独立组合。
+- 新增 Froxel Medium/High；High 为默认体积后端，使用全视图对数 Z 分层、场景深度终止和受预算约束的光学积分。
+- 方向体积阴影使用独立 base/refined Guide，在全分辨率 scene depth 上重建小 Caster 阴影柱；真实几何断层与体积阴影边缘由不同证据保护。
+- 所有 Froxel 图片与 layout 发布保持事务式；预算、格式或资源证明不足时整套安全回退到 Legacy，不提交无界 GPU 工作。1080p 默认请求可进入，1440p/4K 的最坏请求允许按 admission 回退。
+- 地图作者可控制体积光、全局高度雾和局部雾区域；公共 JAPI 仍使用有界句柄、有限数值和固定参数合同。
+
+### 稳定性与诊断
+
+- Vulkan logical device 一旦进入 `VK_ERROR_DEVICE_LOST`，D3D9 Reset/ResetEx、提交、Present、frame worker 和 pipeline compiler 不再尝试在旧设备上继续创建或提交 GPU 工作，而是完成 CPU 侧有界退役并返回 removed 语义。
+- 真实 Vulkan 返回值与 synthetic fail-stop 分开记录；支持时会一次性采集有界 `VK_EXT_device_fault` 文本信息，不在 submission 线程等待，也不采集 vendor binary。
+- Shadow Arena 保持 64 MiB 页、384 MiB/代际和 1.125 GiB 总上限；事务预留、GPU fence、map/device epoch 与最终 replay 验证继续 fail-closed。
+- 32 位性能历史最多保留 4000 帧，避免长时间采集侵占 Warcraft III 地址空间；累计 workload 与错误计数仍覆盖完整运行时间。
+- 发布构建在编译期关闭 legacy `warvk:cmd` 与未验收的 Consume/开发 observer 路线，环境变量不能绕过发布冻结。
+
+### CPU 性能
+
+- exact-owner publication 会在 DirectGrouped 进入昂贵 packet 构建前排除已由 earlier producer 完成的对象，并消除 resolved replay 的重复整表复制。
+- 同场景 A-B-B-A 中，主线程 CPU 由 `6.135 ms` 降至 `5.778 ms`（`-0.357 ms / -5.82%`）；Populate `-76.27%`、DirectGrouped `-87.42%`、BuildEligible `-96.38%`。
+- 上述数字证明生产者 CPU 路线收益，不等同于所有地图的绝对 FPS 承诺；体积效果、GPU 工作量、地图内容和物理前台状态仍会影响最终帧率。
+- 提前联合剔除、Persistent Package、ReBAR、CPU-MT 蒙皮和 Canonical Queue Takeover 仍未达到发布门，1.21.00 不会用未验证路径换取表面帧率。
 
 完整内容见 [CHANGELOG.md](CHANGELOG.md)，地图作者接口见 [WarVK/README.md](WarVK/README.md)。
 
 ## 运行要求
 
 - Windows 10 或 Windows 11
-- 支持 Vulkan 1.3 或更高版本的显卡与官方驱动
+- 支持 Vulkan 1.3 或更高版本的显卡与最新官方驱动
 - Warcraft III 1.27a（32 位）
 
 WarVK 只针对经典 1.27a 可执行文件与已验证的 `Game.dll` 布局。未知签名会安全拒绝 Hook，不会扫描猜测地址。
@@ -65,38 +74,36 @@ WarVK 只针对经典 1.27a 可执行文件与已验证的 `Game.dll` 布局。�
 ## 安装方法
 
 1. 备份 Warcraft III 目录，尤其是已有的 `d3d9.dll`。
-2. 将发行包中的 `d3d9.dll` 复制到 `war3.exe` 同级目录。
-3. 启动游戏，确认 `d3d9.log` 中出现 `DXVK: 1.2003`。
+2. 将玩家发行包中的 `d3d9.dll` 复制到 `war3.exe` 同级目录。
+3. 启动游戏，确认 `d3d9.log` 中出现 `DXVK: 1.21.00`。
 4. 按 `Ctrl + F1` 打开或关闭 WarVK 设置面板。
 
-玩家目录只需要发行包明确列出的文件。源码、测试工具、研究资料与 YDWE 作者包不应复制到游戏目录。
+WarVK 不是地图运行时 Loader。玩家目录只需要发行包明确列出的文件；作者包中的 JASS/YDWE Catalog 用于制作地图，不应整包复制到游戏目录。
 
 ## 常用设置
 
-- 解锁帧率
-- 开启后处理
-- 开启阴影并选择阴影/TAA 模式
-- 调整阴影强度与过滤
-- 配置点光源与点阴影
-- 配置体积光与体积雾
-- 调整抗锯齿、Bloom、曝光与描边
+- 解锁帧率和后处理
+- 太阳 CSM、阴影过滤与 TAA 模式
+- 点光源与点阴影
+- Legacy / Froxel Medium / Froxel High 体积后端
+- 全局高度雾与局部体积雾
+- 抗锯齿、Bloom、曝光与描边
 
-## 已知问题（1.2003）
+## 已知边界（1.21.00）
 
-- 高单位密度区域压低镜头时，太阳阴影候选、蒙皮与四级联工作量可能超过安全预算。为防止超量
-  GPU 工作触发 TDR，不完整的 CSM 会被拒绝发布，因此可能表现为阴影闪烁或暂时不显示，但准备
-  成本仍然存在；当前不会通过降低 4096 CSM、扩大 Arena 或放宽资源验证来掩盖问题。项目将尽量
-  在下一个小版本中通过保守剔除和工作复用解决，进度见 [#5](https://github.com/CallDisaster/War3VK/issues/5)。
-- 同一 Warcraft III 进程中退出地图后继续进入另一张地图，已知可能造成持续性能下降、阴影异常或其他资源生命周期问题。1.2003 不支持可靠的跨地图连续游玩，建议每次退出地图后完整退出 Warcraft III，再重新启动并进入下一张地图。
-- 上述问题计划在后续版本继续修复；低视角阴影预算问题跟踪于 [#5](https://github.com/CallDisaster/War3VK/issues/5)，同进程跨地图跟踪于 [#6](https://github.com/CallDisaster/War3VK/issues/6)。“一次启动只游玩一张地图”仍是 1.2 系列推荐的使用方式。
+- 同一 Warcraft III 进程退出地图后再进入其他地图仍未完成正式发布验收，可能出现持续性能下降、阴影异常或资源生命周期问题。建议退出地图后完整退出 Warcraft III，再重新启动并进入下一张地图；该问题继续由 [#6](https://github.com/CallDisaster/War3VK/issues/6) 跟踪。
+- Issue #5 的提前联合剔除仍为默认关闭的开发观察路线。1.21.00 已消除本轮确认的 producer 重复工作与活跃缓存颠簸，但没有宣称 terrain/static/skinned 的前端剔除已经完成。
+- 1440p/4K 的最坏 Froxel 请求可能因有界 admission 自动回退 Legacy。这是防止无界 GPU 工作的稳定性策略，不表示显卡或驱动故障。
+- 极细树叶、草线和远距离 alpha silhouette 仍可能有少量亚像素变化；本版已移除已确认的周期旋转、错误深度过滤和跨级联 alpha 差异，但不以 TAA 历史拖影掩盖剩余运动。
+- 隔离桌面数据只用于稳定性和相对 A/B；玩家前台绝对 FPS 应以相同地图、相同相机和相同设置测试。
 
 ## 故障排查与反馈
 
 - 启动黑屏通常来自显卡驱动过旧，或游戏目录中存在冲突的第三方 `d3d9.dll`。
-- 性能不足时优先关闭体积效果，其次减少点阴影，再降低后处理。太阳 CSM 会保持 4096，除非运行时发生安全的锁存式分配回退。
+- 性能不足时优先降低或关闭体积效果，其次减少点阴影，再降低后处理。太阳 CSM 默认保持 4096，除非运行时发生安全的锁存式分配回退。
 - 不要在同一游戏目录同时放入多个 D3D9 代理 DLL。
 - 反馈时优先提供 `d3d9.log`、`runtime_status.json`、GPU incident JSON 和 WarVK 崩溃转储；公开前请移除个人路径或私有地图信息。
-- 若在未重启游戏的情况下切换过地图，请先完整退出 Warcraft III，再重新启动并只进入目标地图；反馈跨地图问题时请同时说明地图进入顺序与第一次异常时的证据。
+- 跨地图报告请说明地图进入顺序；普通单地图问题请从全新 Warcraft III 进程复现。
 
 ## 卸载
 
@@ -104,22 +111,20 @@ WarVK 只针对经典 1.27a 可执行文件与已验证的 `Game.dll` 布局。�
 
 ## 给开发者
 
-主要代码区域：
-
 - `src/d3d9/`：D3D9 运行时、设置、阴影/光照管线与接入层
 - `src/d3d9/war3/`：游戏 Hook、语义桥、资源生命周期、GPU 蒙皮、JAPI、数学与诊断
 - `subprojects/war3fx/`：WarVK Shader
 - `WarVK/`：JASS 库、YDWE Catalog、图标与作者文档
-- `AutoTest/`：静态合同、Win32 runnable、性能门与 attach-only 取证
+- `AutoTest/`：静态合同、Win32 runnable、性能门与取证
 
 32 位构建：
 
 ```powershell
-.\build32_safe.cmd src/d3d9/d3d9.dll -j8
-ninja -C build32 -n
+.\build32_safe.cmd src/d3d9/d3d9.dll -j2
+ninja -C build32 -n src/d3d9/d3d9.dll
 ```
 
-主产物为 `build32/src/d3d9/d3d9.dll`。发布包范围与排除项见 [docs/RELEASE_1.2.0.md](docs/RELEASE_1.2.0.md)。
+主产物为 `build32/src/d3d9/d3d9.dll`。发布包范围与排除项见 [docs/RELEASE_1.21.00.md](docs/RELEASE_1.21.00.md)。
 
 ## 许可证与致谢
 

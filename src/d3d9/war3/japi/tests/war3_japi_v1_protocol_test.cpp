@@ -35,7 +35,7 @@ void TestSystemAndForwarding() {
   const auto version =
       Dispatch(Carrier::LocalizedString, "warvk:v1;system.version");
   Check(version.ok(), "system.version must succeed without a backend");
-  Check(version.text == "WarVK JAPI 1.2003",
+  Check(version.text == "WarVK JAPI 1.21.00",
         "system.version must identify the integrated runtime");
 
   const auto protocol =

@@ -2,7 +2,7 @@
  * @file war3_shader_api.cpp
  * @brief War3MapReforge 外部 Shader API 实现
  * 
- * @version 1.2003
+ * @version 1.21.00 (product); public ABI remains 1.2.0
  * @date 2024-12-21
  */
 

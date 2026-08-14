@@ -1,5 +1,96 @@
 # 更新日志
 
+## v1.21.00 - 2026-08-14
+
+本版本开始采用 `1.小版本.修复版本` 编号：`1.x` 是当前大版本架构系列，`1.21` 是功能小版本，
+末尾 `00` 表示该小版本的首个稳定发布。后续纯修复依次进入 `1.21.01`、`1.21.02`；下一组成组
+功能或正式性能路线进入 `1.22.00`。此前的 `1.2003` 保留旧编号，不重写历史标签。
+
+产品、DLL 资源、日志和 JAPI 显示版本统一为 **1.21.00**。外部 Shader API 数字版本仍为 `1.2.0`，
+JASS 线协议仍为 `warvk:v1`，地图作者无需因产品版本号变化迁移已有脚本。
+
+### 阴影正确性与画质
+
+- 方向光 CSM 改为 compare-first PCF：先对每个 texel 执行深度比较，再过滤可见性；移除周期性
+  世界坐标 Poisson 旋转，使用固定、零质心的对称核，并为可信 receiver plane 的每个 tap 修正
+  比较深度。DirectInline 和 prepass 使用同一套有限性与整核回退合同。
+- 全部方向级联默认使用相同 alpha cutoff。旧版逐级联增加阈值会让树叶等 cutout Caster 在级联
+  blend/切换时改变轮廓；非零 far bias 现在只作为显式 opt-in。
+- Stage11 exact producer 为当前 scene、同 epoch last-complete publication 和 GPU 在途 consumer
+  引用建立受保护工作集；64 MiB 只作为非活跃静态缓存的 LRU 目标。可见树木/建筑不再因缓存
+  自我淘汰、随后受每帧 32 次分配门补回而周期性整批闪烁。
+- 新增 scene-stamped producer completeness：position/UV/index 分配预算、真实 allocation failure、
+  fallback byte budget、Arena admission/freeze failure 都会显式标记缺失 Caster。未封印、stamp 不匹配
+  或存在 required omission 的 scene 会在任何 clear/draw/异步 prepare 前被整份拒绝。
+- Defrag/relocation 后 replay 在命令录制线程重新解析当前 logical buffer binding；validator、排序、
+  hash 和最终 bind 使用同一份 resolved draw，不再持有 capture-time 的旧物理 `VkBuffer`。
+- Warcraft Transparent Type0 建造附件继续使用子模型当前 draw、精确 VB/IB/UV 与完整 palette。
+  用户前台复测确认不死族和暗夜精灵建造过程阴影连续。
+- 点阴影统一径向 receiver-depth/bias 域。用户前台复测确认地面与单位上的摩尔纹/连续条带不再复现。
+
+### 体积光与局部雾
+
+- 新增最多 8 个 Sphere/Box/Cylinder 局部体积雾区域，可与全局介质独立组合；参数、句柄、数量、
+  数值有限性和射线区间均保持有界。
+- 新增 Froxel Medium/High，High 为默认体积后端；使用全视图 `[20,10000]` 对数 Z、64/128 层、
+  独立 effect 网格 scene-depth 终止及有界的太阳阴影光学积分。
+- 方向体积阴影新增独立 base/refined Guide：Integrate 写入方向遮挡证据，Composite 在全分辨率
+  scene depth 上重建；小 Caster 阴影柱不再完全受 `1/4` effect 网格限制，几何断层与体积阴影
+  边缘使用不同证据。
+- Caster silhouette 使用 2x2 comparison-first gather；体积阴影 Guide 按真实 half-texel footprint
+  拆分区间，减少动态 Caster 整格跳变。
+- Froxel effect、base guide 和 refined guide 采用事务式创建与独立 layout ownership。资源、格式或
+  shader-work admission 失败时整套回退 Legacy。1080p 默认请求可进入；1440p/4K 最坏路径允许
+  fail-closed 回退，不提交无界工作。
+
+### Vulkan 终态与 TDR 诊断
+
+- 修复 D3D9 CS phantom sequence：device lost 时未派发 chunk 不再留下永远无法完成的等待序号。
+- Submission/finish/presenter/frame worker 在全局 terminal latch 后停止新的 Vulkan/WSI work，仍会
+  exactly-once 完成 command object、frame tracker、signal 和 CPU retirement，避免 waitForIdle 或
+  worker join 永久卡住。
+- D3D9 CreateShader、ResetEx 和 AdditionalSwapChainEx，以及 pipeline compiler 的 enqueue/dequeue
+  边界都会在 terminal loss 后 fail-stop，不尝试在不可恢复的旧 VkDevice 上重新创建资源。
+- 为 command buffer、pipeline、query、event、waitForIdle、fence/keyed-mutex 等规范允许返回
+  `VK_ERROR_DEVICE_LOST` 的真实调用补齐 provenance；synthetic CS loss 不会伪装成 driver fault。
+- 支持时一次性采集有界 `VK_EXT_device_fault` description/address/vendor text。查询不在 submission
+  drain 上运行，不启用 vendor binary；基础 incident 先落盘，完成后最多追加一份关联 enrichment。
+
+### CPU 性能与内存
+
+- exact-owner publication 在 DirectGrouped 构建 packet 前排除 earlier producer 已完成的记录；
+  同场景 99% 以上的重复 CurrentDraw 候选不再走 BuildEligible。
+- resolved replay 快照由 directional、volume-sun 和 point-shadow consumer 共享，删除每个 consumer
+  对约 160 个大 draw 结构的重复复制与引用计数。
+- 同场景 A-B-B-A：主线程 CPU `6.135 -> 5.778 ms`（`-0.357 ms / -5.82%`），Populate
+  `-76.27%`、DirectGrouped `-87.42%`、BuildEligible `-96.38%`。这是生产者 CPU 收益，不能
+  外推为所有地图的绝对 FPS 增幅。
+- 32 位性能历史统一钳制到 4000 帧，防止扩展后的逐帧诊断容器耗尽 Warcraft III 地址空间；累计
+  workload、预算和错误计数仍覆盖完整运行。
+- 提前联合剔除、Persistent Package、ReBAR、CPU-MT 蒙皮和 Canonical Queue Takeover 继续默认关闭。
+  1.21.00 不会把未通过完整正确性/性能门的 Consume 路线作为发布默认。
+
+### 验证
+
+- 当前合并候选通过 216/216 静态脚本、50/50 Win32 runnable、Fresh Win32 Release `-j2` 构建、
+  DLL exact-target no-work 和 `git diff --check`。
+- 体积光测试图隔离桌面 smoke：3901 帧/62 秒，shadow incomplete、budget exceeded、partial、Arena
+  overflow、device lost 和新 GPU Event 153/4101 全为 0。该数据只证明稳定性，不代表前台绝对 FPS。
+- “生与死”低视角 5x5 巡航 603 秒，峰值 1196 Caster/4784 级联 draw，Arena 峰值约 328.7 MiB，
+  未提高 384 MiB/代际上限；TDR、Arena overflow、partial publication 和新 GPU incident 全为 0。
+- 用户前台已确认建造动画、点阴影及当前组合画面基本正常；正式 GitHub Release 仍须在发布前审核
+  本更新日志、README、最终 1.21.00 DLL 哈希和两个发行包。
+
+### 已知边界
+
+- 同进程跨地图仍未完成正式发布验收，建议退出地图后完整退出并重启 Warcraft III；继续由
+  [#6](https://github.com/CallDisaster/War3VK/issues/6) 跟踪。
+- Issue #5 的提前联合剔除尚未成为 Release Consume。当前版本修复了确认的 producer 重复开销、
+  活跃缓存颠簸与 partial publication，但不宣称所有 terrain/static/skinned 前端剔除已经完成。
+- 极细树叶、草线和远距离 alpha silhouette 仍可能存在少量亚像素变化；本版不以无条件 TAA 历史
+  或额外模糊掩盖剩余运动。
+- 1440p/4K 最坏 Froxel 请求可能按 admission 回退 Legacy；这是设计内的安全边界。
+
 ## v1.2003 Hotfix 3 - 2026-08-09
 
 本版本开始采用 `1.2MHH` 编号：`1.2` 是大版本系列，`M` 是功能小版本，末两位

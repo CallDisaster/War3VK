@@ -44,7 +44,8 @@ WarVK 是一个面向 **Warcraft III 1.27a** 的 Windows 图形增强项目。�
 - 最近已提交的阴影基础已将地图/设备 epoch、Arena quarantine、fence retirement 与最终 replay
   验证接入生命周期。跨地图时旧资源不得发布给新地图；新地图在没有完整 CSM 前应安全退化为
   **无阴影**，不能采样未发布的深度图。
-- 当前工作树含 **WarVK JAPI 1.2.0 Release 候选**：补齐点光位置、体积光和全局高度雾
+- 当前工作树含 **WarVK 1.21.00 Release 审核候选**：产品与 JAPI 显示版本已更新，外部 Shader API
+  数字版本仍为 1.2.0、JASS 线协议仍为 `warvk:v1`。该线补齐点光位置、体积光和全局高度雾
   的作者接口，新增 scalar 数学求值，并重整 YDWE 分类。2026-08-12 的局部雾候选已进一步接通
   最多 8 个 Sphere/Box/Cylinder、解析射线区间、独立全局介质开关、受预算约束的局部 half-res ROI，
   并以视角无关 CSM 光学证据替代阴影柱俯仰特判；77/77 静态、21/21 Win32 runnable、DLL 构建及
@@ -61,8 +62,8 @@ WarVK 是一个面向 **Warcraft III 1.27a** 的 Windows 图形增强项目。�
   已让早退同时检查 guide，并恢复受双重光学证据约束的峰值遮挡；29/29 定向、78/78 静态、
   21/21 Win32 runnable、DLL 构建及 no-work 通过，尚待玩家前台视觉/性能 A/B，详见
   `docs/agent-history/2026-08-14-directional-volumetric-shadow-guide-candidate.md`。
-- 产品、DLL 资源、外部 Shader API 与 JAPI 显示版本已统一为 `1.2.0 Release`；GitHub 源码、
-  玩家包、地图作者包及明确排除项见 `docs/RELEASE_1.2.0.md`。
+- 产品、DLL 资源与 JAPI 显示版本已统一为 `1.21.00`；外部 Shader API ABI 仍为 `1.2.0`。
+  GitHub 源码、玩家包、地图作者包及明确排除项见 `docs/RELEASE_1.21.00.md`。
 - 当前候选验证为：474/474 静态测试、15/15 Win32 runnable、真实 YDWE Catalog 35/35 回读与
   WTG/WCT 校验、Win32 DLL 构建及 `ninja -C build32 -n` no-work。DLL 为 33,745,880 bytes，
   SHA-256 `84112587871BD421A3B927C65119258851A3E471734633220167AA81877FFF80`；未部署或启动游戏。
@@ -185,7 +186,7 @@ WarVK 是一个面向 **Warcraft III 1.27a** 的 Windows 图形增强项目。�
 - 当前 RTX 4060 Ti 的主 15.73 GiB device-local heap 不可 host-visible；唯一同时
   `DEVICE_LOCAL | HOST_VISIBLE` 的 heap 只有 214 MiB。因此 ReBAR direct-upload 实验不满足既定
   准入条件，保持未实现/默认关闭，不能占用小 BAR heap 冒充完整 ReBAR 收益。
-- 1.2003 的发布范围仍限定为“新启动进程只进入一张地图”。同进程退出地图后再进入其他地图仍可能
+- 1.21.00 的发布范围仍限定为“新启动进程只进入一张地图”。同进程退出地图后再进入其他地图仍可能
   造成性能下降、阴影异常或其他生命周期问题，已由用户决定延期到下一版本；README/CHANGELOG
   必须保留该已知问题。点阴影 receiver-bias 修复已由用户前台确认，不再把旧摩尔纹列为当前已知问题。
 - 当前 JAPI/体积效果仍需用户地图物理验收；可见桌面 AutoTest 的低视角稳定门不能代替玩家前台

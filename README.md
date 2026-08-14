@@ -1,125 +1,133 @@
-# WarVK 1.2003
+# WarVK 1.21.00
 
-[![Platform](https://img.shields.io/badge/platform-Windows-lightgrey.svg)]()
+![Platform](https://img.shields.io/badge/platform-Windows-lightgrey.svg)
 ![Vulkan](https://img.shields.io/badge/Vulkan-1.3+-red)
 ![Warcraft III](https://img.shields.io/badge/Warcraft%20III-1.27a-gold)
 
 [简体中文](README_CN.md) · [Changelog](CHANGELOG.md) · [WarVK JAPI](WarVK/README.md)
 
-WarVK is a graphics enhancement runtime for Warcraft III 1.27a. It uses a DXVK-derived D3D9-to-Vulkan backend and adds modern directional and point shadows, volumetric lighting, post-processing, diagnostics, and an author-facing JASS API.
+WarVK is a graphics enhancement runtime for Warcraft III 1.27a. It uses a DXVK-derived D3D9-to-Vulkan backend and adds modern directional and point shadows, volumetric lighting and local fog, post-processing, diagnostics, and an author-facing JASS API.
 
-Version 1.2003 is Hotfix 3 for the 1.2 semantic rendering architecture. WarVK combines Warcraft runtime identity, model, pose, material, and current-draw evidence to construct its own shadow scene. Legacy D3D9 capture remains a guarded, current-frame compatibility path rather than the only source of rendering truth.
+Version 1.21.00 is a new feature release in the 1.x series. It focuses on removing duplicate shadow-producer work, fixing Stage11 static-caster flicker, enforcing terminal behavior after Vulkan device loss, and integrating the new bounded Froxel volumetric renderer.
 
 > [!IMPORTANT]
-> Update to the latest official NVIDIA, AMD, or Intel graphics driver before installing. The current runtime requests **Vulkan 1.3**, which includes Vulkan 1.2; a driver that exposes only Vulkan 1.2 is not sufficient for this build.
+> Update to the latest official NVIDIA, AMD, or Intel graphics driver before installing. The runtime requests **Vulkan 1.3**, which includes Vulkan 1.2; a driver that exposes only Vulkan 1.2 is not sufficient for this build.
 
 > [!NOTE]
-> WarVK prioritizes rendering quality and correctness. 4096-resolution cascaded shadows, point shadows, volumetric effects, and post-processing all have a real performance cost.
+> WarVK prioritizes image quality and resource-lifetime correctness. 4096 CSM, point shadows, Froxel volumetrics, and full post-processing all have a real CPU/GPU cost.
 
-## Highlights in 1.2003
+## Version numbering
 
-### Shadows and lighting
+Starting with 1.21.00, releases use `1.minor.fix`:
 
-- Four-cascade directional shadows now default to a stable 4096 resolution, with a latched 2048 fallback only when allocation cannot be completed safely.
-- Sharper PCF tuning reduces overly soft CSM edges without changing point-shadow filtering.
-- Alpha-tested foliage, animated/skinned units, rigid geometry, buildings, and terrain use stricter current-frame source ownership.
-- Construction attachments rendered through Warcraft's Transparent Type0 path now retain their parent object identity while capturing the exact child draw and current matrix palette. This fixes missing or periodically flickering Undead and Night Elf construction-animation shadows without restoring an unsafe cross-frame VB/IB cache.
-- Path blockers and native static/blob shadow residue are excluded from the WarVK shadow scene.
-- Fixes Issue #4, where broad filtering of the native shadow layer also removed unit selection circles. UI decals such as selection circles are now preserved while legacy unit/building shadows remain precisely rejected. Physical retesting confirmed that selection circles are restored and the reported tree flicker was no longer observed.
-- Point-light shadows keep every PCF tap in one exact radial receiver-depth domain, with a bounded slope fallback only when no trustworthy receiver plane exists. Physical retesting confirms that the previous ground/unit moiré and coherent banding are fixed.
-- TAA v2 is available as an optional temporal mode with variance clipping, reactive feedback, history diagnostics, and one-shot history invalidation. DirectInline remains the release default.
-- Volumetric sunlight, volumetric point lights, and independently controlled global height fog are available through the runtime and author API.
+- `1.x` identifies the current major architecture series;
+- `1.21` identifies feature release 21;
+- the final `00` is the first stable build in that feature line; fixes follow as `1.21.01`, `1.21.02`, and so on;
+- the next grouped feature/performance release will become `1.22.00`.
 
-### Stability and performance
+The previous `1.2003` release used the old numbering scheme. The external Shader API numeric version remains `1.2.0`, and the JASS wire protocol remains `warvk:v1`; existing map integrations do not need to migrate for this product-version change.
 
-- Shadow Arena capture is transactional: vertex, blend, UV, and index data are reserved as one bundle and fail closed as one caster.
-- Arena generations are retired by GPU completion fences instead of frame-index reuse, preventing in-flight data from being overwritten.
-- Map/device epochs isolate manifests, cached geometry, GPU skinning, point-shadow work, TAA history, and receiver publications across map changes.
-- Final CSM and point-shadow replay validates buffer ranges, index domains, formats, generations, matrices, and skinning inputs before issuing Vulkan draws.
-- Incomplete CSM candidates are never published caster by caster. A complete same-map shadow is published atomically, or the receiver safely shows no directional shadow.
-- Release builds compile out the legacy `warvk:cmd` development entry point, and JASS VM rebuilds no longer release render-owned resources from a hook thread.
-- Render settings cross asynchronous work through a locked mailbox and immutable frame snapshots; active device and pipeline pointers no longer escape without lifetime protection.
-- `Reset`/`ResetEx` device-epoch changes, Arena quarantine, GPU-skin rebinding, and receiver invalidation are serialized by the Present owner and remain fail-closed on failure.
-- Bounded bulk reads for write-combined index buffers remove a major CPU regression without restoring unsafe cross-frame VB/IB caches.
-- Compact work tables, conservative union culling, persistent GPU packages, a persistent point-shadow planner, and CPU multi-threaded skinning contracts are included as guarded infrastructure. Experimental Consume paths remain disabled until their correctness and performance gates pass.
+## Highlights in 1.21.00
 
-### Map-author API
+### Shadow correctness and image quality
 
-- WarVK JAPI is built into the proxy `d3d9.dll`, which must be installed before Warcraft III starts. The author package contains no in-map DLL loader and does not require a separate `war3map.dll`.
-- The public wire protocol remains `warvk:v1`. High-frequency numeric calls can use a verified typed Hashtable transport while text commands retain the compatible string route.
-- Authors can create and update point lights, enable point shadows, control volumetric lighting and global height fog, and manage the WarVK lighting clock independently from Warcraft gameplay time.
-- Lightning templates support textures, colours, widths, animation, branching, formula curves, and uploaded polyline curves.
-- The bounded MathProgram/Curve runtime can evaluate scalar, `vec2`, and `vec3` expressions, return real or integer results to JASS, query derivatives and arc length, and drive continuous lightning ribbons.
-- YDWE metadata is grouped into system, diagnostics, sun/CSM, lighting clock, point light, volumetric light, volumetric fog, lightning, template, math, and curve categories. Mode arguments use selectable trigger types instead of raw integer entry.
+- Directional CSM now uses compare-first PCF with a fixed symmetric kernel, per-tap receiver-plane depth correction, and cascade-parity alpha cutoffs. This removes known periodic sampling patterns and silhouette changes at cascade transitions.
+- The Stage11 exact producer protects the current active static working set and publishes an explicit producer-completeness contract. High-pressure scenes no longer lose an entire set of casters because the cache evicted its own visible working set.
+- Warcraft Transparent Type0 construction attachments use the child model's current draw, exact VB/IB/UV data, and complete matrix palette. Player testing confirmed continuous Undead and Night Elf construction-animation shadows.
+- Point shadows now use a consistent radial receiver-depth domain and corrected bias. Player testing confirmed the former ground/unit moiré and continuous banding no longer reproduce.
+- Replay resolves logical buffer bindings immediately before Vulkan command recording. Defrag or relocation cannot leave a draw bound to a capture-time physical `VkBuffer`.
+- CSM depth, matrices, resource generation, and receiver parameters are published as one complete bundle; an incomplete candidate never replaces a complete shadow map.
 
-See [CHANGELOG.md](CHANGELOG.md) for the full release summary and [WarVK/README.md](WarVK/README.md) for the author API.
+### Volumetric lighting and local fog
+
+- Adds bounded local volumetric fog with up to eight Sphere, Box, or Cylinder regions, independently composable with the global medium.
+- Adds Froxel Medium and Froxel High. High is the default volumetric backend and uses full-view logarithmic Z slicing, scene-depth termination, and bounded optical integration.
+- Directional volumetric shadows use separate base/refined guides and full-resolution scene-depth reconstruction to preserve small-caster shafts without treating every low-resolution effect edge as geometry.
+- Froxel image creation and layout publication are transactional. Unsupported formats, missing proof, or excessive work cause a complete fallback to Legacy rather than unbounded GPU submission. 1080p defaults are admitted; worst-case 1440p/4K requests may safely fall back.
+- Map authors can control volumetric lighting, global height fog, and local fog regions through the existing bounded JAPI contract.
+
+### Stability and diagnostics
+
+- Once a Vulkan logical device reaches `VK_ERROR_DEVICE_LOST`, D3D9 Reset/ResetEx, submission, Present, frame workers, and pipeline compilation stop issuing new GPU work on that device. CPU-side retirement completes with device-removed semantics.
+- Direct driver results are distinguished from synthetic fail-stop state. When supported, one bounded `VK_EXT_device_fault` text snapshot is captured outside submission drain; vendor binaries are not collected.
+- Shadow Arena remains capped at 64 MiB pages, 384 MiB per generation, and 1.125 GiB total. Transactional reservation, GPU fences, map/device epochs, and final replay validation remain fail-closed.
+- Performance history is capped at 4000 frames to protect Warcraft III's 32-bit address space while cumulative workload/error counters still cover the full run.
+- Release builds compile out legacy `warvk:cmd` and unapproved Consume/development-observer routes; environment variables cannot bypass the release freeze.
+
+### CPU performance
+
+- Exact-owner publication removes records already completed by an earlier producer before DirectGrouped performs expensive packet construction. Resolved replay tables are no longer copied again for each consumer.
+- In a matched A-B-B-A scene, main-thread CPU time improved from `6.135 ms` to `5.778 ms` (`-0.357 ms / -5.82%`); Populate improved by `76.27%`, DirectGrouped by `87.42%`, and BuildEligible by `96.38%`.
+- These measurements establish a producer-side CPU improvement, not a universal FPS guarantee. Volumetrics, GPU workload, map content, and foreground state still determine final frame rate.
+- Early union culling, Persistent Package, ReBAR, CPU-MT skinning, and Canonical Queue Takeover remain below their release gates and are disabled in 1.21.00.
+
+See [CHANGELOG.md](CHANGELOG.md) for the full change history and [WarVK/README.md](WarVK/README.md) for the map-author API.
 
 ## Requirements
 
 - Windows 10 or Windows 11
-- A GPU and official driver exposing Vulkan 1.3 or newer
+- A GPU and current official driver supporting Vulkan 1.3 or newer
 - Warcraft III 1.27a (32-bit)
 
-WarVK targets the classic 1.27a executable and verified `Game.dll` layouts. Unknown executable signatures fail closed rather than guessing addresses.
+WarVK targets the classic 1.27a executable and verified `Game.dll` layouts only. Unknown signatures are rejected safely rather than scanned heuristically.
 
 ## Installation
 
 1. Back up the Warcraft III directory, especially any existing `d3d9.dll`.
-2. Copy the release `d3d9.dll` next to `war3.exe`.
-3. Start the game and confirm that `d3d9.log` reports `DXVK: 1.2003`.
-4. Press `Ctrl + F1` to open or close the WarVK settings panel.
+2. Copy `d3d9.dll` from the player package next to `war3.exe`.
+3. Start the game and confirm that `d3d9.log` reports `DXVK: 1.21.00`.
+4. Press `Ctrl + F1` to show or hide the WarVK settings panel.
 
-The player package needs only the files explicitly listed in the release archive. Source folders, test tools, research data, and the YDWE author package do not belong in the game directory.
+WarVK is not an in-map DLL loader. Only files explicitly included in the player package belong in the game directory; the JASS/YDWE author package is for map development.
 
 ## Common controls
 
-- Unlock FPS
-- Enable post-processing
-- Enable shadows and select shadow/TAA modes
-- Adjust shadow strength and filtering
-- Configure point lights and point shadows
-- Configure volumetric lighting and fog
-- Adjust anti-aliasing, bloom, exposure, and outlines
+- Frame-rate unlock and post-processing
+- Directional CSM, filtering, and TAA mode
+- Point lights and point shadows
+- Legacy / Froxel Medium / Froxel High volumetric backend
+- Global height fog and local fog regions
+- Anti-aliasing, bloom, exposure, and outlines
 
-## Known issues in 1.2003
+## Known boundaries in 1.21.00
 
-- In dense scenes, lowering the camera can push directional-shadow candidate collection, skinning, and four-cascade replay beyond the safe budget. To avoid submitting excessive GPU work that may trigger a TDR, an incomplete CSM is rejected; this can appear as flickering or temporarily missing shadows while preparation cost remains. We plan to address this with conservative culling and work reuse in the next minor release where possible. Progress is tracked in [#5](https://github.com/CallDisaster/War3VK/issues/5).
-- Leaving a map and then loading another map in the same Warcraft III process can cause persistent performance loss, shadow corruption, or other resource-lifetime problems. Reliable cross-map sessions are not supported in 1.2003. Fully exit Warcraft III and restart it before loading another map.
-- These issues remain scheduled for follow-up; low-angle shadow-budget work is tracked in [#5](https://github.com/CallDisaster/War3VK/issues/5), and cross-map lifetime is tracked in [#6](https://github.com/CallDisaster/War3VK/issues/6). Launching the game, playing one map, and then exiting remains the recommended workflow for the 1.2 series.
+- Leaving a map and loading another in the same Warcraft III process has not completed release validation and may still cause persistent performance loss, shadow corruption, or resource-lifetime issues. Fully exit and restart Warcraft III before loading another map. Tracking remains open in [#6](https://github.com/CallDisaster/War3VK/issues/6).
+- Issue #5 early union culling remains a disabled development-observer path. Version 1.21.00 removes confirmed duplicate producer work and active-cache thrashing, but does not claim that terrain/static/skinned front-end culling is complete.
+- Worst-case 1440p/4K Froxel requests may fall back to Legacy through bounded admission. This is a stability policy, not a GPU or driver failure.
+- Extremely fine foliage, grass, or distant alpha silhouettes may retain minor subpixel motion. This release removes known periodic rotation, incorrect depth filtering, and cross-cascade alpha differences without hiding residual motion behind unconditional TAA history.
+- Isolated-desktop results are used only for stability and relative A/B measurements. Foreground FPS should be compared at the same map, camera, and settings.
 
 ## Troubleshooting and reports
 
 - A black screen at startup usually indicates an outdated Vulkan driver or a conflicting third-party `d3d9.dll`.
-- For poor performance, disable volumetric effects first, then reduce point-shadow count and post-processing. Directional CSM remains 4096 unless the runtime safely latches the allocation fallback.
+- For poor performance, reduce or disable volumetrics first, then reduce point-shadow count and post-processing. Directional CSM stays at 4096 unless allocation safely latches the fallback.
 - Do not copy multiple D3D9 proxy DLLs into the same game directory.
-- Useful report files include `d3d9.log`, `runtime_status.json`, GPU incident JSON, and WarVK crash dumps. Remove personal paths or map data before publishing logs.
-- If a map has already been left in the current process, fully exit Warcraft III, restart it, and load only the target map. Cross-map reports should include the exact transition order and the first incident snapshot.
+- Useful reports include `d3d9.log`, `runtime_status.json`, GPU incident JSON, and WarVK crash dumps. Remove personal paths or private map data before publishing them.
+- Cross-map reports should include the map order. Reproduce ordinary single-map issues from a fresh Warcraft III process.
 
 ## Uninstall
 
-Remove WarVK's `d3d9.dll` from the game directory and restore the previous file if one existed. Logs and diagnostic captures can be deleted separately.
+Remove WarVK's `d3d9.dll` and restore the previous file if one existed. Logs and diagnostic captures can be deleted separately.
 
 ## For developers
-
-The primary code areas are:
 
 - `src/d3d9/`: D3D9 runtime, settings, shadow/lighting pipeline, and integration
 - `src/d3d9/war3/`: Warcraft hooks, semantic bridge, resource lifetime, GPU skinning, JAPI, math, and diagnostics
 - `subprojects/war3fx/`: WarVK shaders
 - `WarVK/`: JASS library, YDWE catalog, icon, and author documentation
-- `AutoTest/`: static contracts, runnable tests, performance gates, and attach-only diagnostics
+- `AutoTest/`: static contracts, Win32 runnable tests, performance gates, and diagnostics
 
 Build the 32-bit runtime with:
 
 ```powershell
-.\build32_safe.cmd src/d3d9/d3d9.dll -j8
-ninja -C build32 -n
+.\build32_safe.cmd src/d3d9/d3d9.dll -j2
+ninja -C build32 -n src/d3d9/d3d9.dll
 ```
 
-The output is `build32/src/d3d9/d3d9.dll`. Release contents and exclusions are defined in [docs/RELEASE_1.2.0.md](docs/RELEASE_1.2.0.md).
+The output is `build32/src/d3d9/d3d9.dll`. Release contents and exclusions are defined in [docs/RELEASE_1.21.00.md](docs/RELEASE_1.21.00.md).
 
 ## License and acknowledgements
 
 WarVK is distributed under GPLv3 at the project level. See [LICENSE](LICENSE), [COPYING](COPYING), and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Upstream and third-party components retain their original licences and notices.
 
-WarVK builds on work from DXVK, Dear ImGui, MinHook, Vulkan ecosystem projects, and Warcraft III community research. It is an unofficial third-party project; keep backups before testing new releases.
+WarVK builds on DXVK, Dear ImGui, MinHook, the Vulkan ecosystem, and Warcraft III community research. It is an unofficial third-party project; keep backups before testing new releases.
