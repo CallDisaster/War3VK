@@ -52,7 +52,8 @@ namespace dxvk {
 
         void ensureResources(VkExtent3D extent, VkFormat colorFormat,
                              VkFormat depthFormat, uint32_t resolutionDivisor,
-                             bool storageEffect);
+                             bool storageEffect,
+                             uint32_t directionalGuideDivisor);
         bool ensureFroxelResources(VkExtent3D fullExtent,
                                    War3VolumetricQuality quality);
         void invalidateFroxelHistory();
@@ -108,6 +109,25 @@ namespace dxvk {
         VkExtent3D m_cachedEffectExtent = {0, 0, 1};
         VkFormat m_cachedEffectFormat = VK_FORMAT_UNDEFINED;
         bool m_effectStorageEnabled = false;
+
+        // Directional visibility is higher frequency than the froxel
+        // scattering field. The base guide is written beside the low-res
+        // effect; the optional refined guide re-integrates only base-guide
+        // edge pixels at a finer 2D resolution. Readability is applied after
+        // this independent guide is reconstructed, never inside the low-res
+        // RGBA effect.
+        Rc<DxvkImage> m_directionalGuideBaseImage;
+        Rc<DxvkImageView> m_directionalGuideBaseView;
+        Rc<DxvkImageView> m_directionalGuideBaseStorageView;
+        Rc<DxvkImage> m_directionalGuideRefinedImage;
+        Rc<DxvkImageView> m_directionalGuideRefinedView;
+        Rc<DxvkImageView> m_directionalGuideRefinedStorageView;
+        Rc<DxvkImageView> m_directionalGuideResolvedView;
+        VkExtent3D m_cachedDirectionalGuideBaseExtent = {0, 0, 1};
+        VkExtent3D m_cachedDirectionalGuideRefinedExtent = {0, 0, 1};
+        bool m_directionalGuideReadyThisFrame = false;
+        bool m_directionalGuideRefineEnabled = false;
+        float m_directionalGuideReadabilityScale = 0.0f;
 
         // Froxel current field and ping-pong stable histories remain in
         // GENERAL for compute read/write. Rc command-list tracking owns every

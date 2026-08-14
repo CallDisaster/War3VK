@@ -74,6 +74,12 @@ constexpr uint32_t kVolumetricFroxelMediumEffectDivisor = 8u;
 constexpr uint32_t kVolumetricFroxelHighEffectDivisor = 4u;
 constexpr uint32_t kVolumetricFroxelMediumTraversalSteps = 1024u;
 constexpr uint32_t kVolumetricFroxelHighTraversalSteps = 2048u;
+constexpr uint32_t kVolumetricDirectionalGuideTargetDivisor = 2u;
+constexpr uint64_t kVolumetricDirectionalGuideCellBudget = 100'000'000ull;
+constexpr uint64_t kVolumetricDirectionalGuideTraversalBudget =
+    350'000'000ull;
+constexpr uint32_t kVolumetricDirectionalGuideMinTraversalSteps = 64u;
+constexpr uint32_t kVolumetricDirectionalGuideMaxTraversalSteps = 1024u;
 
 struct VolumetricLightPushConstants {
   uint32_t colorSampler;
@@ -155,8 +161,14 @@ struct VolumetricCompositePushConstants {
   uint32_t colorSampler;
   uint32_t effectSampler;
   uint32_t depthSampler;
-  uint32_t pad1;
+  uint32_t guideSampler;
   Vector4 rtSize;
+  // x=guide width, y=guide height, z=guide enabled, w=reserved.
+  Vector4 guideSize;
+  Vector4 viewport;
+  // x=viewport MinZ, y=viewport MaxZ, z=max readability attenuation,
+  // w=linear readability scale after guide reconstruction.
+  Vector4 viewportZ;
 };
 
 struct VolumetricFroxelInjectPushConstants {
@@ -192,22 +204,24 @@ struct VolumetricFroxelIntegratePushConstants {
   Vector4 params;
   uint32_t shadowSampler;
   uint32_t maxTraversalSteps;
-  uint32_t pad0;
-  uint32_t pad1;
+  uint32_t guideSampler;
+  uint32_t refineMode;
   Vector4 sunColorScale;
   Vector4 sunParams;
+  // x=output guide W, y=output guide H, z=base guide W, w=base guide H.
+  Vector4 guideSize;
 };
 static_assert(sizeof(VolumetricPointLightUniform) == 800u,
               "VolumetricPointLightUniform GLSL ABI drift");
 static_assert(sizeof(VolumetricFogVolumeUniform) == 528u,
               "VolumetricFogVolumeUniform GLSL ABI drift");
-static_assert(sizeof(VolumetricCompositePushConstants) == 32u,
+static_assert(sizeof(VolumetricCompositePushConstants) == 80u,
               "VolumetricCompositePushConstants GLSL ABI drift");
 static_assert(sizeof(VolumetricFroxelInjectPushConstants) == 80u,
               "VolumetricFroxelInjectPushConstants GLSL ABI drift");
 static_assert(sizeof(VolumetricFroxelTemporalPushConstants) == 128u,
               "VolumetricFroxelTemporalPushConstants GLSL ABI drift");
-static_assert(sizeof(VolumetricFroxelIntegratePushConstants) == 128u,
+static_assert(sizeof(VolumetricFroxelIntegratePushConstants) == 144u,
               "VolumetricFroxelIntegratePushConstants GLSL ABI drift");
 
 VkImageSubresourceLayers toLayers(const VkImageSubresourceRange& range) {
@@ -571,12 +585,16 @@ const DxvkPipelineLayout* War3VolumetricLightPass::createPipelineLayout() const 
 
 const DxvkPipelineLayout*
 War3VolumetricLightPass::createCompositePipelineLayout() const {
-  std::array<DxvkDescriptorSetLayoutBinding, 3> bindings = {
+  std::array<DxvkDescriptorSetLayoutBinding, 5> bindings = {
       DxvkDescriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
                                      VK_SHADER_STAGE_FRAGMENT_BIT),
       DxvkDescriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
                                      VK_SHADER_STAGE_FRAGMENT_BIT),
       DxvkDescriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
+                                     VK_SHADER_STAGE_FRAGMENT_BIT),
+      DxvkDescriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
+                                     VK_SHADER_STAGE_FRAGMENT_BIT),
+      DxvkDescriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
                                      VK_SHADER_STAGE_FRAGMENT_BIT),
   };
 
@@ -628,7 +646,7 @@ War3VolumetricLightPass::createFroxelTemporalLayout() const {
 
 const DxvkPipelineLayout*
 War3VolumetricLightPass::createFroxelIntegrateLayout() const {
-  std::array<DxvkDescriptorSetLayoutBinding, 5> bindings = {
+  std::array<DxvkDescriptorSetLayoutBinding, 7> bindings = {
       DxvkDescriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
                                      VK_SHADER_STAGE_COMPUTE_BIT),
       DxvkDescriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
@@ -636,6 +654,10 @@ War3VolumetricLightPass::createFroxelIntegrateLayout() const {
       DxvkDescriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1,
                                      VK_SHADER_STAGE_COMPUTE_BIT),
       DxvkDescriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
+                                     VK_SHADER_STAGE_COMPUTE_BIT),
+      DxvkDescriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
+                                     VK_SHADER_STAGE_COMPUTE_BIT),
+      DxvkDescriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1,
                                      VK_SHADER_STAGE_COMPUTE_BIT),
       DxvkDescriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
                                      VK_SHADER_STAGE_COMPUTE_BIT),
@@ -692,7 +714,8 @@ void War3VolumetricLightPass::ensureResources(VkExtent3D extent,
                                                VkFormat colorFormat,
                                                VkFormat depthFormat,
                                                uint32_t resolutionDivisor,
-                                               bool storageEffect) {
+                                               bool storageEffect,
+                                               uint32_t directionalGuideDivisor) {
   if (!m_colorCopy || m_cachedExtent.width != extent.width ||
       m_cachedExtent.height != extent.height || m_cachedFormat != colorFormat) {
     m_cachedExtent = extent;
@@ -708,8 +731,9 @@ void War3VolumetricLightPass::ensureResources(VkExtent3D extent,
     info.mipLevels = 1;
     info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                  VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    info.stages =
-        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+    info.stages = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                  VK_PIPELINE_STAGE_TRANSFER_BIT;
     info.access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT |
                   VK_ACCESS_TRANSFER_WRITE_BIT;
     info.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -752,8 +776,9 @@ void War3VolumetricLightPass::ensureResources(VkExtent3D extent,
     info.mipLevels = 1;
     info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                  VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    info.stages =
-        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+    info.stages = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                  VK_PIPELINE_STAGE_TRANSFER_BIT;
     info.access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT |
                   VK_ACCESS_TRANSFER_WRITE_BIT;
     info.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -848,6 +873,96 @@ void War3VolumetricLightPass::ensureResources(VkExtent3D extent,
       viewInfo.layout = VK_IMAGE_LAYOUT_GENERAL;
       m_effectStorageView = m_effectImage->createView(viewInfo);
     }
+  }
+
+  if (!storageEffect) {
+    m_directionalGuideReadyThisFrame = false;
+    m_directionalGuideResolvedView = nullptr;
+    return;
+  }
+
+  constexpr VkFormat guideFormat = VK_FORMAT_R16_SFLOAT;
+  const uint32_t guideDivisor = std::clamp<uint32_t>(
+      directionalGuideDivisor, kVolumetricDirectionalGuideTargetDivisor,
+      resolutionDivisor);
+  const VkExtent3D refinedExtent = {
+      std::max<uint32_t>(1u, (extent.width + guideDivisor - 1u) /
+                                  guideDivisor),
+      std::max<uint32_t>(1u, (extent.height + guideDivisor - 1u) /
+                                  guideDivisor),
+      1u};
+
+  const auto createGuide = [&](const char* debugName, VkExtent3D imageExtent,
+                               Rc<DxvkImage>& image,
+                               Rc<DxvkImageView>& sampledView,
+                               Rc<DxvkImageView>& storageView) {
+    DxvkImageCreateInfo info = {};
+    info.type = VK_IMAGE_TYPE_2D;
+    info.format = guideFormat;
+    info.flags = 0;
+    info.sampleCount = VK_SAMPLE_COUNT_1_BIT;
+    info.extent = imageExtent;
+    info.numLayers = 1;
+    info.mipLevels = 1;
+    info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+    info.stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    info.access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    info.debugName = debugName;
+    image = m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+    DxvkImageViewKey viewInfo;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+    viewInfo.format = guideFormat;
+    viewInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+    viewInfo.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    viewInfo.aspects = VK_IMAGE_ASPECT_COLOR_BIT;
+    viewInfo.mipIndex = 0;
+    viewInfo.mipCount = 1;
+    viewInfo.layerIndex = 0;
+    viewInfo.layerCount = 1;
+    VkComponentMapping mapping = {VK_COMPONENT_SWIZZLE_IDENTITY,
+                                  VK_COMPONENT_SWIZZLE_IDENTITY,
+                                  VK_COMPONENT_SWIZZLE_IDENTITY,
+                                  VK_COMPONENT_SWIZZLE_IDENTITY};
+    viewInfo.packedSwizzle = DxvkImageViewKey::packSwizzle(mapping);
+    sampledView = image->createView(viewInfo);
+
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+    viewInfo.layout = VK_IMAGE_LAYOUT_GENERAL;
+    storageView = image->createView(viewInfo);
+  };
+
+  if (!m_directionalGuideBaseImage ||
+      m_cachedDirectionalGuideBaseExtent.width != effectExtent.width ||
+      m_cachedDirectionalGuideBaseExtent.height != effectExtent.height) {
+    m_cachedDirectionalGuideBaseExtent = effectExtent;
+    createGuide("War3DirectionalVolumeGuideBase", effectExtent,
+                m_directionalGuideBaseImage, m_directionalGuideBaseView,
+                m_directionalGuideBaseStorageView);
+  }
+
+  m_directionalGuideRefineEnabled =
+      refinedExtent.width > effectExtent.width ||
+      refinedExtent.height > effectExtent.height;
+  if (m_directionalGuideRefineEnabled &&
+      (!m_directionalGuideRefinedImage ||
+       m_cachedDirectionalGuideRefinedExtent.width != refinedExtent.width ||
+       m_cachedDirectionalGuideRefinedExtent.height != refinedExtent.height)) {
+    m_cachedDirectionalGuideRefinedExtent = refinedExtent;
+    createGuide("War3DirectionalVolumeGuideRefined", refinedExtent,
+                m_directionalGuideRefinedImage,
+                m_directionalGuideRefinedView,
+                m_directionalGuideRefinedStorageView);
+  }
+  if (!m_directionalGuideRefineEnabled) {
+    m_directionalGuideRefinedImage = nullptr;
+    m_directionalGuideRefinedView = nullptr;
+    m_directionalGuideRefinedStorageView = nullptr;
+    m_cachedDirectionalGuideRefinedExtent = effectExtent;
   }
 }
 
@@ -1180,6 +1295,9 @@ bool War3VolumetricLightPass::drawVolumetricLight(
     const VkRect2D& effectScissor,
     uint32_t& outPointShadowedLightCount) {
   outPointShadowedLightCount = 0u;
+  m_directionalGuideReadyThisFrame = false;
+  m_directionalGuideResolvedView = nullptr;
+  m_directionalGuideReadabilityScale = 0.0f;
   if (!m_layout || !m_linearSampler || !m_colorCopyView || !m_depthCopyView ||
       !m_effectView || !m_csmUniformBuffers[0] || !m_lightBuffers[0] ||
       !m_fogVolumeBuffers[0] || !input.settings)
@@ -1938,23 +2056,58 @@ bool War3VolumetricLightPass::drawVolumetricLight(
     temporalReadyInfo.pMemoryBarriers = &temporalReady;
     ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &temporalReadyInfo);
 
-    VkImageMemoryBarrier2 effectToWrite = {
-        VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
-    effectToWrite.srcStageMask =
-        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    effectToWrite.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-    effectToWrite.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    effectToWrite.dstAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
-    effectToWrite.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    effectToWrite.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    effectToWrite.image = m_effectImage->handle();
-    effectToWrite.subresourceRange = m_effectView->imageSubresources();
-    VkDependencyInfo effectToWriteInfo = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-    effectToWriteInfo.imageMemoryBarrierCount = 1u;
-    effectToWriteInfo.pImageMemoryBarriers = &effectToWrite;
-    ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &effectToWriteInfo);
+    if (!m_directionalGuideBaseImage || !m_directionalGuideBaseView ||
+        !m_directionalGuideBaseStorageView)
+      return false;
 
-    std::array<DxvkDescriptorWrite, 5> integrateDescriptors = {};
+    std::array<VkImageMemoryBarrier2, 3> computeTargets = {};
+    computeTargets[0] = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    computeTargets[0].srcStageMask =
+        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    computeTargets[0].srcAccessMask =
+        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    computeTargets[0].dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    computeTargets[0].dstAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
+    computeTargets[0].oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    computeTargets[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    computeTargets[0].image = m_effectImage->handle();
+    computeTargets[0].subresourceRange = m_effectView->imageSubresources();
+
+    computeTargets[1] = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    computeTargets[1].srcStageMask =
+        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    computeTargets[1].srcAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
+    computeTargets[1].dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    computeTargets[1].dstAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
+    computeTargets[1].oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    computeTargets[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    computeTargets[1].image = m_directionalGuideBaseImage->handle();
+    computeTargets[1].subresourceRange =
+        m_directionalGuideBaseView->imageSubresources();
+
+    uint32_t computeTargetCount = 2u;
+    if (m_directionalGuideRefineEnabled &&
+        m_directionalGuideRefinedImage &&
+        m_directionalGuideRefinedView &&
+        m_directionalGuideRefinedStorageView) {
+      computeTargets[2] = computeTargets[1];
+      computeTargets[2].image = m_directionalGuideRefinedImage->handle();
+      computeTargets[2].subresourceRange =
+          m_directionalGuideRefinedView->imageSubresources();
+      computeTargetCount = 3u;
+    } else {
+      m_directionalGuideRefineEnabled = false;
+    }
+
+    VkDependencyInfo computeTargetsInfo = {
+        VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    computeTargetsInfo.imageMemoryBarrierCount = computeTargetCount;
+    computeTargetsInfo.pImageMemoryBarriers = computeTargets.data();
+    ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer,
+                            &computeTargetsInfo);
+
+    std::array<DxvkDescriptorWrite, 7> integrateDescriptors = {};
     integrateDescriptors[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     integrateDescriptors[0].descriptor =
         m_froxelHistoryViews[historyWriteIndex]->getDescriptor();
@@ -1966,6 +2119,13 @@ bool War3VolumetricLightPass::drawVolumetricLight(
     integrateDescriptors[3].buffer = csmInfo;
     integrateDescriptors[4].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     integrateDescriptors[4].descriptor = shadowMapView->getDescriptor();
+    integrateDescriptors[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    integrateDescriptors[5].descriptor =
+        m_directionalGuideBaseStorageView->getDescriptor();
+    // The base pass never reads binding 6. Bind the depth copy as a legal
+    // sampled texture2DArray instead of aliasing a simultaneous storage write.
+    integrateDescriptors[6].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    integrateDescriptors[6].descriptor = m_depthCopyView->getDescriptor();
 
     VolumetricFroxelIntegratePushConstants integratePc = {};
     integratePc.sampler = m_linearSampler->getDescriptor().samplerIndex;
@@ -1990,10 +2150,14 @@ bool War3VolumetricLightPass::drawVolumetricLight(
     // artifact and making the column shrink as its interval moved farther down
     // the ray. The integration shader now consumes this budget directly while
     // accumulating texel/depth-crossing sub-intervals.
-    integratePc.maxTraversalSteps =
+    const uint32_t baseShadowTraversalSteps =
         settings.quality == War3VolumetricQuality::FroxelHigh
             ? kVolumetricFroxelHighTraversalSteps
             : kVolumetricFroxelMediumTraversalSteps;
+    integratePc.maxTraversalSteps = baseShadowTraversalSteps;
+    integratePc.guideSampler =
+        m_linearSampler->getDescriptor().samplerIndex;
+    integratePc.refineMode = 0u;
     integratePc.sunColorScale = Vector4(
         pc.sunColorScale.x, pc.sunColorScale.y, pc.sunColorScale.z,
         pc.sunColorScale.w * injectPc.params0.x);
@@ -2005,6 +2169,11 @@ bool War3VolumetricLightPass::drawVolumetricLight(
             ? 0.0f
             : clampFinite(settings.unshadowedScattering, 0.0f, 1.0f, 0.03f),
         clampFinite(settings.weight, 0.0f, 3.0f, 1.0f));
+    integratePc.guideSize = Vector4(
+        float(m_cachedDirectionalGuideBaseExtent.width),
+        float(m_cachedDirectionalGuideBaseExtent.height),
+        float(m_cachedDirectionalGuideBaseExtent.width),
+        float(m_cachedDirectionalGuideBaseExtent.height));
 
     ctx->cmdBindPipeline(DxvkCmdBuffer::ExecBuffer,
                          VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -2016,15 +2185,108 @@ bool War3VolumetricLightPass::drawVolumetricLight(
                      (effectExtent.width + 7u) / 8u,
                      (effectExtent.height + 7u) / 8u, 1u);
 
-    VkImageMemoryBarrier2 effectToRead = effectToWrite;
-    effectToRead.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    effectToRead.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
-    effectToRead.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-    effectToRead.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-    effectToRead.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-    effectToRead.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    effectToWriteInfo.pImageMemoryBarriers = &effectToRead;
-    ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &effectToWriteInfo);
+    uint32_t directionalGuideTraversalSteps = 0u;
+    if (m_directionalGuideRefineEnabled) {
+      VkImageMemoryBarrier2 baseGuideReady = {
+          VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+      baseGuideReady.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+      baseGuideReady.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
+      baseGuideReady.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+      baseGuideReady.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
+      baseGuideReady.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+      baseGuideReady.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+      baseGuideReady.image = m_directionalGuideBaseImage->handle();
+      baseGuideReady.subresourceRange =
+          m_directionalGuideBaseView->imageSubresources();
+      VkDependencyInfo baseGuideReadyInfo = {
+          VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+      baseGuideReadyInfo.imageMemoryBarrierCount = 1u;
+      baseGuideReadyInfo.pImageMemoryBarriers = &baseGuideReady;
+      ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer,
+                              &baseGuideReadyInfo);
+
+      integrateDescriptors[5].descriptor =
+          m_directionalGuideRefinedStorageView->getDescriptor();
+      integrateDescriptors[6].descriptor =
+          m_directionalGuideBaseView->getDescriptor();
+      const uint64_t refinedPixels =
+          uint64_t(m_cachedDirectionalGuideRefinedExtent.width) *
+          uint64_t(m_cachedDirectionalGuideRefinedExtent.height);
+      const uint64_t budgetedSteps = refinedPixels != 0u
+          ? kVolumetricDirectionalGuideTraversalBudget / refinedPixels
+          : 0u;
+      integratePc.maxTraversalSteps = static_cast<uint32_t>(
+          std::clamp<uint64_t>(
+              budgetedSteps,
+              uint64_t(kVolumetricDirectionalGuideMinTraversalSteps),
+              uint64_t(kVolumetricDirectionalGuideMaxTraversalSteps)));
+      directionalGuideTraversalSteps = integratePc.maxTraversalSteps;
+      integratePc.refineMode = 1u;
+      integratePc.guideSize = Vector4(
+          float(m_cachedDirectionalGuideRefinedExtent.width),
+          float(m_cachedDirectionalGuideRefinedExtent.height),
+          float(m_cachedDirectionalGuideBaseExtent.width),
+          float(m_cachedDirectionalGuideBaseExtent.height));
+      ctx->bindResources(DxvkCmdBuffer::ExecBuffer, m_froxelIntegrateLayout,
+                         integrateDescriptors.size(),
+                         integrateDescriptors.data(), sizeof(integratePc),
+                         &integratePc);
+      ctx->cmdDispatch(
+          DxvkCmdBuffer::ExecBuffer,
+          (m_cachedDirectionalGuideRefinedExtent.width + 7u) / 8u,
+          (m_cachedDirectionalGuideRefinedExtent.height + 7u) / 8u, 1u);
+      m_directionalGuideResolvedView = m_directionalGuideRefinedView;
+    } else {
+      m_directionalGuideResolvedView = m_directionalGuideBaseView;
+    }
+
+    std::array<VkImageMemoryBarrier2, 2> sampledOutputs = {};
+    sampledOutputs[0] = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    sampledOutputs[0].srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    sampledOutputs[0].srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
+    sampledOutputs[0].dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    sampledOutputs[0].dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
+    sampledOutputs[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    sampledOutputs[0].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    sampledOutputs[0].image = m_effectImage->handle();
+    sampledOutputs[0].subresourceRange = m_effectView->imageSubresources();
+    sampledOutputs[1] = sampledOutputs[0];
+    if (m_directionalGuideRefineEnabled) {
+      sampledOutputs[1].image = m_directionalGuideRefinedImage->handle();
+      sampledOutputs[1].subresourceRange =
+          m_directionalGuideRefinedView->imageSubresources();
+    } else {
+      sampledOutputs[1].image = m_directionalGuideBaseImage->handle();
+      sampledOutputs[1].subresourceRange =
+          m_directionalGuideBaseView->imageSubresources();
+    }
+    VkDependencyInfo sampledOutputsInfo = {
+        VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    sampledOutputsInfo.imageMemoryBarrierCount = sampledOutputs.size();
+    sampledOutputsInfo.pImageMemoryBarriers = sampledOutputs.data();
+    ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer,
+                            &sampledOutputsInfo);
+
+    const float directionalSunPeak = std::max(
+        {integratePc.sunColorScale.x, integratePc.sunColorScale.y,
+         integratePc.sunColorScale.z}) *
+        std::max(integratePc.sunColorScale.w, 0.0f);
+    const auto smoothstep = [](float edge0, float edge1, float value) {
+      const float t = std::clamp((value - edge0) / (edge1 - edge0),
+                                 0.0f, 1.0f);
+      return t * t * (3.0f - 2.0f * t);
+    };
+    const float sourceGate = smoothstep(0.004f, 0.040f,
+                                        directionalSunPeak);
+    const float readabilityMix = std::clamp(
+        (clampFinite(settings.weight, 0.0f, 3.0f, 1.0f) - 1.0f) / 1.5f,
+        0.0f, 1.0f);
+    m_directionalGuideReadabilityScale =
+        0.55f * 0.62f *
+        (csmUbo.volumeSunParams.x > 0.5f ? 1.05f : 1.0f) *
+        sourceGate * readabilityMix;
+    m_directionalGuideReadyThisFrame =
+        m_directionalGuideResolvedView != nullptr;
 
     m_froxelHistoryIndex = historyWriteIndex;
     m_froxelHistoryValid = settings.froxelTemporalEnabled &&
@@ -2042,6 +2304,9 @@ bool War3VolumetricLightPass::drawVolumetricLight(
     ctx->track(m_froxelHistoryImages[historyReadIndex], DxvkAccess::Read);
     ctx->track(m_froxelHistoryImages[historyWriteIndex], DxvkAccess::Write);
     ctx->track(m_effectImage, DxvkAccess::Write);
+    ctx->track(m_directionalGuideBaseImage, DxvkAccess::Write);
+    if (m_directionalGuideRefineEnabled)
+      ctx->track(m_directionalGuideRefinedImage, DxvkAccess::Write);
     ctx->track(m_depthCopy, DxvkAccess::Read);
     ctx->track(shadowMapView->image(), DxvkAccess::Read);
     ctx->track(pointShadowSampleView->image(), DxvkAccess::Read);
@@ -2056,16 +2321,20 @@ bool War3VolumetricLightPass::drawVolumetricLight(
         (s_froxelSubmitLogs % 240u) == 0u) {
       WAR3_RENDER_LOG(
           "DXVK War3Volumetric: froxel submitted backend=%u grid=%ux%ux%u "
-          "effect=%ux%u commonNear=%.1f commonFar=%.1f history=%d volumeSun=%d "
+          "effect=%ux%u guide=%ux%u refineSteps=%u commonNear=%.1f "
+          "commonFar=%.1f history=%d volumeSun=%d "
           "cascades=%u shadowSteps=%u points=%u pointShadows=%u "
           "fogVolumes=%u\n",
           static_cast<uint32_t>(settings.quality),
           m_froxelGridExtent.width, m_froxelGridExtent.height,
           m_froxelGridExtent.depth, effectExtent.width, effectExtent.height,
+          m_directionalGuideResolvedView->image()->info().extent.width,
+          m_directionalGuideResolvedView->image()->info().extent.height,
+          directionalGuideTraversalSteps,
           double(froxelNear), double(froxelFar),
           historyReadable ? 1 : 0, csmUbo.volumeSunParams.x > 0.5f ? 1 : 0,
           static_cast<uint32_t>(std::max(csmUbo.params.z, 0.0f)),
-          integratePc.maxTraversalSteps, lightUbo.count,
+          baseShadowTraversalSteps, lightUbo.count,
           lightUbo.pointShadowedLightCount, fogVolumeUbo.count);
     }
     return true;
@@ -2131,7 +2400,8 @@ bool War3VolumetricLightPass::compositeVolumetricLight(
     const Rc<DxvkCommandList>& ctx, const War3PipelineInput& input,
     const VkRect2D& compositeScissor) {
   if (!m_compositeLayout || !m_linearSampler || !m_colorCopyView ||
-      !m_effectView || !m_depthCopyView || !input.colorView)
+      !m_effectView || !m_depthCopyView || !input.colorView ||
+      !m_csmUniformBuffers[0])
     return false;
 
   auto colorImage = input.colorView->image();
@@ -2174,20 +2444,49 @@ bool War3VolumetricLightPass::compositeVolumetricLight(
   ctx->cmdSetViewport(1, &viewport);
   ctx->cmdSetScissor(1, &compositeScissor);
 
-  std::array<DxvkDescriptorWrite, 3> descriptors = {};
+  const uint32_t uboSlot =
+      static_cast<uint32_t>(input.frameSerial % kUboRingSlots);
+  const DxvkResourceBufferInfo csmInfo =
+      m_csmUniformBuffers[uboSlot]->getSliceInfo(
+          0, sizeof(VolumetricCsmUniform));
+  const bool guideEnabled = m_directionalGuideReadyThisFrame &&
+      m_directionalGuideResolvedView;
+  const Rc<DxvkImageView> guideView = guideEnabled
+      ? m_directionalGuideResolvedView
+      : m_effectView;
+
+  std::array<DxvkDescriptorWrite, 5> descriptors = {};
   descriptors[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
   descriptors[0].descriptor = m_colorCopyView->getDescriptor();
   descriptors[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
   descriptors[1].descriptor = m_effectView->getDescriptor();
   descriptors[2].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
   descriptors[2].descriptor = m_depthCopyView->getDescriptor();
+  descriptors[3].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+  descriptors[3].descriptor = guideView->getDescriptor();
+  descriptors[4].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+  descriptors[4].buffer = csmInfo;
 
   VolumetricCompositePushConstants pc = {};
   pc.colorSampler = m_linearSampler->getDescriptor().samplerIndex;
   pc.effectSampler = m_linearSampler->getDescriptor().samplerIndex;
   pc.depthSampler = m_linearSampler->getDescriptor().samplerIndex;
+  pc.guideSampler = m_linearSampler->getDescriptor().samplerIndex;
   pc.rtSize = Vector4(float(extent.width), float(extent.height),
                       float(effectExtent.width), float(effectExtent.height));
+  const VkExtent3D guideExtent = guideView->image()->info().extent;
+  pc.guideSize = Vector4(float(guideExtent.width), float(guideExtent.height),
+                         guideEnabled ? 1.0f : 0.0f, 0.0f);
+  pc.viewport = Vector4(float(input.scene.worldCamera.viewport.X),
+                        float(input.scene.worldCamera.viewport.Y),
+                        float(input.scene.worldCamera.viewport.Width),
+                        float(input.scene.worldCamera.viewport.Height));
+  pc.viewportZ = Vector4(input.scene.worldCamera.viewport.MinZ,
+                         input.scene.worldCamera.viewport.MaxZ,
+                         guideEnabled ? 0.24f : 0.0f,
+                         guideEnabled
+                             ? m_directionalGuideReadabilityScale
+                             : 0.0f);
 
   ctx->cmdBindPipeline(DxvkCmdBuffer::ExecBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
                        pipeline);
@@ -2199,7 +2498,10 @@ bool War3VolumetricLightPass::compositeVolumetricLight(
   ctx->track(input.colorView->image(), DxvkAccess::Write);
   ctx->track(m_colorCopy, DxvkAccess::Read);
   ctx->track(m_effectImage, DxvkAccess::Read);
+  if (guideEnabled)
+    ctx->track(guideView->image(), DxvkAccess::Read);
   ctx->track(m_depthCopy, DxvkAccess::Read);
+  ctx->track(m_csmUniformBuffers[uboSlot], DxvkAccess::Read);
   ctx->track(m_linearSampler);
   return true;
 }
@@ -2384,15 +2686,22 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
       VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT;
   const VkFormatFeatureFlags2 froxelFormatFeatures =
       m_device->getFormatFeatures(VK_FORMAT_R16G16B16A16_SFLOAT).optimal;
+  constexpr VkFormatFeatureFlags2 requiredGuideFormatFeatures =
+      VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
+      VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT;
+  const VkFormatFeatureFlags2 guideFormatFeatures =
+      m_device->getFormatFeatures(VK_FORMAT_R16_SFLOAT).optimal;
   bool froxelAdmitted = froxelRequested &&
       (froxelFormatFeatures & requiredFroxelFormatFeatures) ==
-          requiredFroxelFormatFeatures;
+          requiredFroxelFormatFeatures &&
+      (guideFormatFeatures & requiredGuideFormatFeatures) ==
+          requiredGuideFormatFeatures;
   if (froxelRequested && !froxelAdmitted) {
     static bool s_loggedUnsupportedFroxelFormat = false;
     if (!std::exchange(s_loggedUnsupportedFroxelFormat, true)) {
       WAR3_RENDER_LOG(
-          "DXVK War3Volumetric: RGBA16F sampled/storage/attachment format "
-          "unsupported; falling back to legacy raymarch\n");
+          "DXVK War3Volumetric: RGBA16F effect or R16F directional-guide "
+          "format unsupported; falling back to legacy raymarch\n");
     }
   }
   uint32_t resolutionDivisor = froxelAdmitted
@@ -2542,8 +2851,31 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
     effectScissor = FullRect(effectExtent);
   }
 
+  uint32_t directionalGuideDivisor = resolutionDivisor;
+  if (froxelAdmitted) {
+    const uint32_t guideDepth =
+        settings.quality == War3VolumetricQuality::FroxelHigh
+            ? kVolumetricFroxelHighDepth
+            : kVolumetricFroxelMediumDepth;
+    const uint64_t targetGuideWidth =
+        (uint64_t(extent.width) +
+         kVolumetricDirectionalGuideTargetDivisor - 1u) /
+        kVolumetricDirectionalGuideTargetDivisor;
+    const uint64_t targetGuideHeight =
+        (uint64_t(extent.height) +
+         kVolumetricDirectionalGuideTargetDivisor - 1u) /
+        kVolumetricDirectionalGuideTargetDivisor;
+    const uint64_t targetGuideCells =
+        targetGuideWidth * targetGuideHeight * uint64_t(guideDepth);
+    directionalGuideDivisor =
+        targetGuideCells <= kVolumetricDirectionalGuideCellBudget
+            ? kVolumetricDirectionalGuideTargetDivisor
+            : resolutionDivisor;
+  }
+
   ensureResources(extent, colorInfo.format, depthInfo.format,
-                  resolutionDivisor, froxelAdmitted);
+                  resolutionDivisor, froxelAdmitted,
+                  directionalGuideDivisor);
 
   copyColor(ctx, input.colorView);
   copyDepth(ctx, input.depthView);

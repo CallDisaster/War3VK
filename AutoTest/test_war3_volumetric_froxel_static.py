@@ -85,6 +85,9 @@ class War3VolumetricFroxelStaticTests(unittest.TestCase):
         self.assertIn("VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT", self.cpp)
         self.assertIn("m_froxelHistoryImages", self.header)
         self.assertIn("historyWriteIndex = (historyReadIndex + 1u) % 2u", self.cpp)
+        self.assertIn("VK_FORMAT_R16_SFLOAT", self.cpp)
+        self.assertIn("m_directionalGuideBaseImage", self.header)
+        self.assertIn("m_directionalGuideRefinedImage", self.header)
 
     def test_all_compute_shaders_are_embedded(self):
         for shader in (
@@ -199,10 +202,19 @@ class War3VolumetricFroxelStaticTests(unittest.TestCase):
             "shadowEvidenceOptical",
             "peakShadowOcclusion",
             "selectSegmentCascade proved",
-            "columnReadabilityAttenuation",
-            "float maxColumnAtten = 0.24",
+            "physicalGuide",
+            "opticallySupportedPeak",
+            "peakEvidenceScale",
+            "imageStore(s_shadowGuideOutput",
         ):
             self.assertIn(token, self.integrate)
+        self.assertIn("readabilityAttenuation", self.composite)
+        self.assertIn("guideEnabled ? 0.24f : 0.0f", self.cpp)
+        early_out = self.composite[
+            self.composite.index("float scatterPeak"):
+            self.composite.index("// 单次散射合成")
+        ]
+        self.assertIn("readabilityAttenuation <= 1e-7", early_out)
 
         interval_visibility = self.integrate[
             self.integrate.index("float intervalVisibility"):
@@ -233,17 +245,15 @@ class War3VolumetricFroxelStaticTests(unittest.TestCase):
             t = min(max((value - edge0) / (edge1 - edge0), 0.0), 1.0)
             return t * t * (3.0 - 2.0 * t)
 
-        contrast = 2.10
-        readability_mix = min(max((contrast - 1.0) / 1.5, 0.0), 1.0)
+        weight = 2.10
+        readability_mix = min(max((weight - 1.0) / 1.5, 0.0), 1.0)
         source_gate = smoothstep(0.004, 0.040, 1.0)
         attenuations = []
-        for evidence in (0.0, 0.00035, 0.0020, 0.0060, 0.0200):
-            evidence_gate = smoothstep(0.00035, 0.0060, evidence)
+        for physical_guide in (0.0, 0.05, 0.10, 0.5, 1.0):
             attenuation = min(
-                1.0
+                physical_guide
                 * 0.55
                 * (0.62 * 1.05)
-                * evidence_gate
                 * source_gate
                 * readability_mix,
                 0.24,
@@ -256,23 +266,47 @@ class War3VolumetricFroxelStaticTests(unittest.TestCase):
         ))
         self.assertLessEqual(max(attenuations), 0.24)
         self.assertAlmostEqual(attenuations[-1], 0.24)
+        self.assertLess(attenuations[1], 0.05)
 
-    def test_rgba_upsample_uses_depth_guide_not_its_own_edge(self):
+    def test_optically_supported_peak_restores_clear_air_column_contrast(self):
+        def smoothstep(edge0, edge1, value):
+            t = min(max((value - edge0) / (edge1 - edge0), 0.0), 1.0)
+            return t * t * (3.0 - 2.0 * t)
+
+        evidence_gate = smoothstep(0.00035, 0.0060, 0.0200)
+        path_occlusion = 0.05
+        peak_occlusion = 1.0
+        physical_guide = max(
+            path_occlusion,
+            peak_occlusion * evidence_gate * 0.74,
+        ) * evidence_gate
+        readability_scale = (
+            0.55 * (0.62 * 1.05) * ((2.10 - 1.0) / 1.5)
+        )
+        attenuation = min(physical_guide * readability_scale, 0.24)
+
+        self.assertAlmostEqual(physical_guide, 0.74)
+        self.assertGreater(attenuation, 0.18)
+        self.assertLessEqual(attenuation, 0.24)
+
+    def test_rgba_upsample_uses_receiver_plane_and_independent_shadow_guide(self):
         upsample = self.composite[
             self.composite.index("vec4 depthAwareUpsample"):
             self.composite.index("void main()")
         ]
         for token in (
-            "float guideWeight = spatial[i] * depthWeight",
+            "float guideWeight = spatial[i] * depthWeight * shadowWeight",
             "vec4 sumEffect = vec4(0.0)",
             "sumEffect += resolved * guideWeight",
             "return sumEffect / weightSum",
-            "not a range guide for themselves",
-            "bilinear coverage AA",
+            "fetchGuide",
+            "low-resolution RGBA solution never guides itself",
         ):
             self.assertIn(token, upsample)
+        self.assertIn("reconstructReceiverPlane", self.composite)
         self.assertNotIn("effectEdgeDistance", self.composite)
         self.assertNotIn("scatteringWeight", upsample)
+        self.assertNotIn("referenceIndex", upsample)
 
     def test_flat_depth_rgba_reconstruction_preserves_interior(self):
         dark = 0.76
@@ -348,9 +382,12 @@ class War3VolumetricFroxelStaticTests(unittest.TestCase):
             self.cpp.count("VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT"), 9
         )
         self.assertIn("VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL", self.cpp)
-        self.assertIn("effectToWrite.newLayout = VK_IMAGE_LAYOUT_GENERAL", self.cpp)
         self.assertIn(
-            "effectToRead.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL",
+            "computeTargets[0].newLayout = VK_IMAGE_LAYOUT_GENERAL",
+            self.cpp,
+        )
+        self.assertIn(
+            "sampledOutputs[0].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL",
             self.cpp,
         )
         self.assertIn(
@@ -419,6 +456,35 @@ class War3VolumetricFroxelStaticTests(unittest.TestCase):
         self.assertNotIn("nearTransition", visibility)
         self.assertEqual(visibility.count("textureGather("), 1)
         self.assertNotIn("stored.x + stored.y", visibility)
+
+    def test_gather_footprint_dda_uses_half_texel_boundaries(self):
+        dda = self.integrate[
+            self.integrate.index("float nextTexelBoundary"):
+            self.integrate.index("float opticalIntegral")
+        ]
+        self.assertIn("float shifted = coord - 0.5", dda)
+        self.assertIn(") + 0.5", dda)
+        self.assertIn("texel-center boundary n+0.5", dda)
+
+    def test_directional_guide_refines_only_edges_and_fails_back_complete(self):
+        for token in (
+            "kVolumetricDirectionalGuideTargetDivisor = 2u",
+            "kVolumetricDirectionalGuideCellBudget = 100'000'000ull",
+            "kVolumetricDirectionalGuideTraversalBudget =\n"
+            "    350'000'000ull",
+            "targetGuideCells <= kVolumetricDirectionalGuideCellBudget",
+            "m_directionalGuideRefineEnabled",
+            "guide=%ux%u refineSteps=%u",
+        ):
+            self.assertIn(token, self.cpp)
+        for token in (
+            "needsGuideRefinement",
+            "maximum - minimum > 0.004",
+            "pc.p_refineMode == 0u",
+            "physicalGuide = reconstructedBaseGuide",
+        ):
+            self.assertIn(token, self.integrate)
+        self.assertNotIn("pow(max(physicalOcclusion", self.integrate)
 
     def test_bilinear_comparison_pcf_is_convex_and_continuous(self):
         comparisons = (0.0, 0.25, 0.75, 1.0)  # gather x/y/z/w order

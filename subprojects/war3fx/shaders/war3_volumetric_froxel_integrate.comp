@@ -10,6 +10,8 @@ layout(set = 1, binding = 0) uniform texture3D s_volume;
 layout(set = 1, binding = 1) uniform texture2DArray s_depth;
 layout(set = 1, binding = 2, rgba16f) writeonly uniform image2D s_effect;
 layout(set = 1, binding = 4) uniform texture2DArray s_shadow;
+layout(set = 1, binding = 5, r16f) writeonly uniform image2D s_shadowGuideOutput;
+layout(set = 1, binding = 6) uniform texture2DArray s_baseShadowGuide;
 
 layout(set = 1, binding = 3, scalar, row_major)
 uniform CsmData {
@@ -37,10 +39,11 @@ uniform push_block {
   vec4 p_params;     // effectWidth, effectHeight, extinctionStrength, albedo
   uint p_shadowSampler;
   uint p_maxTraversalSteps;
-  uint p_pad0;
-  uint p_pad1;
+  uint p_guideSampler;
+  uint p_refineMode;
   vec4 p_sunColorScale; // rgb radiance, w intensity
   vec4 p_sunParams;     // anisotropy, shadowStrength, fallback, contrast
+  vec4 p_guideSize;     // output guide W/H, base guide W/H
 } pc;
 
 bool finiteFloat(float v) {
@@ -232,9 +235,13 @@ bool selectSegmentCascade(vec3 rayDir, float distance0, float distance1,
 float nextTexelBoundary(float coord, float slope) {
   if (abs(slope) <= 1.0e-8)
     return 1.0e30;
-  float boundary = slope > 0.0
-    ? floor(coord + 1.0e-5) + 1.0
-    : ceil(coord - 1.0e-5) - 1.0;
+  // textureGather's bilinear footprint changes when filterCoord crosses a
+  // texel-center boundary n+0.5. Splitting at integer texel edges allowed the
+  // four comparison taps to change inside one analytic DDA interval.
+  float shifted = coord - 0.5;
+  float boundary = (slope > 0.0
+    ? floor(shifted + 1.0e-5) + 1.0
+    : ceil(shifted - 1.0e-5) - 1.0) + 0.5;
   return max((boundary - coord) / slope, 1.0e-5);
 }
 
@@ -485,25 +492,72 @@ void integrateShadowedSlice(vec3 rayDir, float distance0, float distance1,
   }
 
   if (current < distance1 && transmittance > 1.0e-5) {
-    integrateFallback(rayDir, current, distance1, localSource, sigmaT,
-                      sunSource, fallback, shadowStrength, contrast, extent,
-                      scattering, transmittance, shadowReferenceIntegral,
-                      shadowPhysicalIntegral, shadowEvidenceOptical,
-                      peakShadowOcclusion);
+    if (pc.p_refineMode == 0u) {
+      integrateFallback(rayDir, current, distance1, localSource, sigmaT,
+                        sunSource, fallback, shadowStrength, contrast, extent,
+                        scattering, transmittance, shadowReferenceIntegral,
+                        shadowPhysicalIntegral, shadowEvidenceOptical,
+                        peakShadowOcclusion);
+    }
   }
+}
+
+float sampleBaseGuide(vec2 uv) {
+  float value = textureLod(
+    sampler2DArray(s_baseShadowGuide,
+      s_samplers[nonuniformEXT(pc.p_guideSampler)]),
+    vec3(clamp(uv, vec2(0.0), vec2(1.0)), 0.0), 0.0).r;
+  return finiteFloat(value) ? clamp(value, 0.0, 1.0) : 0.0;
+}
+
+bool needsGuideRefinement(vec2 uv) {
+  ivec2 baseSize = max(ivec2(pc.p_guideSize.zw + vec2(0.5)), ivec2(1));
+  ivec2 center = clamp(ivec2(uv * vec2(baseSize)), ivec2(0),
+                       baseSize - ivec2(1));
+  float minimum = 1.0;
+  float maximum = 0.0;
+  for (int y = -1; y <= 1; ++y) {
+    for (int x = -1; x <= 1; ++x) {
+      ivec2 p = clamp(center + ivec2(x, y), ivec2(0),
+                      baseSize - ivec2(1));
+      float value = texelFetch(
+        sampler2DArray(s_baseShadowGuide,
+          s_samplers[nonuniformEXT(pc.p_guideSampler)]),
+        ivec3(p, 0), 0).r;
+      value = finiteFloat(value) ? clamp(value, 0.0, 1.0) : 0.0;
+      minimum = min(minimum, value);
+      maximum = max(maximum, value);
+    }
+  }
+  // A low threshold retains thin/small casters whose physical path coverage
+  // is only a few percent, while uniform lit and uniform shadow regions stay
+  // on the cheap reconstruction path.
+  return maximum > 0.003 && maximum - minimum > 0.004;
 }
 
 void main() {
   ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
   ivec2 effectSize = ivec2(int(pc.p_params.x + 0.5),
                            int(pc.p_params.y + 0.5));
-  if (any(greaterThanEqual(pixel, effectSize)))
+  bool refineGuide = pc.p_refineMode != 0u;
+  ivec2 outputSize = refineGuide
+    ? max(ivec2(pc.p_guideSize.xy + vec2(0.5)), ivec2(1))
+    : effectSize;
+  if (any(greaterThanEqual(pixel, outputSize)))
     return;
-  vec2 uv = (vec2(pixel) + vec2(0.5)) / max(vec2(effectSize), vec2(1.0));
+  vec2 uv = (vec2(pixel) + vec2(0.5)) / max(vec2(outputSize), vec2(1.0));
+  float reconstructedBaseGuide = refineGuide ? sampleBaseGuide(uv) : 0.0;
+  if (refineGuide && !needsGuideRefinement(uv)) {
+    imageStore(s_shadowGuideOutput, pixel,
+               vec4(reconstructedBaseGuide, 0.0, 0.0, 1.0));
+    return;
+  }
   vec3 rayDir;
   float distanceLimit;
   if (!reconstructRayAndLimit(uv, rayDir, distanceLimit)) {
-    imageStore(s_effect, pixel, vec4(0.0, 0.0, 0.0, 1.0));
+    imageStore(s_shadowGuideOutput, pixel, vec4(0.0, 0.0, 0.0, 1.0));
+    if (!refineGuide)
+      imageStore(s_effect, pixel, vec4(0.0, 0.0, 0.0, 1.0));
     return;
   }
 
@@ -567,11 +621,13 @@ void main() {
   float extinctionStrength = clamp(pc.p_params.z, 0.0, 1.0);
   float compositeT = mix(1.0, transmittance, extinctionStrength);
 
-  // Froxel scattering alone can make a true shadow column nearly disappear in
-  // deliberately clear air. Reuse the legacy path's bounded readability
-  // contract: whole-path physical contrast plus optically supported local CSM
-  // evidence. No valid shadow interval means no additional attenuation.
-  float resolvedColumnOcclusion = 0.0;
+  // Publish optically supported directional occlusion independently from
+  // low-resolution scattering/transmittance. Whole-path coverage alone is
+  // too weak for a small caster on a long clear-air ray, so retain the legacy
+  // peak evidence term. Edge refinement raises this guide above the effect
+  // grid before the composite consumes it; the peak term therefore no longer
+  // freezes a 1/4 effect texel into the final silhouette.
+  float physicalGuide = 0.0;
   if (shadowReferenceIntegral > 1.0e-7) {
     float physicalRatio = clamp(
       shadowPhysicalIntegral / shadowReferenceIntegral, 0.0, 1.0);
@@ -579,45 +635,26 @@ void main() {
     float shadowEvidenceGate = smoothstep(
       0.00035, 0.0060, shadowEvidenceOptical);
     bool volumeSun = csm.u_volumeSunParams.x > 0.5;
-    float localEvidenceScale = volumeSun ? 0.74 : 0.68;
-    float physicalOcclusion = max(
-      pathOcclusion,
+    float peakEvidenceScale = volumeSun ? 0.74 : 0.68;
+    float opticallySupportedPeak =
       clamp(peakShadowOcclusion, 0.0, 1.0) *
-        shadowEvidenceGate * localEvidenceScale);
-    float contrastControl = clamp(contrast, 0.0, 2.5);
-    float resolvedOcclusion;
-    if (contrastControl <= 1.0) {
-      resolvedOcclusion = physicalOcclusion * contrastControl;
-    } else {
-      float targetExponent = volumeSun ? 0.50 : 0.55;
-      float readabilityMix = clamp(
-        (contrastControl - 1.0) / 1.5, 0.0, 1.0);
-      float readabilityExponent = mix(
-        1.0, targetExponent, readabilityMix);
-      resolvedOcclusion = pow(
-        max(physicalOcclusion, 0.0), max(readabilityExponent, 0.28));
-    }
-    resolvedColumnOcclusion = clamp(resolvedOcclusion, 0.0, 1.0);
+      shadowEvidenceGate * peakEvidenceScale;
+    physicalGuide = clamp(
+      max(pathOcclusion, opticallySupportedPeak), 0.0, 1.0) *
+      shadowEvidenceGate;
   }
 
-  float columnEvidenceGate = smoothstep(
-    0.00035, 0.0060, shadowEvidenceOptical);
-  float sunRadiancePeak = max(
-    max(sunRadiance.r, sunRadiance.g), sunRadiance.b);
-  float columnSourceGate = smoothstep(0.004, 0.040, sunRadiancePeak);
-  float columnReadabilityMix = clamp(
-    (contrast - 1.0) / 1.5, 0.0, 1.0);
-  float attenScale = 0.62;
-  if (csm.u_volumeSunParams.x > 0.5)
-    attenScale *= 1.05;
-  float maxColumnAtten = 0.24;
-  float columnReadabilityAttenuation = min(
-    resolvedColumnOcclusion * 0.55 * attenScale * columnEvidenceGate *
-      columnSourceGate * columnReadabilityMix,
-    maxColumnAtten);
-  compositeT = clamp(
-    compositeT * (1.0 - columnReadabilityAttenuation),
-    exp(-2.0), 1.0);
+  // A refine ray that consumes its hard DDA allocation does not publish a
+  // partial guide. Falling back to the complete base solution is bounded and
+  // fail-stable even when an edge ray crosses an unusually large number of
+  // volume-sun texels.
+  if (refineGuide && traversalStepsRemaining == 0u)
+    physicalGuide = reconstructedBaseGuide;
+
+  imageStore(s_shadowGuideOutput, pixel,
+             vec4(physicalGuide, 0.0, 0.0, 1.0));
+  if (refineGuide)
+    return;
 
   if (!finiteVec4(vec4(scattering, compositeT)))
     imageStore(s_effect, pixel, vec4(0.0, 0.0, 0.0, 1.0));
