@@ -58,7 +58,8 @@ class VolumetricShaderWorkAdmissionStaticTests(unittest.TestCase):
 
     def test_composite_fixed_full_resolution_reads_are_charged(self) -> None:
         self.assertIn("for (int i = 0; i < 4; i++)", self.composite)
-        self.assertIn("kVolumetricCompositeTextureReadsPerPixel = 10u", self.cpp)
+        self.assertIn("kVolumetricCompositeTextureReadsPerPixel = 24u", self.cpp)
+        self.assertIn("maxTotalWork = 350ull * 1024ull * 1024ull", self.header)
         self.assertIn("compositeTextureReads", self.header)
 
     def test_admission_precedes_every_gpu_side_volume_action(self) -> None:

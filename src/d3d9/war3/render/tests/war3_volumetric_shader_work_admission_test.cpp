@@ -21,7 +21,7 @@ War3VolumetricShaderWorkRequest DefaultVolumeSunRequest(
   request.pointProbesPerLight = 2u;
   request.compositeWidth = fullWidth;
   request.compositeHeight = fullHeight;
-  request.compositeTextureReadsPerPixel = 10u;
+  request.compositeTextureReadsPerPixel = 24u;
   return request;
 }
 
@@ -38,8 +38,8 @@ int main() {
     assert(estimate.directionalCascadeEvaluations == 33'177'600u);
     assert(estimate.directionalD32Reads == 298'598'400u);
     assert(estimate.pointCubeReads == 8'294'400u);
-    assert(estimate.compositeTextureReads == 20'736'000u);
-    assert(estimate.totalWork == 329'832'000u);
+    assert(estimate.compositeTextureReads == 49'766'400u);
+    assert(estimate.totalWork == 358'862'400u);
     assert(estimate.totalWork < estimate.limits.maxTotalWork);
   }
 
@@ -63,7 +63,7 @@ int main() {
            War3VolumetricShaderWorkRejectReason::TotalWorkBudget);
     assert(estimate.raySegments == 3'628'800u);
     assert(estimate.directionalD32Reads == 522'547'200u);
-    assert(estimate.compositeTextureReads == 82'944'000u);
+    assert(estimate.compositeTextureReads == 199'065'600u);
   }
 
   {

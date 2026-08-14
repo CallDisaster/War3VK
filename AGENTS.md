@@ -52,8 +52,15 @@ WarVK 是一个面向 **Warcraft III 1.27a** 的 Windows 图形增强项目。�
   `docs/agent-history/2026-08-12-local-volumetric-fog-candidate.md`。
 - 2026-08-13 的 Froxel Medium/High 候选使用统一 `[20,10000]` 对数 Z、受限三维网格、时域重建、
   全分辨率 depth 引导和 compare-first 2×2 Caster 可见度；当前候选默认 Froxel High，并保留显式
-  Legacy 回退。78/78 静态和 21/21 runnable 已在合并前通过，现正与生产者性能线集成；组合 DLL、
-  4K 性能和玩家前台视觉仍未验收，详见 `docs/agent-history/2026-08-13-froxel-dynamic-shadow-comparison-pcf-candidate.md`。
+  Legacy 回退。该基础已合入稳定生产者性能线并通过隔离长门，详见
+  `docs/agent-history/2026-08-13-froxel-dynamic-shadow-comparison-pcf-candidate.md`。
+- 后续研究确认方向阴影没有进入 3D temporal，且 `1/4`/`1/8` effect、raw-depth-only
+  upsample 与低分辨率可读性共同放大移动阶梯。当前未部署候选新增独立 R16F base/边缘自适应
+  `1/2` directional guide，以 full-resolution receiver plane 联合重建，并把最大 24% 可读性
+  移到重建后。首轮玩家回归发现 clear-air 提前返回会丢弃 guide 且路径平均遮挡过弱；当前修订
+  已让早退同时检查 guide，并恢复受双重光学证据约束的峰值遮挡；29/29 定向、78/78 静态、
+  21/21 Win32 runnable、DLL 构建及 no-work 通过，尚待玩家前台视觉/性能 A/B，详见
+  `docs/agent-history/2026-08-14-directional-volumetric-shadow-guide-candidate.md`。
 - 产品、DLL 资源、外部 Shader API 与 JAPI 显示版本已统一为 `1.2.0 Release`；GitHub 源码、
   玩家包、地图作者包及明确排除项见 `docs/RELEASE_1.2.0.md`。
 - 当前候选验证为：474/474 静态测试、15/15 Win32 runnable、真实 YDWE Catalog 35/35 回读与

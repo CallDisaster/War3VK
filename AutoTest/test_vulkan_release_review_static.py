@@ -159,11 +159,18 @@ class VulkanReleaseReviewStaticTests(unittest.TestCase):
             "candidateDepthView",
             "candidateEffect",
             "candidateEffectView",
+            "candidateGuideBase",
+            "candidateGuideBaseView",
+            "candidateGuideRefined",
+            "candidateGuideRefinedView",
         ):
             self.assertIn(token, ensure)
-        last_candidate_create = ensure.rindex("candidateEffect->createView")
         first_publish = ensure.index("m_colorCopy = std::move(candidateColor)")
-        self.assertLess(last_candidate_create, first_publish)
+        for candidate_create in (
+            'createGuide("War3DirectionalVolumeGuideBase"',
+            'createGuide("War3DirectionalVolumeGuideRefined"',
+        ):
+            self.assertLess(ensure.index(candidate_create), first_publish)
         self.assertGreater(
             ensure.index("m_cachedExtent = extent"), first_publish
         )

@@ -9,6 +9,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 HELPER = ROOT / "src/d3d9/war3/render/war3_owned_image_layout.h"
 SHADOW_H = ROOT / "src/d3d9/d3d9_war3_shadow.h"
+VOLUMETRIC_H = ROOT / "src/d3d9/d3d9_war3_volumetric_light.h"
 SHADOW_RESOURCES = ROOT / "src/d3d9/d3d9_war3_shadow_resources.cpp"
 SHADERPACK = ROOT / "src/d3d9/war3_shaderpack.cpp"
 TARGET_SOURCES = (
@@ -53,6 +54,15 @@ class War3OwnedImageLayoutContracts(unittest.TestCase):
             "m_shadowMapLayout",
             "m_shadowCasterMaskLayout",
             "m_volumeSunShadowLayout",
+        ):
+            self.assertIn(state, text)
+
+    def test_volumetric_tracks_effect_and_directional_guide_layouts(self) -> None:
+        text = VOLUMETRIC_H.read_text(encoding="utf-8")
+        for state in (
+            "m_effectLayout",
+            "m_directionalGuideBaseLayout",
+            "m_directionalGuideRefinedLayout",
         ):
             self.assertIn(state, text)
 

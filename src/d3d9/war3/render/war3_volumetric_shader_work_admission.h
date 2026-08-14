@@ -17,9 +17,10 @@ struct War3VolumetricShaderWorkLimits {
   // work. The shader still performs substantial arithmetic in every segment.
   uint64_t maxRaySegments = 4'000'000ull;
   // One work unit is either one ray segment or one shader texture access from
-  // the bounded model below. 320 Mi keeps the 1080p release default eligible,
+  // the bounded model below. 350 Mi keeps the 1080p release default eligible
+  // after the directional-guide reconstruction raised the composite bound,
   // while rejecting the known 1440p/4K volume-sun worst cases.
-  uint64_t maxTotalWork = 320ull * 1024ull * 1024ull;
+  uint64_t maxTotalWork = 350ull * 1024ull * 1024ull;
 
   bool valid() const noexcept {
     return maxRaySegments != 0u && maxTotalWork != 0u;
@@ -46,7 +47,8 @@ struct War3VolumetricShaderWorkRequest {
   uint32_t compositeWidth = 0u;
   uint32_t compositeHeight = 0u;
   // Source-proven conservative bound for the composite shader. The normal
-  // low-resolution path is ten accesses per full-resolution fragment.
+  // guide-aware low-resolution path is 24 accesses per full-resolution
+  // fragment in the conservative branch model.
   uint32_t compositeTextureReadsPerPixel = 0u;
 };
 
