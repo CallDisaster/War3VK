@@ -40,7 +40,7 @@ class Wiring(unittest.TestCase):
         memory = (ROOT / 'src/dxvk/dxvk_memory.cpp').read_text()
         creation = memory.split('DxvkMemoryAllocator::createBufferResource(', 1)[1].split(
             'DxvkMemoryAllocator::createImageResource(', 1)[0]
-        self.assertLess(creation.index('DxvkUnboundBufferGuard unboundBuffer'),
+        self.assertLess(creation.index('DxvkUnboundResourceGuard unboundBuffer'),
                         creation.index('vkGetBufferMemoryRequirements2'))
         self.assertLess(creation.index('allocation->m_buffer = buffer'),
                         creation.index('unboundBuffer.release()'))

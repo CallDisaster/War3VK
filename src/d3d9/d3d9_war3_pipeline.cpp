@@ -1419,6 +1419,11 @@ void War3RenderPipeline::Execute(War3InsertionPoint point,
                 war3shader::internal::HasNativeColorWriteListeners();
         const auto& frameGraphPlan = dxvk::war3::render::War3FrameGraphPlan::Default();
         if (hasListeners) {
+            // Callback draw-call handles borrow this frame's geometry. Keep
+            // slices until the exposed command buffer retires, even if CSM
+            // or outlines are disabled. No authority for external async queues.
+            if (ctx) for (const auto& draw : input.scene.shadowCasters)
+                war3::memory::TrackSnapshotSlices(*ctx, draw);
             UpdateShaderApiFrameBuffers(input);
             auto contextScope = perf.cpuScope("UpdateRenderContext");
             war3shader::internal::ValidateWar3ShaderContextAbi(

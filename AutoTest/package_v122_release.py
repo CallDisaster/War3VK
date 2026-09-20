@@ -19,7 +19,7 @@ AUTHOR = ('WarVK/action.txt', 'WarVK/call.txt', 'WarVK/define.txt',
           'WarVK/jass/warvk_api.j', 'WarVK/jass/warvk_bridge.j',
           'WarVK/jass/warvk_constant.j', 'WarVK/jass/warvk_init.j',
           'WarVK/jass/warvk_smoke_test.j', 'LICENSE', 'COPYING', 'THIRD_PARTY_NOTICES.md')
-RC_SHA = '62BF9F402C90DE8C284F5C9C194517EC165F208F0A03F33A75D2F1FDB56381C3'
+TESTED_CANDIDATE_SHA = '028565BCB33B6EB646E4915115B60CDA3C14C287A4225DAA50F8F6513F9E9BA3'
 DEPENDENCY_LICENSES = ('COPYING', 'LICENSE', 'src/minhook/LICENSE.txt',
     'subprojects/imgui/LICENSE.txt', 'subprojects/dxbc-spirv/LICENSE',
     'subprojects/libdisplay-info/LICENSE', 'smaa/LICENSE.txt',
@@ -69,7 +69,7 @@ def verify_archive(directory, archive, payload):
 def make_archive(directory, archive, payload, evidence):
     if set(members(directory)) != set(payload):
         raise ValueError('Unexpected payload')
-    manifest = dict(schema=1, kind='warvk-release', version='1.22.00',
+    manifest = dict(schema=1, kind='warvk-release', version='1.22.01',
                     files=members(directory), evidence=evidence)
     create_text(directory / 'manifest.json', json.dumps(manifest, ensure_ascii=False, indent=2))
     with zipfile.ZipFile(archive, 'x', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
@@ -127,14 +127,15 @@ def package(root, build, out, manifest_name):
     # VersionInfo reads PE resources, not LoadLibrary/DllMain.
     version = json.loads(subprocess.check_output(['powershell', '-NoProfile', '-Command',
         f"$v=(Get-Item -LiteralPath '{dll}').VersionInfo; @{{v=$v.FileVersion;pre=$v.IsPreRelease;description=$v.FileDescription}}|ConvertTo-Json -Compress"], text=True))
-    if version != {'v': '1.22.00', 'pre': False, 'description': 'WarVK 1.22.00 Direct3D 9 Runtime'}:
+    if version != {'v': '1.22.01', 'pre': False, 'description': 'WarVK 1.22.01 Direct3D 9 Runtime'}:
         raise ValueError('Not a final version resource')
     evidence = dict(sourceCommit=commit, buildInputManifest=identity(build / manifest_name),
         configurationAudit=identity(build / 'release-configuration-audit.json'),
         playerDll=identity(dll), unstrippedDll=original_id,
         mesonCpuTests=len(tests), assertionsEnabledInTests=True, staticScripts=len(results),
-        userReleaseAuthorized=True, playerAcceptedRcSha256=RC_SHA,
-        deltaAfterPlayerTest='Render Stats telemetry fix and final version metadata; no budget/caster/fence policy changes',
+        userReleaseAuthorized=True, playerAcceptedCandidateSha256=TESTED_CANDIDATE_SHA,
+        playerEvidence='One player test reported no observed problem; matching live DLL SHA independently checked',
+        deltaAfterPlayerTest='Product/JAPI version strings, matching runtime version probe and packaging/docs only; no allocation/caster/fence algorithm changes',
         finalDllRuntimeRetested=False, universalGpuVisualOrApiAcceptance=False)
     player, author = out / 'player', out / 'author'
     player.mkdir(); author.mkdir()
@@ -150,8 +151,8 @@ def package(root, build, out, manifest_name):
         dest = author / name
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(root / name, dest)
-    player_zip = out / 'WarVK-1.22.00-win32.zip'
-    author_zip = out / 'WarVK-1.22.00-author-kit.zip'
+    player_zip = out / 'WarVK-1.22.01-win32.zip'
+    author_zip = out / 'WarVK-1.22.01-author-kit.zip'
     make_archive(player, player_zip, PLAYER, evidence)
     make_archive(author, author_zip, AUTHOR, evidence)
     assets = {p.name: identity(p) for p in (dll, player_zip, author_zip)}

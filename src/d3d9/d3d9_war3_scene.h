@@ -1,6 +1,7 @@
 #pragma once
 
 #include "war3/render/war3_render_state.h"
+#include "war3/memory/war3_snapshot_slice.h"
 #include "war3/render/war3_shadow_bounds_policy.h"
 #include "war3/render/war3_shadow_palette_storage.h"
 #include "war3/render/war3_shadow_replay_binding_policy.h"
@@ -280,6 +281,7 @@ namespace dxvk {
         // pinned allocation keeps the capture-time physical backing.
         Rc<DxvkBuffer> positionStorage;
         Rc<DxvkResourceAllocation> positionPinnedAllocation;
+        Rc<war3::memory::SnapshotSlice> positionSnapshotLease;
         DxvkResourceBufferInfo positionInfo;
         uint32_t positionStride = 0;
         uint32_t positionOffset = 0;
@@ -288,6 +290,7 @@ namespace dxvk {
         // Index input
         Rc<DxvkBuffer> indexStorage;
         Rc<DxvkResourceAllocation> indexPinnedAllocation;
+        Rc<war3::memory::SnapshotSlice> indexSnapshotLease;
         DxvkResourceBufferInfo indexInfo;
         VkIndexType indexType = VK_INDEX_TYPE_UINT32;
 
@@ -331,6 +334,7 @@ namespace dxvk {
         // UV流 (纹理坐标，用于采样漫反射贴图)
         Rc<DxvkBuffer> uvStorage;           // UV数据缓冲区
         Rc<DxvkResourceAllocation> uvPinnedAllocation;
+        Rc<war3::memory::SnapshotSlice> uvSnapshotLease;
         DxvkResourceBufferInfo uvInfo;      // UV缓冲区信息
         uint32_t uvStride = 0;              // UV步长
         uint32_t uvOffset = 0;              // UV偏移

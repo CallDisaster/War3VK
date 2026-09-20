@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <cstdint>
 #include <limits>
@@ -40,6 +41,19 @@ inline uint64_t War3Stage11SnapshotResidentCapBytes() noexcept {
   }();
   return value;
 }
+
+inline uint64_t War3Stage11SnapshotAdaptiveHardCapBytes() noexcept {
+  static const uint64_t value = std::getenv("DXVK_WAR3_SNAPSHOT_RESIDENT_CAP_MB")
+      ? War3Stage11SnapshotResidentCapBytes()
+      : kWar3Stage11SnapshotResidentCapMaxBytes;
+  return value;
+}
+
+// Diagnostic publication only, never allocation authority (multi-field samples
+// need not be from the same cut). Production keeps its device-owned decision.
+inline std::atomic<uint64_t> g_stage11AdaptiveTarget{kWar3Stage11SnapshotResidentCapBytes};
+inline std::atomic<uint64_t> g_stage11SliceReusedBytes{0};
+inline std::atomic<uint64_t> g_stage11BudgetGrowthRejects{0};
 
 struct War3Stage11SnapshotSuballocation {
   bool valid = false;

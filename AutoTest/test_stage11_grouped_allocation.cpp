@@ -42,12 +42,12 @@ void TestInitializationAndUnwind() {
   } catch (const std::bad_alloc&) { }
   CHECK(allocation.expired());
   for (bool transfer : {false, true}) {
-    { dxvk::DxvkUnboundBufferGuard guard([&] { ++destroyed; });
+    { dxvk::DxvkUnboundResourceGuard guard([&] { ++destroyed; });
       if (transfer) guard.release(); }
     CHECK(destroyed == 1);
   }
   try {
-    dxvk::DxvkUnboundBufferGuard guard([&] { ++destroyed; });
+    dxvk::DxvkUnboundResourceGuard guard([&] { ++destroyed; });
     throw std::bad_alloc(); // requirements/diagnostic/allocation failure
   } catch (const std::bad_alloc&) { }
   CHECK(destroyed == 2);
@@ -162,10 +162,32 @@ void TestPendingBufferOwnerSurvivesPageRemoval() {
   CHECK(allocation.expired());
 }
 
+void TestSameClassPinningRemainsVisible() {
+  // Negative capacity witness, not GPU recreation: use the production planner
+  // and model whole-page GC with one surviving 256-byte anchor per page.
+  Pool pool;
+  for (unsigned page = 0; page != 24; ++page) {
+    CHECK(pool.allocate(256, Life::ShortLived).safeToUse());
+    while (pool.pages.back().used < pool.pages.back().capacity) {
+      const uint64_t remaining = pool.pages.back().capacity - pool.pages.back().used;
+      CHECK(pool.allocate(std::min<uint64_t>(remaining, 512u << 10u), Life::ShortLived).safeToUse());
+    }
+  }
+  CHECK(pool.pages.size() == 24);
+  CHECK(pool.resident() == (384ull << 20));
+  CHECK(!pool.allocate(512u << 10u, Life::ShortLived).safeToUse());
+  std::cout << "UNRESOLVED same-class pinning: anchors=6144 bytes residentMiB=384 denied=1\n";
+  // All anchors are explicitly released in this model; never infer this from
+  // camera movement, low logical payload or a producer fence alone.
+  pool.pages.clear();
+  CHECK(pool.allocate(512u << 10u, Life::ShortLived).safeToUse());
+}
+
 int main() {
   try {
     TestInitializationAndUnwind();
     TestAnchorsDoNotPinTransientPages();
+    TestSameClassPinningRemainsVisible();
     TestFallbackAfterCreateFailureAndCap();
     TestPendingBufferOwnerSurvivesPageRemoval();
     std::cout << "grouped allocation CPU checks=" << checks << " PASS; no GPU proof\n";

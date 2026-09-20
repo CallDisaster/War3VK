@@ -2,6 +2,8 @@
 #include "war3_shadow_arena.h"
 #include "war3_shadow_arena_stats.h"
 #include "war3_shadow_arena_budget.h"
+#include "war3_memory_budget_sample.h"
+#include "../../../dxvk/dxvk_buffer_allocation_guard.h"
 #include "war3_shadow_arena_lifecycle.h"
 
 #include "../../d3d9_device.h"
@@ -42,11 +44,14 @@ struct ShadowArenaFrameState {
   uint64_t retireSerial = 0u;
   uint64_t generation = 0u;
   uint64_t frameSerial = 0u;
+  ArenaTrimHistory trimHistory{};
 };
 
 std::vector<ShadowArenaFrameState> g_frameStates;
 DxvkDevice* g_ownerDevice = nullptr;
 uint32_t g_allocationHeapIndex = kInvalidGenerationIndex;
+BudgetGrowthRetryGate g_budgetRetry;
+uint64_t g_allocationFrameSerial = 0;
 std::atomic<uint32_t> g_currentFrameIndex{kInvalidGenerationIndex};
 uint32_t g_arenaPageSize = kDefaultArenaPageSize;
 uint32_t g_arenaMaxFrameSize = kDefaultArenaPageSize;
@@ -219,29 +224,13 @@ void PublishArenaMemoryBudget(
 }
 
 void RefreshArenaMemoryBudget(uint64_t frameSerial) {
-  ShadowArenaMemoryBudgetInput input = {};
   const uint32_t primaryHeapIndex = g_allocationHeapIndex;
   DxvkDevice* const device = g_ownerDevice;
-  if (device != nullptr) {
-    input.extensionSupported = device->features().extMemoryBudget != 0u;
-    if (input.extensionSupported &&
-        primaryHeapIndex != kInvalidGenerationIndex) {
-      const DxvkAdapterMemoryInfo memoryInfo =
-          device->adapter()->getMemoryHeapInfo();
-      if (primaryHeapIndex < memoryInfo.heapCount) {
-        const auto& heap = memoryInfo.heaps[primaryHeapIndex];
-        if ((heap.heapFlags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0u) {
-        input.primaryDeviceLocalHeapFound = true;
-        input.heapSizeBytes = heap.heapSize;
-        input.heapBudgetBytes = heap.memoryBudget;
-        input.heapAllocatedBytes = heap.memoryAllocated;
-        }
-      }
-    }
-  }
-
-  PublishArenaMemoryBudget(ResolveShadowArenaMemoryBudget(input),
-                           primaryHeapIndex, frameSerial);
+  const auto sample = SampleShadowMemoryBudget(device, primaryHeapIndex,
+      g_residentBytes.load(std::memory_order_acquire), kShadowArenaFixedResidentLimitBytes,
+      kShadowArenaFixedResidentLimitBytes, g_arenaPageSize, 3);
+  const auto policy = ResolveShadowArenaMemoryBudget(sample);
+  PublishArenaMemoryBudget(policy, primaryHeapIndex, frameSerial);
 }
 
 bool CanGrowArenaBy(uint64_t growthBytes) {
@@ -281,15 +270,29 @@ bool AllocateArenaPage(ShadowArenaFrameState& frameState,
 
   const bool allocationHeapKnown =
       g_allocationHeapIndex != kInvalidGenerationIndex;
-  if (allocationHeapKnown && !CanGrowArenaBy(pageCapacity))
+  if (g_budgetRetry.refused(g_allocationFrameSerial, pageCapacity)) return false;
+  // Also enforce VA/fallback bounds before the first allocation, when the
+  // allocator has not yet revealed its exact heap. Never query per slice.
+  RefreshArenaMemoryBudget(g_budgetSnapshotFrameSerial.load(std::memory_order_acquire));
+  if (!CanGrowArenaBy(pageCapacity)) {
+    g_budgetRetry.refuse(g_allocationFrameSerial, pageCapacity);
     return false;
+  }
 
   DxvkDevice* const device = g_ownerDevice;
   if (device == nullptr)
     return false;
-  Rc<DxvkBuffer> pageBuffer = device->createBuffer(
-      MakeArenaBufferInfo(pageCapacity),
-      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+  Rc<DxvkBuffer> pageBuffer;
+  try {
+    pageBuffer = device->createBuffer(MakeArenaBufferInfo(pageCapacity),
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+  } catch (const DxvkBufferAllocationError&) {
+    // Budget is an estimate, not a reservation. Preserve the existing empty
+    // allocation/fail-closed path if another user consumed the headroom.
+    if (device->getDeviceStatus() != VK_SUCCESS) throw;
+    g_budgetRetry.refuse(g_allocationFrameSerial, pageCapacity);
+    return false;
+  }
   if (pageBuffer == nullptr || !pageBuffer->storage()) {
     war3dbg::Print("DXVK War3[ShadowArena]: Arena 页创建失败 size=%u MB。\n",
                    pageCapacity >> 20);
@@ -305,11 +308,6 @@ bool AllocateArenaPage(ShadowArenaFrameState& frameState,
     // budget heap. Query that exact heap before publishing the first page.
     g_allocationHeapIndex = pageHeapIndex;
     RefreshArenaMemoryBudget(0u);
-    if (!CanGrowArenaBy(pageCapacity)) {
-      g_allocationHeapIndex = kInvalidGenerationIndex;
-      RefreshArenaMemoryBudget(0u);
-      return false;
-    }
   } else if (pageHeapIndex != g_allocationHeapIndex) {
     // Never authorize a page using a different heap's budget snapshot.
     return false;
@@ -317,6 +315,17 @@ bool AllocateArenaPage(ShadowArenaFrameState& frameState,
 
   const uint64_t residentBefore =
       g_residentBytes.load(std::memory_order_acquire);
+  // Physical commitment now includes this unpublished allocation. Do not
+  // charge pageCapacity a second time against remaining physical headroom.
+  const auto after = DecideAdaptiveMemoryBudget(SampleShadowMemoryBudget(
+      device, pageHeapIndex, residentBefore + pageCapacity,
+      kShadowArenaFixedResidentLimitBytes, kShadowArenaFixedResidentLimitBytes,
+      g_arenaPageSize, 3));
+  if (after.vaPressure || residentBefore + pageCapacity > after.target) {
+    g_budgetRetry.refuse(g_allocationFrameSerial, pageCapacity);
+    g_budgetGrowthRejectCount.fetch_add(1u, std::memory_order_relaxed);
+    return false; // Preserve the discovered heap for the next preflight.
+  }
 
   frameState.pages.push_back(ShadowArenaPage{std::move(pageBuffer), pageCapacity});
   frameState.totalCapacity += pageCapacity;
@@ -417,6 +426,8 @@ bool ShadowArena_Init(DxvkDevice* device) {
   if (g_ownerDevice != nullptr && g_ownerDevice != device)
     return false;
   g_ownerDevice = device;
+  g_budgetRetry.reset();
+  g_allocationFrameSerial = 0;
 
   g_arenaPageSize = ResolveArenaPageSize();
   g_arenaMaxFrameSize = ResolveArenaMaxFrameSize(g_arenaPageSize);
@@ -542,6 +553,7 @@ void ShadowArena_Shutdown(DxvkDevice* device) {
 bool ShadowArena_BeginFrame(uint64_t frameSerial, uint64_t completedSerial) {
   if (!ShadowArena_IsInitialized())
     return false;
+  g_allocationFrameSerial = frameSerial;
 
   const uint32_t prevOverflow =
       g_frameOverflowCount.exchange(0u, std::memory_order_relaxed);
@@ -562,8 +574,8 @@ bool ShadowArena_BeginFrame(uint64_t frameSerial, uint64_t completedSerial) {
       g_budgetSnapshotFrameSerial.load(std::memory_order_acquire);
   if (lastBudgetFrame == 0u || frameSerial < lastBudgetFrame ||
       frameSerial - lastBudgetFrame >= kArenaBudgetRefreshIntervalFrames) {
-    // Budget queries are confined to this Present-owned generation switch.
-    // Draw-time allocation only consumes this immutable snapshot.
+    // Refresh at the Present-owned generation switch. Actual page growth
+    // also resamples pressure; ordinary slice allocations do not query it.
     RefreshArenaMemoryBudget(frameSerial);
   }
 
@@ -606,6 +618,24 @@ bool ShadowArena_BeginFrame(uint64_t frameSerial, uint64_t completedSerial) {
 
   g_currentFrameIndex.store(generationIndex, std::memory_order_release);
   auto& frameState = g_frameStates[generationIndex];
+  // The legacy reuse predicate also admits serial zero (unused/startup).
+  // Trimming needs positive retirement evidence, never an unsealed generation.
+  const uint64_t previousUsed = uint64_t(frameState.committedBytes) + frameState.currentOffset;
+  const bool pressure = g_residentBytes.load(std::memory_order_acquire) >
+      g_residentLimitBytes.load(std::memory_order_acquire);
+  const bool trimRetired = frameState.retireSerial != 0u &&
+      ShadowArenaGenerationCanBeReused(frameState.retireSerial, completedSerial);
+  const uint64_t keep = trimRetired
+      ? frameState.trimHistory.target(frameSerial, previousUsed,
+          frameState.totalCapacity, g_arenaPageSize, pressure)
+      : frameState.totalCapacity;
+  while (!frameState.pages.empty() &&
+         frameState.totalCapacity - frameState.pages.back().capacity >= keep) {
+    const uint32_t bytes = frameState.pages.back().capacity;
+    frameState.pages.pop_back();
+    frameState.totalCapacity -= bytes;
+    g_residentBytes.fetch_sub(bytes, std::memory_order_release);
+  }
   frameState.currentPage = 0u;
   frameState.currentOffset = 0u;
   frameState.committedBytes = 0u;

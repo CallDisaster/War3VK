@@ -5,10 +5,20 @@ from pathlib import Path
 import tempfile
 import unittest
 import zipfile
-from package_v122_release import make_archive, verify_archive, verify_win32, members, PLAYER, AUTHOR
+from package_v122_release import make_archive, verify_archive, verify_win32, members, PLAYER, AUTHOR, TESTED_CANDIDATE_SHA
 
 
 class ReleaseArchiveTests(unittest.TestCase):
+    def test_patch_version_and_player_identity(self):
+        self.assertEqual(TESTED_CANDIDATE_SHA,
+            '028565BCB33B6EB646E4915115B60CDA3C14C287A4225DAA50F8F6513F9E9BA3')
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); package = root / 'package'; package.mkdir()
+            (package / 'README.md').write_text('payload', encoding='utf-8')
+            make_archive(package, root / 'p.zip', ('README.md',), {})
+            manifest = json.loads((package / 'manifest.json').read_text())
+            self.assertEqual(manifest['version'], '1.22.01')
+
     def test_actual_pe_reader_contract(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'fixture.dll'

@@ -89,9 +89,11 @@ namespace dxvk {
         VkDeviceSize allocated = m_memoryStats[i].allocated.load();
         VkDeviceSize used = m_memoryStats[i].used.load();
 
+        info.heaps[i].memoryCommitted = std::max(memBudget.heapUsage[i], allocated);
         info.heaps[i].memoryBudget    = memBudget.heapBudget[i];
         info.heaps[i].memoryAllocated = std::max(memBudget.heapUsage[i], allocated) - allocated + used;
       } else {
+        info.heaps[i].memoryCommitted = m_memoryStats[i].allocated.load();
         info.heaps[i].memoryBudget    = memProps.memoryProperties.memoryHeaps[i].size;
         info.heaps[i].memoryAllocated = m_memoryStats[i].used.load();
       }

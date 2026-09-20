@@ -23,15 +23,15 @@ MESON = read("src/d3d9/meson.build")
 class ShadowArenaMemoryBudgetStaticTests(unittest.TestCase):
     def test_policy_never_raises_fixed_residency_cap(self) -> None:
         self.assertIn("kShadowArenaFixedResidentLimitBytes", BUDGET)
-        self.assertIn("kShadowArenaMemoryReserveBytes", BUDGET)
-        self.assertIn("kShadowArenaBudgetFractionDenominator = 4u", BUDGET)
+        self.assertIn("DecideAdaptiveMemoryBudget(input)", BUDGET)
+        self.assertNotIn("ShadowArenaMemoryBudgetInput", BUDGET)
         self.assertIn("std::min(", BUDGET)
         self.assertIn("result.fixedResidentLimitBytes", BUDGET)
         self.assertIn("result.proportionalLimitBytes", BUDGET)
         self.assertIn("result.reserveLimitBytes", BUDGET)
-        self.assertIn("if (!saneSnapshot)", BUDGET)
+        self.assertIn("std::min(adaptive.target, growthLimit)", BUDGET)
 
-    def test_budget_query_is_confined_to_generation_safe_points(self) -> None:
+    def test_budget_query_at_generation_and_new_page_not_per_slice(self) -> None:
         init = ARENA.split("bool ShadowArena_Init(DxvkDevice* device)", 1)[1].split(
             "bool ShadowArena_IsInitialized()", 1
         )[0]
@@ -45,6 +45,11 @@ class ShadowArenaMemoryBudgetStaticTests(unittest.TestCase):
         self.assertIn("RefreshArenaMemoryBudget(frameSerial)", begin)
         self.assertNotIn("getMemoryHeapInfo", allocate)
         self.assertIn("CanGrowArenaBy(pageCapacity)", allocate)
+        self.assertIn("RefreshArenaMemoryBudget(", allocate)
+        slices = ARENA.split("bool TryAllocateFromCurrentGeneration(", 1)[1].split(
+            "void NoteArenaAdmissionFailure", 1)[0]
+        self.assertNotIn("SampleShadowMemoryBudget", slices)
+        self.assertNotIn("RefreshArenaMemoryBudget", slices)
 
     def test_budget_uses_the_allocator_selected_heap(self) -> None:
         refresh = ARENA.split("void RefreshArenaMemoryBudget(", 1)[1].split(

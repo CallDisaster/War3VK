@@ -12,6 +12,7 @@
 #include "d3d9_format.h"
 #include "d3d9_include.h"
 #include "d3d9_mem.h"
+#include "war3/memory/war3_adaptive_memory_budget.h"
 #include "d3d9_multithread.h"
 
 
@@ -2617,6 +2618,8 @@ private:
   struct War3Stage11SnapshotPage {
     uint64_t id = 0u;
     Rc<DxvkBuffer> buffer;
+    war3::memory::SnapshotSliceTable<> slices;
+    bool sliceRecyclingSealed = false; // metadata exhaustion falls back to legacy append-only
     VkDeviceSize capacity = 0u;
     VkDeviceSize used = 0u;
     // Allocation/retention intent, not geometry validity or a GPU reuse lease.
@@ -2636,6 +2639,8 @@ private:
       m_war3Stage11SnapshotPages;
   uint64_t m_war3Stage11SnapshotNextPageId = 1u;
   uint64_t m_war3Stage11SnapshotResidentBytes = 0u;
+  uint32_t m_war3Stage11SnapshotHeap = UINT32_MAX;
+  war3::memory::BudgetGrowthRetryGate m_war3Stage11BudgetRetry;
   uint64_t m_war3Stage11SnapshotReclaimedPages = 0u;
   const bool m_war3Stage11CensusEnabled = war3::stage11_census::Enabled();
   war3::stage11_census::Schedule m_war3Stage11CensusSchedule;
@@ -2671,6 +2676,7 @@ private:
     Rc<DxvkBuffer> positionBuffer;
     Rc<DxvkResourceAllocation> positionPinnedAllocation;
     std::shared_ptr<War3Stage11SnapshotPage> positionSnapshotPage;
+    Rc<war3::memory::SnapshotSlice> positionSnapshotLease;
     VkDeviceSize positionSnapshotOffset = 0u;
     DxvkResourceBufferInfo positionInfo = {};
     uint32_t positionStride = 0u;
@@ -2691,6 +2697,7 @@ private:
     Rc<DxvkBuffer> indexBuffer;
     Rc<DxvkResourceAllocation> indexPinnedAllocation;
     std::shared_ptr<War3Stage11SnapshotPage> indexSnapshotPage;
+    Rc<war3::memory::SnapshotSlice> indexSnapshotLease;
     VkDeviceSize indexSnapshotOffset = 0u;
     DxvkResourceBufferInfo indexInfo = {};
     VkIndexType indexType = VK_INDEX_TYPE_UINT16;
@@ -2778,6 +2785,7 @@ private:
     Rc<DxvkBuffer> uvBuffer;
     Rc<DxvkResourceAllocation> uvPinnedAllocation;
     std::shared_ptr<War3Stage11SnapshotPage> uvSnapshotPage;
+    Rc<war3::memory::SnapshotSlice> uvSnapshotLease;
     VkDeviceSize uvSnapshotOffset = 0u;
     DxvkResourceBufferInfo uvInfo = {};
     uint32_t uvStride = 0u;
@@ -3102,6 +3110,7 @@ private:
       VkDeviceSize requiredBytes,
       war3::render::War3Stage11PageLifetime lifetime,
       std::shared_ptr<War3Stage11SnapshotPage>& outPage,
+      Rc<war3::memory::SnapshotSlice>& outLease,
       VkDeviceSize& outOffset, VkDeviceSize& outCapacity);
   void War3CollectUnusedStage11SnapshotPages();
   void War3RefreshStage11SnapshotPageStats();

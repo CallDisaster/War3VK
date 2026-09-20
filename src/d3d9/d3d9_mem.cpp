@@ -62,6 +62,11 @@ namespace dxvk {
   }
 
   D3D9Memory D3D9MemoryAllocator::Alloc(uint32_t Size) {
+    if (unlikely(Size == 0))
+      return {};
+    if (unlikely(Size > std::numeric_limits<uint32_t>::max() - (CACHE_LINE_SIZE - 1)))
+      return {};
+
     std::lock_guard<dxvk::mutex> lock(m_mutex);
 
     uint32_t alignedSize = align(Size, CACHE_LINE_SIZE);
@@ -247,7 +252,8 @@ namespace dxvk {
     , m_mapping ( CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_COMMIT, 0, Size, nullptr) ) {
     m_freeRanges.push_back({ 0, Size });
     uint32_t mappingGranularity = Allocator->MappingGranularity();
-    m_mappingRanges.resize(((Size + mappingGranularity - 1) / mappingGranularity));
+    // Ceiling division without wrapping uint32_t near the largest valid size.
+    m_mappingRanges.resize(Size / mappingGranularity + (Size % mappingGranularity != 0));
   }
 
   D3D9MemoryChunk::~D3D9MemoryChunk() {
@@ -369,6 +375,8 @@ namespace dxvk {
 
   D3D9Memory D3D9MemoryChunk::AllocLocked(uint32_t Size) {
     // 必须由 allocator 锁保护。
+    if (unlikely(Size == 0))
+      return {};
 
     uint32_t offset = 0;
     uint32_t size = 0;
@@ -379,10 +387,9 @@ namespace dxvk {
         size = Size;
         range->offset += Size;
         range->length -= Size;
-        // 保留既有 allocator 行为：小于 4 KiB 的尾段计入 chunk 占用，
-        // 但 D3D9Memory 的 payload 大小仍保持调用方请求值。
-        if (range->length < (4 << 10)) {
-          size += range->length;
+        // FreeLocked returns only payload Size. Discarding a nonzero tail here
+        // would permanently pin the chunk, even if only one cache line is lost.
+        if (range->length == 0) {
           m_freeRanges.erase(range);
         }
         break;

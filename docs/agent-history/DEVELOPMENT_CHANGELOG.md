@@ -3,6 +3,66 @@
 本账本记录集成候选、验证和未通过项。根 CHANGELOG 的旧版本历史保持不变；
 1.22正式范围见 `docs/RELEASE_1.22.00.md`；带DRAFT的旧文档仅供追溯，不覆盖后续验收与发布决定。
 
+## 2026-09-20 1.22.01玩家反馈与修复版发布准备（尚未推送）
+
+- 最终版本标识构建已通过：断言开启CPU99/99、全量静态275/275、正式配置20/20、包工具9/9、离线包读方25/25、py_compile/diff空白；exact DLL编译链接及no-work通过，PE32/i386、版本1.22.01、PRERELEASE=false。未剥离DLL36,065,732B / D7A540926C02904E96F25ADE9D643B0E768B711CC41EE5A12EFC0A87400C1BC3。与已试玩source-adaptive-r9相比，产品输入变化精确限7个版本/探针/对应测试文件；内存算法无新增变化。当前仍未上传，不把本条当成功回执。
+
+- 用户测试上一轮028565BC候选后反馈没有观察到问题，并授权主线程决定继续优化或推送修复版；选择冻结修复范围，继续优化留给后续版本。
+- 只读核玩家DLL为36,065,732B / 028565BCB33B6EB646E4915115B60CDA3C14C287A4225DAA50F8F6513F9E9BA3，等于交付候选；无相关游戏/编译进程。未要求重装、未覆盖现场。玩家反馈仅一轮，无新报告/完整矩阵，不升级成全面GPU或性能证明。
+- 正式增量限1.22.01产品/JAPI版本及匹配探针、测试版本断言、中英README/CHANGELOG/范围文档/打包清单；分配、caster、fence算法不再新增修改。旧1.22.00历史、标签/附件不动。Shader ABI与JASS wire不变。
+- 计划用固定依赖镜像，重新跑产品构建/no-work/配置、断言开启99项CPU及275脚本；再提交白名单源码，冻结对应包，校验远端附件后公开。此条为准备状态，不是GitHub成功回执。
+
+## 2026-09-20 20:42 自适应预算与切片退役：离线候选收口，未实机
+
+- 最终输入 `source-adaptive-r9.json`（SHA-256 `B767B06C64A39A6B2C16C3306AFBDCAA4E3D5FDA23340E3E949C08BD7197E2B2`）含 2892 文件；构建后主树与冻结镜像逐 SHA 复核 0 差异。随后仅补本日志与研究文档回执，不回写构建输入。保留用户 StormBreaker dirty，构建只用原 gitlink 固定依赖。
+- 断言开启 CPU Meson **99/99**，静态脚本 **275/275**；自适应/切片生产组件测试 **23,965** 检查通过，含真实 DXVK object tracker 与模拟完成、10,000 次跨线程最后引用释放、24 页同类小锚点负例、满表退化和所有消费者接线。并非 GPU 执行或视觉证明。
+- 新增同帧扩页失败负缓存：只抑制同帧同等/更大请求的重复预算查询，较小请求与下帧可重新查询，既有尾部/已退役空洞照常可用，Reset 清除。组件测量：10,000 次 claim/release/hole 102 us；满 2048 槽重复失败查找 1000 次 50 us，测量窗口堆分配为 0。不是渲染帧耗时，也不声称 command-list tracker 的所有操作零分配。
+- BelowNormal/-j2 的最终 exact DLL 增量 **40/40**、no-work、player-release 配置审计 `ok=true`、PE `pei-i386/i386`、相关 py_compile 与 diff 空白检查通过。最终未剥离候选 **36,065,732 B / 028565BCB33B6EB646E4915115B60CDA3C14C287A4225DAA50F8F6513F9E9BA3**；CreateNew 等价原字节冻结于 `E:/WarVK-Builds/v1.22-maintenance-20260920-r1/adaptive-candidate-028565BC/d3d9.dll`。
+- 动态的是各池扩页额度，不是整机显存硬隔离：使用实际 heap budget、物理 commitment（含 DXVK 缓存后备）和 Win32 VA 余量。快照在可信预算下默认最多 512 MiB，显式配置上限仍生效，不支持预算时保留 384 MiB fallback；这改变旧默认 384 的增长策略，并非把上限提升当作钉页修复。Arena 每代 384/总 1152 MiB 仍不变。预留余量并不保证驱动永不 OOM。
+- 最高优先级同类钉页已接入切片级租约/空洞复用，覆盖缓存、CS 复制、surface/volume/point shadow、轮廓、GPU 输入取证、同步 Shader 回调。只在最后消费者完成后复用；不搬移存活字节、不放宽 caster 完整性。元数据耗尽会封页回退原 append-only/整页退役，仍可能保留碎片；真实活跃集合超过预算也未被消除。
+- Arena 只在已完成且 retireSerial 非零的代际切换点按 120 帧需求窗口缩空闲尾页，每次最多一页。逻辑退役不承诺驱动物理显存立即下降；Render Stats 明示“最近扩页额度”，不是连续显存采样。
+- 未部署、未启动游戏、未提交/推送/更新稳定 Release。玩家 DLL 仍为 **31,213,491 B / 62BF9F402C90DE8C284F5C9C194517EC165F208F0A03F33A75D2F1FDB56381C3**；收口相关编译/游戏进程为 0，编译资源已释放。待独立隔离 2560×1440 压力/恢复/跨消费者/GPU incident 与玩家阴影视觉门；不宣称本候选已解决现场所有无影/撕裂或提升 FPS。
+- 前批 Image 异常清理、D3D9 小尾段/溢出、截图按需分配维护包含在本组合并随本轮回归；跨 attempt Recovered 与同步慢 I/O 关闭边界仍未处理，不将它们列为完成。完整契约与日志索引见 `docs/research/2026-09-20-adaptive-budget-and-slice-retirement.md`。
+
+## 2026-09-20 自适应预算与切片退役：开发中 CPU checkpoint（历史中间态）
+
+- source-adaptive-r6 CPU Meson99/99，切片测试23,956检查（真实DxvkObjectTracker、模拟完成，不是GPU）；r7静态275/275与DLL编译通过。满2048槽重复失败查找1000次由r5约37,649us降到r6约49us（负结果缓存随申请/释放失效；不是游戏帧时对比）。表为81,960B/页，上限32页约2.50MiB元数据；不声称DXVK批量tracker也零分配。
+- 最终全消费者审查又补轮廓两路径、GPU输入采集和外部Shader同步回调的切片保留；剥离CPU保留记录时同时清租约；Arena缩页增加正数retireSerial门。这些后续修改待最终r8组合重跑，不继承r7通过。
+- 过程复核：切片组件扩至20,895项检查后通过；Arena首轮编译因声明遗漏失败，第二轮又发现误插到普通Reset的缩页块（未定义frameSerial）失败。已删除Reset中的缩页，加入唯一BeginFrame缩页守卫；第三轮组合DLL编译通过。这些是中间构建，不追认为最终通过。继续统一Arena纯策略和测试、核算满表成本；未进行GPU实机。
+- 主树基于 24140e4；保留前批维护改动与用户 StormBreaker dirty，不部署、不修改稳定发布。
+- 统一实际 heap/physical commitment/VA 增长许可；快照切片租约随缓存、CS 复制和三类阴影消费
+  进入现有 DXVK command-list tracking；元数据饱和退回原 append-only 页，不新增 caster 拒绝。
+- Arena 仅在已退役代际的 owner 切换点按需求窗口减空闲尾页；保持每代384/总1152MiB工作界限。
+- Win32 O2 生产组件/Rc CPU测试893检查通过；接线守卫5/5。首编译缺 util_likely include 已修。
+  这些测试不运行GPU，不代表物理回收、阴影连续性、性能或跨地图验收。
+- 详见 `docs/research/2026-09-20-adaptive-budget-and-slice-retirement.md`；组合构建与更多反例待完成。
+
+## 2026-09-20 发布后内存维护：首批实现与定向回归
+
+- 最终离线收口（source-revision3）：断言开启的 Meson **98/98**、静态脚本 **274/274**、py_compile/diff 空白通过。原文 Image 函数+Vulkan 替身 70 检查、真实 Win32 allocator 139 检查、原文截图函数+资源替身 62 检查、截图 core 100000 次并发交接通过；这些不等于 GPU/玩家验证。最终截图回收放在现有设备锁内的 beginPresent，覆盖 skipped/unsupported Present，仍不回收 Submitted/Quarantined。
+- 独立固定依赖构建首次 exact DLL 466/466 完成，后续最终源码增量重生成/编译/链接通过；exact DLL no-work、player-release 配置审计 ok=true、PE pei-i386/i386。未剥离候选 **36,051,519 B / 76500A3E75BF9764D059ED7CD9EF5E4DBF5FD7F05DEE545907FB3E44EC74590C**，位于 `E:/WarVK-Builds/v1.22-maintenance-20260920-r1/build32-product/src/d3d9/d3d9.dll`；14 个变更源码/测试路径逐 SHA 与 source-revision3 一致，最终文档回执不回写源码快照。既有 StormBreaker dirty 未参与构建，未修改。
+- 中间失败保留：首次显式测试目标列表漏编 wire 往返工具，完整测试为 96/97（缺 executable），补建该 exact 工具后重跑通过；最终又加入截图 core 标准用例，形成上述 98/98。第一次产品配置审计因 strip=false 未过，显式改为 true 后重新构建与审计才通过，不追认失败为通过。
+- 同寿命钉页负例共 3224 检查通过的含义是**负例被正确复现**：6144 B 的存活锚点仍可钉住 384 MiB 模型池，打印 UNRESOLVED，不是修复完成。跨 attempt Recovered、同步慢 I/O 关闭也仍待后续批次；无请求截图避免的 42.1875 MiB 仅指 1440p 三槽逻辑后备，不是实测 VA/显存释放量。
+- 收尾玩家 DLL 仍为 **31,213,491 B / 62BF9F402C90DE8C284F5C9C194517EC165F208F0A03F33A75D2F1FDB56381C3**，未覆盖；游戏/编辑器/编译相关进程 0。未实机、未提交、未推送或更新 Release，已发布 v1.22.00 和稳定 CHANGELOG 保持不动。**编译资源已释放；游戏现场未触碰。**完整路径与验收范围见 `docs/plan/2026-09-20-post-release-memory-maintenance.md`。
+
+以下为本批早期 checkpoint；最终结果以上述收口为准，历史失败不删除：
+
+- 用户授权修复后，先落三项 P1：未移交 VkImage 的统一作用域 guard、Image 构造完成后登记；D3D9 CPU chunk 保留小尾段并前置拒绝零请求/对齐溢出；异步截图将请求意图与后备分离，首次真实请求才建槽，Retired 经所有者 CAS 回收（Submitted/Quarantined 不回收）。未改 caster/快照池/Arena 预算、未覆盖玩家 DLL、未提交或发布。
+- 首个独立测试快照（source-revision1）：新增原文 image 函数/Vulkan 替身故障注入、真实 Win32 d3d9_mem.cpp 回归、原文 screenshot prepare/reset/请求分配函数+资源替身；连同既有 grouped-allocation 与旧 tail-offline，定向 Meson 5/5 通过。旧 tail-offline 从 5 pass + 1 FAIL + 1 ERROR 转为 7/7，测试原文未放宽；已加入标准 Meson 入口。新增 wiring 4/4、既有 screenshot 16/16、grouped static 2/2 通过。真实 Win32 allocator 139 检查通过；不等于 GPU/玩家验收。
+- 后续补 sparse page-table 对象池抛异常时的本地所有权与 uint32 ceiling-division，加入同寿命小锚点钉页负例，待本次完整重跑；上项旧 5/5 不追认后续改动。
+- 过程偏差：首次扩大测试用 `meson test --num-processes 2`，该参数仅限制测试，不限制自动 Ninja；实际观察到并行编译超过 -j2，已按 PID/命令行核实后停止本轮 Ninja 并等待子编译结束。该次 exit1/中断不算通过；改为显式 BelowNormal `ninja -j2 <精确测试目标>`，随后 `meson test --no-rebuild`。不得把此轮全部描述为始终满足 -j2。
+- 未闭合：同类钉页、跨 attempt Recovered、同步磁盘写入取消边界。本轮不扩大池或开启索引摘要实验，不把零映射截图后备称作整个模块零内存；冷启动延迟、真实原生截图与 history export 仍需独立实机门。
+
+## 2026-09-20 发布后独立内存审查回读（只读源码核验，未修复）
+
+- 用户提交独立审查文本。当前HEAD24140e4；审查涉及的memory/image/D3D9 allocator/screenshot/palette recorder生产文件与v1.22.00标签无差异。本轮不修改产品源码、不构建/部署/启动游戏、不提交/推送或改Release；仅登记复核结论。
+- 源码确认：createImageResource在vkCreateImage成功后、allocation接管之前没有异常清理guard；普通/导入DxvkImage均先registerResource再执行可失败步骤，而基类析构为空、注销仅在派生析构。故障路径的句柄/登记闭合需要补齐；未证明游戏现场已因此泄漏或UAF。
+- 源码确认：D3D9MemoryChunk删除小于4KiB尾段但只返回请求长度、Free也仅归还该长度；顶层Alloc缺零长度与对齐溢出前置拒绝。本轮执行test_d3d9_memory_chunk_tail_offline.py：7项中5通过、1 FAIL（尾段）、1 ERROR（缺零请求守卫），exit1。其Python模型通过不能冒充生产实现通过；该非*_static.py脚本未进入此前273脚本组，需补发布测试入口与真实生产回归，不能改锚点销账。
+- 源码确认：AsyncScreenshot默认启用，Present无请求也调用prepare，预热3个mapped slot；2560x1440的逻辑buffer容量42.1875MiB，非实测private/commit/VRAM增量，不能称无限泄漏。同步WriteFile配合join仍有慢I/O关闭边界，但本轮未做Windows慢盘实测。
+- 寿命分组确已进入生产；整页use_count回收仍不能处理同类内部少量存活切片钉页。索引范围摘要默认关闭，未计作默认节省。审查给出的6144B钉384MiB为对方独立探针结果，本轮仅核机制，未取得或复跑探针。
+- 诊断CloseWindow仍使用累计saw*，而MarkStage只按新attempt重置判序；跨尝试Recovered风险与源码相符，本轮未独立重放该C++探针，更不宣称读方已认证恢复。
+- 建议1.22.01依序处理Image异常/登记、D3D9尾段/零请求/溢出、截图冷启动/空闲/关闭预算；同类页压力先采有效区间/死区/持有者证据，不扩预算、不直接开启范围/剔除实验。已有玩家正向反馈及93/273历史结果保留，但不作为上述未覆盖故障的通过证明。
+
 ## 2026-09-20 16:15 台北：v1.22.00正式发布已完成
 
 - 用户发布授权下，将0df497914c3352539f14fea2af40a600ea7b25fb与新annotated v1.22.00标签atomic/fast-forward推送origin/main；未force、未改旧标签、未上传实验分支。GitHub Release ID392359706已从draft转为非prerelease、latest，发布时间2026-09-20T08:15:30Z。

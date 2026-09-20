@@ -38,6 +38,9 @@ namespace dxvk {
     VkDeviceSize heapSize;
     VkDeviceSize memoryBudget;
     VkDeviceSize memoryAllocated;
+    // Physical/driver estimate including allocator-retained backing. Not the
+    // adjusted logical allocation figure exposed to D3D clients.
+    VkDeviceSize memoryCommitted;
   };
 
   /**

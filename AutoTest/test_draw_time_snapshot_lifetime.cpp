@@ -11,9 +11,9 @@ unsigned checks=0;
 // the device. They prove cache reference/field behavior, NOT GPU completion.
 struct Resource {};
 struct Entry {
-  std::shared_ptr<Resource> positionBuffer, positionPinnedAllocation, positionSnapshotPage;
+  std::shared_ptr<Resource> positionBuffer, positionPinnedAllocation, positionSnapshotPage, positionSnapshotLease;
   std::shared_ptr<Resource> indexBuffer, indexPinnedAllocation, indexSnapshotPage;
-  std::shared_ptr<Resource> uvBuffer, uvPinnedAllocation, uvSnapshotPage;
+  std::shared_ptr<Resource> uvBuffer, uvPinnedAllocation, uvSnapshotPage, uvSnapshotLease;
   uint64_t positionSnapshotOffset=0, uvSnapshotOffset=0;
   uint64_t positionCapacity=0, indexCapacity=0, uvCapacity=0, ownedGpuBytes=0;
   uint64_t positionInfo=0, uvInfo=0;

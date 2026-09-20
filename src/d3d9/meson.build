@@ -347,6 +347,39 @@ war3_stage11_grouped_allocation_test = executable(
 test('war3_stage11_grouped_allocation', war3_stage11_grouped_allocation_test,
   timeout : 30)
 
+adaptive_memory_slice_test = executable('adaptive_memory_slice_test',
+  '../../AutoTest/test_adaptive_memory_and_slice.cpp', install : false)
+test('adaptive_memory_slice', adaptive_memory_slice_test, timeout : 30)
+
+maintenance_python = import('python').find_installation()
+image_probe_source = custom_target('image_allocation_probe',
+  input : '../dxvk/dxvk_memory.cpp', output : 'image_allocation_probe.inc',
+  command : [maintenance_python, files('../../AutoTest/extract_image_allocation_probe.py'), '@INPUT@', '@OUTPUT@'])
+image_unwind_test = executable('image_allocation_unwind_test',
+  ['../../AutoTest/test_image_allocation_unwind.cpp', image_probe_source],
+  include_directories : [dxvk_include_path], install : false)
+test('image_allocation_unwind', image_unwind_test, timeout : 30)
+screenshot_probe_source = custom_target('screenshot_cold_probe',
+  input : 'war3/tools/war3_async_screenshot.cpp',
+  output : ['screenshot_cold_probe.inc', 'screenshot_request_probe.inc'],
+  command : [maintenance_python, files('../../AutoTest/extract_screenshot_cold_probe.py'), '@INPUT@', '@OUTPUT0@', '@OUTPUT1@'])
+screenshot_cold_test = executable('screenshot_cold_production_test',
+  ['../../AutoTest/test_screenshot_cold_production.cpp', screenshot_probe_source],
+  include_directories : [dxvk_include_path], install : false)
+test('screenshot_cold_production', screenshot_cold_test, timeout : 30)
+screenshot_core_test = executable('native_async_screenshot_core_test',
+  '../../AutoTest/test_native_async_screenshot_core.cpp',
+  cpp_args : ['-UNDEBUG'], dependencies : [dependency('threads')], install : false)
+test('native_async_screenshot_core', screenshot_core_test, timeout : 30)
+if platform == 'windows' and cpu_family == 'x86'
+  memory_allocator_test = executable('d3d9_memory_allocator_production_test',
+    ['../../AutoTest/test_d3d9_memory_allocator_production.cpp', 'd3d9_mem.cpp'],
+    include_directories : [dxvk_include_path], install : false)
+  test('d3d9_memory_allocator_production', memory_allocator_test, timeout : 30)
+endif
+test('d3d9_memory_chunk_tail_offline', maintenance_python,
+  args : files('../../AutoTest/test_d3d9_memory_chunk_tail_offline.py'), timeout : 30)
+
 war3_shadow_culling_counterexamples_test = executable(
   'war3_shadow_culling_counterexamples_test',
   ['../../AutoTest/test_shadow_culling_counterexamples.cpp',

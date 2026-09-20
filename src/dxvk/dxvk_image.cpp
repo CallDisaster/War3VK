@@ -1,6 +1,7 @@
 #include "dxvk_image.h"
 
 #include "dxvk_device.h"
+#include "dxvk_buffer_allocation_guard.h"
 
 namespace dxvk {
   
@@ -127,8 +128,6 @@ namespace dxvk {
     m_properties    (memFlags),
     m_shaderStages  (util::shaderStages(createInfo.stages)),
     m_info          (createInfo) {
-    m_allocator->registerResource(this);
-
     copyFormatList(createInfo.viewFormatCount, createInfo.viewFormats);
 
     // Assign debug name to image
@@ -153,7 +152,9 @@ namespace dxvk {
     m_globalLayout = (m_info.sharing.mode != DxvkSharedHandleMode::Import)
       ? m_info.initialLayout : m_info.layout;
 
-    assignStorage(allocateStorage());
+    DxvkPublishInitialImageStorage(allocateStorage(),
+      [this] (auto&& storage) { assignStorage(std::move(storage)); },
+      [this] { m_allocator->registerResource(this); });
   }
 
 
@@ -170,8 +171,6 @@ namespace dxvk {
     m_info          (createInfo),
     m_stableAddress (true),
     m_globalLayout  (createInfo.initialLayout) {
-    m_allocator->registerResource(this);
-
     copyFormatList(createInfo.viewFormatCount, createInfo.viewFormats);
 
     // Create backing storage for existing image resource
@@ -179,7 +178,10 @@ namespace dxvk {
     allocationInfo.resourceCookie = cookie();
 
     VkImageCreateInfo imageInfo = getImageCreateInfo(DxvkImageUsageInfo());
-    assignStorage(m_allocator->importImageResource(imageInfo, allocationInfo, imageHandle));
+    DxvkPublishInitialImageStorage(
+      m_allocator->importImageResource(imageInfo, allocationInfo, imageHandle),
+      [this] (auto&& storage) { assignStorage(std::move(storage)); },
+      [this] { m_allocator->registerResource(this); });
   }
 
 

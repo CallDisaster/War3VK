@@ -3,26 +3,12 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include "war3_adaptive_memory_budget.h"
 
 namespace dxvk::war3::memory {
 
 constexpr uint64_t kShadowArenaFixedResidentLimitBytes =
     1152ull * 1024ull * 1024ull;
-constexpr uint64_t kShadowArenaMemoryReserveBytes =
-    512ull * 1024ull * 1024ull;
-constexpr uint32_t kShadowArenaBudgetFractionNumerator = 1u;
-constexpr uint32_t kShadowArenaBudgetFractionDenominator = 4u;
-
-struct ShadowArenaMemoryBudgetInput {
-  bool extensionSupported = false;
-  bool primaryDeviceLocalHeapFound = false;
-  uint64_t heapSizeBytes = 0u;
-  uint64_t heapBudgetBytes = 0u;
-  uint64_t heapAllocatedBytes = 0u;
-  uint64_t fixedResidentLimitBytes =
-      kShadowArenaFixedResidentLimitBytes;
-  uint64_t fixedReserveBytes = kShadowArenaMemoryReserveBytes;
-};
 
 struct ShadowArenaMemoryBudgetPolicy {
   bool supported = false;
@@ -37,46 +23,25 @@ struct ShadowArenaMemoryBudgetPolicy {
   uint64_t effectiveResidentLimitBytes = 0u;
 };
 
-/**
- * Resolves the maximum total logical Shadow Arena residency.
- *
- * A trustworthy VK_EXT_memory_budget snapshot clamps the legacy fixed cap by
- * both one quarter of currently available primary VRAM and the bytes left
- * after preserving a fixed 512 MiB reserve. Missing or malformed extension
- * data preserves the legacy cap; it never increases it. An over-budget but
- * otherwise valid snapshot is trustworthy pressure and therefore resolves to
- * zero new residency rather than being mistaken for unsupported data.
- */
+// Compatibility-shaped diagnostics, derived from the SAME policy used by
+// snapshots. No second allocation algorithm or available-minus-resident rule.
 inline ShadowArenaMemoryBudgetPolicy ResolveShadowArenaMemoryBudget(
-    const ShadowArenaMemoryBudgetInput& input) noexcept {
+    const AdaptiveBudgetInput& input) noexcept {
   ShadowArenaMemoryBudgetPolicy result = {};
-  result.supported = input.extensionSupported;
-  result.heapSizeBytes = input.heapSizeBytes;
-  result.heapBudgetBytes = input.heapBudgetBytes;
-  result.heapAllocatedBytes = input.heapAllocatedBytes;
-  result.fixedResidentLimitBytes = input.fixedResidentLimitBytes;
-  result.effectiveResidentLimitBytes = input.fixedResidentLimitBytes;
-
-  const bool saneSnapshot = input.extensionSupported &&
-      input.primaryDeviceLocalHeapFound && input.heapSizeBytes != 0u &&
-      input.heapBudgetBytes != 0u &&
-      input.heapBudgetBytes <= input.heapSizeBytes;
-  if (!saneSnapshot)
-    return result;
-
-  result.trusted = true;
-  result.availableBytes = input.heapBudgetBytes > input.heapAllocatedBytes
-      ? input.heapBudgetBytes - input.heapAllocatedBytes
-      : 0u;
-  result.proportionalLimitBytes =
-      (result.availableBytes / kShadowArenaBudgetFractionDenominator) *
-      kShadowArenaBudgetFractionNumerator;
-  result.reserveLimitBytes = result.availableBytes > input.fixedReserveBytes
-      ? result.availableBytes - input.fixedReserveBytes
-      : 0u;
-  result.effectiveResidentLimitBytes = std::min(
-      {result.fixedResidentLimitBytes, result.proportionalLimitBytes,
-       result.reserveLimitBytes});
+  const auto adaptive = DecideAdaptiveMemoryBudget(input);
+  result.supported = input.supported;
+  result.trusted = adaptive.trusted;
+  result.heapSizeBytes = input.heapSize;
+  result.heapBudgetBytes = input.budget;
+  result.heapAllocatedBytes = input.committed;
+  result.fixedResidentLimitBytes = input.hardCap;
+  result.availableBytes = input.budget > input.committed ? input.budget - input.committed : 0;
+  result.proportionalLimitBytes = adaptive.trusted ? (input.budget / 8) * input.quotaEighths : 0;
+  result.reserveLimitBytes = adaptive.headroom;
+  // Saturating addition: physical headroom already excludes current backing.
+  const uint64_t growthLimit = input.resident > UINT64_MAX - adaptive.headroom
+      ? UINT64_MAX : input.resident + adaptive.headroom;
+  result.effectiveResidentLimitBytes = std::min(adaptive.target, growthLimit);
   return result;
 }
 

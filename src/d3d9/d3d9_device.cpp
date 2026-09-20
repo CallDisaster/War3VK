@@ -1,5 +1,6 @@
 // Phase 7.99 marker bump 034957
 #include "d3d9_device.h"
+#include "war3/memory/war3_memory_budget_sample.h"
 #include "../dxvk/dxvk_buffer_allocation_guard.h"
 #include "war3/render/war3_draw_time_snapshot_lifetime.h"
 #include "war3/tools/war3_data_collection_tree.h"
@@ -5726,6 +5727,9 @@ void War3UpdateSemanticReplayInputDiagnostics(War3FrameScene& scene) {
         continue;
       // 置空几何 → 所有 consumer 跳过（不画 shadow map / outline / 矩阵 SSBO）。
       caster.positionStorage = nullptr;
+      caster.positionSnapshotLease = nullptr;
+      caster.indexSnapshotLease = nullptr;
+      caster.uvSnapshotLease = nullptr;
       caster.indexStorage = nullptr;
       caster.indexCount = 0u;
       caster.vertexCount = 0u;
@@ -21692,6 +21696,7 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
         // 用 capture 时拷的 device-local buffer
         draw.positionStorage = entry.positionBuffer;
         draw.positionPinnedAllocation = entry.positionPinnedAllocation;
+        draw.positionSnapshotLease = entry.positionSnapshotLease;
         draw.positionInfo = entry.positionInfo;
         draw.positionStride = entry.positionStride;
         draw.positionOffset = entry.positionOffset;
@@ -21722,6 +21727,7 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
           draw.indexed = true;
           draw.indexStorage = entry.indexBuffer;
           draw.indexPinnedAllocation = entry.indexPinnedAllocation;
+          draw.indexSnapshotLease = entry.indexSnapshotLease;
           draw.indexInfo = entry.indexInfo;
           draw.indexType = entry.indexType;
           draw.indexCount = entry.indexCount;
@@ -21746,6 +21752,7 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
             entry.uvInfo.buffer != VK_NULL_HANDLE) {
           draw.uvStorage = entry.uvBuffer;
           draw.uvPinnedAllocation = entry.uvPinnedAllocation;
+          draw.uvSnapshotLease = entry.uvSnapshotLease;
           draw.uvInfo = entry.uvInfo;
           draw.uvStride = entry.uvStride;
           draw.uvOffset = entry.uvOffset;
@@ -23402,6 +23409,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer(
     draw.indexed = entry.indexed;
     draw.positionStorage = entry.positionBuffer;
     draw.positionPinnedAllocation = entry.positionPinnedAllocation;
+    draw.positionSnapshotLease = entry.positionSnapshotLease;
     draw.positionInfo = entry.positionInfo;
     draw.positionStride = entry.positionStride;
     draw.positionOffset = entry.positionOffset;
@@ -23441,6 +23449,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer(
       } else {
         draw.uvStorage = entry.uvBuffer;
         draw.uvPinnedAllocation = entry.uvPinnedAllocation;
+        draw.uvSnapshotLease = entry.uvSnapshotLease;
         draw.uvInfo = entry.uvInfo;
       }
     }
@@ -23470,6 +23479,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer(
     if (entry.indexed) {
       draw.indexStorage = entry.indexBuffer;
       draw.indexPinnedAllocation = entry.indexPinnedAllocation;
+      draw.indexSnapshotLease = entry.indexSnapshotLease;
       draw.indexInfo = entry.indexInfo;
       draw.indexType = entry.indexType;
       draw.indexCount = entry.indexCount;
@@ -23693,16 +23703,18 @@ D3D9DeviceEx::War3AllocateStage11Snapshot(
     VkDeviceSize requiredBytes,
     war3::render::War3Stage11PageLifetime lifetime,
     std::shared_ptr<War3Stage11SnapshotPage>& outPage,
+    Rc<war3::memory::SnapshotSlice>& outLease,
     VkDeviceSize& outOffset, VkDeviceSize& outCapacity) {
   using namespace dxvk::war3::render;
   outPage.reset();
+  outLease = nullptr;
   outOffset = 0u;
   outCapacity = 0u;
 
   uint64_t alignedBytes = 0u;
   // 2026-09-19：运行时上限（可配置、封顶 32 页 = 512 MiB）。
   const uint64_t snapshotResidentCap =
-      dxvk::war3::render::War3Stage11SnapshotResidentCapBytes();
+      dxvk::war3::render::War3Stage11SnapshotAdaptiveHardCapBytes();
   const auto fail = [&](War3Stage11SnapshotAllocationResult reason,
                         uint64_t publication = 0u) {
     // Failure-only, bounded in-memory evidence. Recorder-off allocations do
@@ -23761,12 +23773,54 @@ D3D9DeviceEx::War3AllocateStage11Snapshot(
     return War3PlanStage11LifetimePage(request, views.data(), uint32_t(i));
   };
 
+  // Reuse retired intervals before growing. Never move a live slice. The
+  // lease owns both CPU visibility and command-list completion, unlike Page
+  // use_count alone. Keep lifetime/domain matching from the existing planner.
+  for (const auto& page : m_war3Stage11SnapshotPages) {
+    if (page->mapEpoch != request.mapEpoch || page->deviceEpoch != request.deviceEpoch ||
+        page->lifetime != lifetime || page->sliceRecyclingSealed || !page->slices.hasSlot()) continue;
+    const auto tail = War3PlanStage11SnapshotSuballocation(page->used, page->capacity, alignedBytes);
+    uint64_t offset = 0;
+    if (tail.valid || !page->slices.findHole(page->capacity, alignedBytes, offset)) continue;
+    auto* lease = page->slices.claim(page, offset, alignedBytes);
+    if (!lease) continue;
+    outLease = lease;
+    lease->decRef(); // adopt the claim's initial reference
+    outPage = page;
+    outOffset = offset;
+    outCapacity = alignedBytes;
+    g_stage11SliceReusedBytes.fetch_add(alignedBytes, std::memory_order_relaxed);
+    ++m_war3Scene.shadowStats.drawTimeSnapshotSuballocationCount;
+    m_war3Scene.shadowStats.drawTimeSnapshotSuballocationBytes += alignedBytes;
+    War3RefreshStage11SnapshotPageStats();
+    return War3Stage11SnapshotAllocationResult::Success;
+  }
   auto plan = choosePage();
   if (!plan.usesExistingPage()) {
     War3CollectUnusedStage11SnapshotPages();
     plan = choosePage();
   }
   bool createdPage = false;
+  if (plan.createsPage()) {
+    const uint64_t pageBytes = plan.pageBytes;
+    bool permitsGrowth = false;
+    if (!m_war3Stage11BudgetRetry.refused(m_war3ShadowPersistentFrameSerial, pageBytes)) {
+      const auto budget = war3::memory::DecideAdaptiveMemoryBudget(
+        war3::memory::SampleShadowMemoryBudget(m_dxvkDevice.ptr(),
+            m_war3Stage11SnapshotHeap, m_war3Stage11SnapshotResidentBytes,
+            snapshotResidentCap, std::min(snapshotResidentCap, kWar3Stage11SnapshotResidentCapBytes),
+            kWar3Stage11SnapshotPageBytes, 1));
+      g_stage11AdaptiveTarget.store(budget.target, std::memory_order_relaxed);
+      permitsGrowth = budget.canGrow(m_war3Stage11SnapshotResidentBytes, pageBytes);
+      if (!permitsGrowth) m_war3Stage11BudgetRetry.refuse(m_war3ShadowPersistentFrameSerial, pageBytes);
+    }
+    if (!permitsGrowth) {
+      g_stage11BudgetGrowthRejects.fetch_add(1, std::memory_order_relaxed);
+      // A soft growth refusal must still permit a legal existing-page tail.
+      request.pageCreateGateOpen = false;
+      plan = choosePage();
+    }
+  }
   if (plan.createsPage()) {
     const uint64_t pageBytes = plan.pageBytes;
     uint64_t publicationFailure = 0u; // old wire: zero means no publication failure
@@ -23789,6 +23843,30 @@ D3D9DeviceEx::War3AllocateStage11Snapshot(
     } catch (const DxvkBufferAllocationError&) {
       if (m_dxvkDevice->getDeviceStatus() != VK_SUCCESS)
         throw; // Device loss is terminal, never a capacity retry.
+      m_war3Stage11BudgetRetry.refuse(m_war3ShadowPersistentFrameSerial, pageBytes);
+    }
+    if (buffer != nullptr && !buffer->storage()) buffer = nullptr;
+    if (buffer != nullptr) {
+      const uint32_t heap = buffer->storage()->getMemoryHeapIndex();
+      const bool heapMismatch = m_war3Stage11SnapshotHeap != UINT32_MAX &&
+          heap != m_war3Stage11SnapshotHeap;
+      if (!heapMismatch && heap != UINT32_MAX) m_war3Stage11SnapshotHeap = heap;
+      // Bootstrap has no exact heap until allocation; validate it before
+      // publishing. The new page is already included in physical commitment.
+      const auto after = war3::memory::DecideAdaptiveMemoryBudget(
+          war3::memory::SampleShadowMemoryBudget(m_dxvkDevice.ptr(), heap,
+              m_war3Stage11SnapshotResidentBytes + pageBytes, snapshotResidentCap,
+              std::min(snapshotResidentCap, kWar3Stage11SnapshotResidentCapBytes),
+              kWar3Stage11SnapshotPageBytes, 1));
+      g_stage11AdaptiveTarget.store(after.target, std::memory_order_relaxed);
+      if (heapMismatch || heap == UINT32_MAX || after.vaPressure ||
+          m_war3Stage11SnapshotResidentBytes + pageBytes > after.target) {
+        buffer = nullptr; // unpublished buffer only; try old legal tails below
+        m_war3Stage11BudgetRetry.refuse(m_war3ShadowPersistentFrameSerial, pageBytes);
+        g_stage11BudgetGrowthRejects.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        m_war3Stage11SnapshotHeap = heap;
+      }
     }
     if (buffer != nullptr) {
       const auto publication = War3PublishStage11SnapshotPage(
@@ -23837,6 +23915,16 @@ D3D9DeviceEx::War3AllocateStage11Snapshot(
   for (const auto& page : m_war3Stage11SnapshotPages) {
     if (page->id != plan.pageId)
       continue;
+    auto* lease = page->slices.claim(page, plan.offset, plan.sliceBytes);
+    if (!lease) {
+      // Bounded metadata must not reject a legal old append allocation. Once
+      // one slice cannot be tracked, this entire page stays append-only until
+      // ordinary whole-page retirement. Previously leased slices stay valid.
+      page->sliceRecyclingSealed = true;
+    } else {
+      outLease = lease;
+      lease->decRef();
+    }
     page->used = VkDeviceSize(plan.nextUsed);
     outPage = page;
     outOffset = VkDeviceSize(plan.offset);
@@ -23899,6 +23987,11 @@ void D3D9DeviceEx::War3ResetStage11SnapshotPages() {
   // buffer and guarantees that the new map/device epoch never suballocates
   // from an old page.
   m_war3Stage11SnapshotPages.clear();
+  m_war3Stage11SnapshotHeap = UINT32_MAX;
+  m_war3Stage11BudgetRetry.reset();
+  war3::render::g_stage11AdaptiveTarget.store(
+      std::min(war3::render::War3Stage11SnapshotAdaptiveHardCapBytes(),
+          war3::render::kWar3Stage11SnapshotResidentCapBytes), std::memory_order_relaxed);
   m_war3Stage11SnapshotResidentBytes = 0u;
   m_war3Stage11CensusSchedule = {};
   War3RefreshStage11SnapshotPageStats();
@@ -23935,7 +24028,7 @@ void D3D9DeviceEx::War3SampleStage11BudgetAtPresent() {
     s.deviceIdentity = uint64_t(reinterpret_cast<uintptr_t>(this));
     s.mapEpoch = schedule.map; s.deviceEpoch = schedule.device;
     s.frame = m_war3ShadowPersistentFrameSerial; s.stage = uint32_t(stage);
-    s.cap = war3::render::War3Stage11SnapshotResidentCapBytes();
+    s.cap = war3::render::War3Stage11SnapshotAdaptiveHardCapBytes();
     s.capacityRejects = schedule.rejects;
     s.uploadRangeHits = schedule.uploadRangeHits;
     s.unknownCounts = schedule.unknown; s.unknownPositionBytes = schedule.bytes;
@@ -27478,6 +27571,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     draw.indexed = entry.indexed;
     draw.positionStorage = entry.positionBuffer;
     draw.positionPinnedAllocation = entry.positionPinnedAllocation;
+    draw.positionSnapshotLease = entry.positionSnapshotLease;
     draw.positionInfo = entry.positionInfo;
     draw.positionStride = entry.positionStride;
     draw.positionOffset = entry.positionOffset;
@@ -27524,6 +27618,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       } else {
         draw.uvStorage = entry.uvBuffer;
         draw.uvPinnedAllocation = entry.uvPinnedAllocation;
+        draw.uvSnapshotLease = entry.uvSnapshotLease;
         draw.uvInfo = entry.uvInfo;
       }
     }
@@ -27555,6 +27650,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     if (entry.indexed) {
       draw.indexStorage = entry.indexBuffer;
       draw.indexPinnedAllocation = entry.indexPinnedAllocation;
+      draw.indexSnapshotLease = entry.indexSnapshotLease;
       draw.indexInfo = entry.indexInfo;
       draw.indexType = entry.indexType;
       draw.indexCount = entry.indexCount;
@@ -43298,6 +43394,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           entry.consumeVertexOffset = 0;
           entry.positionCapacity = 0u;
           entry.positionSnapshotPage.reset();
+          entry.positionSnapshotLease = nullptr;
           entry.positionSnapshotOffset = 0u;
           entry.gpuSkinLeaseBacked = true;
           if (gpuSkinSemanticInputExact)
@@ -43316,6 +43413,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           entry.consumeVertexOffset = 0;
           entry.positionCapacity = 0u;
           entry.positionSnapshotPage.reset();
+          entry.positionSnapshotLease = nullptr;
           entry.positionSnapshotOffset = 0u;
           entry.gpuSkinLeaseBacked = true;
           entry.gpuSkinInput = gpuSkinSemanticInput;
@@ -43325,6 +43423,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           entry.positionInfo = directStaticPositionInfo;
           entry.positionCapacity = 0u;
           entry.positionSnapshotPage.reset();
+          entry.positionSnapshotLease = nullptr;
           entry.positionSnapshotOffset = 0u;
           m_war3Scene.shadowStats.drawTimeDirectStaticPositionBindCount++;
           m_war3Scene.shadowStats.drawTimeDirectStaticPositionBytes +=
@@ -43335,6 +43434,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           entry.positionInfo = directUploadPositionInfo;
           entry.positionCapacity = 0u;
           entry.positionSnapshotPage.reset();
+          entry.positionSnapshotLease = nullptr;
           entry.positionSnapshotOffset = 0u;
           m_war3Scene.shadowStats.drawTimeDirectUploadPositionBindCount++;
           m_war3Scene.shadowStats.drawTimeDirectUploadPositionBytes +=
@@ -43407,13 +43507,16 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         bool positionPageAllocationFailed = false;
         if (needsNewPositionBuffer) {
           std::shared_ptr<War3Stage11SnapshotPage> snapshotPage;
+          Rc<war3::memory::SnapshotSlice> snapshotLease;
           VkDeviceSize snapshotOffset = 0u;
           VkDeviceSize snapshotCapacity = 0u;
           const auto snapshotResult = War3AllocateStage11Snapshot(
-              posBytes, snapshotLifetime, snapshotPage, snapshotOffset, snapshotCapacity);
+              posBytes, snapshotLifetime, snapshotPage, snapshotLease,
+              snapshotOffset, snapshotCapacity);
           if (snapshotResult ==
               War3Stage11SnapshotAllocationResult::Success) {
             entry.positionSnapshotPage = std::move(snapshotPage);
+            entry.positionSnapshotLease = std::move(snapshotLease);
             entry.positionSnapshotOffset = snapshotOffset;
             entry.positionBuffer = entry.positionSnapshotPage->buffer;
             entry.positionCapacity = snapshotCapacity;
@@ -43474,10 +43577,12 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
             !generationBackedPositionReuse) {
           auto srcBuf = posSlice.buffer();
           EmitCs([cDst = entry.positionBuffer, cSrc = srcBuf,
+                  cLease = entry.positionSnapshotLease,
                   cDstOff = entry.positionSnapshotOffset,
                   cSrcOff = posSrcOffset,
                   cBytes = posBytes](DxvkContext *ctx) {
             ctx->copyBuffer(cDst, cDstOff, cSrc, cSrcOff, cBytes);
+            ctx->retainUntilCompletion(cLease);
           });
           m_war3Scene.shadowStats.drawTimeVBCachePositionCopyCount++;
           m_war3Scene.shadowStats.drawTimeVBCachePositionCopyBytes +=
@@ -43510,6 +43615,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           entry.uvInfo = {};
           entry.uvCapacity = 0u;
           entry.uvSnapshotPage.reset();
+          entry.uvSnapshotLease = nullptr;
           entry.uvSnapshotOffset = 0u;
         }
         entry.uvPinnedAllocation = nullptr;
@@ -43536,6 +43642,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           entry.uvFormat = VK_FORMAT_R32G32_SFLOAT;
           entry.uvCapacity = 0u;
           entry.uvSnapshotPage.reset();
+          entry.uvSnapshotLease = nullptr;
           entry.uvSnapshotOffset = 0u;
           currentUvBackingUsable = true;
         } else if (gpuSkinOutputHasUv) {
@@ -43547,6 +43654,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           entry.uvOffset = 24u;
           entry.uvFormat = VK_FORMAT_R32G32_SFLOAT;
           entry.uvSnapshotPage = entry.positionSnapshotPage;
+          entry.uvSnapshotLease = entry.positionSnapshotLease;
           entry.uvSnapshotOffset = entry.positionSnapshotOffset;
           currentUvBackingUsable = true;
           m_war3Scene.shadowStats.drawTimeVBCacheUvSharedPositionCount++;
@@ -43580,6 +43688,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                 entry.uvPinnedAllocation = entry.positionPinnedAllocation;
                 entry.uvInfo = entry.positionInfo;
                 entry.uvSnapshotPage = entry.positionSnapshotPage;
+                entry.uvSnapshotLease = entry.positionSnapshotLease;
                 entry.uvSnapshotOffset = entry.positionSnapshotOffset;
                 currentUvBackingUsable = true;
                 m_war3Scene.shadowStats
@@ -43669,6 +43778,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                       entry.uvInfo = directUploadUvInfo;
                       entry.uvCapacity = 0u;
                       entry.uvSnapshotPage.reset();
+                      entry.uvSnapshotLease = nullptr;
                       entry.uvSnapshotOffset = 0u;
                       m_war3Scene.shadowStats
                           .drawTimeDirectUploadUvBindCount++;
@@ -43679,14 +43789,16 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                         (entry.uvBuffer == nullptr ||
                          entry.uvCapacity < uvBytes)) {
                       std::shared_ptr<War3Stage11SnapshotPage> snapshotPage;
+                      Rc<war3::memory::SnapshotSlice> snapshotLease;
                       VkDeviceSize snapshotOffset = 0u;
                       VkDeviceSize snapshotCapacity = 0u;
                       const auto snapshotResult = War3AllocateStage11Snapshot(
-                          uvBytes, snapshotLifetime, snapshotPage, snapshotOffset,
+                          uvBytes, snapshotLifetime, snapshotPage, snapshotLease, snapshotOffset,
                           snapshotCapacity);
                       if (snapshotResult ==
                           War3Stage11SnapshotAllocationResult::Success) {
                         entry.uvSnapshotPage = std::move(snapshotPage);
+                        entry.uvSnapshotLease = std::move(snapshotLease);
                         entry.uvSnapshotOffset = snapshotOffset;
                         entry.uvBuffer = entry.uvSnapshotPage->buffer;
                         entry.uvCapacity = snapshotCapacity;
@@ -43714,10 +43826,12 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                         !generationBackedUvReuse) {
                     auto uvSrcBuf = uvSrcSlice.buffer();
                     EmitCs([cDst = entry.uvBuffer, cSrc = uvSrcBuf,
+                            cLease = entry.uvSnapshotLease,
                             cDstOff = entry.uvSnapshotOffset,
                             cSrcOff = uvSrcOffset,
                             cBytes = uvBytes](DxvkContext* ctx) {
                       ctx->copyBuffer(cDst, cDstOff, cSrc, cSrcOff, cBytes);
+                      ctx->retainUntilCompletion(cLease);
                     });
                     m_war3Scene.shadowStats.drawTimeVBCacheUvCopyCount++;
                     m_war3Scene.shadowStats.drawTimeVBCacheUvCopyBytes +=
@@ -43817,6 +43931,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
               entry.indexInfo = directStaticIndexInfo;
               entry.indexCapacity = 0u;
               entry.indexSnapshotPage.reset();
+              entry.indexSnapshotLease = nullptr;
               entry.indexSnapshotOffset = 0u;
               m_war3Scene.shadowStats.drawTimeDirectStaticIndexBindCount++;
               m_war3Scene.shadowStats.drawTimeDirectStaticIndexBytes +=
@@ -43827,6 +43942,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
               entry.indexInfo = directUploadIndexInfo;
               entry.indexCapacity = 0u;
               entry.indexSnapshotPage.reset();
+              entry.indexSnapshotLease = nullptr;
               entry.indexSnapshotOffset = 0u;
               m_war3Scene.shadowStats.drawTimeDirectUploadIndexBindCount++;
               m_war3Scene.shadowStats.drawTimeDirectUploadIndexBytes +=
@@ -43836,14 +43952,16 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                 (entry.indexBuffer == nullptr ||
                  entry.indexCapacity < idxBytes)) {
               std::shared_ptr<War3Stage11SnapshotPage> snapshotPage;
+              Rc<war3::memory::SnapshotSlice> snapshotLease;
               VkDeviceSize snapshotOffset = 0u;
               VkDeviceSize snapshotCapacity = 0u;
               const auto snapshotResult = War3AllocateStage11Snapshot(
-                  idxBytes, snapshotLifetime, snapshotPage, snapshotOffset,
+                  idxBytes, snapshotLifetime, snapshotPage, snapshotLease, snapshotOffset,
                   snapshotCapacity);
               if (snapshotResult ==
                   War3Stage11SnapshotAllocationResult::Success) {
                 entry.indexSnapshotPage = std::move(snapshotPage);
+                entry.indexSnapshotLease = std::move(snapshotLease);
                 entry.indexSnapshotOffset = snapshotOffset;
                 entry.indexBuffer = entry.indexSnapshotPage->buffer;
                 entry.indexCapacity = snapshotCapacity;
@@ -43864,10 +43982,12 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                   !generationBackedIndexReuse) {
               auto idxSrcBuf = drawTimeIndexSlice.buffer();
               EmitCs([cDst = entry.indexBuffer, cSrc = idxSrcBuf,
+                      cLease = entry.indexSnapshotLease,
                       cDstOff = entry.indexSnapshotOffset,
                       cSrcOff = idxSrcOffset,
                       cBytes = idxBytes](DxvkContext *ctx) {
                 ctx->copyBuffer(cDst, cDstOff, cSrc, cSrcOff, cBytes);
+                ctx->retainUntilCompletion(cLease);
               });
               m_war3Scene.shadowStats.drawTimeVBCacheIndexCopyCount++;
               m_war3Scene.shadowStats.drawTimeVBCacheIndexCopyBytes +=
@@ -45620,6 +45740,9 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         NotePathBlockerRejectLog(draw.rawcode, draw.jHandle,
                                   "LegacyCapture/Finalize");
         draw.positionStorage = nullptr;
+        draw.positionSnapshotLease = nullptr;
+        draw.indexSnapshotLease = nullptr;
+        draw.uvSnapshotLease = nullptr;
         draw.indexStorage = nullptr;
         draw.indexCount = 0u;
         draw.vertexCount = 0u;
@@ -45641,6 +45764,9 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                                                        : -1),
           draw.numVertices, draw.indexCount, 2u, 1u);
       draw.positionStorage = nullptr;
+      draw.positionSnapshotLease = nullptr;
+      draw.indexSnapshotLease = nullptr;
+      draw.uvSnapshotLease = nullptr;
       draw.indexStorage = nullptr;
       draw.indexCount = 0u;
       draw.vertexCount = 0u;
@@ -50272,6 +50398,9 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     retainedDraw.indexed = false;
     retainedDraw.gpuSkinInput = {};
     retainedDraw.positionStorage = nullptr;
+    retainedDraw.positionSnapshotLease = nullptr;
+    retainedDraw.indexSnapshotLease = nullptr;
+    retainedDraw.uvSnapshotLease = nullptr;
     retainedDraw.positionInfo = {};
     retainedDraw.indexStorage = nullptr;
     retainedDraw.indexInfo = {};

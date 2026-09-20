@@ -547,6 +547,7 @@ void War3ShadowReceiverPass::renderUnitOutlineScreenSpace(
 
       if (draw.positionStorage.ptr() != nullptr)
         ctx->track(draw.positionStorage);
+      war3::memory::TrackSnapshotSlices(*ctx, draw);
       if (draw.positionPinnedAllocation.ptr() != nullptr)
         ctx->track(draw.positionPinnedAllocation);
       if (draw.indexStorage.ptr() != nullptr &&
@@ -1004,6 +1005,7 @@ void War3ShadowReceiverPass::renderUnitOutline(const Rc<DxvkCommandList> &ctx,
     // 追踪资源
     if (draw.positionStorage.ptr() != nullptr)
       ctx->track(draw.positionStorage);
+    war3::memory::TrackSnapshotSlices(*ctx, draw);
     if (draw.positionPinnedAllocation.ptr() != nullptr)
       ctx->track(draw.positionPinnedAllocation);
     if (draw.indexStorage.ptr() != nullptr &&

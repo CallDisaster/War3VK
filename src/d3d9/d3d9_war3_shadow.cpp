@@ -5078,6 +5078,7 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
       if (!prep.lifetimeResourcesTracked) {
         if (draw.positionStorage.ptr() != nullptr)
           ctx->track(draw.positionStorage);
+        war3::memory::TrackSnapshotSlices(*ctx, draw);
         if (draw.positionPinnedAllocation.ptr() != nullptr)
           ctx->track(draw.positionPinnedAllocation);
         if (draw.indexStorage.ptr() != nullptr &&
@@ -5517,6 +5518,7 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
 
         if (draw.positionStorage.ptr() != nullptr)
           ctx->track(draw.positionStorage);
+        war3::memory::TrackSnapshotSlices(*ctx, draw);
         if (draw.positionPinnedAllocation.ptr() != nullptr)
           ctx->track(draw.positionPinnedAllocation);
         if (draw.indexStorage.ptr() != nullptr &&
@@ -8598,6 +8600,7 @@ void War3ShadowReceiverPass::renderPointShadow(
 
         if (draw.positionStorage.ptr() != nullptr)
           ctx->track(draw.positionStorage);
+        war3::memory::TrackSnapshotSlices(*ctx, draw);
         if (draw.positionPinnedAllocation.ptr() != nullptr)
           ctx->track(draw.positionPinnedAllocation);
         if (draw.indexStorage.ptr() != nullptr &&

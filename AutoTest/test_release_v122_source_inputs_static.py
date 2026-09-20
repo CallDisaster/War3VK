@@ -19,9 +19,9 @@ class ReleaseSourceInputs(unittest.TestCase):
 
     def test_release_version_and_final_identity(self):
         rc = (ROOT / 'src/d3d9/version.rc').read_text(encoding='utf-8')
-        self.assertIn('FILEVERSION        1,22,0,0', rc)
+        self.assertIn('FILEVERSION        1,22,1,0', rc)
         self.assertIn('FILEFLAGS          0', rc)
-        self.assertIn('WarVK 1.22.00 Direct3D 9 Runtime', rc)
+        self.assertIn('WarVK 1.22.01 Direct3D 9 Runtime', rc)
         self.assertNotIn('RC1', rc)
 
     def test_minhook_is_built_from_pinned_source_not_an_untracked_archive(self):

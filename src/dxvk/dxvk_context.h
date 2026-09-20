@@ -505,6 +505,13 @@ namespace dxvk {
      * \param [in] srcOffset Source data offset
      * \param [in] numBytes Number of bytes to copy
      */
+    // Lifetime only: caller retains its suballocation until this command list
+    // completes. Does not replace buffer hazards or physical allocation pins.
+    template<typename T>
+    void retainUntilCompletion(const Rc<T>& object) {
+      if (object != nullptr) m_cmd->track(object);
+    }
+
     void copyBuffer(
       const Rc<DxvkBuffer>&       dstBuffer,
             VkDeviceSize          dstOffset,

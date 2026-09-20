@@ -1230,7 +1230,7 @@ void War3Imgui::drawRenderStatsPanel() {
     CsmResolutionDiagnostics csm;
     MEMORYSTATUSEX processMemory{};
     bool processMemoryValid = false;
-    uint64_t snapshotCap = 0;
+    uint64_t snapshotCap = 0, sliceReusedBytes = 0, budgetGrowthRejects = 0;
   };
   static Samples samples;
   if (m_renderStatsRefresh.due(GetTickCount64())) {
@@ -1239,7 +1239,9 @@ void War3Imgui::drawRenderStatsPanel() {
     samples.replay = QueryShadowReplayDiagnostics();
     samples.receiver = render::QueryShadowDisplayStats();
     samples.csm = QueryCsmResolutionDiagnostics();
-    samples.snapshotCap = render::War3Stage11SnapshotResidentCapBytes();
+    samples.snapshotCap = render::g_stage11AdaptiveTarget.load(std::memory_order_relaxed);
+    samples.sliceReusedBytes = render::g_stage11SliceReusedBytes.load(std::memory_order_relaxed);
+    samples.budgetGrowthRejects = render::g_stage11BudgetGrowthRejects.load(std::memory_order_relaxed);
     samples.processMemory = {};
     samples.processMemory.dwLength = sizeof(MEMORYSTATUSEX);
     samples.processMemoryValid = GlobalMemoryStatusEx(&samples.processMemory) != FALSE;
@@ -1250,6 +1252,8 @@ void War3Imgui::drawRenderStatsPanel() {
   const auto mib = [](uint64_t value) { return ui::BytesToMiB(value); };
   const auto u64 = [](uint64_t value) { return static_cast<unsigned long long>(value); };
   ImGui::TextDisabled("4 Hz 刷新；不需要开启性能录制或帧取证");
+  ImGui::Text("已退休切片累计复用 %.1f MiB / 动态预算增长拒绝 %llu",
+      mib(samples.sliceReusedBytes), u64(samples.budgetGrowthRejects));
   ImGui::TextWrapped("各来源独立采样，可能相差数帧；数值用于诊断，不代表像素验收。单位 MiB。");
 
   if (!p.producerSealFrameSerial) {
@@ -1266,7 +1270,7 @@ void War3Imgui::drawRenderStatsPanel() {
   }
 
   ImGui::Separator();
-  ImGui::Text("快照页池 Stage11：常驻 %.1f / 上限 %.1f MiB",
+  ImGui::Text("快照页池 Stage11：常驻 %.1f / 最近扩页额度 %.1f MiB",
       mib(p.drawTimeSnapshotPageResidentBytes), mib(samples.snapshotCap));
   ImGui::ProgressBar(ui::BudgetFraction(p.drawTimeSnapshotPageResidentBytes, samples.snapshotCap),
       ImVec2(-1, 0), "快照页池常驻 / 预算");
@@ -1294,9 +1298,9 @@ void War3Imgui::drawRenderStatsPanel() {
   ImGui::Text("Arena 累计：溢出 %llu / 准入拒绝 %llu / 忙拒绝 %llu / 隔离 %llu",
       u64(a.overflowCount), u64(a.admissionRejectedCount), u64(a.busyReuseRejectCount), u64(a.quarantineCount));
   ImGui::TextDisabled("Arena 为独立临时上传池；原子字段非同一事务快照，不能据此授权回收。");
-  ImGui::TextWrapped("已完成的页会循环复用，当前不随镜头压力自动缩容；上一提交代不表示 GPU 已完成。");
+  ImGui::TextWrapped("已完成代际按需求窗口逐页缩减空闲尾页；上一提交代不表示 GPU 已完成。");
   if (a.budgetSupported && a.budgetTrusted && a.budgetFrameSerial) {
-    ImGui::Text("Vulkan 主堆：预算 %.1f / 本分配器已分配 %.1f / 可用估计 %.1f MiB",
+    ImGui::Text("Vulkan 分配堆：预算 %.1f / 物理承诺估计 %.1f / 可用估计 %.1f MiB",
         mib(a.budgetBytes), mib(a.allocatedBytes), mib(a.availableBytes));
     ImGui::TextDisabled("堆预算采样帧 %llu；不是整张显卡的实时占用。", u64(a.budgetFrameSerial));
   } else {

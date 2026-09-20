@@ -71,7 +71,7 @@ struct AsyncScreenshot::Impl {
   std::condition_variable wake;
   std::thread worker;
   uint32_t width = 0, height = 0;
-  bool warmed = false;
+  bool sourceReady = false; // Validated dimensions/format, NOT allocated buffers.
   uint64_t presentOrdinal = 0;
   std::atomic<uint32_t> burstRemaining{0};
 
@@ -89,6 +89,57 @@ struct AsyncScreenshot::Impl {
     stop.store(true, std::memory_order_release);
     wake.notify_one();
     if (worker.joinable()) worker.join();
+  }
+
+  // Owner-only reclamation. Retired is published after GPU AND encoder finish,
+  // or a request cancelled before submission. Never inspect/reclaim Submitted.
+  void releaseRetiredSlots() {
+    for (auto& slot : slots) {
+      if (!screenshot::Claim(slot.state, State::Retired, State::Preparing)) continue;
+      slot.buffer = nullptr;
+      slot.fence = nullptr;
+      slot.value = 0;
+      slot.width = 0;
+      slot.height = 0;
+      slot.history.reset();
+      slot.state.store(State::Free, std::memory_order_release);
+    }
+  }
+
+  // Present owner only, after claiming Requested/Free -> Preparing. Intent is
+  // allowed without backing storage; neither idle Present nor reset allocates.
+  bool prepareRequestedSlot(Slot& slot) {
+    try {
+      uint64_t bytes = 0;
+      if (!screenshot::Layout(width, height, bytes) || fault.load()) return false;
+      if (!slot.buffer || slot.buffer->info().size != bytes) {
+        DxvkBufferCreateInfo bufferInfo{};
+        bufferInfo.size = bytes;
+        bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        bufferInfo.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT;
+        bufferInfo.access = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+        bufferInfo.debugName = "War3 async screenshot staging";
+        constexpr auto memory = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        slot.buffer = device->createBuffer(bufferInfo, memory | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+        const auto actualMemory = slot.buffer->storage()->getMemoryProperties();
+        if ((actualMemory & memory) != memory || !slot.buffer->mapPtr(0))
+          throw DxvkError("Async screenshot requires coherent mapped memory");
+        Logger::info(str::format("[AsyncScreenshot] on-demand staging bytes=", bytes,
+            " actual-memory-flags=", actualMemory));
+      }
+      if (!slot.fence) slot.fence = device->createFence(DxvkFenceCreateInfo{0});
+      slot.width = width;
+      slot.height = height;
+      slot.history.reset();
+      return true;
+    } catch (...) {
+      fault.store(true, std::memory_order_release);
+      available.store(false, std::memory_order_release);
+      // The intent was already handled. Report a failed shot, never pretend it
+      // was saved or invoke the blocking native path retroactively.
+      Logger::err("[AsyncScreenshot] on-demand staging failed; requested shot cancelled");
+      return false;
+    }
   }
 
   bool save(const Slot& slot) {
@@ -284,7 +335,7 @@ bool AsyncScreenshot::request() {
 void AsyncScreenshot::reset() {
   std::lock_guard<std::mutex> requestLock(registry().mutex);
   m->available.store(false, std::memory_order_release);
-  m->warmed = false;
+  m->sourceReady = false;
   m->burstRemaining.store(0);
   for (auto& slot : m->slots) {
     if (screenshot::Claim(slot.state, State::Requested, State::Retired))
@@ -301,6 +352,9 @@ void AsyncScreenshot::beginPresent() {
   // Called under the device lock before any early return. A failed/skipped
   // Present is thus visible as a gap, not mislabelled as consecutive captures.
   ++m->presentOrdinal;
+  // Also runs before failed/skipped/unsupported Presents: completed readbacks
+  // must not stay mapped just because no supported backbuffer is available.
+  m->releaseRetiredSlots();
 }
 
 uint64_t AsyncScreenshot::presentOrdinal() const noexcept {
@@ -316,39 +370,14 @@ void AsyncScreenshot::prepare(const Rc<DxvkImage>& image,bool advanceBurst) {
       (info.format == VK_FORMAT_B8G8R8A8_UNORM || info.format == VK_FORMAT_B8G8R8A8_SRGB) &&
       screenshot::Layout(info.extent.width, info.extent.height, bytes);
   if (!supported) { reset(); return; }
-  if (!m->warmed || m->width != info.extent.width || m->height != info.extent.height) {
+  if (!m->sourceReady || m->width != info.extent.width || m->height != info.extent.height) {
     reset();
     m->width = info.extent.width;
     m->height = info.extent.height;
   }
   try {
-    for (auto& slot : m->slots) {
-      if (!screenshot::Claim(slot.state, State::Retired, State::Preparing)) continue;
-      if (!slot.buffer || slot.buffer->info().size != bytes) {
-        DxvkBufferCreateInfo bufferInfo{};
-        bufferInfo.size = bytes;
-        bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-        bufferInfo.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT;
-        bufferInfo.access = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
-        bufferInfo.debugName = "War3 async screenshot staging";
-        constexpr auto memory = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-        // Readback, not upload: prefer cached host memory. DXVK may drop only
-        // HOST_CACHED if unavailable; coherence remains mandatory. Verify the
-        // actual allocation, not memFlags() (which echoes requested flags).
-        slot.buffer = m->device->createBuffer(bufferInfo, memory | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
-        const auto actualMemory = slot.buffer->storage()->getMemoryProperties();
-        if ((actualMemory & memory) != memory || !slot.buffer->mapPtr(0))
-          throw DxvkError("Async screenshot requires coherent mapped memory");
-        Logger::info(str::format("[AsyncScreenshot] staging bytes=", bytes,
-            " actual-memory-flags=", actualMemory));
-      }
-      if (!slot.fence) slot.fence = m->device->createFence(DxvkFenceCreateInfo{0});
-      slot.width = m->width;
-      slot.height = m->height;
-      slot.history.reset();
-      slot.state.store(State::Free, std::memory_order_release);
-    }
-    m->warmed = true;
+    m->releaseRetiredSlots();
+    m->sourceReady = true;
     m->available.store(true, std::memory_order_release);
     if (advanceBurst&&m->burstRemaining.load()) {
       bool claimed = false;
@@ -374,9 +403,9 @@ void AsyncScreenshot::prepare(const Rc<DxvkImage>& image,bool advanceBurst) {
 std::optional<AsyncScreenshot::Copy> AsyncScreenshot::take(uint32_t index) {
   auto& slot = m->slots[index];
   if (!screenshot::Claim(slot.state, State::Requested, State::Preparing)) return std::nullopt;
-  // A completed old-resolution slot is not eligible until re-prewarmed. Never
-  // copy current pixels into an old-size allocation or defer the request.
-  if (m->fault.load() || !slot.buffer || !slot.fence || slot.width != m->width ||
+  // Allocate only for this claimed intent, on the actual selected Present.
+  // Never copy current pixels into old-size backing or defer a failed request.
+  if (!m->prepareRequestedSlot(slot) || !slot.buffer || !slot.fence || slot.width != m->width ||
       slot.height != m->height || slot.value == UINT64_MAX) {
     slot.state.store(State::Quarantined, std::memory_order_release);
     m->cancelled.fetch_add(1); m->wake.notify_one();
@@ -403,6 +432,11 @@ std::optional<AsyncScreenshot::Copy> AsyncScreenshot::takeHistory(const std::sha
   for(uint32_t index=0;index<screenshot::SlotCount;++index){
     auto& slot=m->slots[index];
     if(!screenshot::Claim(slot.state,State::Free,State::Preparing))continue;
+    if(!m->prepareRequestedSlot(slot)) {
+      slot.state.store(State::Quarantined,std::memory_order_release);
+      job->done.store(true,std::memory_order_release);
+      return {};
+    }
     if(!slot.buffer||!slot.fence||slot.width!=job->width||slot.height!=job->height||slot.value==UINT64_MAX){
       slot.state=State::Retired;continue;}
     slot.history=job;slot.serial=fileSerial.fetch_add(1)+1;slot.presentOrdinal=job->present;

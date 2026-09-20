@@ -33,13 +33,13 @@ void DxvkPublishInitialBufferStorage(
 // Owns a newly created, not-yet-published Vulkan handle until ownership moves
 // to DxvkResourceAllocation. No command can reference it at this point.
 template<typename Cleanup>
-class DxvkUnboundBufferGuard {
+class DxvkUnboundResourceGuard {
 public:
-  explicit DxvkUnboundBufferGuard(Cleanup cleanup)
+  explicit DxvkUnboundResourceGuard(Cleanup cleanup)
   : m_cleanup(std::move(cleanup)) { }
-  DxvkUnboundBufferGuard(const DxvkUnboundBufferGuard&) = delete;
-  DxvkUnboundBufferGuard& operator=(const DxvkUnboundBufferGuard&) = delete;
-  ~DxvkUnboundBufferGuard() noexcept {
+  DxvkUnboundResourceGuard(const DxvkUnboundResourceGuard&) = delete;
+  DxvkUnboundResourceGuard& operator=(const DxvkUnboundResourceGuard&) = delete;
+  ~DxvkUnboundResourceGuard() noexcept {
     if (m_owned)
       m_cleanup();
   }
@@ -48,5 +48,14 @@ private:
   Cleanup m_cleanup;
   bool m_owned = true;
 };
+
+template<typename Storage, typename Assign, typename Publish>
+void DxvkPublishInitialImageStorage(
+    Storage&& storage, Assign&& assign, Publish&& publish) {
+  if (!storage)
+    throw DxvkError(std::string("Failed to allocate image storage"));
+  assign(std::move(storage));
+  publish();
+}
 
 }

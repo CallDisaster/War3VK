@@ -40,7 +40,8 @@ class RenderStatsPanelContract(unittest.TestCase):
         for query in ("QueryShadowProducerRuntimeDiagnostics()", "ShadowArena_QueryMemoryStats()",
                       "QueryShadowReplayDiagnostics()", "QueryCsmResolutionDiagnostics()",
                       "QueryShadowDisplayStats()",
-                      "War3Stage11SnapshotResidentCapBytes()", "GlobalMemoryStatusEx("):
+                      "g_stage11AdaptiveTarget.load(", "g_stage11SliceReusedBytes.load(",
+                      "g_stage11BudgetGrowthRejects.load(", "GlobalMemoryStatusEx("):
             self.assertEqual(self.panel.count(query), 1)
             self.assertIn(query, reads)
         self.assertIn("m_renderStatsRefresh.reset();", body(self.ui, "void War3Imgui::shutdown()"))
@@ -103,7 +104,8 @@ class RenderStatsPanelContract(unittest.TestCase):
         self.assertNotIn("g_lastSubmittedUsedBytes.store", body(source, "bool ShadowArena_BeginFrame("))
         for signature in ("bool ShadowArena_Init(", "void ShadowArena_Shutdown("):
             self.assertIn("g_lastSubmittedUsedBytes.store(0u", body(source, signature))
-        self.assertIn("不随镜头压力自动缩容", self.panel)
+        self.assertIn("按需求窗口逐页缩减空闲尾页", self.panel)
+        self.assertIn("frameState.trimHistory.target(", source)
 
 
 if __name__ == "__main__":

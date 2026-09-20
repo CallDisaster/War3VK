@@ -975,7 +975,7 @@ namespace dxvk {
         "\n  flags:   ", createInfo.flags));
     }
 
-    DxvkUnboundBufferGuard unboundBuffer([&] {
+    DxvkUnboundResourceGuard unboundBuffer([&] {
       vk->vkDestroyBuffer(vk->device(), buffer, nullptr);
     });
 
@@ -1081,6 +1081,12 @@ namespace dxvk {
         "\n  samples: ", createInfo.samples));
     }
 
+    // No consumer can reference this handle until allocation takes ownership.
+    // Cover allocation/metadata exceptions as well as a normal null result.
+    DxvkUnboundResourceGuard unboundImage([&] {
+      vk->vkDestroyImage(vk->device(), image, nullptr);
+    });
+
     // Check memory requirements, including whether or not we need a dedicated allocation
     VkMemoryDedicatedRequirements dedicatedRequirements = { VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS };
 
@@ -1173,13 +1179,15 @@ namespace dxvk {
           allocation->m_sparsePageTable = pageTable.release();
       } else {
         // Just need a page table, but no memory
-        allocation = createAllocation(pageTable.release(), allocationInfo);
+        // The allocation object pool can itself throw before it takes the
+        // table. Keep both local owners alive until that transfer succeeds.
+        allocation = createAllocation(pageTable.get(), allocationInfo);
+        if (allocation)
+          pageTable.release();
       }
     }
 
     if (!allocation) {
-      vk->vkDestroyImage(vk->device(), image, nullptr);
-
       if (allocationInfo.mode.isClear()) {
         logMemoryError(requirements.memoryRequirements);
         logMemoryStats();
@@ -1191,6 +1199,7 @@ namespace dxvk {
     // Set up allocation object and bind memory
     allocation->m_flags.set(DxvkAllocationFlag::OwnsImage);
     allocation->m_image = image;
+    unboundImage.release();
 
     if (allocation->m_memory) {
       vr = vk->vkBindImageMemory(vk->device(), image, allocation->m_memory,

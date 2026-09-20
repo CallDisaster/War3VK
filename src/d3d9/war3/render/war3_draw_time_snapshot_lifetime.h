@@ -75,6 +75,7 @@ void War3ReleaseDrawTimePositionBacking(Entry& entry) noexcept {
     entry.uvBuffer = nullptr;
     entry.uvPinnedAllocation = nullptr;
     entry.uvSnapshotPage.reset();
+  entry.uvSnapshotLease = nullptr;
     entry.uvSnapshotOffset = 0u;
     entry.uvInfo = {};
     entry.uvStride = 0u;
@@ -86,6 +87,7 @@ void War3ReleaseDrawTimePositionBacking(Entry& entry) noexcept {
   entry.positionBuffer = nullptr;
   entry.positionPinnedAllocation = nullptr;
   entry.positionSnapshotPage.reset();
+  entry.positionSnapshotLease = nullptr;
   entry.positionSnapshotOffset = 0u;
   entry.positionInfo = {};
   entry.positionCapacity = 0u;
@@ -101,6 +103,7 @@ void War3ReleaseDrawTimeUvBacking(Entry& entry) noexcept {
   entry.uvBuffer = nullptr;
   entry.uvPinnedAllocation = nullptr;
   entry.uvSnapshotPage.reset();
+  entry.uvSnapshotLease = nullptr;
   entry.uvSnapshotOffset = 0u;
   entry.uvInfo = {};
   entry.uvStride = 0u;

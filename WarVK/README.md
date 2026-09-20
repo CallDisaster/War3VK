@@ -1,8 +1,8 @@
 # WarVK JAPI
 
-## 1.22.00 作者须知
+## 1.22.01 作者须知
 
-产品/JAPI显示1.22.00，Shader API1.2.0、JASS wire `warvk:v1`不变。太阳禁用现在停止直射和
+产品/JAPI显示1.22.01，Shader API1.2.0、JASS wire `warvk:v1`不变。太阳禁用现在停止直射和
 相应太阳阴影，环境/自发光保留；1.27a typed Hashtable carrier签名已修正，失败仍回退字符串通道。
 请查询功能位与错误结果：目录包装存在不等于功能实现或全部效果已验收。当前仍有明确返回
 UnsupportedFeature的outline/bloom/postfx/aa包装；历史限定测试不是全部109命令验收。

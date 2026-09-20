@@ -1,14 +1,21 @@
-# WarVK 1.22.00
+# WarVK 1.22.01
 
 [简体中文](README_CN.md) · [Changelog](CHANGELOG.md) · [Map-author API](WarVK/README.md) · [Downloads](https://github.com/CallDisaster/War3VK/releases/latest)
 
 WarVK enhances **Warcraft III 1.27a (32-bit)** using a DXVK-derived D3D9-to-Vulkan backend. It adds directional/point shadows, volumetric lighting, local fog, post-processing, diagnostics and a bounded JASS API, without changing map gameplay.
 
-## Highlights in 1.22.00
+## Highlights in 1.22.01
+
+- **Adaptive memory budgets and idle retirement.** Pool growth checks the actual heap budget, physical backing commitment and 32-bit address-space headroom. Completed Arena generations can gradually release idle tail pages; live resources are not revoked.
+- **Snapshot hole reuse.** Retired intervals can be reused after their final CPU/command/GPU consumer releases them, without waiting for every slice in a page to expire. Metadata exhaustion and fragmentation retain conservative fallbacks.
+- **Failure cleanup and screenshot memory.** Complete image allocation/registration unwind, preserve small D3D9 allocator tails and reject overflow. Screenshot readback slots are allocated on demand and returned when idle after completion.
+- The matching candidate received one positive player test. This is not all-GPU, cross-map, slow-storage shutdown or long-duration certification. See [1.22.01 scope](docs/RELEASE_1.22.01.md).
+
+### Retained improvements from the 1.22 series
 
 - **Remove unnecessary frame-end readback waits.** On the verified native synchronization path without a pixel consumer, CPU preparation can overlap GPU rendering again. Works with performance recording both off and on. Real fences, Present and unsupported-call fallbacks remain intact.
 - **Asynchronous screenshots.** Bounded GPU readback slots and exact completion signals allow pixel processing/file output in the background. Native TGA compatibility is retained; elapsed frames are never used as completion proof.
-- **Shadow-memory recovery on large maps.** Stage11 position/UV/index snapshots are grouped by retention lifetime, reducing small long-lived entries pinning pages of expired short-lived data. Failed captures no longer renew successful-cache lifetimes. The default **384 MiB pool budget is unchanged**; required casters are not discarded to fake recovery.
+- **Shadow-memory recovery on large maps.** Stage11 position/UV/index snapshots are grouped by retention lifetime. Failed captures no longer renew successful-cache lifetimes; 1.22.01 adds safe interval reuse. Required casters are not discarded to fake recovery.
 - **Stretched-shadow input fixes ([#8](https://github.com/CallDisaster/War3VK/issues/8)).** Repair stale palette-slot reuse, group coverage and matrix source/coordinate-space handoffs. Captured bad triangles were independently reconstructed. Fixes are included, not a claim that every intermittent defect is conclusively eliminated.
 - **Author controls.** Correct solar-disable semantics and Warcraft 1.27a typed JASS carrier signatures. Existing explicit point lights, Froxel and local fog remain available; unsupported commands do not silently succeed.
 - **Working Render Stats.** Ctrl+F1 shows snapshot pages, Arena, allocator budgets, 32-bit address space and shadow completeness. Pool gauges stay valid on cache-hit-only frames. Arena distinguishes retained capacity from last submitted generation usage.
@@ -29,8 +36,8 @@ A historical same-DLL, matched isolated 2560×1440 A-B-B-A experiment measured m
 - Only verified executable/Game.dll signatures are supported; unknown layouts are not guessed.
 
 1. Fully exit Warcraft III and the editor; back up any existing `d3d9.dll` separately.
-2. Extract **WarVK-1.22.00-win32.zip** and put its DLL beside `war3.exe`.
-3. Start normally; `d3d9.log` should report `DXVK: 1.22.00`.
+2. Extract **WarVK-1.22.01-win32.zip** and put its DLL beside `war3.exe`.
+3. Start normally; `d3d9.log` should report `DXVK: 1.22.01`.
 4. Press **Ctrl+F1** for settings and Render Stats. Normal optimizations do not require recording.
 
 Do not use old experimental launch scripts for normal play. Environment variables are an internal diagnostic surface and can override defaults; supported player/author entry points are the panel and documented JAPI. Heavy frame evidence is **off by default**. Do not install conflicting D3D9 proxy DLLs.
@@ -39,8 +46,9 @@ The separate **author-kit** ZIP contains JASS/YDWE integration, not a runtime DL
 
 ## Reading memory statistics
 
-- **Snapshot pool:** default 384 MiB, separate from Arena; not the GPU's total VRAM limit.
-- **Arena retained capacity:** reusable GPU buffers, capped at 384 MiB per generation and 1152 MiB total. Pages currently do not shrink automatically when camera pressure falls. A full capacity bar alone is not allocation failure.
+- **Snapshot pool:** adaptive quota up to 512 MiB by default with trusted driver budget data; otherwise 384 MiB fallback. Existing explicit caps still constrain it. This is neither preallocation nor the GPU's total VRAM limit.
+- **Arena retained capacity:** at most 384 MiB per generation and 1152 MiB total; actual growth quota can be lower. Completed generations gradually shed idle tail pages. DXVK/driver backing caches may release later; a full capacity bar alone is not allocation failure.
+- **Last growth quota:** the most recent growth decision, not continuous VRAM sampling. GPU headroom and 32-bit VA can both block growth; extreme working sets can still exhaust available space.
 - **Last submitted generation usage:** bytes used before resetting that generation's cursor, not proof of GPU completion or visible geometry size.
 - Cache references overlap pool backing; do not add them as independent allocations. Sources may represent different frames. VA means address space, not physical RAM or VRAM.
 
@@ -61,8 +69,8 @@ Fully exit before restoring the backed-up DLL. To uninstall, remove WarVK's DLL;
 
 ## Development / licensing
 
-Product/JAPI display: **1.22.00**, with later fixes numbered **1.22.01** etc. External Shader API remains **1.2.0**, JASS wire remains **warvk:v1**; existing scripts do not need an ABI migration.
+Product/JAPI display: **1.22.01**; subsequent fixes retain the 1.22 numbering series. External Shader API remains **1.2.0**, JASS wire remains **warvk:v1**; existing scripts do not need an ABI migration.
 
-Runtime code: `src/d3d9/`; Warcraft integration: `src/d3d9/war3/`; shaders: `subprojects/war3fx/`; author integration: `WarVK/`; tests: `AutoTest/`. Use pinned dependencies and explicit release options, not an old diagnostic build directory. See [release scope](docs/RELEASE_1.22.00.md).
+Runtime code: `src/d3d9/`; Warcraft integration: `src/d3d9/war3/`; shaders: `subprojects/war3fx/`; author integration: `WarVK/`; tests: `AutoTest/`. Use pinned dependencies and explicit release options, not an old diagnostic build directory. See [release scope](docs/RELEASE_1.22.01.md).
 
 WarVK is GPLv3 at project level: [LICENSE](LICENSE), [COPYING](COPYING), [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Dependencies retain their original notices. This is an unofficial project built on DXVK, Dear ImGui, MinHook, Vulkan and Warcraft community research.

@@ -228,6 +228,9 @@ uint64_t InputCapture::capture(const Rc<DxvkCommandList>& ctx,Key key,bool volum
       const auto& d=*draws[idx];if(d.stage!=11||shape(d)!=(priority==0))continue;
       ++s.eligible;if(shape(d))++s.focusCount;
       if(s.draws.size()>=DrawsPerSlot){++s.omitted;continue;}
+      // Capture can consume geometry even when its subsequent shadow draw is
+      // rejected. Retain before issuing any copy/dispatch, including unwind.
+      dxvk::war3::memory::TrackSnapshotSlices(*ctx, d);
       Draw r{};r.index=idx;r.part=uint64_t(reinterpret_cast<uintptr_t>(d.shadowRenderablePart));
       r.metadata=d.shadowMetadataKeyHash;r.geometry=d.shadowExactGeometryKeyHash;r.alphaFrame=d.alphaMetadataFrameSerial;r.boundsGeneration=d.boundsSourceGeneration;
       r.provenance=d.inputEvidenceProvenance;
