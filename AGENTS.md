@@ -47,6 +47,8 @@ WarVK 是一个面向 **Warcraft III 1.27a** 的 Windows 图形增强项目。�
 
 ## 当前状态
 
+- 2026-09-20 用户完成1.22正式配置RC试玩并授权发布；最终先补Render Stats假零与Arena用量标签，预算/准入不变。发布范围与已知边界以[1.22发布说明](docs/RELEASE_1.22.00.md)及最新开发日志为准；以下日期条目是历史checkpoint，不能覆盖最新状态或外推未做的实机门。
+
 - 2026-09-20 已完成B-primary本地源码整合，后续唯一主目录为本目录`dxvk`、分支`codex/v1.22-main-tree-20260920`；旧A/B分支、stash与外部备份保留。**本目录旧build32及StormBreaker原dirty不得用于发布构建**，须独立clean配置/依赖验收；未推送/发布、玩家DLL未动。详见[整合回执](docs/plan/2026-09-20-formal-main-tree-integration.md)。
 
 - 2026-09-20 Stage11三流寿命分页FAC候选已有本次玩家移动/各区域阴影恢复正向反馈，默认384MiB与GPU退休保留；正式配置、组合长时/性能及发布包尚未完成，不外推全面修复。现进入[发布收尾](docs/plan/2026-09-20-v122-release-closeout-checklist.md)，[离线证据](docs/plan/2026-09-20-stage11-production-lifetime-recovery.md)与旧失败分别保留。

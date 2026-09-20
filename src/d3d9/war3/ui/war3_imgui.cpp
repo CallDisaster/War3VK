@@ -1280,19 +1280,21 @@ void War3Imgui::drawRenderStatsPanel() {
   ImGui::TextWrapped("页内占用包含未单独回收的旧切片，并非当前镜头的几何净量。缓存引用与页常驻有重叠，不可相加；池上限也不是总显存上限。");
 
   ImGui::Separator();
-  ImGui::Text("Arena：当前代使用 %.1f MiB / 多代常驻 %.1f MiB",
-      mib(a.usedBytes), mib(a.residentBytes));
+  ImGui::Text("Arena：上一提交代使用 %.1f MiB / 保留容量 %.1f MiB",
+      mib(a.lastSubmittedUsedBytes), mib(a.residentBytes));
+  ImGui::TextDisabled("当前代瞬时使用 %.1f MiB（切帧后可为 0；不是上一帧用量）", mib(a.usedBytes));
   {
     ImGui::Text("Arena 常驻上限 %.1f MiB / 活跃代 %u / 代号 %llu",
         mib(a.residentLimitBytes), a.activeGenerationCount, u64(a.generation));
     ImGui::ProgressBar(ui::BudgetFraction(a.residentBytes, a.residentLimitBytes),
-        ImVec2(-1, 0), "Arena 常驻 / 预算");
+        ImVec2(-1, 0), "Arena 保留容量 / 预算（不是帧内用量）");
   }
   ImGui::Text("提交 serial %llu / 完成 serial %llu / 当前不完整 %s",
       u64(a.submittedSerial), u64(a.completedSerial), a.frameIncomplete ? "是" : "否");
   ImGui::Text("Arena 累计：溢出 %llu / 准入拒绝 %llu / 忙拒绝 %llu / 隔离 %llu",
       u64(a.overflowCount), u64(a.admissionRejectedCount), u64(a.busyReuseRejectCount), u64(a.quarantineCount));
   ImGui::TextDisabled("Arena 为独立临时上传池；原子字段非同一事务快照，不能据此授权回收。");
+  ImGui::TextWrapped("已完成的页会循环复用，当前不随镜头压力自动缩容；上一提交代不表示 GPU 已完成。");
   if (a.budgetSupported && a.budgetTrusted && a.budgetFrameSerial) {
     ImGui::Text("Vulkan 主堆：预算 %.1f / 本分配器已分配 %.1f / 可用估计 %.1f MiB",
         mib(a.budgetBytes), mib(a.allocatedBytes), mib(a.availableBytes));

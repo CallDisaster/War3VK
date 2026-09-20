@@ -110,6 +110,7 @@ std::atomic<uint64_t> g_quarantineCount{0u};
 std::atomic<uint64_t> g_lastQuarantinedGeneration{0u};
 std::atomic<uint64_t> g_lastQuarantinedRetireSerial{0u};
 std::atomic<uint64_t> g_currentUsedBytes{0u};
+std::atomic<uint64_t> g_lastSubmittedUsedBytes{0u};
 std::atomic<uint32_t> g_activeGenerationCount{0u};
 std::atomic<uint32_t> g_frameIncomplete{0u};
 
@@ -449,6 +450,7 @@ bool ShadowArena_Init(DxvkDevice* device) {
   g_lastOverflowCapacityBytes.store(0u, std::memory_order_release);
   g_generationCounter.store(0u, std::memory_order_release);
   g_lastSubmittedSerial.store(0u, std::memory_order_release);
+  g_lastSubmittedUsedBytes.store(0u, std::memory_order_release);
   g_lastCompletedSerial.store(0u, std::memory_order_release);
   g_busyReuseRejectCount.store(0u, std::memory_order_release);
   g_totalOverflowCount.store(0u, std::memory_order_release);
@@ -531,6 +533,7 @@ void ShadowArena_Shutdown(DxvkDevice* device) {
   g_frameStates.clear();
   g_residentBytes.store(0u, std::memory_order_release);
   g_currentUsedBytes.store(0u, std::memory_order_release);
+  g_lastSubmittedUsedBytes.store(0u, std::memory_order_release);
   g_activeGenerationCount.store(0u, std::memory_order_release);
   g_allocationHeapIndex = kInvalidGenerationIndex;
   g_ownerDevice = nullptr;
@@ -631,6 +634,11 @@ void ShadowArena_EndFrame(uint64_t frameSerial) {
   if (frameState.frameSerial != frameSerial)
     return;
   frameState.retireSerial = frameSerial;
+  // Preserve the sealed generation's usage across BeginFrame's cursor reset.
+  // This is submitted usage, not GPU completion or current visible geometry.
+  g_lastSubmittedUsedBytes.store(
+      uint64_t(frameState.committedBytes) + frameState.currentOffset,
+      std::memory_order_release);
   g_lastSubmittedSerial.store(frameSerial, std::memory_order_release);
 }
 
@@ -970,6 +978,7 @@ ShadowArenaMemoryStats ShadowArena_QueryMemoryStats() noexcept {
   // Do not call the full diagnostic query here: it also reads owner-only
   // page-tail state. This display path deliberately reads atomic scalars only.
   result.usedBytes = g_currentUsedBytes.load(std::memory_order_relaxed);
+  result.lastSubmittedUsedBytes = g_lastSubmittedUsedBytes.load(std::memory_order_relaxed);
   result.residentBytes = g_residentBytes.load(std::memory_order_relaxed);
   result.residentLimitBytes = g_residentLimitBytes.load(std::memory_order_relaxed);
   result.generation = g_generationCounter.load(std::memory_order_relaxed);

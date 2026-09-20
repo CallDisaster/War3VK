@@ -1,0 +1,7 @@
+# Frozen differential-test references have byte-level SHA-256 contracts.
+# Git must not rewrite their line endings when moving between worktrees.
+/src/d3d9/war3/semantic/tests/*_legacy_reference.inc -text
+/src/d3d9/war3/semantic/war3_palette_taxonomy_emission.cpp -text
+/src/d3d9/war3/semantic/war3_palette_taxonomy_emission.h -text
+/src/d3d9/war3/semantic/war3_palette_submitted_aggregation.cpp -text
+/src/d3d9/war3/semantic/war3_palette_submitted_aggregation.h -text

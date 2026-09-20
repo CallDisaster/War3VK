@@ -372,6 +372,9 @@ def check_version(root: Path, version: str) -> list[str]:
         errors.append("JAPI display version mismatch")
     if 'kCanonicalVersion = "v1"' not in japi:
         errors.append("JASS wire ABI changed")
+    bridge = read(root, "src/d3d9/war3/hooks/war3_jass_command_bridge.cpp")
+    if f'result.publicVersionText.find("WarVK JAPI {version}")' not in bridge:
+        errors.append("JASS runtime probe version mismatch")
     shader = read(root, "src/d3d9/war3_shader_api.h")
     if not all(x in shader for x in ("API_VERSION_MAJOR = 1", "API_VERSION_MINOR = 2", "API_VERSION_PATCH = 0")):
         errors.append("shader API version changed")

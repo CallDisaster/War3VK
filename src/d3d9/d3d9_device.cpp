@@ -52,6 +52,7 @@
 #include "war3/memory/war3_current_up_shadow_replay_contract.h"
 #include "war3/memory/war3_exact_index_domain_observer_cache.h"
 #include "war3/memory/war3_shadow_arena.h"
+#include "war3/memory/war3_snapshot_pool_stats.h"
 #include "war3/memory/war3_storm_hook.h"
 #include "war3/model/war3_model_hook.h"
 #include "war3/model/war3_model_resource_cache.h"
@@ -17910,6 +17911,7 @@ void D3D9DeviceEx::War3MaybeInsertBeforeUi(bool forceFrameEnd) {
   }
   input.scene = std::move(m_war3Scene);
   m_war3Scene = War3FrameScene{};
+  War3RefreshStage11SnapshotPageStats();
   m_war3SceneRotatedFrameSerial = m_war3ShadowPersistentFrameSerial + 1u;
   m_war3ShadowPaletteHashIndex.clear();
   m_war3SemanticPaletteCache.clear();
@@ -23861,16 +23863,17 @@ D3D9DeviceEx::War3AllocateStage11Snapshot(
 
   ++m_war3Scene.shadowStats.drawTimeSnapshotSuballocationCount;
   m_war3Scene.shadowStats.drawTimeSnapshotSuballocationBytes += alignedBytes;
-  m_war3Scene.shadowStats.drawTimeSnapshotPageResidentBytes =
-      m_war3Stage11SnapshotResidentBytes;
-  uint64_t usedBytes = 0u;
-  for (const auto& page : m_war3Stage11SnapshotPages) {
-    usedBytes = page->used > std::numeric_limits<uint64_t>::max() - usedBytes
-        ? std::numeric_limits<uint64_t>::max()
-        : usedBytes + uint64_t(page->used);
-  }
-  m_war3Scene.shadowStats.drawTimeSnapshotPageUsedBytes = usedBytes;
+  War3RefreshStage11SnapshotPageStats();
   return War3Stage11SnapshotAllocationResult::Success;
+}
+
+void D3D9DeviceEx::War3RefreshStage11SnapshotPageStats() {
+  // Owner-only, bounded to the existing pool's page count. Frame counters are
+  // reset independently; resident/used gauges describe the surviving pool even
+  // in cache-hit-only frames. The UI never walks these live containers.
+  war3::memory::SampleSnapshotPoolStats(m_war3Stage11SnapshotPages,
+      m_war3Stage11SnapshotResidentBytes, m_war3Stage11SnapshotReclaimedPages,
+      m_war3Scene.shadowStats);
 }
 
 void D3D9DeviceEx::War3CollectUnusedStage11SnapshotPages() {
@@ -23887,10 +23890,7 @@ void D3D9DeviceEx::War3CollectUnusedStage11SnapshotPages() {
     ++m_war3Stage11SnapshotReclaimedPages;
     it = m_war3Stage11SnapshotPages.erase(it);
   }
-  m_war3Scene.shadowStats.drawTimeSnapshotPageResidentBytes =
-      m_war3Stage11SnapshotResidentBytes;
-  m_war3Scene.shadowStats.drawTimeSnapshotPageReclaimedCount =
-      m_war3Stage11SnapshotReclaimedPages;
+  War3RefreshStage11SnapshotPageStats();
 }
 
 void D3D9DeviceEx::War3ResetStage11SnapshotPages() {
@@ -23901,6 +23901,7 @@ void D3D9DeviceEx::War3ResetStage11SnapshotPages() {
   m_war3Stage11SnapshotPages.clear();
   m_war3Stage11SnapshotResidentBytes = 0u;
   m_war3Stage11CensusSchedule = {};
+  War3RefreshStage11SnapshotPageStats();
 }
 
 void D3D9DeviceEx::War3SampleStage11BudgetAtPresent() {
@@ -24216,6 +24217,7 @@ void D3D9DeviceEx::War3ResetShadowSessionState(uint64_t retireSerial) {
   m_war3BestWorldCameraTier = 0u;
   m_war3SceneRotatedFrameSerial = 0u;
   m_war3Scene = War3FrameScene{};
+  War3RefreshStage11SnapshotPageStats();
   m_war3ShadowPaletteHashIndex.clear();
   m_war3SemanticPaletteCache.clear();
   m_war3SemanticPaletteCacheHashIndex.clear();
@@ -30932,6 +30934,7 @@ bool D3D9DeviceEx::War3ExecuteSemanticShadowSceneForValidation(
 
   input.scene = std::move(m_war3Scene);
   m_war3Scene = War3FrameScene{};
+  War3RefreshStage11SnapshotPageStats();
   m_war3SceneRotatedFrameSerial = m_war3ShadowPersistentFrameSerial + 1u;
   m_war3ShadowPaletteHashIndex.clear();
   m_war3SemanticPaletteCache.clear();
@@ -33917,6 +33920,7 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
     if (!war3FrameSceneAlreadyRotated) {
       // m_shadowDataPool.newFrame();
       m_war3Scene = War3FrameScene{};
+      War3RefreshStage11SnapshotPageStats();
       m_war3ShadowPaletteHashIndex.clear();
       m_war3SemanticPaletteCache.clear();
       m_war3SemanticPaletteCacheHashIndex.clear();

@@ -74,6 +74,19 @@ function build_arch {
         --libdir "x$1"                                      \
         -Db_ndebug=if-release                               \
         -Dbuild_id=$opt_buildid                             \
+        -Denable_dxgi=false -Denable_d3d8=false              \
+        -Denable_d3d9=true -Denable_d3d10=false -Denable_d3d11=false \
+        -Dnative_glfw=disabled -Dnative_sdl2=disabled -Dnative_sdl3=disabled \
+        -Dwarvk_internal_frame_recorder=false               \
+        -Dwarvk_skin_palette_contract_candidate=true        \
+        -Dwarvk_data_collection_tree_dev=false               \
+        -Dwarvk_shadow_observers_dev=false                  \
+        -Dwarvk_rts_shadow_candidate_dev=false               \
+        -Dwarvk_coherent_up_index_trim_dev=false             \
+        -Dwarvk_current_up_shadow_replay_dev=false           \
+        -Dwarvk_coherent_real_index_trim_dev=false           \
+        -Dwarvk_coherent_real_perf_candidate_dev=false       \
+        -Dwarvk_device_address_binding_report_dev=false     \
         "$DXVK_BUILD_DIR/build.$1"
 
   cd "$DXVK_BUILD_DIR/build.$1"

@@ -224,13 +224,16 @@ d3d9_src = [
 ]
 
 
-# MinHook configuration
-minhook_lib_path = join_paths(meson.source_root(), 'src/minhook')
+# Build the pinned MinHook sources; no untracked precompiled archive is needed.
 minhook_inc_path = include_directories('../MinHook/include')
-
-d3d9_ld_args      = [
-  join_paths(minhook_lib_path, 'libMinHook.x86.a')
-]
+minhook_hde_source = cpu_family == 'x86_64' ? '../minhook/src/hde/hde64.c' : '../minhook/src/hde/hde32.c'
+minhook_lib = static_library('warvk_minhook',
+  ['../minhook/src/buffer.c', '../minhook/src/hook.c',
+   '../minhook/src/trampoline.c', minhook_hde_source],
+  include_directories : [minhook_inc_path],
+  install : false,
+)
+d3d9_ld_args      = []
 d3d9_link_depends = []
 
 war3_data_collection_tree_test = executable(
@@ -497,6 +500,7 @@ endif
 d3d9_dll = shared_library(dxvk_name_prefix+'d3d9', d3d9_src,
   glsl_generator.process(d3d9_shaders), d3d9_war3_gpu_skin_ff_vs, d3d9_res,
   dependencies        : [ dxso_dep, dxvk_dep, imgui_dep, lib_dwmapi, lib_dbghelp ],
+  link_with           : [ minhook_lib ],
   include_directories : [ dxvk_include_path, minhook_inc_path ],
   install             : true,
   vs_module_defs      : 'd3d9'+def_spec_ext,

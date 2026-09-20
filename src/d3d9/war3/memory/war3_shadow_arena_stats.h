@@ -7,6 +7,7 @@ namespace dxvk::war3::memory {
 // transaction-wide allocation/retirement proof. No frame-page traversal.
 struct ShadowArenaMemoryStats {
   uint64_t usedBytes = 0, residentBytes = 0, residentLimitBytes = 0;
+  uint64_t lastSubmittedUsedBytes = 0;
   uint64_t generation = 0, submittedSerial = 0, completedSerial = 0;
   uint64_t overflowCount = 0, admissionRejectedCount = 0;
   uint64_t busyReuseRejectCount = 0, quarantineCount = 0;

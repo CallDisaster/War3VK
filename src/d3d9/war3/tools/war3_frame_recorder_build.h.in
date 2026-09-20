@@ -1,0 +1,7 @@
+#pragma once
+// Generated only for the recorder implementation. Other targets do not acquire
+// diagnostic defaults from NDEBUG or the unrelated shadow observer switches.
+// CPU tests explicitly compile both profiles against the production resolver.
+#ifndef WARVK_INTERNAL_FRAME_RECORDER_DEFAULT
+#define WARVK_INTERNAL_FRAME_RECORDER_DEFAULT @WARVK_INTERNAL_FRAME_RECORDER_DEFAULT@
+#endif

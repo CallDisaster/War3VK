@@ -3104,6 +3104,7 @@ private:
       std::shared_ptr<War3Stage11SnapshotPage>& outPage,
       VkDeviceSize& outOffset, VkDeviceSize& outCapacity);
   void War3CollectUnusedStage11SnapshotPages();
+  void War3RefreshStage11SnapshotPageStats();
   void War3ResetStage11SnapshotPages();
   void War3TryCaptureShadowCaster(D3DPRIMITIVETYPE PrimitiveType,
                                   INT BaseVertexIndex, UINT MinVertexIndex,

@@ -47,8 +47,8 @@ class RenderStatsPanelContract(unittest.TestCase):
 
     def test_atomic_memory_query_only(self):
         assignments = re.findall(r"result\.(\w+)\s*=\s*(g_\w+)\.load\(std::memory_order_relaxed\);", self.arena)
-        self.assertEqual(len(assignments), 18)
-        self.assertEqual(len(set(name for name, _ in assignments)), 18)
+        self.assertEqual(len(assignments), 19)
+        self.assertEqual(len(set(name for name, _ in assignments)), 19)
         source = (ROOT / "src/d3d9/war3/memory/war3_shadow_arena.cpp").read_text(encoding="utf-8")
         for _, variable in assignments:
             self.assertRegex(source, r"std::atomic<\w+>\s+" + variable + r"\b")
@@ -78,9 +78,32 @@ class RenderStatsPanelContract(unittest.TestCase):
                      "producerRequiredCasterOmissionCount", "producerCompletenessReasonMask",
                      "drawTimeVBCacheStaticLiveBytes", "drawTimeVBCacheStaticProtectedBytes"):
             self.assertIn("p." + name, self.panel)
-        for name in ("usedBytes", "residentBytes", "residentLimitBytes", "activeGenerationCount",
+        for name in ("usedBytes", "lastSubmittedUsedBytes", "residentBytes", "residentLimitBytes", "activeGenerationCount",
                      "submittedSerial", "completedSerial", "overflowCount", "quarantineCount"):
             self.assertIn("a." + name, self.panel)
+
+    def test_pool_gauges_refreshed_after_all_scene_resets_and_pool_mutations(self):
+        source = (ROOT / "src/d3d9/d3d9_device.cpp").read_text(encoding="utf-8")
+        resets = re.findall(r"m_war3Scene = War3FrameScene\{\};\s*(\w+)\(\);", source)
+        self.assertEqual(resets, ["War3RefreshStage11SnapshotPageStats"] * 4)
+        self.assertEqual(source.count("m_war3Scene = War3FrameScene{};"), 4)
+        for method in ("War3CollectUnusedStage11SnapshotPages", "War3ResetStage11SnapshotPages",
+                       "War3AllocateStage11Snapshot"):
+            self.assertIn("War3RefreshStage11SnapshotPageStats();", body(source, "D3D9DeviceEx::" + method + "("))
+        refresh = body(source, "void D3D9DeviceEx::War3RefreshStage11SnapshotPageStats()")
+        self.assertIn("SampleSnapshotPoolStats", refresh)
+        for forbidden in ("EmitCs", "createBuffer", "erase", "clear", "mutex"):
+            self.assertNotIn(forbidden, refresh)
+
+    def test_last_submitted_usage_survives_begin_frame_but_not_device_shutdown(self):
+        source = (ROOT / "src/d3d9/war3/memory/war3_shadow_arena.cpp").read_text(encoding="utf-8")
+        end = body(source, "void ShadowArena_EndFrame(")
+        self.assertLess(end.index("if (frameState.frameSerial != frameSerial)"), end.index("g_lastSubmittedUsedBytes.store"))
+        self.assertIn("uint64_t(frameState.committedBytes) + frameState.currentOffset", end)
+        self.assertNotIn("g_lastSubmittedUsedBytes.store", body(source, "bool ShadowArena_BeginFrame("))
+        for signature in ("bool ShadowArena_Init(", "void ShadowArena_Shutdown("):
+            self.assertIn("g_lastSubmittedUsedBytes.store(0u", body(source, signature))
+        self.assertIn("不随镜头压力自动缩容", self.panel)
 
 
 if __name__ == "__main__":

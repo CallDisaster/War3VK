@@ -1,5 +1,14 @@
 # WarVK JAPI
 
+## 1.22.00 作者须知
+
+产品/JAPI显示1.22.00，Shader API1.2.0、JASS wire `warvk:v1`不变。太阳禁用现在停止直射和
+相应太阳阴影，环境/自发光保留；1.27a typed Hashtable carrier签名已修正，失败仍回退字符串通道。
+请查询功能位与错误结果：目录包装存在不等于功能实现或全部效果已验收。当前仍有明确返回
+UnsupportedFeature的outline/bloom/postfx/aa包装；历史限定测试不是全部109命令验收。
+原版模型自动灯接管已搁置，`WarVKSetModelPointLightsEnabled`等实验包装不作为本版支持承诺；
+已有显式创建点光接口继续保留。玩家需先安装1.22运行时，作者包不包含DLL/Loader。
+
 WarVK 的运行时内置于 DXVK `d3d9.dll`。地图通过 Warcraft III 自带的
 `Preloader`、`GetLocalizedHotkey` 和 `GetLocalizedString` 调用
 `warvk:v1` 协议，不声明额外 Native，也不需要 `war3map.dll` 提供这套接口。
