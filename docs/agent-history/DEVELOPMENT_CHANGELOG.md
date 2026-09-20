@@ -3,6 +3,13 @@
 本账本记录集成候选、验证和未通过项。根 CHANGELOG 的旧版本历史保持不变；
 1.22正式范围见 `docs/RELEASE_1.22.00.md`；带DRAFT的旧文档仅供追溯，不覆盖后续验收与发布决定。
 
+## 2026-09-20 16:15 台北：v1.22.00正式发布已完成
+
+- 用户发布授权下，将0df497914c3352539f14fea2af40a600ea7b25fb与新annotated v1.22.00标签atomic/fast-forward推送origin/main；未force、未改旧标签、未上传实验分支。GitHub Release ID392359706已从draft转为非prerelease、latest，发布时间2026-09-20T08:15:30Z。
+- 四附件远端状态uploaded，名称/大小/SHA均与本地逐项相等：DLL31,213,491B/ED4BFAEE…D8812；玩家ZIP7,267,655B/F10C3287…679A8；作者ZIP94,698B/E23348CA…F38FB；SHA256SUMS.txt260B/CCCACE07…ACD01。完整值见发布回执与附件。仅白名单发布，无原始证据/游戏资产/测试环境变量。
+- 本次最终Render Stats增量的离线证据与已知边界沿用上方实际记录；未重新实机、未将旧候选结果追认到最终DLL。玩家目录仍为RC1且未部署，编译/游戏资源已释放。主树仅保留既有StormBreaker dirty；原stash、A/B分支与旧包保留。
+- [正式Release](https://github.com/CallDisaster/War3VK/releases/tag/v1.22.00)。随后仅将本成功回执加入main，不移动已发布标签或重打已冻结资产。
+
 ## 2026-09-20 正式包离线收口（发布事务前）
 
 - 打包后追加核验：GNU strip默认改写PE时间戳，预览84190E1D与首包98BD6B28仅0x88/0x89时间戳、0xD8/0xD9校验和4字节不同，机器代码未变。两者未发布、保留本地；改用--preserve-dates后两次独立剥离逐字节一致，最终正式DLL改为31,213,491B / ED4BFAEEC775B6E2F088351A4F0F164609E23300056EECC16294171E9F4D8812。下条原预览身份不作为最终下载身份。

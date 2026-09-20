@@ -1,5 +1,21 @@
 # WarVK v1.22.00 正式发布构建回执
 
+## 远程完成回执（覆盖下方事务前状态）
+
+2026-09-20T08:15:30Z（台北16:15）已正式公开；Release ID392359706、draft=false、prerelease=false、latest。
+`v1.22.00`标签解引用为`0df497914c3352539f14fea2af40a600ea7b25fb`；该commit已以fast-forward推送origin/main，未force或覆盖旧标签。
+四附件远端digest/size与本地完全一致：
+
+| 附件 | 字节 | SHA-256 |
+| --- | ---: | --- |
+| d3d9.dll | 31,213,491 | `ED4BFAEEC775B6E2F088351A4F0F164609E23300056EECC16294171E9F4D8812` |
+| WarVK-1.22.00-win32.zip | 7,267,655 | `F10C32878E72BD0CCC6F4AEF000D8BA2158676B96CCCC5CAEBA495B6C15679A8` |
+| WarVK-1.22.00-author-kit.zip | 94,698 | `E23348CAB63659E9E12A9E8795629E9FC3BB1CFF5C4AFC178634115F621F38FB` |
+| SHA256SUMS.txt | 260 | `CCCACE071E2322AEED205D799EF06B6493143506A36FCE568D18A43766CACD01` |
+
+最终显示改动未重新实机，玩家目录仍是用户原先安装的RC1；没有自动替换。
+本成功回执后续单独提交main；不移动标签、不改包内sourceCommit、不重打资产。
+
 ## 授权与验收边界
 
 用户在正式配置RC1试玩后明确表示没有大问题，要求更新README/CHANGELOG并推送稳定Release；随后追加先修Render Stats显示。
