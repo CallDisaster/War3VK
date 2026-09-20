@@ -117,7 +117,10 @@ def package(root, build, out, manifest_name):
     objdump = Path('E:/Dev/MinGW/bin/objdump.exe')
     out.mkdir(parents=True, exist_ok=False)
     dll = out / 'd3d9.dll'
-    subprocess.run(['E:/Dev/MinGW/bin/strip.exe', '--strip-unneeded', '-o', str(dll), str(original)], check=True)
+    # PE binutils otherwise stamps the current time and changes the digest on
+    # every invocation, despite identical machine code. Preserve source dates.
+    subprocess.run(['E:/Dev/MinGW/bin/strip.exe', '--strip-unneeded', '--preserve-dates',
+                    '-o', str(dll), str(original)], check=True)
     if pe_tables(dll, objdump) != pe_tables(original, objdump) or identity(original) != original_id:
         raise ValueError('Strip altered API or original')
     verify_win32(dll)

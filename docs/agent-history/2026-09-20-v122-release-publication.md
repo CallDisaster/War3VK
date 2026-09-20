@@ -17,11 +17,13 @@
 
 | 产物 | 字节 | SHA-256 |
 | --- | ---: | --- |
-| 玩家DLL（剥离包副本） | 31,213,491 | `84190E1DC48CEB62381E81473F277DA53B9EA12F3DCAD61BCC0938CCB4A49863` |
+| 玩家DLL（剥离包副本） | 31,213,491 | `ED4BFAEEC775B6E2F088351A4F0F164609E23300056EECC16294171E9F4D8812` |
 | 原始含调试符号DLL | 36,051,280 | `FC7EA415E222E0B16C1C27707779D25489AD86633B3B5FAE752E951E050C45A1` |
 
 PE32/i386。剥离不作用于原始构建；正式包审计还要检查导入/导出不变及ZIP所有成员字节。
 ZIP摘要由附件`SHA256SUMS.txt`提供，源码commit由包内manifest记载。
+首轮预览/打包曾受strip当前时间戳影响（84190E1D/98BD6B28，仅PE时间戳/校验和4字节不同），均未上传。
+最终使用--preserve-dates，两次独立剥离SHA相同；正式包另存r2，旧包原样保留，不覆盖旧证据。
 
 ## 本轮离线验证
 
@@ -41,7 +43,7 @@ release-meson-tests.log、static-release/results.json、release-configuration-au
 先建立draft上传白名单资产，核对远程摘要后再公开为stable/latest。不得force或覆盖旧标签。
 成功状态以GitHub release及对应标签commit为准：
 [WarVK v1.22.00](https://github.com/CallDisaster/War3VK/releases/tag/v1.22.00)。
-本地完整事务回执保存到新建的`D:/WarVK-Releases/1.22.00-20260920/`，不把环境变量/测试全日志上传。
+本地最终事务回执保存到新建的`D:/WarVK-Releases/1.22.00-20260920-r2/`，不把环境变量/测试全日志上传。
 
 ## 保留边界
 
