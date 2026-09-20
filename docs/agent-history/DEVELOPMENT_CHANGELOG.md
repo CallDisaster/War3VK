@@ -3,6 +3,15 @@
 本账本记录集成候选、验证和未通过项。根 CHANGELOG 的旧版本历史保持不变；
 1.22正式范围见 `docs/RELEASE_1.22.00.md`；带DRAFT的旧文档仅供追溯，不覆盖后续验收与发布决定。
 
+## 2026-09-20 21:29 台北：v1.22.01正式发布完成
+
+- 源码提交7e281568862ba40de3be07e98d108c20144b93e7（63文件/+1943/-313）与新annotated v1.22.01已atomic、fast-forward推送origin/main；无force、未改旧版本。Release ID392439670于2026-09-20T13:29:12Z公开，draft=false、prerelease=false、latest=v1.22.01。
+- 四附件远端uploaded且size/SHA与本地一致：DLL31,221,683B / 5C6AEEDF04BB1379969279033F0A9A556173D9A84F763FD09C88557CCD2A9AF3；玩家ZIP7,275,748B / 3B565191E76707127AD2687CE614DA7B355EC3C256A098DADC145112026DB924；作者ZIP94,794B / 4F99F4EB631E42D21A97990777FEBCC67EB9F87B20D8856801664CE404B9662B；摘要文件260B / D9C2F56CE1E4D395A2E27E09A1DBFE093B6219F02CBE9135106CBDA617702C7F。包成员/CRC/字节与两次独立strip重复性通过。
+- 过程保留：首个实际打包因产品b_ndebug=true而打包器要求if-release被拒；统一发布配置后重新生成/no-work/配置审计通过，未剥离DLL仍为同一D7A54092完整哈希，不放宽包门禁。草稿按tag查询404，按列表解析唯一release ID复核，无重复创建；摘要校验后才公开。
+- 断言开启CPU99/99、静态275/275及20/9/25发布相关测试沿用上条本轮实测；对应候选有玩家单轮反馈，正式版本增量未重新实机，不扩大为完整GPU/跨地图/长期接受。已知限制随中英README/CHANGELOG/Release一同发布。
+- 玩家DLL保持028565BC候选，未自动覆盖；编译/游戏进程0。StormBreaker原dirty保留、未提交或构建。发布包与本地回执在D:/WarVK-Releases/1.22.01-20260920；本条成功回执随后单独提交，不移动已发布标签或重打包。
+- [正式Release](https://github.com/CallDisaster/War3VK/releases/tag/v1.22.01)。后续优化另起批次，不继续扩大本补丁范围。
+
 ## 2026-09-20 1.22.01玩家反馈与修复版发布准备（尚未推送）
 
 - 最终版本标识构建已通过：断言开启CPU99/99、全量静态275/275、正式配置20/20、包工具9/9、离线包读方25/25、py_compile/diff空白；exact DLL编译链接及no-work通过，PE32/i386、版本1.22.01、PRERELEASE=false。未剥离DLL36,065,732B / D7A540926C02904E96F25ADE9D643B0E768B711CC41EE5A12EFC0A87400C1BC3。与已试玩source-adaptive-r9相比，产品输入变化精确限7个版本/探针/对应测试文件；内存算法无新增变化。当前仍未上传，不把本条当成功回执。

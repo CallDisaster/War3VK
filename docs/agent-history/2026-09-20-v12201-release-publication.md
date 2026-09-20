@@ -1,5 +1,26 @@
 # v1.22.01 发布事务回执
 
+## 远程成功回执（覆盖下方事务前状态）
+
+2026-09-20T13:29:12Z（台北21:29）已正式公开：Release ID392439670，draft=false、
+prerelease=false、latest=v1.22.01。新标签解引用为7e281568862ba40de3be07e98d108c20144b93e7；
+与main以atomic/fast-forward推送，没有force或修改旧版本。源码提交63文件/+1943/-313。
+
+| 附件 | 字节 | SHA-256 |
+| --- | ---: | --- |
+| d3d9.dll | 31,221,683 | `5C6AEEDF04BB1379969279033F0A9A556173D9A84F763FD09C88557CCD2A9AF3` |
+| WarVK-1.22.01-win32.zip | 7,275,748 | `3B565191E76707127AD2687CE614DA7B355EC3C256A098DADC145112026DB924` |
+| WarVK-1.22.01-author-kit.zip | 94,794 | `4F99F4EB631E42D21A97990777FEBCC67EB9F87B20D8856801664CE404B9662B` |
+| SHA256SUMS.txt | 260 | `D9C2F56CE1E4D395A2E27E09A1DBFE093B6219F02CBE9135106CBDA617702C7F` |
+
+四附件uploaded，公开前后远端digest与本地一致；ZIP逐成员/CRC/字节与重复strip检查通过。
+首次打包因b_ndebug=true/if-release口径不一致拒绝，改回既有发布配置后重新生成与核验；
+DLL未变化，未放宽检查。草稿tag查询404后只读发现唯一ID，再按该ID核验与公开，未重复建release。
+
+玩家现场仍为028565BC候选，无部署/游戏启动；资源已释放。StormBreaker原dirty保留。
+本成功回执后续单独提交main，不移动发布标签/包sourceCommit，不重打包；
+[下载](https://github.com/CallDisaster/War3VK/releases/tag/v1.22.01)。
+
 ## 当前状态：离线验证完成，远程发布尚未执行
 
 用户单轮试玩后授权主线程选择继续优化或推送修复版；主线程选择冻结范围并发布补丁。
