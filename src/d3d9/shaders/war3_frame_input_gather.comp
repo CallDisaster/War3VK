@@ -1,0 +1,54 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+// Diagnostic word-copy only: no skinning, filtering or floating point math.
+layout(buffer_reference, std430, buffer_reference_align=4) readonly buffer Source { uint words[]; };
+layout(buffer_reference, std430, buffer_reference_align=4) buffer Destination { uint words[]; };
+layout(push_constant, scalar) uniform Params {
+  Source source;
+  Source indices;
+  Destination outputData;
+  uint sourceBytes;
+  uint indexBytes;
+  int vertexOffset;
+  uint stride;
+  uint indexSize; // 0 = nonindexed
+  uint count;
+  uint first;
+  uint reserved;
+} p;
+layout(local_size_x=64) in;
+void main() {
+  uint ordinal=gl_GlobalInvocationID.x;
+  if(ordinal>=p.count)return;
+  uint raw=p.first+ordinal;
+  bool valid=true;
+  if(p.indexSize!=0){
+    uint byteOffset=raw*p.indexSize;
+    valid=byteOffset<=p.indexBytes && p.indexSize<=p.indexBytes-byteOffset;
+    if(valid){
+      uint packed=p.indices.words[byteOffset>>2];
+      raw=p.indexSize==2?((packed>>((byteOffset&2)*8))&0xffffu):packed;
+    }else raw=0xffffffffu;
+  }
+  uint vertex=raw;
+  if(p.vertexOffset>=0){
+    valid=valid && raw<=0x7fffffffu-uint(p.vertexOffset);
+    vertex=raw+uint(p.vertexOffset);
+  }else{
+    uint magnitude=uint(-(p.vertexOffset+1))+1u;
+    valid=valid && raw>=magnitude;vertex=raw-magnitude;
+  }
+  valid=valid && p.stride!=0 && vertex<p.sourceBytes/p.stride;
+  uint recordWords=4+p.stride/4;
+  uint outWord=ordinal*recordWords;
+  p.outputData.words[outWord+0]=raw;
+  p.outputData.words[outWord+1]=vertex;
+  p.outputData.words[outWord+2]=valid?1u:0u;
+  p.outputData.words[outWord+3]=0;
+  for(uint j=0;j<p.stride/4;++j){
+    uint value=0;
+    if(valid) value=p.source.words[vertex*(p.stride/4)+j];
+    p.outputData.words[outWord+4+j]=value;
+  }
+}

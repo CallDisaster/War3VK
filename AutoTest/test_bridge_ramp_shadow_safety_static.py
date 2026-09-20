@@ -838,8 +838,14 @@ class BridgeRampShadowSafetyTests(unittest.TestCase):
             "positionHash, uint32_t(BaseVertexIndex)",
             referenced_block,
         )
+        # 2026-09-18 T7/U5：Stage13 隐式 tag 改为显式 domain 表达（数值逐位不变）。
+        # 本门禁原先钉死裸常数；现在钉死"常数只来自显式 domain 取值"，数值本身由
+        # war3/shadow/war3_shadow_geometry_domain.h 与
+        # AutoTest/test_registry_domain_isolation_static.py 共同钉死（F1-2）。
         self.assertIn(
-            "kStage13ReferencedContentTag = 0x53314301u",
+            "kStage13ReferencedContentTag =\n"
+            "      dxvk::war3::shadow::ShadowGeometryDomainTag(\n"
+            "          dxvk::war3::shadow::ShadowGeometryDomain::Stage13Exact)",
             self.device,
         )
         self.assertIn(

@@ -41,9 +41,15 @@ selection = populate.index(
 )
 assert reset < snapshot_publish < selection
 
-builder_start = DEVICE.index("uint64_t War3SemanticDirectRecordSelectionKey(")
-builder_end = DEVICE.index("uint64_t War3ProducerClaimObserveObjectKey(", builder_start)
-builder = DEVICE[builder_start:builder_end]
+# M1 迁移：记录级 selector 已迁到语义模块。
+SEMANTIC = (
+    ROOT / "src/d3d9/war3/semantic/war3_device_semantic_predicates.cpp"
+).read_text(encoding="utf-8")
+builder_start = SEMANTIC.index("uint64_t War3SemanticDirectRecordSelectionKey(")
+builder_end = SEMANTIC.index(
+    "struct War3SemanticUnitValidationCacheEntry", builder_start
+)
+builder = SEMANTIC[builder_start:builder_end]
 assert "visibleQueryCache->queryPtr(" in builder
 assert "registry.queryByRenderablePartAndLayer(" in builder
 

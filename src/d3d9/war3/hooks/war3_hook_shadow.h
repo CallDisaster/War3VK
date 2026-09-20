@@ -189,4 +189,23 @@ uint64_t QueryShadowProjectorAddSimpleBlockedCount();
 uint32_t QueryShadowProjectorBlockedFourCCSampleAt(uint32_t idx);
 uint32_t QueryShadowProjectorObservedFourCCSampleAt(uint32_t idx);
 
+// 2026-08-26 / P2 批次 0：RegisterImage producer 治理计数器。
+// 本批只暴露只读 Query；安装开关仍为 false，运行时计数为 0 是预期。
+uint64_t QueryShadowRegisterImageEnterCount();
+uint64_t QueryShadowRegisterImageBlockedCount();
+uint64_t QueryShadowRegisterImageStaticStampCount();
+uint64_t QueryShadowRegisterImageEmitterStampCount();
+uint64_t QueryShadowRegisterImageSelectionCount();
+uint64_t QueryShadowRegisterImageOcclusionCount();
+uint64_t QueryShadowRegisterImageWithParamsCount();
+uint64_t QueryShadowRegisterImageObjectBridgeCount();
+uint64_t QueryShadowRegisterImageFromPointCount();
+uint64_t QueryShadowRegisterImageFromTwoPointsCount();
+uint64_t QueryShadowRegisterImageUnknownSourceCount();
+
+// 2026-08-26 / P2 批次 0：ShadowPath_StaticStamp_Toggle 直写静态阴影计数器。
+uint64_t QueryShadowPathStaticStampEnterCount();
+uint64_t QueryShadowPathStaticStampBlockedCount();
+uint64_t QueryShadowPathStaticStampPassthroughCleanupCount();
+
 } // namespace dxvk::war3::hooks

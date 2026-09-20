@@ -522,6 +522,24 @@ struct ShadowRuntimeBridgeSummary {
   uint64_t dispatchToShapeFromShadowSetupCount = 0;
   uint64_t dispatchToShapeFromOtherCallerCount = 0;
 
+  // P2 批次 0：RegisterImage producer 治理统计（hook 未安装时保持 0）。
+  uint64_t registerImageEnterCount = 0;
+  uint64_t registerImageBlockedCount = 0;
+  uint64_t registerImageStaticStampCount = 0;
+  uint64_t registerImageEmitterStampCount = 0;
+  uint64_t registerImageSelectionCount = 0;
+  uint64_t registerImageOcclusionCount = 0;
+  uint64_t registerImageWithParamsCount = 0;
+  uint64_t registerImageObjectBridgeCount = 0;
+  uint64_t registerImageFromPointCount = 0;
+  uint64_t registerImageFromTwoPointsCount = 0;
+  uint64_t registerImageUnknownSourceCount = 0;
+
+  // P2 批次 0：ShadowPath_StaticStamp_Toggle 直写 producer 治理。
+  uint64_t staticStampPathEnterCount = 0;
+  uint64_t staticStampPathBlockedCount = 0;
+  uint64_t staticStampPathCleanupCount = 0;
+
   // Phase 7.108：ShadowProjector 永久 atomic 计数（独立于 D3D9 mesh draw 路径）。
   uint64_t projectorAddFromObjectEnterCount = 0;
   uint64_t projectorAddFromObjectBlockedCount = 0;
@@ -858,6 +876,7 @@ struct ShadowRuntimeBridgeSummary {
   uint64_t semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeBlendedCacheCount = 0;
   uint64_t semanticSceneSubmittedSkinnedPaletteSourceSubmitTimePublishedRegistryCount = 0;
   uint64_t semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeCModelFallbackCount = 0;
+  uint64_t semanticSceneSubmittedSkinnedPaletteSourceOwnedPartSnapshotCount = 0;
   uint64_t semanticSceneSubmittedSkinnedPaletteStablePartSampleCount = 0;
   uint64_t semanticSceneSubmittedSkinnedPaletteHashChurnCount = 0;
   uint64_t semanticSceneSubmittedSkinnedPaletteSourceChurnCount = 0;
@@ -879,10 +898,41 @@ struct ShadowRuntimeBridgeSummary {
   uint64_t semanticSceneDirectPaletteAttributionSnapshotHitCount = 0;
   uint64_t semanticSceneDirectPaletteCaptureTrustedSourceHitCount = 0;
   uint64_t semanticSceneDirectPaletteCaptureTrustedSourceMissCount = 0;
+  // 2026-09-16 P0 palette 缝隙修复度量：记忆槽位复核（device=Gap A，
+  // shadowCore=Gap B）。ServedAfterConfirm 证明合法快路径未误杀；
+  // RejectedStale 须伴随替代来源增长而非 SourceNone；
+  // ProducerSnapshotFallback 是 Gap B 的 producer 快照替代路径命中数。
+  uint64_t semanticSceneSkinnedPaletteSlotCacheDeviceServedAfterConfirmCount = 0;
+  uint64_t semanticSceneSkinnedPaletteSlotCacheDeviceRejectedStaleCount = 0;
+  // 2026-09-17 上级裁定（线程修复方案 B 第一部分）：构建推进边界线程见证（进程累计值）。
+  // 与上面的 A5/palette 槽位缓存拒绝计数不同分母，不得混算。
+  uint64_t semanticBuildOffThreadRefusedCount = 0;
+  // 2026-09-17 上级裁定：入口分类计数（**进程累计值**，分段增量由读数侧差分得到）。
+  // 上级明确：入口分类与拒绝原因**不是天然互斥的统计维度**，
+  // 不得未经证明相加成「总拒绝」。
+  uint64_t semanticBuildOwnerUnestablishedRefusedCount = 0;
+  uint64_t semanticBuildDirectAdvanceRefusedCount = 0;
+  uint64_t semanticSceneSkinnedPaletteSlotCacheShadowCoreServedAfterConfirmCount = 0;
+  uint64_t semanticSceneSkinnedPaletteSlotCacheShadowCoreRejectedStaleCount = 0;
+  uint64_t semanticSceneSkinnedPaletteSlotCacheShadowCoreProducerSnapshotFallbackCount = 0;
+  // 2026-09-17 Gap B 补强：全链帧证明通过 + 四类细分拒绝（和 == RejectedStale）。
+  uint64_t semanticSceneSkinnedPaletteSlotCacheShadowCoreFrameProofServedCount = 0;
+  uint64_t semanticSceneSkinnedPaletteSlotCacheShadowCoreGroupShortRejectedCount = 0;
+  uint64_t semanticSceneSkinnedPaletteSlotCacheShadowCoreBindingFrameStaleRejectedCount = 0;
+  uint64_t semanticSceneSkinnedPaletteSlotCacheShadowCoreSlotRangeStaleRejectedCount = 0;
+  uint64_t semanticSceneSkinnedPaletteSlotCacheShadowCoreSnapshotFrameStaleRejectedCount = 0;
   // Phase 7.30 Step A：stale→live 过渡归因。
   uint64_t semanticSceneSubmittedSkinnedPaletteStaleRestoreSubmittedCount = 0;
   uint64_t semanticSceneSubmittedSkinnedPaletteAfterStaleRestoreLargeDeltaCount = 0;
   uint64_t semanticSceneSubmittedSkinnedPaletteLiveToLiveLargeDeltaCount = 0;
+  // 2026-09-17 活跃路径纯计数（上级 Q-B 条件批准；无条件编译，不设默认关闭门控）。
+  // 只证明"路径到达 / 提交数量"，不构成来源归属或对象级关联的证据。
+  // 口径：当帧值；device 侧在 m_war3Scene.shadowStats 每帧整体重建，经
+  //   NoteShadowSceneStats 在 Present 安全点发布；写入者只有渲染所有者线程。
+  uint64_t semanticSceneAppendEntrySkinnedCount = 0;
+  uint64_t semanticSceneCanonicalGateRejectSkinnedCount = 0;
+  uint64_t semanticSceneDrawTimeProducerSubmittedSkinnedCount = 0;
+  uint64_t semanticSceneDirectCurrentDrawSubmittedSkinnedCount = 0;
   uint64_t semanticSceneDirectStickyPartSelectionRetainedCount = 0;
   uint64_t semanticSceneDirectStickyPartSelectionDroppedCount = 0;
   uint64_t semanticSceneDirectStickyPartSelectionFallbackCount = 0;
@@ -1470,6 +1520,8 @@ struct ShadowRuntimeBridgeSummary {
   uint64_t semanticCoreSkippedNoPoseAnonymousSubpart = 0;
   uint64_t semanticCoreSkippedNoPoseLookupMiss = 0;
   uint64_t semanticCoreSkippedNoRuntimeGroupPalette = 0;
+  uint64_t semanticCoreSkippedPathBlocker = 0;
+  uint64_t semanticCoreSkippedPathBlockerGeometryMarker = 0;
   uint64_t semanticCoreBuildDurationUs = 0;
   uint64_t semanticCoreBuildFrameSerial = 0;
   uint64_t semanticCoreBuildPublishRevision = 0;
@@ -1510,6 +1562,8 @@ struct ShadowRuntimeBridgeSummary {
   uint64_t nativeD3D9BackendCanonicalPublishCount = 0;
   uint64_t nativeD3D9BackendCanonicalPublishRejectNotReadyCount = 0;
   uint64_t nativeD3D9BackendCanonicalPublishRejectNoPositionsCount = 0;
+  uint64_t nativeD3D9BackendCanonicalSkippedPathBlockerCount = 0;
+  uint64_t nativeD3D9BackendCanonicalSkippedPathBlockerGeometryMarkerCount = 0;
   uint64_t nativeD3D9BackendGeometryRejectCount = 0;
   uint64_t nativeD3D9BackendPaletteRejectCount = 0;
   uint64_t nativeD3D9BackendMaterialRejectCount = 0;

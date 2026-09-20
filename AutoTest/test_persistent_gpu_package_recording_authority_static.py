@@ -31,13 +31,20 @@ class PersistentPackageRecordingAuthorityContracts(unittest.TestCase):
         cls.test = AUTHORITY_TEST.read_text(encoding="utf-8")
         cls.meson = MESON.read_text(encoding="utf-8")
 
-    def test_remains_isolated_from_production_and_meson(self) -> None:
+    def test_remains_isolated_from_production_dll_but_test_registered(self) -> None:
+        # 2026-09-16: the recording-authority test is now registered as a meson
+        # test target (merge from A-tree architecture-review follow-up), but the
+        # authority model must stay out of the production DLL source list
+        # (d3d9_src).
+        dll_region = self.meson.split("d3d9_src = [", 1)[1].split(
+            "d3d9_dll = shared_library", 1
+        )[0]
         self.assertNotIn(
             "war3_persistent_gpu_package_recording_authority.cpp",
-            self.meson,
+            dll_region,
         )
-        self.assertNotIn(
-            "war3_persistent_gpu_package_recording_authority_test.cpp",
+        self.assertIn(
+            "'war3_persistent_gpu_package_recording_authority',",
             self.meson,
         )
         for forbidden in (

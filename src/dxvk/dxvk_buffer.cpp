@@ -1,5 +1,6 @@
 #include "dxvk_barrier.h"
 #include "dxvk_buffer.h"
+#include "dxvk_buffer_allocation_guard.h"
 #include "dxvk_device.h"
 
 #include <algorithm>
@@ -17,8 +18,6 @@ namespace dxvk {
     m_shaderStages  (util::shaderStages(createInfo.stages)),
     m_sharingMode   (device->getSharingMode()),
     m_info          (createInfo) {
-    m_allocator->registerResource(this);
-
     // Assign debug name to buffer
     if (device->debugFlags().test(DxvkDebugFlag::Capture) ||
         DxvkDeviceAddressBindingBuildEnabled) {
@@ -32,7 +31,9 @@ namespace dxvk {
     m_info.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
 
     // Create and assign actual buffer resource
-    assignStorage(allocateStorage());
+    DxvkPublishInitialBufferStorage(allocateStorage(),
+      [this] (auto&& storage) { assignStorage(std::move(storage)); },
+      [this] { m_allocator->registerResource(this); });
   }
 
 
@@ -49,8 +50,6 @@ namespace dxvk {
     m_sharingMode   (device->getSharingMode()),
     m_info          (createInfo),
     m_stableAddress (true) {
-    m_allocator->registerResource(this);
-
     DxvkAllocationInfo allocationInfo = { };
     allocationInfo.resourceCookie = cookie();
 
@@ -60,7 +59,10 @@ namespace dxvk {
     info.size = m_info.size;
     m_sharingMode.fill(info);
 
-    assignStorage(allocator.importBufferResource(info, allocationInfo, importInfo));
+    DxvkPublishInitialBufferStorage(
+      allocator.importBufferResource(info, allocationInfo, importInfo),
+      [this] (auto&& storage) { assignStorage(std::move(storage)); },
+      [this] { m_allocator->registerResource(this); });
   }
 
 

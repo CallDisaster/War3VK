@@ -887,6 +887,7 @@ bool IsNativePostProcessDisabled();
  * @brief 是否存在任何渲染事件监听者（内部使用）
  */
 bool HasAnyRenderListeners();
+bool HasNativeColorWriteListeners();
 
 /**
  * @brief 分发渲染事件（内部使用）

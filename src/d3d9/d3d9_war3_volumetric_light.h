@@ -13,6 +13,24 @@
 
 namespace dxvk {
 
+    // Opt-in execution witness. "Submitted" means recorded GPU commands, not
+    // GPU completion or visual acceptance. -1 means no successful backend draw.
+    struct War3VolumetricExecutionDiagnostics {
+        uint64_t frameSerial = 0u;
+        uint64_t mapEpoch = 0u;
+        uint64_t deviceEpoch = 0u;
+        uint64_t observedFrames = 0u;
+        uint32_t requestedBackend = 0u;
+        int32_t effectiveBackend = -1;
+        const char* stage = "diagnostics-disabled-or-not-run";
+        uint32_t fogVolumes = 0u;
+        uint32_t width = 0u;
+        uint32_t height = 0u;
+        bool compositeSubmitted = false;
+    };
+
+    War3VolumetricExecutionDiagnostics QueryWar3VolumetricExecutionDiagnostics();
+
     struct War3VolumetricShaderWorkRuntimeDiagnostics {
         uint64_t frameSerial = 0u;
         uint64_t evaluatedFrameCount = 0u;
@@ -88,7 +106,8 @@ namespace dxvk {
                                   bool farIsOne,
                                   const VkRect2D& effectScissor,
                                   int effectiveSamples,
-                                  uint32_t& outPointShadowedLightCount);
+                                  uint32_t& outPointShadowedLightCount,
+                                  int32_t& outEffectiveBackend);
         bool compositeVolumetricLight(const Rc<DxvkCommandList>& ctx,
                                       const War3PipelineInput& input,
                                       const VkRect2D& compositeScissor);

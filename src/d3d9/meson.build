@@ -1,6 +1,7 @@
 d3d9_res = wrc_generator.process('version.rc')
 
 d3d9_shaders = files([
+  'shaders/war3_frame_input_gather.comp',
   'shaders/d3d9_convert_yuy2_uyvy.comp',
   'shaders/d3d9_convert_l6v5u5.comp',
   'shaders/d3d9_convert_x8l8v8u8.comp',
@@ -42,6 +43,7 @@ d3d9_src = [
   'd3d9_adapter.cpp',
   'd3d9_monitor.cpp',
   'd3d9_device.cpp',
+  'd3d9_native_light.cpp',
   'd3d9_state.cpp',
   'd3d9_cursor.cpp',
   'd3d9_swapchain.cpp',
@@ -146,14 +148,24 @@ d3d9_src = [
   'war3/state/war3_render_state.cpp',
   'war3/debug/war3_debug.cpp',
   'war3/tools/war3_perf_monitor.cpp',
+  'war3/tools/war3_data_collection_tree.cpp',
+  'war3/tools/war3_frame_timeline.cpp',
   'war3/tools/war3_resource_residency_census.cpp',
   'war3/tools/war3_diagnostics_hub.cpp',
   'war3/tools/war3_control_plane.cpp',
   'war3/tools/war3_frame_capture.cpp',
+  'war3/tools/war3_async_screenshot.cpp',
+  'war3/tools/war3_frame_evidence.cpp',
+  'war3/tools/war3_palette_object_evidence_sink.cpp',
+  'war3/tools/war3_frame_recorder_memory.cpp',
+  'war3/tools/war3_frame_inputs.cpp',
+  'war3/tools/war3_frame_history.cpp',
+  'war3/hooks/war3_native_capture.cpp',
   'war3/tools/war3_internal_test_api.cpp',
   'war3/core/war3_storm.cpp',
   'war3/core/war3_file_manager.cpp',
   'war3/model/war3_model_hook.cpp',
+  'war3/model/war3_native_light_bridge.cpp',
   'war3/model/war3_model_resource_cache.cpp',
   'war3/model/war3_model_registry.cpp',
   'war3/gpu_skin/war3_gpu_skin_compute.cpp',
@@ -174,6 +186,10 @@ d3d9_src = [
   'war3/shadow/war3_shadow_backend_native_d3d9.cpp',
   'war3/shadow/war3_shadow_native_runtime.cpp',
   'war3/shadow/war3_shadow_alpha_test_payload.cpp',
+  'war3/semantic/war3_device_semantic_predicates.cpp',
+  'war3/semantic/war3_live_palette_selection.cpp',
+  'war3/semantic/war3_palette_taxonomy_emission.cpp',
+  'war3/semantic/war3_palette_submitted_aggregation.cpp',
   'war3/native/war3_native_hooks.cpp',
   'war3/native/war3_native_renderer.cpp',
   'war3/native/war3_native_renderer_core.cpp',
@@ -217,6 +233,226 @@ d3d9_ld_args      = [
 ]
 d3d9_link_depends = []
 
+war3_data_collection_tree_test = executable(
+  'war3_data_collection_tree_test',
+  ['war3/render/tests/war3_data_collection_tree_test.cpp',
+   'war3/tools/war3_data_collection_tree.cpp'],
+  cpp_args : ['-DWARVK_DATA_COLLECTION_TREE_DEV=1'],
+  dependencies : [dependency('threads')],
+  install : false,
+)
+test('war3_data_collection_tree', war3_data_collection_tree_test,
+  env : ['DXVK_WAR3_DATA_COLLECTION_TREE=1', 'DXVK_WAR3_DATA_COLLECTION_SAMPLE_PERIOD=64'], timeout : 30)
+
+# CPU-only proof for the identity-only query, separate from geometry readiness.
+war3_geoset_identity_view_test = executable(
+  'war3_geoset_identity_view_test',
+  'war3/render/tests/war3_geoset_identity_view_test.cpp',
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test('war3_geoset_identity_view', war3_geoset_identity_view_test, timeout : 30)
+
+# M1 semantic responsibility migration: pure selection predicates moved out of
+# d3d9_device.cpp. Host-only test. It links the real migrated module translation
+# unit, and the test file itself supplies host-side stand-ins for the
+# device/registry/hook primitives the module calls (plus the verbatim
+# pre-migration implementation as a differential reference). No Vulkan device
+# and no d3d9_device.cpp are involved.
+war3_device_semantic_predicates_test = executable(
+  'war3_device_semantic_predicates_test',
+  ['war3/semantic/tests/war3_device_semantic_predicates_test.cpp',
+   'war3/semantic/war3_device_semantic_predicates.cpp'],
+  # War3 headers use '../../util/...' relative includes, which only resolve
+  # when an include directory two levels below src/ is on the search path
+  # (the d3d9.dll target gets one incidentally from the MinHook include dir).
+  # Pass the same base explicitly so this host test can include the module
+  # header without depending on that accident.
+  include_directories : [ dxvk_include_path, include_directories('war3') ],
+  install             : false,
+)
+test(
+  'war3_device_semantic_predicates',
+  war3_device_semantic_predicates_test,
+  timeout : 30,
+)
+
+# M2-1 live palette selection migration: pure palette helpers (palette hash,
+# 48-byte pose decode, runtime pose array read, pose alias resolve) and the four
+# runtime config getters moved out of d3d9_device.cpp. Same host-test shape as
+# the M1 target above: links the real migrated module translation unit, the test
+# supplies host-side stand-ins, and the verbatim pre-migration implementation is
+# the differential reference. util_matrix.cpp provides Matrix4's out-of-line
+# operators (same precedent as war3_runtime_group_palette_kernel_diff_test).
+war3_live_palette_selection_test = executable(
+  'war3_live_palette_selection_test',
+  ['war3/semantic/tests/war3_live_palette_selection_test.cpp',
+   'war3/semantic/war3_live_palette_selection.cpp',
+   'war3/semantic/war3_palette_taxonomy_emission.cpp',
+   'war3/semantic/war3_palette_submitted_aggregation.cpp',
+   '../util/util_matrix.cpp'],
+  include_directories : [ dxvk_include_path, include_directories('war3') ],
+  install             : false,
+)
+test(
+  'war3_live_palette_selection',
+  war3_live_palette_selection_test,
+  timeout : 30,
+)
+
+# Production recorder state/ring contract, plus the real Win32 CPU control and
+# CreateNew exporter. Neither test creates a Vulkan device or proves visuals.
+frame_recorder_build = configuration_data()
+frame_recorder_build.set('WARVK_INTERNAL_FRAME_RECORDER_DEFAULT', get_option('warvk_internal_frame_recorder') ? 1 : 0)
+configure_file(input : 'war3/tools/war3_frame_recorder_build.h.in',
+  output : 'war3_frame_recorder_build.h', configuration : frame_recorder_build)
+war3_frame_recorder_session_test = executable(
+  'war3_frame_recorder_session_test',
+  '../../AutoTest/test_frame_recorder_session.cpp',
+  dependencies : [ dependency('threads') ],
+  install : false,
+)
+test('war3_frame_recorder_session', war3_frame_recorder_session_test, timeout : 30)
+war3_stage11_snapshot_publication_test = executable(
+  'war3_stage11_snapshot_publication_test',
+  '../../AutoTest/test_stage11_snapshot_publication.cpp',
+  install : false,
+)
+test('war3_stage11_snapshot_publication', war3_stage11_snapshot_publication_test, timeout : 30)
+war3_stage11_budget_census_test = executable(
+  'war3_stage11_budget_census_test',
+  '../../AutoTest/test_stage11_budget_census.cpp',
+  install : false,
+)
+test('war3_stage11_budget_census', war3_stage11_budget_census_test, timeout : 30)
+
+# Night-shift offline prototypes: shared production policy, no device or GPU.
+war3_stage11_lifetime_page_policy_test = executable(
+  'war3_stage11_lifetime_page_policy_test',
+  '../../AutoTest/test_stage11_lifetime_page_policy.cpp',
+  include_directories : [ dxvk_include_path ],
+  install : false,
+)
+test('war3_stage11_lifetime_page_policy', war3_stage11_lifetime_page_policy_test,
+  timeout : 60)
+
+war3_stage11_grouped_allocation_test = executable(
+  'war3_stage11_grouped_allocation_test',
+  '../../AutoTest/test_stage11_grouped_allocation.cpp',
+  install : false,
+)
+test('war3_stage11_grouped_allocation', war3_stage11_grouped_allocation_test,
+  timeout : 30)
+
+war3_shadow_culling_counterexamples_test = executable(
+  'war3_shadow_culling_counterexamples_test',
+  ['../../AutoTest/test_shadow_culling_counterexamples.cpp',
+   'war3/render/war3_union_consumer_visibility.cpp'],
+  include_directories : [ dxvk_include_path ],
+  install : false,
+)
+test('war3_shadow_culling_counterexamples', war3_shadow_culling_counterexamples_test,
+  timeout : 30)
+war3_index_upload_summary_test = executable(
+  'war3_index_upload_summary_test',
+  '../../AutoTest/test_index_upload_summary.cpp',
+  install : false,
+)
+test('war3_index_upload_summary', war3_index_upload_summary_test, timeout : 30)
+war3_draw_time_snapshot_lifetime_test = executable(
+  'war3_draw_time_snapshot_lifetime_test',
+  '../../AutoTest/test_draw_time_snapshot_lifetime.cpp',
+  install : false,
+)
+test('war3_draw_time_snapshot_lifetime', war3_draw_time_snapshot_lifetime_test, timeout : 30)
+if platform == 'windows'
+  recorder_memory_test = executable('war3_frame_recorder_memory_test',
+    ['../../AutoTest/test_frame_recorder_memory.cpp', 'war3/tools/war3_frame_recorder_memory.cpp'],
+    include_directories : [ dxvk_include_path ], install : false)
+  test('war3_frame_recorder_memory', recorder_memory_test, timeout : 30)
+  recorder_memory_control_test = executable('war3_frame_recorder_memory_control_test',
+    ['../../AutoTest/test_frame_recorder_memory.cpp', 'war3/tools/war3_frame_evidence.cpp',
+     'war3/tools/war3_palette_object_evidence_sink.cpp'],
+    cpp_args : ['-DWARVK_RECORDER_MEMORY_CONTROL_TEST=1', '-DWARVK_INTERNAL_FRAME_RECORDER_DEFAULT=0'],
+    include_directories : [ dxvk_include_path ],
+    dependencies : [ dependency('threads') ], install : false)
+  test('war3_frame_recorder_memory_control', recorder_memory_control_test, timeout : 30)
+  foreach profile : [0, 1]
+    recorder_defaults_test = executable(
+      'war3_frame_recorder_defaults_' + profile.to_string() + '_test',
+      ['../../AutoTest/test_frame_recorder_defaults.cpp', 'war3/tools/war3_frame_evidence.cpp',
+       'war3/tools/war3_palette_object_evidence_sink.cpp',
+       'war3/tools/war3_frame_recorder_memory.cpp'],
+      include_directories : [ dxvk_include_path ],
+      dependencies : [ dependency('threads') ],
+      cpp_args : ['-DWARVK_INTERNAL_FRAME_RECORDER_DEFAULT=' + profile.to_string()],
+      install : false,
+    )
+    foreach mode : ['default', 'disabled', 'invalid', 'external', 'explicit-on']
+      test('war3_frame_recorder_defaults_' + profile.to_string() + '_' + mode,
+        recorder_defaults_test, args : [mode, profile.to_string()], timeout : 30)
+    endforeach
+  endforeach
+  war3_frame_evidence_runtime_test = executable(
+    'war3_frame_evidence_runtime_test',
+    ['../../AutoTest/test_frame_evidence_runtime.cpp', 'war3/tools/war3_frame_evidence.cpp',
+     'war3/tools/war3_palette_object_evidence_sink.cpp',
+     'war3/tools/war3_frame_recorder_memory.cpp'],
+    include_directories : [ dxvk_include_path ],
+    dependencies : [ dependency('threads') ],
+    install : false,
+  )
+  test('war3_frame_evidence_runtime', war3_frame_evidence_runtime_test,
+    env : ['DXVK_WAR3_FRAME_EVIDENCE=1', 'DXVK_WAR3_FRAME_EVIDENCE_INPUTS=0'], timeout : 30)
+  test('war3_frame_evidence_disabled', war3_frame_evidence_runtime_test, args : ['disabled'],
+    env : ['DXVK_WAR3_FRAME_EVIDENCE=0'], timeout : 30)
+
+  # 2026-09-17 上级 codex 01a02e0b：**生产转换器 ↔ 生产解析器往返**（真实链路，无复制品）。
+  # C++ 侧只用生产 CPU 控制器 arm/freeze/export（不需要 D3D 设备）并把导出路径打印到 stdout；
+  # Python 侧对每个场景调用生产解析器 AutoTest/analyze_palette_object_evidence.py 并断言判定，
+  # 一侧失败即整体非零退出。本项目此前没有在 meson 内调用 Python 的先例，故显式 find_program
+  # 并优先使用 Windows 启动器 py（本机 py = Python 3.13 + PIL，解析器 import 需要它）。
+  palette_roundtrip_python = find_program('py', 'python3', 'python')
+  war3_palette_object_diagnostics_test = executable(
+  'war3_palette_object_diagnostics_test',
+  [
+    'war3/render/tests/war3_palette_object_diagnostics_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_palette_object_diagnostics',
+  war3_palette_object_diagnostics_test,
+  timeout : 30,
+)
+war3_palette_object_wire_roundtrip_test = executable(
+    'war3_palette_object_wire_roundtrip_test',
+    ['war3/render/tests/war3_palette_object_wire_roundtrip_test.cpp',
+     'war3/tools/war3_frame_evidence.cpp',
+     'war3/tools/war3_palette_object_evidence_sink.cpp',
+     'war3/tools/war3_frame_recorder_memory.cpp'],
+    include_directories : [ dxvk_include_path ],
+    dependencies : [ dependency('threads') ],
+    install : false,
+  )
+  test('war3_palette_object_wire_roundtrip', palette_roundtrip_python,
+    args : [join_paths(meson.current_source_dir(),
+                       '../../AutoTest/test_palette_object_wire_roundtrip.py'),
+            war3_palette_object_wire_roundtrip_test],
+    env : ['DXVK_WAR3_FRAME_EVIDENCE=1',
+           'DXVK_WAR3_FRAME_EVIDENCE_INPUTS=0',
+           'DXVK_WAR3_FRAME_EVIDENCE_PALETTE_OBJECT=1'],
+    timeout : 60)
+endif
+
+war3_render_stats_view_test = executable(
+  'war3_render_stats_view_test',
+  '../../AutoTest/test_render_stats_view.cpp',
+  install : false,
+)
+test('war3_render_stats_view', war3_render_stats_view_test, timeout : 30)
+
 if platform != 'windows'
   d3d9_ld_args      += [ '-Wl,--version-script', join_paths(meson.current_source_dir(), 'd3d9.sym') ]
   d3d9_link_depends += files('d3d9.sym')
@@ -226,6 +462,9 @@ lib_dwmapi = cpp.find_library('dwmapi')
 lib_dbghelp = cpp.find_library('dbghelp')
 
 d3d9_cpp_args = []
+if get_option('warvk_skin_palette_contract_candidate')
+  d3d9_cpp_args += [ '-DWARVK_SKIN_PALETTE_CONTRACT_DEFAULT=1' ]
+endif
 if get_option('warvk_shadow_observers_dev')
   d3d9_cpp_args += [ '-DWARVK_ENABLE_SHADOW_OBSERVERS_DEV=1' ]
 endif
@@ -251,6 +490,9 @@ if get_option('warvk_device_address_binding_report_dev')
   # library and every D3D9 translation unit that includes its value snapshots.
   d3d9_cpp_args += [ '-DWARVK_ENABLE_DEVICE_ADDRESS_BINDING_REPORT_DEV=1' ]
 endif
+if get_option('warvk_data_collection_tree_dev')
+  d3d9_cpp_args += [ '-DWARVK_DATA_COLLECTION_TREE_DEV=1' ]
+endif
 
 d3d9_dll = shared_library(dxvk_name_prefix+'d3d9', d3d9_src,
   glsl_generator.process(d3d9_shaders), d3d9_war3_gpu_skin_ff_vs, d3d9_res,
@@ -272,6 +514,25 @@ d3d9_dep = declare_dependency(
 # Public WarVK v1 parser/dispatcher contract. This compiles the exact
 # production source with the rendering backend replaced by a fail-closed stub,
 # so strict wire parsing can run without loading d3d9.dll or Warcraft.
+war3_sun_light_policy_test = executable(
+  'war3_sun_light_policy_test',
+  'war3/render/tests/war3_sun_light_policy_test.cpp',
+  include_directories : [ dxvk_include_path ],
+  install : false,
+)
+test('war3_sun_light_policy', war3_sun_light_policy_test, timeout : 30)
+
+# 2026-09-18 独立复审批次 4：真实准入规则（owned-part 快照）的正常/异常对照。
+# 既有 differential 测试把 QueryOwnedRenderablePartPaletteSnapshot 替换成替身，
+# 故真实规则此前无覆盖；本目标直接测其纯谓词。
+war3_skin_palette_admission_test = executable(
+  'war3_skin_palette_admission_test',
+  'war3/render/tests/war3_skin_palette_admission_test.cpp',
+  include_directories : [ dxvk_include_path ],
+  install : false,
+)
+test('war3_skin_palette_admission', war3_skin_palette_admission_test, timeout : 30)
+
 war3_japi_v1_protocol_test = executable(
   'war3_japi_v1_protocol_test',
   [
@@ -474,6 +735,121 @@ test(
   'war3_shadow_palette_storage',
   war3_shadow_palette_storage_test,
   timeout : 30,
+)
+
+# 2026-09-17 S2（收窄版）：两个 TryBuildRuntimeGroupPalette 共享的纯计算内核行为合同
+# （分组等权平均 / 4 段重映射 / group 表校验 / 槽位扫描 / 4 步 vs 5 步 fallback 集合）。
+# 与来源选择链无关（S2 不合并来源），因此不链接任何 d3d9 / 游戏状态源。
+war3_runtime_group_palette_kernel_test = executable(
+  'war3_runtime_group_palette_kernel_test',
+  [
+    'war3/render/tests/war3_runtime_group_palette_kernel_test.cpp',
+    '../util/util_matrix.cpp',   # 必需：Matrix4 的 + += == [] 均 out-of-line
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_runtime_group_palette_kernel',
+  war3_runtime_group_palette_kernel_test,
+  timeout : 30,
+)
+
+# 2026-09-17 上级裁定（线程修复方案 B 第一部分）：构建推进所有者门的宿主机边界测试。
+# 只包含轻量头 war3_shadow_build_thread_gate.h（inline 纯判定），不链接 d3d9 / 游戏状态源；
+# 覆盖所有者未建立、正常推进、管道 drain、隐式 hot-wait、直接底层入口、错误所有者与 Reset。
+war3_shadow_build_thread_gate_test = executable(
+  'war3_shadow_build_thread_gate_test',
+  [
+    'war3/render/tests/war3_shadow_build_thread_gate_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_shadow_build_thread_gate',
+  war3_shadow_build_thread_gate_test,
+  timeout : 30,
+)
+
+# 2026-09-18 T7 批次 4（U5）：registry domain 显式化与 owner-check 判定内核的
+# 宿主机边界测试。只包含轻量头 war3/shadow/war3_shadow_geometry_domain.h
+# （inline 纯判定，生产与测试共用）以及既有 util/util_bit.h 的 FNV-1a
+# （用于证明显式 domain tag 与历史隐式 tag 的 key 材料逐位相同）。
+# 不链接 d3d9 / 游戏状态源。覆盖：tag 取值与互异性、域内接受 / 跨域拒绝 /
+# 同域异几何拒绝、跨 domain key 碰撞反例（隔离前命中 vs 隔离后拒绝）、
+# publish owner-check 零副作用、GC / domain 作用域清理只影响本 domain、
+# 以及纯域内路径不产生任何拒绝计数。
+war3_shadow_geometry_domain_test = executable(
+  'war3_shadow_geometry_domain_test',
+  [
+    'war3/render/tests/war3_shadow_geometry_domain_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_shadow_geometry_domain',
+  war3_shadow_geometry_domain_test,
+  timeout : 30,
+)
+
+# 2026-09-17 上级裁定：构建进度摘要状态机（按值发布 / 代际守卫 / 无可变别名 / 每块不新增堆分配）
+# 的宿主机生命周期测试。只包含轻量头 war3_shadow_build_progress.h（POD + 代际守卫），
+# 不链接 d3d9 / 游戏状态源；覆盖 Begin->Publish->Complete 正常序列、旧代际被拒且不写值、
+# Complete 后拒绝、未 Begin 时拒绝、替换构建、Reset 后旧块不可回写、代际不回绕到 0、
+# 以及按值语义（改写调用方对象 / 副本不影响已发布值）。
+war3_shadow_build_progress_test = executable(
+  'war3_shadow_build_progress_test',
+  [
+    'war3/render/tests/war3_shadow_build_progress_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_shadow_build_progress',
+  war3_shadow_build_progress_test,
+  timeout : 30,
+)
+
+# 2026-09-17 上级裁定（codex 01a02e0b）：构建推进 / 发布**生命周期**的宿主机测试。
+# 只包含产品组件头 war3_shadow_build_lifecycle.h（inline，生产与测试共用同一份实现），
+# 不链接 d3d9 / 游戏状态源。用局部 atomic 计数器驱动 ShadowBuildLifecycle，覆盖未知所有者、
+# 两种入口（入口 / 直接底层入口）、非所有者、正常所有者、正常推进（beginBuild->publish->complete）、
+# 取消、Reset 后旧工作不得重新发布、替换在途构建，以及 std::shared_mutex 下的并发摘要读取。
+war3_shadow_build_lifecycle_test = executable(
+  'war3_shadow_build_lifecycle_test',
+  [
+    'war3/render/tests/war3_shadow_build_lifecycle_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_shadow_build_lifecycle',
+  war3_shadow_build_lifecycle_test,
+  timeout : 60,
+)
+
+# 2026-09-17 S2（收窄版）：可复现随机差分（固定种子、每组 30 万输入）+ 适配层派生
+# 边界 + 分配/槽位扫描成本口径。内含从 pre-S2 副本逐语句抽取的旧实现（5 步 core /
+# 4 步 upper，legacy 命名空间）与记录在案的旧实现副本 SHA-256；两个生产适配层因
+# 依赖 d3d9 记录类型与 TU 内部状态无法在宿主机链接，故用"派生建模 + 内核差分"覆盖，
+# 其文本一致性由 AutoTest/test_runtime_group_palette_kernel_single_source_static.py 负责。
+war3_runtime_group_palette_kernel_diff_test = executable(
+  'war3_runtime_group_palette_kernel_diff_test',
+  [
+    'war3/render/tests/war3_runtime_group_palette_kernel_diff_test.cpp',
+    '../util/util_matrix.cpp',   # 必需：Matrix4 的 + += == [] 均 out-of-line
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_runtime_group_palette_kernel_diff',
+  war3_runtime_group_palette_kernel_diff_test,
+  timeout : 300,
 )
 
 # Frame-local palette indexes retain their contiguous nodes across clear and
@@ -1090,6 +1466,61 @@ test(
   timeout : 30,
 )
 
+# CPU/value-only MT skin controller contract. It proves producer/commit state
+# transitions and proof gating without a device, native hook or GPU resource.
+war3_cpu_skin_mt_controller_contract_test = executable(
+  'war3_cpu_skin_mt_controller_contract_test',
+  [
+    'war3/gpu_skin/war3_cpu_skin_mt_controller_contract.cpp',
+    'war3/gpu_skin/tests/war3_cpu_skin_mt_controller_contract_test.cpp',
+  ],
+  dependencies        : [ dependency('threads') ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_cpu_skin_mt_controller_contract',
+  war3_cpu_skin_mt_controller_contract_test,
+  timeout : 30,
+)
+
+# Value-only package recording authority boundary. It proves one-shot terminal
+# emit semantics and allocation-fault rollback without constructing a renderer,
+# command list, package store or any GPU resource.
+war3_persistent_gpu_package_recording_authority_test = executable(
+  'war3_persistent_gpu_package_recording_authority_test',
+  [
+    'war3/gpu_skin/war3_persistent_gpu_package_proof_catalog.cpp',
+    'war3/gpu_skin/war3_persistent_gpu_package_recording_authority.cpp',
+    'war3/gpu_skin/tests/war3_persistent_gpu_package_recording_authority_test.cpp',
+  ],
+  dependencies        : [ dependency('threads') ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_persistent_gpu_package_recording_authority',
+  war3_persistent_gpu_package_recording_authority_test,
+  timeout : 30,
+)
+
+# Pure header-only frame timeline ledger test. It validates cross-frame slice
+# accounting, legacy intersection and fail-closed fault latching without any
+# D3D9 device, thread or GPU state.
+war3_frame_timeline_test = executable(
+  'war3_frame_timeline_test',
+  [
+    'war3/render/tests/war3_frame_timeline_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_frame_timeline',
+  war3_frame_timeline_test,
+  timeout : 30,
+)
+
 # Bounded text-only VK_EXT_device_fault capture. The runnable links no DXVK
 # device and uses a fake dispatch function to prove one-shot terminal policy.
 war3_dxvk_device_fault_capture_test = executable(
@@ -1125,6 +1556,62 @@ test(
   'war3_dxvk_device_address_binding',
   war3_dxvk_device_address_binding_test,
   timeout : 30,
+)
+
+# 2026-09-17 对象级 palette 证据记录器（Step 1③）宿主机合同：字段映射、状态推进、
+# 每帧/每会话/终态预算、表满、弱身份可见性与零堆分配。纯 CPU，不加载游戏或 Vulkan。
+war3_palette_object_evidence_test = executable(
+  'war3_palette_object_evidence_test',
+  [
+    'war3/render/tests/war3_palette_object_evidence_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  # 案例 20（2026-09-17 结构性重入）在独立工作线程上跑重入场景、主线程按超时做看门狗，
+  # 因此该宿主机测试需要线程库（与 war3_palette_object_wire_roundtrip_test 一致）。
+  dependencies        : [ dependency('threads') ],
+  install             : false,
+)
+test(
+  'war3_palette_object_evidence',
+  war3_palette_object_evidence_test,
+  timeout : 60,
+)
+
+# 2026-09-17 D6 前置：对象级 palette 证据的**离线 CPU 成本测量**（容量/饱和最坏探测长度、
+# 六个 dropped* 触发点、零堆分配（含 32 次 Reset 循环）、满表 CloseWindow 关闭开销、
+# 子门判定与 R/S/E/D 每事件成本）。纯宿主机，不加载游戏 / 不创建 Vulkan 设备 / 不做像素测量。
+# 它自带生产解析器不需要的依赖，但需要真实 PaletteObjectRecorder() 与
+# PaletteObjectEvidenceEnabled()，故与往返夹具链接同一组生产 TU。
+war3_palette_object_evidence_cost_test = executable(
+  'war3_palette_object_evidence_cost_test',
+  ['war3/render/tests/war3_palette_object_evidence_cost_test.cpp',
+   'war3/tools/war3_frame_evidence.cpp',
+   'war3/tools/war3_palette_object_evidence_sink.cpp',
+   'war3/tools/war3_frame_recorder_memory.cpp'],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_palette_object_evidence_cost',
+  war3_palette_object_evidence_cost_test,
+  timeout : 60,
+)
+
+# 2026-09-17 对象级 palette 证据（Step 1③）**R 点采集支持**宿主机合同：
+# 具名原因 POD、未执行检查的 NotChecked 语义（不得冒充 R0）、A0-A5 判据 2^6 穷举下
+# "原判断顺序/返回值不变"、以及子门关闭（nullptr）时不填充。纯 CPU。
+war3_palette_slot_recheck_evidence_test = executable(
+  'war3_palette_slot_recheck_evidence_test',
+  [
+    'war3/render/tests/war3_palette_slot_recheck_evidence_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_palette_slot_recheck_evidence',
+  war3_palette_slot_recheck_evidence_test,
+  timeout : 60,
 )
 
 if platform != 'windows'

@@ -1,0 +1,660 @@
+{
+  "schemaVersion": 1,
+  "coverageComplete": false,
+  "groups": [
+    {
+      "path": "src/d3d9/war3/render/war3_render_exec_batch.cpp",
+      "include": "../tools/war3_data_collection_tree.h",
+      "functions": [
+        {
+          "name": "ExecBatchProcessor::Begin",
+          "tag": "SemanticBuild",
+          "line": 207
+        },
+        {
+          "name": "ExecBatchProcessor::End",
+          "tag": "SemanticBuild",
+          "line": 566
+        }
+      ]
+    },
+    {
+      "path": "src/d3d9/war3/render/war3_render_identity_bridge.cpp",
+      "include": "../tools/war3_data_collection_tree.h",
+      "functions": [
+        {
+          "name": "TryResolveRenderObjectIdentity",
+          "tag": "InstanceQuery",
+          "line": 54
+        },
+        {
+          "name": "TryResolveCurrentRenderObjectIdentity",
+          "tag": "InstanceQuery",
+          "line": 84
+        }
+      ]
+    },
+    {
+      "path": "src/d3d9/war3/hooks/war3_hook_render.cpp",
+      "include": "../tools/war3_data_collection_tree.h",
+      "functions": [
+        {
+          "name": "PublishVisibleRenderableFromDispatch",
+          "tag": "VisiblePublish",
+          "line": 1910
+        }
+      ]
+    },
+    {
+      "path": "src/d3d9/d3d9_device.cpp",
+      "include": "war3/tools/war3_data_collection_tree.h",
+      "functions": [
+        {
+          "name": "D3D9DeviceEx::War3BuildShadowSemanticContext",
+          "tag": "SemanticBuild",
+          "line": 21042
+        },
+        {
+          "name": "D3D9DeviceEx::War3TryPublishSemanticDrawTimePose",
+          "tag": "PoseWrite",
+          "line": 21158
+        },
+        {
+          "name": "D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer",
+          "tag": "Populate",
+          "line": 25416
+        },
+        {
+          "name": "D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped",
+          "tag": "DirectGrouped",
+          "line": 26587
+        },
+        {
+          "name": "D3D9DeviceEx::War3TryPopulateSemanticShadowScene",
+          "tag": "Populate",
+          "line": 31572
+        },
+        {
+          "name": "D3D9DeviceEx::War3CaptureShadowDrawMetadata",
+          "tag": "MetadataCapture",
+          "line": 42180
+        },
+        {
+          "name": "D3D9DeviceEx::War3TryCaptureShadowCaster",
+          "tag": "DrawCapture",
+          "line": 42753
+        }
+      ]
+    },
+    {
+      "path": "src/d3d9/war3/render/war3_scene_collector.cpp",
+      "include": "../tools/war3_data_collection_tree.h",
+      "functions": [
+        {
+          "name": "SceneCollector::CollectWorldObjects",
+          "tag": "SceneCollect",
+          "line": 215
+        }
+      ]
+    },
+    {
+      "path": "src/d3d9/war3/render/war3_visible_renderables.cpp",
+      "include": "../tools/war3_data_collection_tree.h",
+      "functions": [
+        {
+          "name": "ResolveGeosetMetadata",
+          "tag": "GeosetQuery",
+          "line": 920
+        },
+        {
+          "name": "VisibleRenderableRegistry::beginFrame",
+          "tag": "RegistryMaintenance",
+          "line": 2040
+        },
+        {
+          "name": "VisibleRenderableRegistry::endFrame",
+          "tag": "VisibleFinalize",
+          "line": 2184
+        },
+        {
+          "name": "VisibleRenderableRegistry::registerMainQueueRange",
+          "tag": "VisiblePublish",
+          "line": 2283
+        },
+        {
+          "name": "VisibleRenderableRegistry::registerSemanticCandidate",
+          "tag": "VisiblePublish",
+          "line": 2394
+        },
+        {
+          "name": "VisibleRenderableRegistry::registerTransparentEntry",
+          "tag": "VisiblePublish",
+          "line": 2790
+        },
+        {
+          "name": "VisibleRenderableRegistry::queryByPayload",
+          "tag": "VisibleQuery",
+          "line": 2850
+        },
+        {
+          "name": "VisibleRenderableRegistry::queryByRenderablePart",
+          "tag": "VisibleQuery",
+          "line": 2876
+        },
+        {
+          "name": "VisibleRenderableRegistry::queryByRenderablePartAndLayer",
+          "tag": "VisibleQuery",
+          "line": 2910
+        },
+        {
+          "name": "VisibleRenderableRegistry::queryByWorldObjectEntry",
+          "tag": "VisibleQuery",
+          "line": 3174
+        },
+        {
+          "name": "VisibleRenderableRegistry::queryByHandle",
+          "tag": "VisibleQuery",
+          "line": 3200
+        },
+        {
+          "name": "VisibleRenderableRegistry::queryBySceneNode",
+          "tag": "VisibleQuery",
+          "line": 3226
+        },
+        {
+          "name": "VisibleRenderableRegistry::queryByRuntimeModel",
+          "tag": "VisibleQuery",
+          "line": 3253
+        },
+        {
+          "name": "VisibleRenderableRegistry::refreshShadowManifestFromCurrentDraw",
+          "tag": "SnapshotPublish",
+          "line": 3288
+        }
+      ]
+    },
+    {
+      "path": "src/d3d9/war3/model/war3_model_resource_cache.cpp",
+      "include": "../tools/war3_data_collection_tree.h",
+      "functions": [
+        {
+          "name": "CaptureGeosetRecord",
+          "tag": "GeosetCapture",
+          "line": 446
+        },
+        {
+          "name": "CaptureGeosetHeaderRecord",
+          "tag": "GeosetCapture",
+          "line": 614
+        },
+        {
+          "name": "ShadowModelResourceCache::materializeGeosetDataRecordLocked",
+          "tag": "GeosetMaterialize",
+          "line": 1054
+        },
+        {
+          "name": "ShadowModelResourceCache::materializeGeosetAliasRecordLocked",
+          "tag": "GeosetMaterialize",
+          "line": 1078
+        },
+        {
+          "name": "ShadowModelResourceCache::recordGeosetCreate",
+          "tag": "GeosetCapture",
+          "line": 1315
+        },
+        {
+          "name": "ShadowModelResourceCache::noteModelResourceBinding",
+          "tag": "GeosetBind",
+          "line": 1354
+        },
+        {
+          "name": "ShadowModelResourceCache::noteRuntimeModelBinding",
+          "tag": "GeosetBind",
+          "line": 1476
+        },
+        {
+          "name": "ShadowModelResourceCache::noteRuntimeGeosetBinding",
+          "tag": "GeosetBind",
+          "line": 1609
+        },
+        {
+          "name": "ShadowModelResourceCache::findGeosetByPtr",
+          "tag": "GeosetQuery",
+          "line": 1771
+        },
+        {
+          "name": "ShadowModelResourceCache::findGeosetByData",
+          "tag": "GeosetQuery",
+          "line": 1786
+        },
+        {
+          "name": "ShadowModelResourceCache::findGeosetIdentityByData",
+          "tag": "GeosetQuery",
+          "line": 1801
+        },
+        {
+          "name": "ShadowModelResourceCache::findGeosetSnapshotByData",
+          "tag": "GeosetQuery",
+          "line": 1890
+        },
+        {
+          "name": "ShadowModelResourceCache::findGeosetStampByDataForEpoch",
+          "tag": "GeosetQuery",
+          "line": 1945
+        },
+        {
+          "name": "ShadowModelResourceCache::hydrateGeosetByKnownPtrs",
+          "tag": "GeosetQuery",
+          "line": 1977
+        },
+        {
+          "name": "ShadowModelResourceCache::findModelGeoset",
+          "tag": "GeosetQuery",
+          "line": 2036
+        },
+        {
+          "name": "ShadowModelResourceCache::findRuntimeModelGeoset",
+          "tag": "GeosetQuery",
+          "line": 2079
+        }
+      ]
+    },
+    {
+      "path": "src/d3d9/war3/model/war3_model_registry.cpp",
+      "include": "../tools/war3_data_collection_tree.h",
+      "functions": [
+        {
+          "name": "ModelRegistry::recordSpriteModelPath",
+          "tag": "ModelBind",
+          "line": 524
+        },
+        {
+          "name": "ModelRegistry::recordRuntimeModelBinding",
+          "tag": "ModelBind",
+          "line": 556
+        },
+        {
+          "name": "ModelRegistry::findBySprite",
+          "tag": "ModelQuery",
+          "line": 591
+        },
+        {
+          "name": "ModelRegistry::findByRuntimeModel",
+          "tag": "ModelQuery",
+          "line": 605
+        },
+        {
+          "name": "ModelRegistry::findByPath",
+          "tag": "ModelQuery",
+          "line": 619
+        },
+        {
+          "name": "ModelInstanceRegistry::noteRenderObject",
+          "tag": "InstanceWrite",
+          "line": 1008
+        },
+        {
+          "name": "ModelInstanceRegistry::noteRenderObjectsBatch",
+          "tag": "InstanceWrite",
+          "line": 1026
+        },
+        {
+          "name": "ModelInstanceRegistry::noteInstanceIdentity",
+          "tag": "InstanceWrite",
+          "line": 1050
+        },
+        {
+          "name": "ModelInstanceRegistry::bindSpriteToInstance",
+          "tag": "InstanceWrite",
+          "line": 1145
+        },
+        {
+          "name": "ModelInstanceRegistry::bindRuntimeModelToSprite",
+          "tag": "InstanceWrite",
+          "line": 1188
+        },
+        {
+          "name": "ModelInstanceRegistry::noteRuntimeCreationProvenance",
+          "tag": "InstanceWrite",
+          "line": 1218
+        },
+        {
+          "name": "ModelInstanceRegistry::noteRuntimeSourceObject",
+          "tag": "InstanceWrite",
+          "line": 1270
+        },
+        {
+          "name": "ModelInstanceRegistry::noteRuntimeOwnerIdentity",
+          "tag": "InstanceWrite",
+          "line": 1311
+        },
+        {
+          "name": "ModelInstanceRegistry::findByWorldObjectEntry",
+          "tag": "InstanceQuery",
+          "line": 1395
+        },
+        {
+          "name": "ModelInstanceRegistry::findBySceneNode",
+          "tag": "InstanceQuery",
+          "line": 1409
+        },
+        {
+          "name": "ModelInstanceRegistry::findByUnitPtr",
+          "tag": "InstanceQuery",
+          "line": 1423
+        },
+        {
+          "name": "ModelInstanceRegistry::findBySpritePtr",
+          "tag": "InstanceQuery",
+          "line": 1437
+        },
+        {
+          "name": "ModelInstanceRegistry::findByRuntimeModel",
+          "tag": "InstanceQuery",
+          "line": 1451
+        },
+        {
+          "name": "ModelInstanceRegistry::findOwnerByRuntimeModel",
+          "tag": "InstanceQuery",
+          "line": 1560
+        },
+        {
+          "name": "ModelInstanceRegistry::findByHandle",
+          "tag": "InstanceQuery",
+          "line": 1575
+        },
+        {
+          "name": "ModelInstanceRegistry::findFirstForAugment",
+          "tag": "InstanceQuery",
+          "line": 1591
+        },
+        {
+          "name": "ModelInstanceRegistry::findFirstForAugmentView",
+          "tag": "InstanceQuery",
+          "line": 1626
+        },
+        {
+          "name": "PoseRegistry::recordPose",
+          "tag": "PoseWrite",
+          "line": 1909
+        },
+        {
+          "name": "PoseRegistry::recordSpriteFramePose",
+          "tag": "PoseWrite",
+          "line": 1945
+        },
+        {
+          "name": "PoseRegistry::recordMatrixPalette",
+          "tag": "PoseWrite",
+          "line": 1979
+        },
+        {
+          "name": "PoseRegistry::findByRuntimeModel",
+          "tag": "PoseQuery",
+          "line": 2003
+        },
+        {
+          "name": "PoseRegistry::findBySceneNode",
+          "tag": "PoseQuery",
+          "line": 2016
+        },
+        {
+          "name": "PoseRegistry::findByUnitPtr",
+          "tag": "PoseQuery",
+          "line": 2029
+        },
+        {
+          "name": "PoseRegistry::findByRuntimeModelAugment",
+          "tag": "PoseQuery",
+          "line": 2083
+        },
+        {
+          "name": "PoseRegistry::findBySceneNodeAugment",
+          "tag": "PoseQuery",
+          "line": 2097
+        },
+        {
+          "name": "PoseRegistry::findByUnitPtrAugment",
+          "tag": "PoseQuery",
+          "line": 2111
+        }
+      ]
+    },
+    {
+      "path": "src/d3d9/war3/render/war3_shadow_object_registry.cpp",
+      "include": "../tools/war3_data_collection_tree.h",
+      "functions": [
+        {
+          "name": "ShadowObjectRegistry::noteRenderObject",
+          "tag": "ShadowObjectWrite",
+          "line": 396
+        },
+        {
+          "name": "ShadowObjectRegistry::noteRenderObjectsBatch",
+          "tag": "ShadowObjectWrite",
+          "line": 415
+        },
+        {
+          "name": "ShadowObjectRegistry::noteInstanceIdentity",
+          "tag": "ShadowObjectWrite",
+          "line": 440
+        },
+        {
+          "name": "ShadowObjectRegistry::noteModelBinding",
+          "tag": "ShadowObjectWrite",
+          "line": 543
+        },
+        {
+          "name": "ShadowObjectRegistry::notePose",
+          "tag": "ShadowObjectWrite",
+          "line": 594
+        },
+        {
+          "name": "ShadowObjectRegistry::noteSpriteFramePose",
+          "tag": "ShadowObjectWrite",
+          "line": 649
+        },
+        {
+          "name": "ShadowObjectRegistry::findByWorldObjectEntry",
+          "tag": "ShadowObjectQuery",
+          "line": 699
+        },
+        {
+          "name": "ShadowObjectRegistry::findBySceneNode",
+          "tag": "ShadowObjectQuery",
+          "line": 712
+        },
+        {
+          "name": "ShadowObjectRegistry::findByUnitPtr",
+          "tag": "ShadowObjectQuery",
+          "line": 725
+        },
+        {
+          "name": "ShadowObjectRegistry::findByHandle",
+          "tag": "ShadowObjectQuery",
+          "line": 738
+        },
+        {
+          "name": "ShadowObjectRegistry::findBySpritePtr",
+          "tag": "ShadowObjectQuery",
+          "line": 751
+        },
+        {
+          "name": "ShadowObjectRegistry::findByRuntimeModel",
+          "tag": "ShadowObjectQuery",
+          "line": 764
+        },
+        {
+          "name": "ShadowObjectRegistry::findFirstForAugment",
+          "tag": "ShadowObjectQuery",
+          "line": 855
+        },
+        {
+          "name": "ShadowObjectRegistry::findFirstForAugmentView",
+          "tag": "ShadowObjectQuery",
+          "line": 893
+        }
+      ]
+    },
+    {
+      "path": "src/d3d9/war3/render/war3_current_draw_contract.cpp",
+      "include": "../tools/war3_data_collection_tree.h",
+      "functions": [
+        {
+          "name": "DecodeCapturedPaletteForRecord",
+          "tag": "PaletteDecode",
+          "line": 1333
+        },
+        {
+          "name": "PublishCurrentDrawPreparedSlice",
+          "tag": "CurrentDrawPublish",
+          "line": 1975
+        },
+        {
+          "name": "QueryCurrentDrawPreparedSlice",
+          "tag": "CurrentDrawQuery",
+          "line": 2034
+        },
+        {
+          "name": "PublishCurrentDrawContract",
+          "tag": "CurrentDrawPublish",
+          "line": 2091
+        },
+        {
+          "name": "QueryCurrentDrawContract",
+          "tag": "CurrentDrawQuery",
+          "line": 2858
+        },
+        {
+          "name": "QueryCurrentDrawGeometryContract",
+          "tag": "CurrentDrawQuery",
+          "line": 2901
+        },
+        {
+          "name": "QueryCurrentDrawContractCapturedPalette",
+          "tag": "CurrentDrawQuery",
+          "line": 2948
+        },
+        {
+          "name": "DecodeCurrentDrawGroupSlots",
+          "tag": "PaletteDecode",
+          "line": 2982
+        }
+      ]
+    },
+    {
+      "path": "src/d3d9/war3/render/war3_render_objects.cpp",
+      "include": "../tools/war3_data_collection_tree.h",
+      "functions": [
+        {
+          "name": "RenderObjectRegistry::registerWorldObject",
+          "tag": "InstanceWrite",
+          "line": 383
+        },
+        {
+          "name": "RenderObjectRegistry::registerWorldObjectsBatch",
+          "tag": "InstanceWrite",
+          "line": 409
+        },
+        {
+          "name": "RenderObjectRegistry::mapSceneNode",
+          "tag": "InstanceWrite",
+          "line": 550
+        },
+        {
+          "name": "RenderObjectRegistry::queryBySceneNode",
+          "tag": "InstanceQuery",
+          "line": 567
+        },
+        {
+          "name": "RenderObjectRegistry::queryByEntry",
+          "tag": "InstanceQuery",
+          "line": 595
+        },
+        {
+          "name": "RenderObjectRegistry::resolveObjectInfo",
+          "tag": "InstanceQuery",
+          "line": 721
+        }
+      ]
+    },
+    {
+      "path": "src/d3d9/war3/render/war3_shadow_runtime_bridge.cpp",
+      "include": "../tools/war3_data_collection_tree.h",
+      "functions": [
+        {
+          "name": "AugmentShadowSemanticContext",
+          "tag": "SemanticAugment",
+          "line": 9678
+        }
+      ]
+    },
+    {
+      "path": "src/d3d9/war3/render/war3_renderer.cpp",
+      "include": "../tools/war3_data_collection_tree.h",
+      "functions": [
+        {
+          "name": "War3Renderer::ResetMapSession",
+          "tag": "RegistryMaintenance",
+          "line": 147
+        },
+        {
+          "name": "War3Renderer::BeginFrame",
+          "tag": "RegistryMaintenance",
+          "line": 183
+        },
+        {
+          "name": "War3Renderer::PublishSemanticRegistriesForScene",
+          "tag": "SnapshotPublish",
+          "line": 210
+        }
+      ]
+    },
+    {
+      "path": "src/d3d9/war3/model/war3_model_hook.cpp",
+      "include": "../tools/war3_data_collection_tree.h",
+      "functions": [
+        {
+          "name": "RecordRuntimePose",
+          "tag": "ModelObservation",
+          "line": 6852
+        },
+        {
+          "name": "RecordRuntimeMatrixPalette",
+          "tag": "ModelObservation",
+          "line": 6988
+        },
+        {
+          "name": "RecordRuntimePaletteTree",
+          "tag": "ModelObservation",
+          "line": 7088
+        },
+        {
+          "name": "RecordRuntimePaletteTreeIfStale",
+          "tag": "ModelObservation",
+          "line": 7179
+        },
+        {
+          "name": "RecordSpriteFramePoseFromSprite",
+          "tag": "ModelObservation",
+          "line": 7193
+        },
+        {
+          "name": "QueryBlendedPaletteBySlotIndex",
+          "tag": "PaletteCapture",
+          "line": 9013
+        },
+        {
+          "name": "QueryBlendedPaletteBySlotIndexExact",
+          "tag": "PaletteCapture",
+          "line": 9114
+        },
+        {
+          "name": "QueryRenderablePartPaletteSnapshot",
+          "tag": "PaletteCapture",
+          "line": 9290
+        }
+      ]
+    }
+  ]
+}

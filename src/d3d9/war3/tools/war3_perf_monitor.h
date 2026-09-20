@@ -8,7 +8,10 @@
 #include "../gpu_skin/war3_gpu_skin_native_bridge.h"
 #include "../render/war3_shadow_runtime_bridge.h"
 #include "war3_resource_residency_census.h"
+#include "war3_stage11_budget_census.h"
 #include "war3_perf_history_policy.h"
+#include "war3_data_collection_tree.h"
+#include "war3_frame_timeline.h"
 
 #include "../../dxvk/dxvk_cmdlist.h"
 #include "../../dxvk/dxvk_device.h"
@@ -205,6 +208,16 @@ struct FrameWorkloadSnapshot {
     uint64_t rejectUvBufferCreate = 0;
     uint64_t rejectRegistryInsert = 0;
     uint64_t rejectOther = 0;
+    // 2026-09-18 T7/U5 registry domain owner-check rejects. Per-interval
+    // observability only: steady state must be 0, and a non-zero value is
+    // proof that an out-of-domain touch was refused. Naming follows the
+    // device-side War3ShadowPersistentDiagnosticsFrame fields.
+    uint64_t rejectDomainConflict = 0;
+    uint64_t domainLookupRejects = 0;
+    uint64_t domainPublishRejects = 0;
+    uint64_t domainGcEraseRejects = 0;
+    uint64_t domainResetPurgeRejects = 0;
+    uint64_t domainResetOwnerRejects = 0;
     uint64_t createAttempts = 0;
     uint64_t bytesNeededTotal = 0;
     uint64_t bytesNeededMax = 0;
@@ -298,6 +311,16 @@ public:
         uint64_t rejectUvBufferCreate = 0;
         uint64_t rejectRegistryInsert = 0;
         uint64_t rejectOther = 0;
+        // 2026-09-18 T7/U5 registry domain owner-check rejects. Per-interval
+        // observability only: steady state must be 0, and a non-zero value is
+        // proof that an out-of-domain touch was refused. Naming follows the
+        // device-side War3ShadowPersistentDiagnosticsFrame fields.
+        uint64_t rejectDomainConflict = 0;
+        uint64_t domainLookupRejects = 0;
+        uint64_t domainPublishRejects = 0;
+        uint64_t domainGcEraseRejects = 0;
+        uint64_t domainResetPurgeRejects = 0;
+        uint64_t domainResetOwnerRejects = 0;
         uint64_t createAttempts = 0;
         uint64_t bytesNeededTotal = 0;
         uint64_t bytesNeededMax = 0;
@@ -399,6 +422,7 @@ public:
         War3PerfMonitor* m_monitor = nullptr;
         uint32_t m_sampleWeight = 1;
         bool m_detailSample = false;
+        uint64_t m_timelineToken = 0;
     };
 
     static War3PerfMonitor& instance();
@@ -474,7 +498,10 @@ public:
 
     // 开关
     void setEnabled(bool enabled) { m_enabled.store(enabled, std::memory_order_relaxed); }
-    void setRecording(bool recording) { m_recording.store(recording, std::memory_order_relaxed); }
+    void setRecording(bool recording) {
+        m_recording.store(recording, std::memory_order_relaxed);
+        collection::SetRecording(recording && m_enabled.load(std::memory_order_relaxed));
+    }
     bool isEnabled() const { return m_enabled.load(std::memory_order_relaxed); }
     bool isRecording() const { return m_recording.load(std::memory_order_relaxed); }
     void resetHistory();
@@ -484,9 +511,21 @@ public:
     void noteShadowMetadataFrame(uint64_t captureUs, uint64_t captureCalls);
     void notePersistentGeometryFrame(
         const PersistentGeometryFrameStats& stats);
+    void noteStage11BudgetSample(const stage11_census::Sample& sample);
     // 登记业务帧主序号（m_war3ShadowPersistentFrameSerial），用于报告里
     // 与 perf frameEpoch 建立对齐点。仅原子写，热路径无锁。
     void noteBusinessFrameSerial(uint64_t serial);
+    // Low-frequency status read of ONE completed frame and aggregate lifetime.
+    // These are not VisibleRenderableRegistry frame numbers or in-flight notes.
+    struct PublishedPerfState {
+        bool enabled = false;
+        bool recording = false;
+        bool valid = false;
+        uint64_t businessFrameSerial = 0;
+        uint64_t frameEpoch = 0;
+        uint64_t producerAccumulationEpoch = 0;
+    };
+    PublishedPerfState queryPublishedPerfState();
     void noteShadowMapFallback(bool reusedLastComplete, bool renderedCurrentPartial);
     void noteShadowReceiverFrame(uint32_t replayCasterCount,
                                  uint64_t replayGeometryWork,
@@ -1003,6 +1042,7 @@ private:
         uint64_t semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeBlendedCacheCount = 0;
         uint64_t semanticSceneSubmittedSkinnedPaletteSourceSubmitTimePublishedRegistryCount = 0;
         uint64_t semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeCModelFallbackCount = 0;
+        uint64_t semanticSceneSubmittedSkinnedPaletteSourceOwnedPartSnapshotCount = 0;
         uint64_t semanticSceneSubmittedSkinnedPaletteStablePartSampleCount = 0;
         uint64_t semanticSceneSubmittedSkinnedPaletteHashChurnCount = 0;
         uint64_t semanticSceneSubmittedSkinnedPaletteSourceChurnCount = 0;
@@ -1028,6 +1068,14 @@ private:
         uint64_t semanticSceneSubmittedSkinnedPaletteStaleRestoreSubmittedCount = 0;
         uint64_t semanticSceneSubmittedSkinnedPaletteAfterStaleRestoreLargeDeltaCount = 0;
         uint64_t semanticSceneSubmittedSkinnedPaletteLiveToLiveLargeDeltaCount = 0;
+        // 2026-09-17 活跃路径纯计数（上级 Q-B 条件批准；无条件编译，不设默认关闭门控）。
+        // 只证明"路径到达 / 提交数量"，不构成来源归属或对象级关联的证据。
+        // 口径：当帧值；device 侧在 m_war3Scene.shadowStats 每帧整体重建，经
+        //   NoteShadowSceneStats 在 Present 安全点发布；写入者只有渲染所有者线程。
+        uint64_t semanticSceneAppendEntrySkinnedCount = 0;
+        uint64_t semanticSceneCanonicalGateRejectSkinnedCount = 0;
+        uint64_t semanticSceneDrawTimeProducerSubmittedSkinnedCount = 0;
+        uint64_t semanticSceneDirectCurrentDrawSubmittedSkinnedCount = 0;
         uint64_t semanticSceneDirectManifestObjectCount = 0;
         uint64_t semanticSceneDirectManifestObservedPartCount = 0;
         uint64_t semanticSceneDirectManifestShadowEligiblePartCount = 0;
@@ -1233,6 +1281,15 @@ private:
         uint64_t persistentRejectUvBufferCreate = 0;
         uint64_t persistentRejectRegistryInsert = 0;
         uint64_t persistentRejectOther = 0;
+        // 2026-09-18 T7/U5 registry domain owner-check rejects, accumulated over
+        // the report recording window (same scope as the other persistentReject*
+        // counters). Steady state must be 0.
+        uint64_t persistentRejectDomainConflict = 0;
+        uint64_t persistentDomainLookupRejects = 0;
+        uint64_t persistentDomainPublishRejects = 0;
+        uint64_t persistentDomainGcEraseRejects = 0;
+        uint64_t persistentDomainResetPurgeRejects = 0;
+        uint64_t persistentDomainResetOwnerRejects = 0;
         // Persistent pool observation. *Last/*Max are gauges. NeededTotal is
         // additive requested byte traffic; UsedGaugeSum exists only to derive
         // an average of end-of-Present gauge samples.
@@ -1317,6 +1374,7 @@ private:
         std::deque<FrameSnapshot> frameHistory;
         std::vector<SectionStats> sections;
         ShadowBudgetAggregate shadowBudgetAggregate;
+        uint64_t producerAccumulationEpoch = 0;
         uint32_t processId = 0;
         DWORD mainThreadId = 0;
         uint64_t processStartFileTime100ns = 0;
@@ -1347,6 +1405,9 @@ private:
             bool monitorDisabledByEnv = false;
         };
         ReportMeta meta;
+        std::string dataCollectionJson;
+        std::string frameTimelineJson;
+        stage11_census::History stage11BudgetCensus;
     };
 
     struct ExportJob {
@@ -1367,6 +1428,8 @@ private:
                        uint32_t calls);
     void flushThreadCpuDeltas(ThreadCpuState& state);
     void flushCurrentThreadCpuDeltas();
+    // Caller holds m_mutex. Exhaustion stays zero, never reuses an epoch.
+    void resetShadowBudgetAggregateLocked();
     static ThreadCpuState& threadCpuState();
     bool shouldSampleDetailScope(ThreadCpuState& state) const;
     static bool detailTraceEnabled();
@@ -1420,6 +1483,7 @@ private:
     // 当前帧数据
     uint64_t m_frameIndex = 0;
     uint64_t m_frameEpochSerial = 0;
+    uint64_t m_producerAccumulationEpoch = 1; // guarded by m_mutex
     std::chrono::steady_clock::time_point m_frameStart;
     CpuProbeSnapshot m_frameCpuProbeStart;
     FrameWorkloadSnapshot m_currentFrameWorkload = {};
@@ -1447,6 +1511,7 @@ private:
     std::atomic<uint32_t> m_pendingExportJobs { 0 };
     std::atomic<uint64_t> m_lastBusinessFrameSerial { 0 };
     ShadowBudgetAggregate m_shadowBudgetAggregate = {};
+    stage11_census::History m_stage11BudgetCensus;
 
     friend class ScopedSection;
     friend class FrameGuard;

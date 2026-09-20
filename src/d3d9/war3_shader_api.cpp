@@ -1506,6 +1506,14 @@ bool HasAnyRenderListeners() {
     return !g_callbacks.empty();
 }
 
+bool HasNativeColorWriteListeners() {
+    if (war3module::HasNativeColorWriteModules()) return true;
+    std::lock_guard<std::mutex> lock(g_callbackMutex);
+    for (const auto& entry : g_callbacks)
+        if (entry.callback) return true;
+    return false;
+}
+
 /**
  * @brief 分发渲染事件
  * 

@@ -1,6 +1,9 @@
 #version 460
 
 #extension GL_EXT_scalar_block_layout : require
+#extension GL_GOOGLE_include_directive : enable
+
+#include "war3_shadow_caster_interface.h"
 
 // ===== 顶点输入 =====
 layout(location = 0) in vec4 in_pos;           // 位置
@@ -44,7 +47,7 @@ uniform push_block {
 };
 
 void applyTerrainDepthBias(inout vec4 clipPos) {
-  if ((p_flags & 0x10u) != 0u && p_terrainDepthBias > 0.0 && clipPos.w > 0.0) {
+  if ((p_flags & WAR3_SHADOW_CASTER_FLAG_STAGE1_TERRAIN) != 0u && p_terrainDepthBias > 0.0 && clipPos.w > 0.0) {
     clipPos.z = min(clipPos.z + p_terrainDepthBias * clipPos.w, clipPos.w);
   }
 }
@@ -63,14 +66,12 @@ float loadGpuSkinPaletteFloat(uint byteOffset) {
 }
 
 bool tryLoadGpuSkinDirectVertex(out vec4 position, out vec2 uv) {
-  const uint gpuSkinDirectFlag = 0x40u;
-  const uint gpuSkinNoFallbackFlag = 0x80u;
-  const uint gpuSkinMetadataMask = 0x000fff00u;
-  const uint gpuSkinFormat2Layout1Uv1 = 0x00011200u;
-
-  if ((p_flags & (gpuSkinDirectFlag | gpuSkinNoFallbackFlag)) !=
-          (gpuSkinDirectFlag | gpuSkinNoFallbackFlag) ||
-      (p_flags & gpuSkinMetadataMask) != gpuSkinFormat2Layout1Uv1 ||
+  if ((p_flags & (WAR3_SHADOW_CASTER_FLAG_GPU_SKIN_DIRECT_INPUT |
+                  WAR3_SHADOW_CASTER_FLAG_GPU_SKIN_NO_FALLBACK)) !=
+          (WAR3_SHADOW_CASTER_FLAG_GPU_SKIN_DIRECT_INPUT |
+           WAR3_SHADOW_CASTER_FLAG_GPU_SKIN_NO_FALLBACK) ||
+      (p_flags & WAR3_SHADOW_CASTER_GPU_SKIN_METADATA_MASK) !=
+          WAR3_SHADOW_CASTER_GPU_SKIN_FORMAT2_LAYOUT1_UV1 ||
       p_pad1 == 0u || p_blendCount == 0u || p_blendCount > 256u ||
       gl_VertexIndex < 0 || uint(gl_VertexIndex) >= p_pad1) {
     return false;
@@ -124,7 +125,7 @@ bool tryLoadGpuSkinDirectVertex(out vec4 position, out vec2 uv) {
 
   position = vec4(positionX, positionY, positionZ, 1.0);
   uv = vec2(0.0);
-  if ((p_flags & 0x4u) != 0u) {
+  if ((p_flags & WAR3_SHADOW_CASTER_FLAG_ALPHA_TEST) != 0u) {
     uv = vec2(
         uintBitsToFloat(loadGpuSkinSourceWord(texcoord0Address + 0u)),
         uintBitsToFloat(loadGpuSkinSourceWord(texcoord0Address + 4u)));
@@ -145,8 +146,8 @@ void main() {
   // the native/compute output VB. Reconstruct the current pose from the exact
   // immutable source + palette before applying light VP. VS-A/B0 still bind a
   // fully skinned 32-byte vertex and therefore keep the direct projection path.
-  if ((p_flags & 0x40u) != 0u) {
-    if ((p_flags & 0x80u) != 0u &&
+  if ((p_flags & WAR3_SHADOW_CASTER_FLAG_GPU_SKIN_DIRECT_INPUT) != 0u) {
+    if ((p_flags & WAR3_SHADOW_CASTER_FLAG_GPU_SKIN_NO_FALLBACK) != 0u &&
         !tryLoadGpuSkinDirectVertex(position, uv)) {
       // B1 has no safe dynamic-VB fallback. Host preflight makes this an
       // all-draw invariant failure; place the primitive outside clip space.
@@ -162,7 +163,7 @@ void main() {
   }
 
   // 非混合模式：GPU 端 MVP 计算（worldMatrix 从 SSBO 读取）
-  if ((p_flags & 0x1u) == 0u) {
+  if ((p_flags & WAR3_SHADOW_CASTER_FLAG_USE_BLEND) == 0u) {
     mat4 wm = u_worldMatrices[p_paletteOffset + uint(gl_InstanceIndex)];
     vec4 worldPos = position * wm;
     vec4 clipPos = worldPos * p_mvp;
@@ -178,7 +179,7 @@ void main() {
   uint blendCount = min(p_blendCount, 3u);
   for (uint i = 0u; i <= blendCount; i++) {
     uint idx = i;
-    if ((p_flags & 0x2u) != 0u) {
+    if ((p_flags & WAR3_SHADOW_CASTER_FLAG_INDEXED_BLEND) != 0u) {
       idx = uint(round(in_blendIndices[i]));
     }
 

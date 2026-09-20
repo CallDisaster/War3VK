@@ -1,6 +1,7 @@
 #include "d3d9_window.h"
 
 #include "d3d9_swapchain.h"
+#include "war3/tools/war3_frame_history.h"
 #include "war3/hooks/war3_hook_lifecycle.h"
 #include "war3/ui/war3_imgui.h"
 
@@ -55,6 +56,8 @@ namespace dxvk
     it->second.filter = m_filter;
   }
 
+  static thread_local bool g_historyShortcutTest=false;
+  static constexpr UINT kHistoryShortcutTestMessage=WM_APP+0x6f3;
   LRESULT CALLBACK D3D9WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
     D3D9WindowData windowData = {};
 
@@ -97,6 +100,11 @@ namespace dxvk
       return 0;
 
     using namespace dxvk::war3;
+    if(message==kHistoryShortcutTestMessage&&g_historyShortcutTest)
+      return tools::HandleFrameHistoryShortcut(WM_KEYDOWN,'C',true,true,false);
+    if(tools::HandleFrameHistoryShortcut(message,uint64_t(wparam),
+        (GetKeyState(VK_CONTROL)&0x8000)!=0,(GetKeyState(VK_SHIFT)&0x8000)!=0,
+        (lparam&0x40000000)!=0))return true;
     if (message == WM_KEYDOWN && wparam == VK_F1 &&
         (GetKeyState(VK_CONTROL) & 0x8000)) {
       if ((lparam & 0x40000000) == 0)
@@ -228,6 +236,18 @@ namespace dxvk
     g_windowProcMap.erase(window);
   }
 
+
+  bool TestFrameHistoryWindowShortcut() {
+    HWND target=nullptr;
+    {std::lock_guard lock(g_windowProcMapMutex);
+      for(const auto& entry:g_windowProcMap)
+        if(entry.second.swapchain&&!entry.second.filter&&GetWindowThreadProcessId(entry.first,nullptr)==GetCurrentThreadId()){
+          if(target)return false;target=entry.first;
+        }}
+    if(!target||g_historyShortcutTest)return false;
+    struct Guard{Guard(){g_historyShortcutTest=true;}~Guard(){g_historyShortcutTest=false;}} guard;
+    return SendMessageW(target,kHistoryShortcutTestMessage,0,0)!=0;
+  }
 
   void HookWindowProc(HWND window, D3D9SwapChainEx* swapchain) {
     std::lock_guard lock(g_windowProcMapMutex);

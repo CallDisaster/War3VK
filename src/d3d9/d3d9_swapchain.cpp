@@ -11,9 +11,15 @@
 #include "war3/core/war3_internal_test_config.h"
 #include "war3/core/war3_runtime_profile.h"
 #include "war3/hooks/war3_hook_lifecycle.h"
+#include "war3/hooks/war3_native_capture.h"
+#include "war3/tools/war3_async_screenshot.h"
+#include "war3/tools/war3_async_screenshot_core.h"
 #include "war3/render/war3_native_renderer_probe.h"
 #include "war3/tools/war3_frame_capture.h"
+#include "war3/tools/war3_frame_evidence.h"
+#include "war3/tools/war3_frame_history.h"
 #include "war3/tools/war3_perf_monitor.h"
+#include "war3/tools/war3_frame_timeline.h"
 
 #include <cstdlib>
 #include <atomic>
@@ -241,14 +247,23 @@ namespace dxvk {
         dxvk::war3::runtime::IsWar3RuntimeModuleEnabled(
             dxvk::war3::runtime::War3RuntimeModule::HookUi))
       war3::War3Imgui::get().initialize(m_window, pDevice);
+    m_asyncScreenshot = war3::tools::AsyncScreenshot::Create(m_device);
+    m_frameHistory = war3::tools::FrameHistory::Create(m_device);
   }
 
 
   D3D9SwapChainEx::~D3D9SwapChainEx() {
+    war3::hooks::RevokeNativeFrameSyncPresent(true);
     // Avoids hanging when in this state, see comment
     // in DxvkDevice::~DxvkDevice.
-    if (this_thread::isInModuleDetachment())
+    if (this_thread::isInModuleDetachment()) {
+      // Process termination cannot join a worker under the loader lock.
+      m_asyncScreenshot.release();
       return;
+    }
+    m_asyncScreenshot.reset();
+    war3::tools::FrameHistory::Release(m_frameHistory);
+    m_frameHistory.reset();
 
     {
       // Locking here and in Device::GetFrontBufferData
@@ -312,6 +327,9 @@ namespace dxvk {
           HWND     hDestWindowOverride,
     const RGNDATA* pDirtyRegion,
           DWORD    dwFlags) {
+    war3::hooks::BeginNativeFrameSyncPresent(this);
+    war3::timeline::Present(this, war3::War3PerfMonitor::instance().isRecording());
+    war3::timeline::Scope completePresent("Present");
     // 收口上一帧的 detached 三段 phase-wall 窗口。正常帧以第二个
     // WorldFrame 边界为最后起点；loading/reset 帧可能没有 WorldFrame，
     // 仍必须在 endFrame 前闭合并清空状态，禁止 QPC 起点跨 perf epoch。
@@ -333,12 +351,35 @@ namespace dxvk {
     TraceWar3Present(traceOrdinal, "entry-before-lock", this);
     D3D9DeviceLock lock = m_parent->LockDevice();
     TraceWar3Present(traceOrdinal, "lock-acquired", this);
+    // Deliberately retain the counter observed HERE, not an invented +1 mapping.
+    // BeforeUi's pipeline serial is recorded independently on the CS thread.
+    war3::tools::evidence::Scope frameEvidence(
+      war3::tools::evidence::Kind::PresentBegin,
+      {uint64_t(reinterpret_cast<uintptr_t>(m_device.ptr())),
+       m_parent->m_war3ShadowPersistentFrameSerial,
+       m_parent->m_war3GpuSkinMapEpoch,m_parent->m_war3GpuSkinDeviceEpoch},
+      "PresentEntryCounterObserved");
+    // Every early return cancels unsubmitted requests, never retargets them to
+    // a later frame. Submitted snapshots keep their own buffer/fence identity.
+    struct ScreenshotPresentGuard {
+      war3::tools::AsyncScreenshot* service;
+      bool committed = false;
+      ~ScreenshotPresentGuard() { if (service && !committed) service->reset(); }
+    } screenshotGuard{m_asyncScreenshot.get()};
+    if (m_asyncScreenshot) m_asyncScreenshot->beginPresent();
+    if (frameEvidence.id()) {
+      // This is the exact ordinal written into asynchronous screenshot names;
+      // zero means the screenshot service is not the owner of this Present.
+      frameEvidence.value(2,m_asyncScreenshot ? m_asyncScreenshot->presentOrdinal() : 0);
+      frameEvidence.value(3,uint64_t(reinterpret_cast<uintptr_t>(this)));
+    }
     deviceLockScope = war3::War3PerfMonitor::ScopedCpuScope{};
 
     if (m_parent->CheckVulkanDeviceLostFailStop(
             "D3D9SwapChain.Present.Entry")) {
       TraceWar3Present(traceOrdinal, "vk-device-lost-fail-stop", this,
                        D3DERR_DEVICEREMOVED);
+      war3::timeline::PresentResult(D3DERR_DEVICEREMOVED);
       return D3DERR_DEVICEREMOVED;
     }
 
@@ -354,6 +395,7 @@ namespace dxvk {
       }
       // endFrame() 会把 active epoch 清零；所有本帧 scope 必须先闭合。
       presentEntryScope = war3::War3PerfMonitor::ScopedCpuScope{};
+      war3::timeline::Scope profilerTiming("FrameProfiler");
       war3::War3PerfMonitor::instance().endFrame();
     }
     TraceWar3Present(traceOrdinal, "frame-end-end", this);
@@ -412,6 +454,7 @@ namespace dxvk {
     if (unlikely(m_parent->IsDeviceLost())) {
       TraceWar3Present(traceOrdinal, "device-lost-return", this,
                        D3DERR_DEVICELOST);
+      war3::timeline::PresentResult(D3DERR_DEVICELOST);
       return D3DERR_DEVICELOST;
     }
 
@@ -422,6 +465,7 @@ namespace dxvk {
     // or should be, but it is better than crashing... probably!
     if (m_backBuffers.empty()) {
       TraceWar3Present(traceOrdinal, "no-backbuffer-return", this);
+      war3::timeline::PresentResult(D3D_OK);
       return D3D_OK;
     }
 
@@ -458,8 +502,10 @@ namespace dxvk {
     TraceWar3Present(traceOrdinal, "window-context-begin", this);
     const bool windowContextReady = UpdateWindowCtx();
     TraceWar3Present(traceOrdinal, "window-context-end", this);
-    if (!windowContextReady)
+    if (!windowContextReady) {
+      war3::timeline::PresentResult(D3D_OK);
       return D3D_OK;
+    }
 
     if (options->deferSurfaceCreation && IsDeviceReset(m_wctx))
       m_wctx->presenter->invalidateSurface();
@@ -494,6 +540,7 @@ namespace dxvk {
       TraceWar3Present(traceOrdinal, "gdi-fallback-begin", this);
       const HRESULT hr = PresentImageGDI(m_window);
       TraceWar3Present(traceOrdinal, "gdi-fallback-end", this, hr);
+      war3::timeline::PresentResult(hr);
       return hr;
     }
 #endif
@@ -503,6 +550,7 @@ namespace dxvk {
           !War3UseFpsUnlockOnlyMode() &&
           dxvk::war3::runtime::IsWar3RuntimeModuleEnabled(
               dxvk::war3::runtime::War3RuntimeModule::Diag);
+      CaptureNativeAsyncScreenshot();
       if (diagEnabled || war3::tools::HasPendingFrameCaptureRequest()) {
         war3::tools::ProcessPendingFrameCapture(
             m_parent,
@@ -520,16 +568,22 @@ namespace dxvk {
         }
         war3::War3Imgui::get().endFrame();
       }
+      CaptureNativeAsyncScreenshot(true);
       
       UpdateWindowedRefreshRate();
       UpdateTargetFrameRate(presentInterval);
       TraceWar3Present(traceOrdinal, "present-image-begin", this);
       PresentImage(presentInterval);
+      frameEvidence.outcome(1); // PresentImage returned; NOT GPU completion proof
       TraceWar3Present(traceOrdinal, "present-image-end", this);
 
       if (m_parent->CheckVulkanDeviceLostFailStop(
-              "D3D9SwapChain.PresentImage"))
+              "D3D9SwapChain.PresentImage")) {
+        war3::timeline::PresentResult(D3DERR_DEVICEREMOVED);
         return D3DERR_DEVICEREMOVED;
+      }
+      screenshotGuard.committed = true;
+      war3::hooks::CompleteNativeFrameSyncPresent(this);
       
       if (!War3UseFpsUnlockOnlyMode() &&
           dxvk::war3::runtime::IsWar3RuntimeModuleEnabled(
@@ -540,6 +594,7 @@ namespace dxvk {
       }
       
       TraceWar3Present(traceOrdinal, "success-return", this);
+      war3::timeline::PresentResult(D3D_OK);
       return D3D_OK;
     } catch (const DxvkError& e) {
       TraceWar3Present(traceOrdinal, "exception", this,
@@ -551,10 +606,17 @@ namespace dxvk {
         war3::War3Imgui::get().endFrame();
 #ifdef _WIN32
       if (m_parent->CheckVulkanDeviceLostFailStop(
-              "D3D9SwapChain.Present.Exception"))
+              "D3D9SwapChain.Present.Exception")) {
+        war3::timeline::PresentResult(D3DERR_DEVICEREMOVED);
         return D3DERR_DEVICEREMOVED;
-      return PresentImageGDI(m_window);
+      }
+      {
+        const HRESULT fallback = PresentImageGDI(m_window);
+        war3::timeline::PresentResult(fallback);
+        return fallback;
+      }
 #else
+      war3::timeline::PresentResult(D3DERR_DEVICEREMOVED);
       return D3DERR_DEVICEREMOVED;
 #endif
     }
@@ -991,10 +1053,81 @@ namespace dxvk {
   }
 
 
+  void D3D9SwapChainEx::CaptureNativeAsyncScreenshot(bool afterUi) {
+    if (!m_asyncScreenshot) return;
+    const auto image = m_backBuffers[0]->GetCommonTexture()->GetImage();
+    if (!image) { m_asyncScreenshot->reset();if(m_frameHistory)m_frameHistory->cancel("history-source-image-missing");return; }
+    m_asyncScreenshot->prepare(image,!afterUi);
+    if(m_frameHistory&&!afterUi) {
+      const war3::tools::evidence::Key key{uint64_t(reinterpret_cast<uintptr_t>(m_device.ptr())),
+        m_parent->m_war3ShadowPersistentFrameSerial,m_parent->m_war3GpuSkinMapEpoch,m_parent->m_war3GpuSkinDeviceEpoch};
+      try {
+        auto shot=m_frameHistory->capture(image,key,m_asyncScreenshot->presentOrdinal());
+        if(shot.image)m_parent->EmitCs([dst=shot.image,src=image,key=shot.key,
+            session=shot.session,ordinal=shot.index,present=shot.present](DxvkContext* ctx){
+          const VkImageSubresourceLayers sub{VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};
+          ctx->copyImage(dst,sub,{0,0,0},src,sub,{0,0,0},src->info().extent);
+          war3::tools::evidence::Event event{};event.kind=war3::tools::evidence::Kind::HistoryCopyRecorded;
+          event.key=key;event.data[0]=ordinal;event.data[1]=present;
+          event.data[2]=src->info().extent.width;event.data[3]=src->info().extent.height;
+          war3::tools::evidence::Record(session,event);
+        });
+        auto exportFrame=m_frameHistory->nextExport();
+        if(exportFrame.image) {
+          auto copy=m_asyncScreenshot->takeHistory(exportFrame.request);
+          if(copy) {
+            try {
+              m_parent->EmitCs([src=exportFrame.image,dst=copy->buffer,fence=copy->fence,value=copy->value](DxvkContext* ctx){
+                ctx->copyImageToBuffer(dst,0,4,0,VK_FORMAT_UNDEFINED,src,
+                  {VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},{0,0,0},src->info().extent);
+                ctx->signalFence(fence,value);
+              });
+              m_asyncScreenshot->submitted(copy->slot);
+            }catch(...){m_asyncScreenshot->quarantine(copy->slot);m_frameHistory->cancel("history-copy-submit-failed");}
+          }
+        }
+      }catch(...){m_frameHistory->cancel("history-capture-exception");}
+    }
+    if(!afterUi)return; // history excludes the HUD; requested screenshots include it
+    for (uint32_t i = 0; i < war3::tools::screenshot::SlotCount; ++i) {
+      auto copy = m_asyncScreenshot->take(i);
+      if (!copy) continue;
+      const auto extent = image->info().extent;
+      const war3::tools::evidence::Key evidenceKey{
+        uint64_t(reinterpret_cast<uintptr_t>(m_device.ptr())),m_parent->m_war3ShadowPersistentFrameSerial,
+        m_parent->m_war3GpuSkinMapEpoch,m_parent->m_war3GpuSkinDeviceEpoch};
+      try {
+        m_parent->EmitCs([cImage = image, cBuffer = copy->buffer,
+            cFence = copy->fence, cValue = copy->value, cExtent = extent,
+            cEvidenceKey=evidenceKey,cEvidenceSession=copy->evidenceSession,
+            cShot=copy->serial,cPresent=copy->presentOrdinal](DxvkContext* ctx) {
+          ctx->copyImageToBuffer(cBuffer, 0, 4, 0, VK_FORMAT_UNDEFINED,
+              cImage, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, cExtent);
+          ctx->signalFence(cFence, cValue);
+          if(cEvidenceSession) {
+            war3::tools::evidence::Event event{};
+            event.kind=war3::tools::evidence::Kind::ScreenshotCopyRecorded;event.key=cEvidenceKey;
+            event.data[0]=cShot;event.data[1]=cPresent;event.data[2]=cValue;
+            event.data[3]=cExtent.width;event.data[4]=cExtent.height;
+            war3::tools::evidence::Record(cEvidenceSession,event);
+          }
+        });
+        m_asyncScreenshot->submitted(i);
+      } catch (...) {
+        // Even an ambiguous CS enqueue failure cannot recycle the buffer.
+        m_asyncScreenshot->quarantine(i);
+        Logger::err("[AsyncScreenshot] enqueue failure; slot quarantined");
+      }
+    }
+  }
+
   HRESULT D3D9SwapChainEx::Reset(
           D3DPRESENT_PARAMETERS* pPresentParams,
           D3DDISPLAYMODEEX*      pFullscreenDisplayMode) {
     D3D9DeviceLock lock = m_parent->LockDevice();
+    war3::hooks::RevokeNativeFrameSyncPresent(false);
+    if (m_asyncScreenshot) m_asyncScreenshot->reset();
+    if (m_frameHistory) m_frameHistory->cancel("swapchain-reset");
 
     HRESULT hr = D3D_OK;
 
@@ -1466,6 +1599,8 @@ namespace dxvk {
       }
 
       m_backBuffers.emplace_back(surface);
+      war3::timeline::BackbufferCreated(surface, Flags, desc.Width, desc.Height,
+                                       uint32_t(desc.Format));
     }
 
     // Initialize the image so that we can use it. Clearing

@@ -58,6 +58,9 @@ bool RegisterModule(
 
 // 是否存在已注册模块（内部使用）
 bool HasModules();
+// Conservative color-transaction admission. Only the built-in, audited
+// parameter/UI-only example handler is recognized; names are not identities.
+bool HasNativeColorWriteModules();
 
 // 初始化与关闭（由渲染层驱动）
 void InitializeModules();

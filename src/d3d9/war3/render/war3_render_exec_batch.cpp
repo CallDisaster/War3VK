@@ -1,4 +1,5 @@
 #include "war3_render_exec_batch.h"
+#include "../tools/war3_data_collection_tree.h"
 #include "../../../util/util_math.h"
 #include "../../d3d9_device.h"
 #include "../../d3d9_war3_debug.h"
@@ -203,6 +204,7 @@ void ExecBatchProcessor::SetHandleManagerAddrs(uintptr_t table,
 
 ExecBatchContext ExecBatchProcessor::Begin(void *element, War3BatchTag tag,
                                            int elementStage, bool isType3) {
+  WARVK_DATA_SCOPE(SemanticBuild);
   ExecBatchContext ctx;
   ctx.prevTag = War3RenderState::GetCurrentBatchTag();
   ctx.prevShadowSemantic = War3RenderState::GetTlsShadowSemanticState();
@@ -561,6 +563,7 @@ ExecBatchContext ExecBatchProcessor::Begin(void *element, War3BatchTag tag,
 }
 
 void ExecBatchProcessor::End(const ExecBatchContext &ctx) {
+  WARVK_DATA_SCOPE(SemanticBuild);
   if (ctx.stageOverridden) {
     War3RenderState::SetStage(ctx.prevStage);
   }

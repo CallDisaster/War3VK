@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 
-DEFAULT_SANDBOX_ROOT = Path(r"E:\Work\War3_AutoTestSandbox")
+DEFAULT_SANDBOX_ROOT = Path(r"E:\Work\Warcraft III")
 DEFAULT_INSTANCE_POOL_NAME = "_AutoTestInstances"
 MAX_SESSION_EVENTS = 4000
 

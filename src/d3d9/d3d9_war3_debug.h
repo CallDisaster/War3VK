@@ -9,10 +9,15 @@
 namespace dxvk {
 namespace war3dbg {
 
-inline void Print(const char *fmt, ...) {
-  static bool consoleInit = false;
-  if (!consoleInit) {
-    if (AllocConsole()) {
+// A release game must not acquire a console merely because a diagnostic prints.
+// Keep debugger/DBWIN output independent of the optional console sink.
+inline bool ConsoleOutputEnabled() {
+  static const bool initialized = [] {
+    const char* value = std::getenv("DXVK_WAR3_DEBUG_CONSOLE");
+    if (!value || std::strcmp(value, "1") != 0) return false;
+    // Do not hijack an inherited launcher console or its standard streams.
+    if (GetConsoleWindow() || !AllocConsole()) return false;
+    {
       FILE *dummy;
       freopen_s(&dummy, "CONOUT$", "w", stdout);
       freopen_s(&dummy, "CONOUT$", "w", stderr);
@@ -31,8 +36,12 @@ inline void Print(const char *fmt, ...) {
         SetCurrentConsoleFontEx(hOut, FALSE, &fontInfo);
       }
     }
-    consoleInit = true;
-  }
+    return true;
+  }();
+  return initialized;
+}
+
+inline void Print(const char *fmt, ...) {
 
   char msg[1024];
   va_list args;
@@ -40,8 +49,10 @@ inline void Print(const char *fmt, ...) {
   std::vsnprintf(msg, sizeof(msg), fmt, args);
   va_end(args);
   OutputDebugStringA(msg);
-  std::printf("%s", msg);
-  std::fflush(stdout);
+  if (ConsoleOutputEnabled()) {
+    std::printf("%s", msg);
+    std::fflush(stdout);
+  }
 }
 
 void InstallCrashHandlerOnce();

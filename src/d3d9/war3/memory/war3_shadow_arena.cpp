@@ -1,5 +1,6 @@
 // war3_shadow_arena.cpp
 #include "war3_shadow_arena.h"
+#include "war3_shadow_arena_stats.h"
 #include "war3_shadow_arena_budget.h"
 #include "war3_shadow_arena_lifecycle.h"
 
@@ -962,6 +963,31 @@ uint32_t ShadowArena_RemainingBytes() {
 
 uint64_t ShadowArena_ResidentBytes() {
   return g_residentBytes.load(std::memory_order_acquire);
+}
+
+ShadowArenaMemoryStats ShadowArena_QueryMemoryStats() noexcept {
+  ShadowArenaMemoryStats result;
+  // Do not call the full diagnostic query here: it also reads owner-only
+  // page-tail state. This display path deliberately reads atomic scalars only.
+  result.usedBytes = g_currentUsedBytes.load(std::memory_order_relaxed);
+  result.residentBytes = g_residentBytes.load(std::memory_order_relaxed);
+  result.residentLimitBytes = g_residentLimitBytes.load(std::memory_order_relaxed);
+  result.generation = g_generationCounter.load(std::memory_order_relaxed);
+  result.submittedSerial = g_lastSubmittedSerial.load(std::memory_order_relaxed);
+  result.completedSerial = g_lastCompletedSerial.load(std::memory_order_relaxed);
+  result.overflowCount = g_totalOverflowCount.load(std::memory_order_relaxed);
+  result.admissionRejectedCount = g_admissionRejectedCount.load(std::memory_order_relaxed);
+  result.busyReuseRejectCount = g_busyReuseRejectCount.load(std::memory_order_relaxed);
+  result.quarantineCount = g_quarantineCount.load(std::memory_order_relaxed);
+  result.activeGenerationCount = g_activeGenerationCount.load(std::memory_order_relaxed);
+  result.frameIncomplete = g_frameIncomplete.load(std::memory_order_relaxed);
+  result.budgetBytes = g_budgetHeapBudgetBytes.load(std::memory_order_relaxed);
+  result.allocatedBytes = g_budgetHeapAllocatedBytes.load(std::memory_order_relaxed);
+  result.availableBytes = g_budgetAvailableBytes.load(std::memory_order_relaxed);
+  result.budgetFrameSerial = g_budgetSnapshotFrameSerial.load(std::memory_order_relaxed);
+  result.budgetSupported = g_memoryBudgetSupported.load(std::memory_order_relaxed);
+  result.budgetTrusted = g_memoryBudgetTrusted.load(std::memory_order_relaxed);
+  return result;
 }
 
 ShadowArenaDiagnostics ShadowArena_QueryDiagnostics() {

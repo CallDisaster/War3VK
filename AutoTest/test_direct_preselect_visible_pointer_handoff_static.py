@@ -3,9 +3,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DEVICE = (ROOT / "src/d3d9/d3d9_device.cpp").read_text(encoding="utf-8")
+# M1 迁移：记录级 selector 已迁到语义模块，断言改读新位置（内容与判定顺序不变）。
+SEMANTIC = (
+    ROOT / "src/d3d9/war3/semantic/war3_device_semantic_predicates.cpp"
+).read_text(encoding="utf-8")
 
-selector = DEVICE.split("uint64_t War3SemanticDirectRecordSelectionKey(", 1)[1].split(
-    "uint64_t War3ProducerClaimObserveObjectKey", 1
+selector = SEMANTIC.split("uint64_t War3SemanticDirectRecordSelectionKey(", 1)[1].split(
+    "struct War3SemanticUnitValidationCacheEntry", 1
 )[0]
 assert "const dxvk::war3::render::VisibleRenderableRecord** outVisibleHint" in selector
 assert "*outVisibleHint = nullptr;" in selector

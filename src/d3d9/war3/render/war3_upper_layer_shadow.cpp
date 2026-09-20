@@ -1,5 +1,8 @@
 #include "war3_upper_layer_shadow.h"
 
+// 2026-09-17 S2（收窄版）：与 shadow-core 共享的纯计算内核（只共享计算，不合并来源）。
+#include "war3_runtime_group_palette_kernel.h"
+
 #include "../../d3d9_war3_debug.h"
 #include "../core/war3_internal_test_config.h"
 
@@ -113,132 +116,26 @@ bool TryBuildRuntimeGroupPalette(const model::ShadowGeosetResourceRecord &geoset
   if (vertexGroupCount == 0u)
     return false;
 
-  for (uint32_t i = 0; i < vertexGroupCount; ++i)
-    outMaxVertexGroupSlot =
-        std::max(outMaxVertexGroupSlot, uint32_t(geoset.vertexGroupIndices[i]));
-
-  std::vector<uint32_t> uniqueGroupSlots;
-  uniqueGroupSlots.reserve(outMaxVertexGroupSlot + 1u);
-  std::array<bool, 256> seenGroupSlots = {};
-  for (uint32_t i = 0; i < vertexGroupCount; ++i) {
-    const uint8_t groupSlot = geoset.vertexGroupIndices[i];
-    if (!seenGroupSlots[groupSlot]) {
-      seenGroupSlots[groupSlot] = true;
-      uniqueGroupSlots.push_back(uint32_t(groupSlot));
-    }
-  }
-
-  auto buildDirectMatrixRemap = [&]() -> bool {
-    if (geoset.matrixIndices.empty() ||
-        outMaxVertexGroupSlot >= geoset.matrixIndices.size()) {
-      return false;
-    }
-
-    outPalette.resize(outMaxVertexGroupSlot + 1u);
-    for (uint32_t group = 0u; group <= outMaxVertexGroupSlot; ++group) {
-      const uint32_t matrixIndex = geoset.matrixIndices[group];
-      if (matrixIndex >= pose.matrixCount ||
-          matrixIndex >= pose.matrixPalette.size()) {
-        return false;
-      }
-      outPalette[group] = pose.matrixPalette[matrixIndex];
-    }
-    return true;
-  };
-
-  auto buildSparseMatrixRemap = [&]() -> bool {
-    if (geoset.matrixIndices.empty() || uniqueGroupSlots.empty() ||
-        uniqueGroupSlots.size() > geoset.matrixIndices.size()) {
-      return false;
-    }
-
-    outPalette.assign(outMaxVertexGroupSlot + 1u, Matrix4(0.0f));
-    for (size_t i = 0; i < uniqueGroupSlots.size(); ++i) {
-      const uint32_t matrixIndex = geoset.matrixIndices[i];
-      if (matrixIndex >= pose.matrixCount ||
-          matrixIndex >= pose.matrixPalette.size()) {
-        return false;
-      }
-      outPalette[uniqueGroupSlots[i]] = pose.matrixPalette[matrixIndex];
-    }
-    return true;
-  };
-
-  auto buildDirectPosePalette = [&]() -> bool {
-    if (outMaxVertexGroupSlot >= pose.matrixCount ||
-        outMaxVertexGroupSlot >= pose.matrixPalette.size()) {
-      return false;
-    }
-
-    outPalette.resize(outMaxVertexGroupSlot + 1u);
-    for (uint32_t group = 0u; group <= outMaxVertexGroupSlot; ++group)
-      outPalette[group] = pose.matrixPalette[group];
-    return true;
-  };
-
-  auto buildSparsePosePalette = [&]() -> bool {
-    if (uniqueGroupSlots.empty() || uniqueGroupSlots.size() > pose.matrixCount ||
-        uniqueGroupSlots.size() > pose.matrixPalette.size()) {
-      return false;
-    }
-
-    outPalette.assign(outMaxVertexGroupSlot + 1u, Matrix4(0.0f));
-    for (size_t i = 0; i < uniqueGroupSlots.size(); ++i)
-      outPalette[uniqueGroupSlots[i]] = pose.matrixPalette[i];
-    return true;
-  };
-
-  const uint32_t groupCount = std::min<uint32_t>(
+  // 2026-09-20 S2 成本收口：计算仍由共享纯计算内核唯一完成。本适配层只保留
+  // D4/D5 计数派生与记录视图填充；不合并来源链，也不引入 detail / 日志面。
+  //
+  // 成本口径：内核内部单趟有界扫描（maxSlot + unique）直接写入调用方的
+  // outPalette，复用其容量，不再经过局部 RuntimeGroupPaletteOutput + move。
+  RuntimeGroupPaletteInput kernelInput = {};
+  kernelInput.vertexGroupIndices   = geoset.vertexGroupIndices.data();
+  kernelInput.vertexGroupSlotCount = size_t(vertexGroupCount);
+  kernelInput.matrixGroupSizes     = geoset.matrixGroupSizes.data();
+  kernelInput.groupCount           = std::min<uint32_t>(
       geoset.matrixGroupCount, uint32_t(geoset.matrixGroupSizes.size()));
-  if (groupCount == 0u)
-    return buildDirectMatrixRemap() || buildSparseMatrixRemap() ||
-           buildDirectPosePalette() || buildSparsePosePalette();
+  kernelInput.matrixIndices        = geoset.matrixIndices.data();
+  kernelInput.matrixIndexCount     = geoset.matrixIndices.size();
+  kernelInput.posePalette          = pose.matrixPalette.data();
+  kernelInput.posePaletteSize      = pose.matrixPalette.size();
+  kernelInput.poseMatrixCount      = pose.matrixCount;
 
-  std::vector<uint32_t> prefix(groupCount, 0u);
-  uint32_t running = 0u;
-  for (uint32_t i = 0; i < groupCount; ++i) {
-    prefix[i] = running;
-    running += geoset.matrixGroupSizes[i];
-  }
-
-  if (running > geoset.matrixIndices.size())
-    return buildDirectMatrixRemap() || buildSparseMatrixRemap() ||
-           buildDirectPosePalette() || buildSparsePosePalette();
-
-  outPalette.resize(groupCount);
-  for (uint32_t group = 0; group < groupCount; ++group) {
-    const uint32_t groupSize = geoset.matrixGroupSizes[group];
-    const uint32_t groupBase = prefix[group];
-    if (groupSize == 0u || (groupBase + groupSize) > geoset.matrixIndices.size())
-      return buildDirectMatrixRemap() || buildSparseMatrixRemap() ||
-             buildDirectPosePalette() || buildSparsePosePalette();
-
-    Matrix4 accum(0.0f);
-    for (uint32_t i = 0; i < groupSize; ++i) {
-      const uint32_t matrixIndex = geoset.matrixIndices[groupBase + i];
-      if (matrixIndex >= pose.matrixCount ||
-          matrixIndex >= pose.matrixPalette.size()) {
-        return buildDirectMatrixRemap() || buildSparseMatrixRemap() ||
-               buildDirectPosePalette() || buildSparsePosePalette();
-      }
-
-      accum += pose.matrixPalette[matrixIndex];
-    }
-
-    if (groupSize > 1u)
-      outUsesAveraging = true;
-    outPalette[group] =
-        groupSize == 1u ? accum : (accum / float(groupSize));
-  }
-
-  for (uint32_t i = 0; i < vertexGroupCount; ++i) {
-    const uint32_t groupSlot = geoset.vertexGroupIndices[i];
-    if (groupSlot >= groupCount)
-      return buildDirectMatrixRemap() || buildSparseMatrixRemap() ||
-             buildDirectPosePalette() || buildSparsePosePalette();
-  }
-
-  return true;
+  return TryBuildRuntimeGroupPaletteKernel(
+      kernelInput, RuntimeGroupPaletteFallbackSet::MatrixAndPoseRemap,
+      outPalette, outMaxVertexGroupSlot, outUsesAveraging, nullptr);
 }
 
 } // namespace

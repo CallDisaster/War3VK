@@ -2024,12 +2024,68 @@ War3RuntimeStatusShadowSnapshot BuildShadowSnapshot() {
       .semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeCModelFallbackCount =
       bridgeSummary
           .semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeCModelFallbackCount;
+  summary.semanticSceneSubmittedSkinnedPaletteSourceOwnedPartSnapshotCount = bridgeSummary.semanticSceneSubmittedSkinnedPaletteSourceOwnedPartSnapshotCount;
   summary.semanticSceneSubmittedSkinnedPaletteStablePartSampleCount =
       bridgeSummary.semanticSceneSubmittedSkinnedPaletteStablePartSampleCount;
   summary.semanticSceneSubmittedSkinnedPaletteHashChurnCount =
       bridgeSummary.semanticSceneSubmittedSkinnedPaletteHashChurnCount;
   summary.semanticSceneSubmittedSkinnedPaletteSourceChurnCount =
       bridgeSummary.semanticSceneSubmittedSkinnedPaletteSourceChurnCount;
+  // 2026-09-17 活跃路径纯计数（同链路导出）。
+  summary.semanticSceneAppendEntrySkinnedCount =
+      bridgeSummary.semanticSceneAppendEntrySkinnedCount;
+  summary.semanticSceneCanonicalGateRejectSkinnedCount =
+      bridgeSummary.semanticSceneCanonicalGateRejectSkinnedCount;
+  summary.semanticSceneDrawTimeProducerSubmittedSkinnedCount =
+      bridgeSummary.semanticSceneDrawTimeProducerSubmittedSkinnedCount;
+  summary.semanticSceneDirectCurrentDrawSubmittedSkinnedCount =
+      bridgeSummary.semanticSceneDirectCurrentDrawSubmittedSkinnedCount;
+  // 2026-09-16 P0 palette 缝隙修复度量（device=Gap A / shadowCore=Gap B）。
+  summary.semanticSceneSkinnedPaletteSlotCacheDeviceServedAfterConfirmCount =
+      bridgeSummary
+          .semanticSceneSkinnedPaletteSlotCacheDeviceServedAfterConfirmCount;
+  summary.semanticSceneSkinnedPaletteSlotCacheDeviceRejectedStaleCount =
+      bridgeSummary
+          .semanticSceneSkinnedPaletteSlotCacheDeviceRejectedStaleCount;
+  // 2026-09-17 上级裁定（线程修复方案 B 第一部分）：构建推进边界线程见证。
+  summary.semanticBuildOffThreadRefusedCount =
+      bridgeSummary.semanticBuildOffThreadRefusedCount;
+  summary.semanticBuildOwnerUnestablishedRefusedCount =
+      bridgeSummary.semanticBuildOwnerUnestablishedRefusedCount;
+  summary.semanticBuildDirectAdvanceRefusedCount =
+      bridgeSummary.semanticBuildDirectAdvanceRefusedCount;
+  summary
+      .semanticSceneSkinnedPaletteSlotCacheShadowCoreServedAfterConfirmCount =
+      bridgeSummary
+          .semanticSceneSkinnedPaletteSlotCacheShadowCoreServedAfterConfirmCount;
+  summary.semanticSceneSkinnedPaletteSlotCacheShadowCoreRejectedStaleCount =
+      bridgeSummary
+          .semanticSceneSkinnedPaletteSlotCacheShadowCoreRejectedStaleCount;
+  summary
+      .semanticSceneSkinnedPaletteSlotCacheShadowCoreProducerSnapshotFallbackCount =
+      bridgeSummary
+          .semanticSceneSkinnedPaletteSlotCacheShadowCoreProducerSnapshotFallbackCount;
+  // 2026-09-17 Gap B 补强（同链路导出）。
+  summary
+      .semanticSceneSkinnedPaletteSlotCacheShadowCoreFrameProofServedCount =
+      bridgeSummary
+          .semanticSceneSkinnedPaletteSlotCacheShadowCoreFrameProofServedCount;
+  summary
+      .semanticSceneSkinnedPaletteSlotCacheShadowCoreGroupShortRejectedCount =
+      bridgeSummary
+          .semanticSceneSkinnedPaletteSlotCacheShadowCoreGroupShortRejectedCount;
+  summary
+      .semanticSceneSkinnedPaletteSlotCacheShadowCoreBindingFrameStaleRejectedCount =
+      bridgeSummary
+          .semanticSceneSkinnedPaletteSlotCacheShadowCoreBindingFrameStaleRejectedCount;
+  summary
+      .semanticSceneSkinnedPaletteSlotCacheShadowCoreSlotRangeStaleRejectedCount =
+      bridgeSummary
+          .semanticSceneSkinnedPaletteSlotCacheShadowCoreSlotRangeStaleRejectedCount;
+  summary
+      .semanticSceneSkinnedPaletteSlotCacheShadowCoreSnapshotFrameStaleRejectedCount =
+      bridgeSummary
+          .semanticSceneSkinnedPaletteSlotCacheShadowCoreSnapshotFrameStaleRejectedCount;
   summary.semanticSceneSubmittedSkinnedPaletteSlotIndexChurnCount =
       bridgeSummary
           .semanticSceneSubmittedSkinnedPaletteSlotIndexChurnCount;
@@ -2472,7 +2528,11 @@ json BuildRuntimeStatusJson(const War3RuntimeStatusSnapshot& snapshot) {
         {"state", snapshot.module.state}}},
       {"perf",
        {{"enabled", snapshot.perf.enabled},
-        {"recording", snapshot.perf.recording}}},
+        {"recording", snapshot.perf.recording},
+        {"frameAnchorValid", snapshot.perf.frameAnchorValid},
+        {"businessFrameSerial", snapshot.perf.businessFrameSerial},
+        {"perfFrameEpoch", snapshot.perf.perfFrameEpoch},
+        {"producerAccumulationEpoch", snapshot.perf.producerAccumulationEpoch}}},
       {"profile",
        {{"name", snapshot.profile.name},
         {"disabledModules", snapshot.profile.disabledModules},
@@ -3191,6 +3251,7 @@ json BuildRuntimeStatusJson(const War3RuntimeStatusSnapshot& snapshot) {
         {"semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeCModelFallbackCount",
          snapshot.shadow
              .semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeCModelFallbackCount},
+        {"semanticSceneSubmittedSkinnedPaletteSourceOwnedPartSnapshotCount", snapshot.shadow.semanticSceneSubmittedSkinnedPaletteSourceOwnedPartSnapshotCount},
         {"semanticSceneSubmittedSkinnedPaletteStablePartSampleCount",
          snapshot.shadow
              .semanticSceneSubmittedSkinnedPaletteStablePartSampleCount},
@@ -3200,6 +3261,50 @@ json BuildRuntimeStatusJson(const War3RuntimeStatusSnapshot& snapshot) {
         {"semanticSceneSubmittedSkinnedPaletteSourceChurnCount",
          snapshot.shadow
              .semanticSceneSubmittedSkinnedPaletteSourceChurnCount},
+        {"semanticSceneAppendEntrySkinnedCount",
+         snapshot.shadow.semanticSceneAppendEntrySkinnedCount},
+        {"semanticSceneCanonicalGateRejectSkinnedCount",
+         snapshot.shadow.semanticSceneCanonicalGateRejectSkinnedCount},
+        {"semanticSceneDrawTimeProducerSubmittedSkinnedCount",
+         snapshot.shadow.semanticSceneDrawTimeProducerSubmittedSkinnedCount},
+        {"semanticSceneDirectCurrentDrawSubmittedSkinnedCount",
+         snapshot.shadow.semanticSceneDirectCurrentDrawSubmittedSkinnedCount},
+        {"semanticSceneSkinnedPaletteSlotCacheDeviceServedAfterConfirmCount",
+         snapshot.shadow
+             .semanticSceneSkinnedPaletteSlotCacheDeviceServedAfterConfirmCount},
+        {"semanticSceneSkinnedPaletteSlotCacheDeviceRejectedStaleCount",
+         snapshot.shadow
+             .semanticSceneSkinnedPaletteSlotCacheDeviceRejectedStaleCount},
+        {"semanticBuildOffThreadRefusedCount",
+         snapshot.shadow.semanticBuildOffThreadRefusedCount},
+        {"semanticBuildOwnerUnestablishedRefusedCount",
+         snapshot.shadow.semanticBuildOwnerUnestablishedRefusedCount},
+        {"semanticBuildDirectAdvanceRefusedCount",
+         snapshot.shadow.semanticBuildDirectAdvanceRefusedCount},
+        {"semanticSceneSkinnedPaletteSlotCacheShadowCoreServedAfterConfirmCount",
+         snapshot.shadow
+             .semanticSceneSkinnedPaletteSlotCacheShadowCoreServedAfterConfirmCount},
+        {"semanticSceneSkinnedPaletteSlotCacheShadowCoreRejectedStaleCount",
+         snapshot.shadow
+             .semanticSceneSkinnedPaletteSlotCacheShadowCoreRejectedStaleCount},
+        {"semanticSceneSkinnedPaletteSlotCacheShadowCoreProducerSnapshotFallbackCount",
+         snapshot.shadow
+             .semanticSceneSkinnedPaletteSlotCacheShadowCoreProducerSnapshotFallbackCount},
+        {"semanticSceneSkinnedPaletteSlotCacheShadowCoreFrameProofServedCount",
+         snapshot.shadow
+             .semanticSceneSkinnedPaletteSlotCacheShadowCoreFrameProofServedCount},
+        {"semanticSceneSkinnedPaletteSlotCacheShadowCoreGroupShortRejectedCount",
+         snapshot.shadow
+             .semanticSceneSkinnedPaletteSlotCacheShadowCoreGroupShortRejectedCount},
+        {"semanticSceneSkinnedPaletteSlotCacheShadowCoreBindingFrameStaleRejectedCount",
+         snapshot.shadow
+             .semanticSceneSkinnedPaletteSlotCacheShadowCoreBindingFrameStaleRejectedCount},
+        {"semanticSceneSkinnedPaletteSlotCacheShadowCoreSlotRangeStaleRejectedCount",
+         snapshot.shadow
+             .semanticSceneSkinnedPaletteSlotCacheShadowCoreSlotRangeStaleRejectedCount},
+        {"semanticSceneSkinnedPaletteSlotCacheShadowCoreSnapshotFrameStaleRejectedCount",
+         snapshot.shadow
+             .semanticSceneSkinnedPaletteSlotCacheShadowCoreSnapshotFrameStaleRejectedCount},
         {"semanticSceneSubmittedSkinnedPaletteSlotIndexChurnCount",
          snapshot.shadow
              .semanticSceneSubmittedSkinnedPaletteSlotIndexChurnCount},
@@ -4054,8 +4159,13 @@ War3RuntimeStatusSnapshot BuildRuntimeStatusSnapshot(const char* source,
       static_cast<uint64_t>(stats.callbackErrors);
   snapshot.module.state = ModuleStateToString(stats.state);
 
-  snapshot.perf.enabled = perf.isEnabled();
-  snapshot.perf.recording = perf.isRecording();
+  const auto publishedPerf = perf.queryPublishedPerfState();
+  snapshot.perf.enabled = publishedPerf.enabled;
+  snapshot.perf.recording = publishedPerf.recording;
+  snapshot.perf.frameAnchorValid = publishedPerf.valid;
+  snapshot.perf.businessFrameSerial = publishedPerf.businessFrameSerial;
+  snapshot.perf.perfFrameEpoch = publishedPerf.frameEpoch;
+  snapshot.perf.producerAccumulationEpoch = publishedPerf.producerAccumulationEpoch;
 
   snapshot.profile.name = dxvk::war3::runtime::GetWar3RuntimeProfileName();
   snapshot.profile.disabledModules =

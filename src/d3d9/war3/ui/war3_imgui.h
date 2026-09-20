@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <d3d9.h>
 #include "imgui.h"
+#include "war3_render_stats_view.h"
 #include <atomic>
 
 namespace dxvk {
@@ -43,6 +44,8 @@ namespace dxvk::war3 {
         ~War3Imgui() = default;
 
         void drawDebugWindow();
+        void drawFrameRecorderPanel();
+        void drawRenderStatsPanel();
         void drawCursorOverlay();
 
         bool m_initialized = false;
@@ -51,6 +54,7 @@ namespace dxvk::war3 {
         bool m_frameStarted = false;
         bool m_visible = false;
         D3D9DeviceEx* m_device = nullptr;
+        ui::RenderStatsRefresh m_renderStatsRefresh;
 
         // Custom Cursor
         IDirect3DTexture9* m_cursorTexture = nullptr;

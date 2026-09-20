@@ -41,6 +41,12 @@ War3UnionCsmSphereQuery ValidQuery(uint32_t cascadeIndex,
   query.generations.boundsFrameGeneration = 17u;
   query.generations.cameraFrameGeneration = 17u;
   query.generations.consumerStateFrameGeneration = 17u;
+  query.generations.currentMapGeneration = 23u;
+  query.generations.candidateMapGeneration = 23u;
+  query.generations.consumerMapGeneration = 23u;
+  query.generations.currentDeviceGeneration = 29u;
+  query.generations.candidateDeviceGeneration = 29u;
+  query.generations.consumerDeviceGeneration = 29u;
   query.generations.resourceGeneration = 4u;
   query.generations.expectedResourceGeneration = 4u;
   query.identityKnown = true;
@@ -190,7 +196,8 @@ void TestNonFiniteAndDegenerateInputsFailVisible() {
   query = ValidQuery(2u, War3UnionVisibilityMode::Observe);
   query.lightViewProjection.columns[3][3] = 0.0f;
   result = War3EvaluateConservativeCsmSphere(query);
-  CHECK(result.rejectReason == War3UnionVisibilityRejectReason::DegenerateClipW);
+  CHECK(result.rejectReason ==
+        War3UnionVisibilityRejectReason::NonOrthographicProjection);
 }
 
 void TestOffAndUnprovenClassificationFailVisible() {
@@ -256,6 +263,130 @@ void TestBoundsProvenanceRequiresExactCurrentEvidence() {
         War3ShadowBoundsCullRejectReason::AnimatedAttachment);
 }
 
+void TestOrthographicAndMapDeviceProofs() {
+  auto query = ValidQuery(2u, War3UnionVisibilityMode::Observe);
+  query.bounds.x = 3.0f;
+  auto result = War3EvaluateConservativeCsmSphere(query);
+  CHECK(!result.failVisible);
+  CHECK((result.proofBits & War3UnionProofOutside) != 0u);
+
+  query = ValidQuery(2u, War3UnionVisibilityMode::Observe);
+  query.lightViewProjection.columns[0][3] = 1.0e-30f;
+  result = War3EvaluateConservativeCsmSphere(query);
+  CHECK(result.failVisible);
+  CHECK(result.rejectReason ==
+        War3UnionVisibilityRejectReason::NonOrthographicProjection);
+
+  query = ValidQuery(2u, War3UnionVisibilityMode::Observe);
+  query.lightViewProjection.columns[3][3] = -1.0f;
+  result = War3EvaluateConservativeCsmSphere(query);
+  CHECK(result.failVisible);
+  CHECK(result.rejectReason ==
+        War3UnionVisibilityRejectReason::NonOrthographicProjection);
+
+  query = ValidQuery(2u, War3UnionVisibilityMode::Observe);
+  query.lightViewProjection.columns[0][3] =
+      std::numeric_limits<float>::quiet_NaN();
+  result = War3EvaluateConservativeCsmSphere(query);
+  CHECK(result.failVisible);
+  CHECK(result.rejectReason ==
+        War3UnionVisibilityRejectReason::NonFiniteMatrix);
+
+  query = ValidQuery(2u, War3UnionVisibilityMode::Observe);
+  query.generations.currentMapGeneration = 0u;
+  result = War3EvaluateConservativeCsmSphere(query);
+  CHECK(result.failVisible);
+  CHECK(result.rejectReason ==
+        War3UnionVisibilityRejectReason::MapGenerationUnknown);
+
+  query = ValidQuery(2u, War3UnionVisibilityMode::Observe);
+  query.generations.candidateMapGeneration = 0u;
+  result = War3EvaluateConservativeCsmSphere(query);
+  CHECK(result.rejectReason ==
+        War3UnionVisibilityRejectReason::MapGenerationUnknown);
+
+  query = ValidQuery(2u, War3UnionVisibilityMode::Observe);
+  query.generations.consumerMapGeneration = 0u;
+  result = War3EvaluateConservativeCsmSphere(query);
+  CHECK(result.rejectReason ==
+        War3UnionVisibilityRejectReason::MapGenerationUnknown);
+
+  query = ValidQuery(2u, War3UnionVisibilityMode::Observe);
+  query.generations.currentMapGeneration = 0u;
+  query.generations.candidateMapGeneration = 0u;
+  query.generations.consumerMapGeneration = 0u;
+  query.generations.currentDeviceGeneration = 0u;
+  query.generations.candidateDeviceGeneration = 0u;
+  query.generations.consumerDeviceGeneration = 0u;
+  result = War3EvaluateConservativeCsmSphere(query);
+  CHECK(result.failVisible);
+  CHECK(result.rejectReason ==
+        War3UnionVisibilityRejectReason::MapGenerationUnknown);
+
+  query = ValidQuery(2u, War3UnionVisibilityMode::Observe);
+  query.generations.candidateMapGeneration = 24u;
+  result = War3EvaluateConservativeCsmSphere(query);
+  CHECK(result.failVisible);
+  CHECK(result.rejectReason ==
+        War3UnionVisibilityRejectReason::MapGenerationMismatch);
+
+  query = ValidQuery(2u, War3UnionVisibilityMode::Observe);
+  query.generations.consumerMapGeneration = 22u;
+  result = War3EvaluateConservativeCsmSphere(query);
+  CHECK(result.rejectReason ==
+        War3UnionVisibilityRejectReason::MapGenerationMismatch);
+
+  query = ValidQuery(2u, War3UnionVisibilityMode::Observe);
+  query.generations.currentDeviceGeneration = 0u;
+  result = War3EvaluateConservativeCsmSphere(query);
+  CHECK(result.rejectReason ==
+        War3UnionVisibilityRejectReason::DeviceGenerationUnknown);
+
+  query = ValidQuery(2u, War3UnionVisibilityMode::Observe);
+  query.generations.candidateDeviceGeneration = 0u;
+  result = War3EvaluateConservativeCsmSphere(query);
+  CHECK(result.rejectReason ==
+        War3UnionVisibilityRejectReason::DeviceGenerationUnknown);
+
+  query = ValidQuery(2u, War3UnionVisibilityMode::Observe);
+  query.generations.consumerDeviceGeneration = 0u;
+  result = War3EvaluateConservativeCsmSphere(query);
+  CHECK(result.rejectReason ==
+        War3UnionVisibilityRejectReason::DeviceGenerationUnknown);
+
+  query = ValidQuery(2u, War3UnionVisibilityMode::Observe);
+  query.generations.candidateDeviceGeneration = 30u;
+  result = War3EvaluateConservativeCsmSphere(query);
+  CHECK(result.rejectReason ==
+        War3UnionVisibilityRejectReason::DeviceGenerationMismatch);
+
+  query = ValidQuery(2u, War3UnionVisibilityMode::Observe);
+  query.generations.consumerDeviceGeneration = 28u;
+  result = War3EvaluateConservativeCsmSphere(query);
+  CHECK(result.rejectReason ==
+        War3UnionVisibilityRejectReason::DeviceGenerationMismatch);
+
+  query = ValidQuery(2u, War3UnionVisibilityMode::Observe);
+  query.generations.candidateMapGeneration = 22u;
+  result = War3EvaluateConservativeCsmSphere(query);
+  CHECK(result.rejectReason ==
+        War3UnionVisibilityRejectReason::MapGenerationMismatch);
+
+  query = ValidQuery(2u, War3UnionVisibilityMode::Observe);
+  query.bounds.x = 1.10f;
+  query.bounds.radius = 0.10f;
+  result = War3EvaluateConservativeCsmSphere(query);
+  CHECK(!result.failVisible);
+  CHECK((result.predictedVisibleMask & War3UnionConsumerCsm2) != 0u);
+
+  query = ValidQuery(2u, War3UnionVisibilityMode::Observe);
+  query.lightViewProjection.columns[0][0] = -1.0f;
+  query.bounds.x = 3.0f;
+  result = War3EvaluateConservativeCsmSphere(query);
+  CHECK(!result.failVisible);
+  CHECK((result.predictedVisibleMask & War3UnionConsumerCsm2) == 0u);
+}
+
 } // namespace
 
 int main() {
@@ -274,6 +405,7 @@ int main() {
   TestNonFiniteAndDegenerateInputsFailVisible();
   TestOffAndUnprovenClassificationFailVisible();
   TestBoundsProvenanceRequiresExactCurrentEvidence();
+  TestOrthographicAndMapDeviceProofs();
 
   if (g_failures != 0) {
     std::fprintf(stderr, "%d union visibility checks failed\n", g_failures);

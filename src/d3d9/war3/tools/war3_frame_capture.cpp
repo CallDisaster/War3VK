@@ -1,4 +1,5 @@
 #include "war3_frame_capture.h"
+#include "war3_frame_timeline.h"
 
 #include "../../d3d9_device.h"
 #include "../../d3d9_surface.h"
@@ -480,6 +481,7 @@ bool HasPendingFrameCaptureRequest() {
 
 bool ProcessPendingFrameCapture(D3D9DeviceEx* device, D3D9Surface* sourceSurface,
                                 War3FrameCaptureResult* outResult) {
+  timeline::Scope capturePollTimeline("FrameCapture/Poll");
   War3FrameCaptureResult result = {};
   auto memoryRequest = PopPendingMemoryRequest();
   const std::string& requestPath = GetFrameCaptureRequestPath();

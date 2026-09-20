@@ -3,6 +3,7 @@
 #extension GL_EXT_nonuniform_qualifier : require
 #extension GL_EXT_samplerless_texture_functions : require
 #extension GL_EXT_scalar_block_layout : require
+#extension GL_GOOGLE_include_directive : enable
 
 layout(set = 0, binding = 0) uniform sampler s_samplers[];
 layout(set = 1, binding = 0) uniform texture2DArray s_color;
@@ -17,6 +18,10 @@ layout(set = 1, binding = 10, rg16f) uniform image2D s_shadowHistoryWrite;
 layout(set = 1, binding = 11) uniform texture2DArray s_casterMask;
 layout(set = 1, binding = 12) uniform texture2DArray s_pointContactVisibility;
 layout(set = 1, binding = 13) uniform texture2D s_pointContactHiz;
+// Exact FFP counterfactual with the one native direct/specular light removed.
+layout(set = 1, binding = 14) uniform texture2D s_nativeLightBaseline;
+layout(set = 1, binding = 15) uniform texture2D s_nativeLightWithoutB;
+layout(set = 1, binding = 16) uniform texture2D s_nativeLightWithoutBoth;
 
 layout(set = 1, binding = 3, scalar, row_major)
 uniform ShadowData {
@@ -194,18 +199,9 @@ float casterMaskValue(uint cascadeIndex, vec2 uv) {
     vec3(uv, float(cascadeIndex))).r;
 }
 
-bool isTerrainMaskedOccluder(uint cascadeIndex, vec2 uv, float refDepth) {
-  if (ubo.u_viewportZ.z <= 0.5)
-    return false;
-  if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0)
-    return false;
-
-  float blockerDepth = shadowMapDepth(cascadeIndex, uv);
-  float eps = max(ubo.u_viewportZ.w, 0.0);
-  if (refDepth <= blockerDepth + eps)
-    return false;
-  return casterMaskValue(cascadeIndex, uv) > 0.5;
-}
+#define WAR3_SHADOW_COMMON_PART 1
+#include "war3_shadow_common.glsl"
+#undef WAR3_SHADOW_COMMON_PART
 
 const vec2 kPoisson16[16] = vec2[](
   vec2(-0.94201624, -0.39906216),
@@ -226,51 +222,9 @@ const vec2 kPoisson16[16] = vec2[](
   vec2(-0.97484398, -0.75648379)
 );
 
-const vec2 kPoisson25[25] = vec2[](
-  vec2(-0.978698, -0.088412),
-  vec2(-0.826476,  0.623303),
-  vec2(-0.695914, -0.675318),
-  vec2(-0.243678,  0.914799),
-  vec2(-0.073406, -0.879112),
-  vec2( 0.265552, -0.421003),
-  vec2( 0.347605,  0.172336),
-  vec2( 0.850872,  0.325923),
-  vec2( 0.980188, -0.256911),
-  vec2( 0.489165, -0.732877),
-  vec2(-0.382158, -0.159902),
-  vec2(-0.143106,  0.196586),
-  vec2( 0.087301,  0.520475),
-  vec2( 0.179114, -0.156230),
-  vec2( 0.256418,  0.873281),
-  vec2(-0.408780,  0.551319),
-  vec2(-0.782120, -0.272922),
-  vec2(-0.625204,  0.111715),
-  vec2( 0.413259, -0.411552),
-  vec2( 0.912811,  0.002185),
-  vec2( 0.480792,  0.642580),
-  vec2(-0.177945, -0.632366),
-  vec2(-0.701787, -0.511294),
-  vec2( 0.020200, -0.310701),
-  vec2( 0.693711, -0.211191)
-);
-
-vec2 rotateVec2(vec2 v, vec2 rot) {
-  return vec2(v.x * rot.x - v.y * rot.y, v.x * rot.y + v.y * rot.x);
-}
-
-float computeCascadeBiasScale(int cascadeIndex, int cascadeCount, float scaleParam) {
-  float t = (cascadeCount > 1) ? float(cascadeIndex) / float(cascadeCount - 1) : 0.0;
-  // 远级联偏置放大过大时容易出现“接触阴影丢失（脚底缺阴影）”。
-  // 将最大倍率从 4.0（1+3*t）收敛到 3.0（1+2*t），减轻远级联 Peter-Panning。
-  float target = 1.0 + 2.0 * t;
-  float k = clamp(scaleParam, 0.0, 1.0);
-  return mix(1.0, target, k);
-}
-
-float computeCascadePcfRadius(float baseRadiusTexel, int cascadeIndex, int cascadeCount, float scaleParam) {
-  float scale = computeCascadeBiasScale(cascadeIndex, cascadeCount, scaleParam);
-  return baseRadiusTexel / max(scale, 1e-6);
-}
+#define WAR3_SHADOW_COMMON_PART 2
+#include "war3_shadow_common.glsl"
+#undef WAR3_SHADOW_COMMON_PART
 
 bool computeReceiverPlaneDepthGradient(vec4 lightClip, mat4 lightViewProj,
                                        vec3 worldDx, vec3 worldDy,
@@ -508,40 +462,9 @@ vec3 computeViewNormal(vec3 viewPos, vec3 viewDx, vec3 viewDy) {
   return normV;
 }
 
-vec3 computeWorldUpInView() {
-  vec3 worldUpV = (vec4(0.0, 0.0, 1.0, 0.0) * ubo.u_view).xyz;
-  float upLen2 = dot(worldUpV, worldUpV);
-  return (upLen2 > 1e-12)
-      ? (worldUpV * inversesqrt(upLen2))
-      : vec3(0.0, 1.0, 0.0);
-}
-
-float computeWallReceiverFactor(vec3 normV) {
-  float upDot = abs(dot(normV, computeWorldUpInView()));
-  return smoothstep(0.15, 0.75, 1.0 - upDot);
-}
-
-float computeReceiverGrazingFactor(vec3 normV, vec3 viewPos) {
-  float viewLen2 = dot(viewPos, viewPos);
-  if (viewLen2 <= 1e-8)
-    return 0.0;
-
-  vec3 viewDirV = -viewPos * inversesqrt(viewLen2);
-  float facing = abs(dot(normV, viewDirV));
-  return 1.0 - smoothstep(0.25, 0.65, facing);
-}
-
-float computeLightGrazingFactor(vec3 normV, vec3 lightDirV) {
-  float ndotl = abs(dot(normV, lightDirV));
-  return 1.0 - smoothstep(0.25, 0.72, ndotl);
-}
-
-float computeWallStabilityFactor(vec3 normV, vec3 viewPos, vec3 lightDirV) {
-  float wallFactor = computeWallReceiverFactor(normV);
-  float viewFactor = computeReceiverGrazingFactor(normV, viewPos);
-  float lightFactor = computeLightGrazingFactor(normV, lightDirV);
-  return wallFactor * max(viewFactor, lightFactor);
-}
+#define WAR3_SHADOW_COMMON_PART 3
+#include "war3_shadow_common.glsl"
+#undef WAR3_SHADOW_COMMON_PART
 
 float computeWallFilterWeight(float wallFactor, float wallStabilityFactor,
                               float lightGrazingFactor,
@@ -1441,6 +1364,18 @@ void main() {
       float currentDist = length(lightToFrag);
       float shadowRange = max(ps.lightPos.w, 1.0);
       if (currentDist < shadowRange * 0.999) {
+        if (lights.u_pad[1] == 1u) {
+          float stored = texture(samplerCubeArray(s_pointShadow,
+            s_samplers[nonuniformEXT(pointShadow.u_samplerIndex)]),
+            vec4(lightToFrag,float(debugLight))).r * shadowRange;
+          // Red: blocker within 20 world units of emitter. Green: receiver's
+          // own depth within 4 units. Blue: another farther occluder. White: clear.
+          vec3 diagnosis = stored >= shadowRange * 0.999 ? vec3(1.0) :
+            stored < 20.0 ? vec3(1.0,0.0,0.0) :
+            abs(stored-currentDist) < 4.0 ? vec3(0.0,1.0,0.0) : vec3(0.0,0.0,1.0);
+          o_color=vec4(diagnosis,1.0);
+          return;
+        }
         vec4 debugViewH = vec4(worldPos, 1.0) * ubo.u_view;
         if (validVec4(debugViewH)) {
           float pointNormalConfidence = 0.0;
@@ -1780,12 +1715,53 @@ void main() {
   uint lightCount = min(lights.u_count, 16u);
 
   vec3 accumLight = vec3(0.0);
+  // Four actual FFP endpoints: original, without A, without B, without both.
+  // Bilinear visibility interpolation preserves all four binary endpoints and
+  // is bounded for PCF coverage; summing two C0-Ci differences is NOT correct
+  // across saturation/texture combiners. This is not albedo relighting.
+  uint nativeSlot = lights.u_pad[0] - 1u;
+  uint nativeCount = min(lights.u_pad[2], 2u);
+  vec2 nativeVisibility = vec2(1.0);
+  bool nativeValid = nativeCount > 0u && nativeSlot < lightCount &&
+    nativeSlot < pointShadow.u_lightCount &&
+    nativeCount <= lightCount-nativeSlot && nativeCount <= pointShadow.u_lightCount-nativeSlot;
+  if (nativeValid) {
+    for (uint n=0u; n<nativeCount; ++n) {
+    uint slot = nativeSlot+n;
+    PointShadowLightData ps = pointShadow.u_lights[slot];
+    vec3 ray = worldPos - ps.lightPos.xyz;
+    float distanceToLight = length(ray);
+    float range = max(ps.lightPos.w, 1.0);
+    if (ps.enabled > 0.5 && ps.shadowIntensity > 0.0 && distanceToLight < range) {
+      float confidence = 0.0;
+      vec3 normalV = computePointLightViewNormal(viewPos, confidence);
+      float trust = smoothstep(0.0, 0.35, clamp(confidence, 0.0, 1.0));
+      vec3 normalW = normalV * transpose(mat3(ubo.u_view));
+      float fade = 1.0 - smoothstep(clamp(pointShadow.u_filterParams.w, 0.50, 0.98),
+                                    1.0, distanceToLight / range);
+      nativeVisibility[n] = mix(1.0, samplePointShadowPcf(slot, ray,
+          distanceToLight, range, ps.bias, normalW, trust),
+          clamp(ps.shadowIntensity, 0.0, 1.0) * fade);
+    }
+    }
+    vec3 withoutA = texelFetch(sampler2D(s_nativeLightBaseline,
+        s_samplers[nonuniformEXT(p_colorSampler)]), pix, 0).rgb;
+    vec3 withoutB = texelFetch(sampler2D(s_nativeLightWithoutB,
+        s_samplers[nonuniformEXT(p_colorSampler)]), pix, 0).rgb;
+    vec3 withoutBoth = texelFetch(sampler2D(s_nativeLightWithoutBoth,
+        s_samplers[nonuniformEXT(p_colorSampler)]), pix, 0).rgb;
+    vec3 withB = mix(withoutA, col.rgb, nativeVisibility.x);
+    vec3 noB = mix(withoutBoth, withoutB, nativeVisibility.x);
+    vec3 resolved = mix(noB, withB, nativeVisibility.y);
+    accumLight += (resolved - col.rgb) * mul;
+  }
   const float pointLightEnergyScale = 0.78;
   vec3 pointNormV = normV;
   bool pointNormalReady = false;
   float pointNormalConfidence = 0.0;
 
   for (uint i = 0; i < lightCount; i++) {
+      if (nativeValid && i >= nativeSlot && i-nativeSlot < nativeCount) continue;
       float lRange = lights.u_lights[i].pos.w;
       vec3 lColor = lights.u_lights[i].color.rgb;
       float lIntensity = lights.u_lights[i].color.w;

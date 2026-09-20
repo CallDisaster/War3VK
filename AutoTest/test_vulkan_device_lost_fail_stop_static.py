@@ -79,8 +79,13 @@ class VulkanDeviceLostFailStopStaticTests(unittest.TestCase):
         self.assertIn("D3D9SwapChain.Present.Entry", present)
         self.assertIn("D3D9SwapChain.Present.Exception", present)
         exception_gate = present.index("D3D9SwapChain.Present.Exception")
-        gdi_after_exception = present.index("return PresentImageGDI", exception_gate)
+        gdi_after_exception = present.index(
+            "PresentImageGDI(m_window)", exception_gate)
         self.assertLess(exception_gate, gdi_after_exception)
+        self.assertLess(
+            present.index("return D3DERR_DEVICEREMOVED", exception_gate),
+            gdi_after_exception,
+        )
 
         gdi = function_body(SWAPCHAIN, "D3D9SwapChainEx::PresentImageGDI")
         self.assertLess(

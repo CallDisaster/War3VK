@@ -43,11 +43,17 @@
 
 
 #include "d3d9_war3_shadow.h"
+#include "war3/model/war3_native_light_bridge.h"
 #include "d3d9_war3_ssao.h"
 #include "war3/shadow/war3_shadow_backend_dxvk.h"
+// 2026-09-18 T7 批次 4（U5）：registry domain 的显式类型与 owner-check 判定内核。
+#include "war3/shadow/war3_shadow_geometry_domain.h"
 #include "war3/render/war3_shadow_generation_backed_stream.h"
 #include "war3/render/war3_drawtime_active_ledger.h"
 #include "war3/render/war3_stage11_snapshot_page_policy.h"
+#include "war3/render/war3_stage11_lifetime_page_policy.h"
+#include "war3/tools/war3_stage11_budget_census.h"
+#include "war3/render/war3_index_upload_summary.h"
 #include "war3/gpu_skin/war3_persistent_gpu_package_d3d9_observe_owner.h"
 #include "war3/gpu_skin/war3_persistent_gpu_package_stage11_observe_adapter.h"
 #include <type_traits>
@@ -1827,6 +1833,24 @@ private:
   D3D9Initializer *m_initializer = nullptr;
   D3D9FormatHelper *m_converter = nullptr;
   War3RenderPipeline *m_war3Pipeline = nullptr;
+  struct NativeColorTransaction {
+    Rc<DxvkImageView> original;
+    // C01/C10/C11 remove A/B/both. Together with original C00 these retain
+    // all binary visibility endpoints even across saturating FFP operations.
+    std::array<Rc<DxvkImageView>, 3> alternate;
+    std::array<war3::native_light::Sample, 2> lights = {};
+    std::array<uint64_t, 2> preferred = {};
+    std::array<uint32_t, 2> mask = {};
+    uint64_t worldSerial = 0;
+    uint32_t count = 0, draws = 0, tailDraws = 0;
+    bool active = false, invalid = false, sealed = false, planned = false;
+  } m_nativeColor;
+  bool m_nativeLightSplit = false;
+  void War3PrepareNativeColor();
+  void War3AbortNativeColor(const char* reason);
+  void War3SetNativeColorSplit(bool enabled);
+  void War3PublishNativeColor(War3PipelineInput& input);
+  void War3ResetNativeColor();
   std::unique_ptr<war3::gpu_skin::War3GpuSkinManager>
       m_war3GpuSkinManager;
   std::unique_ptr<war3::gpu_skin::War3GpuSkinCompute>
@@ -2031,6 +2055,7 @@ private:
   // 重放时仍能读取到“当时那一次 draw 的真实数据”， 需要在 capture 时固化本次
   // UploadPerDrawData 的绑定信息。
   struct War3PerDrawUploadInfo {
+    war3::render::IndexUploadSummary ibRangeSummary;
     Rc<DxvkResourceAllocation> storage;
     std::array<DxvkBufferSlice, caps::MaxStreams> vbSlices = {};
     std::array<uint32_t, caps::MaxStreams> vbStrides = {};
@@ -2073,6 +2098,8 @@ private:
     bool ibSourceValid = false;
   };
   War3PerDrawUploadInfo m_war3PerDrawUpload;
+  const bool m_war3UploadRangeEnabled = war3::render::Stage11UploadRangeEnabled();
+  war3::render::IndexUploadBudget m_war3IndexUploadBudget;
   // 上一帧/最近一次“可解析透视投影”的世界相机快照（用于兜底，避免偶发捕获失败导致整帧无阴影）。
   War3WorldCameraState m_war3LastGoodCamera;
   // War3 BeforeUi 插入点需要使用“世界渲染结束时”的 RT/DS。
@@ -2332,6 +2359,12 @@ private:
     uint32_t geometryId = 0;
     uint32_t instances = 0;
     bool instanceable = false;
+    // 显式 domain（形态 (a)）。槽位归属由本字段与 geometryId 共同定义：
+    // lookup / publish / GC 触碰槽位前都要过 DecideShadowGeometryOwner，
+    // 跨 domain 命中一律拒绝（fail-closed）。值语义见
+    // war3/shadow/war3_shadow_geometry_domain.h。
+    dxvk::war3::shadow::ShadowGeometryDomain domain =
+        dxvk::war3::shadow::ShadowGeometryDomain::Generic;
   };
   struct War3ShadowFrozenGeometryCacheEntry {
     War3ShadowCasterDraw drawTemplate = {};
@@ -2356,6 +2389,10 @@ private:
     BlendBufferCreate,
     UvBufferCreate,
     RegistryInsert,
+    // 2026-09-18 T7/U5：目标 key 的 registry 槽位已属于另一个 domain。
+    // publish 必须 fail-closed：不得覆盖对方的槽位，也不得为本次 miss
+    // 分配任何 GPU 资源。
+    DomainConflict,
     Other,
   };
   struct War3ShadowPersistentDiagnosticsFrame {
@@ -2368,6 +2405,9 @@ private:
     uint64_t rejectBlendBufferCreate = 0;
     uint64_t rejectUvBufferCreate = 0;
     uint64_t rejectRegistryInsert = 0;
+    // 2026-09-18 T7/U5：跨 domain publish 拒绝（本桶只覆盖 ShadowCapture 调用方；
+    // helper 层的 domainPublishRejects 覆盖所有调用方）。
+    uint64_t rejectDomainConflict = 0;
     uint64_t rejectOther = 0;
 
     // Creation/GC telemetry covers every caller of the shared persistent
@@ -2386,6 +2426,20 @@ private:
     uint64_t expiryTokensRequeued = 0;
     uint64_t expiryStaleTokens = 0;
     uint64_t expiryAgeEvictions = 0;
+
+    // 2026-09-18 T7/U5 registry domain owner-check 遥测（每 Present 区间）。
+    // 这五项只统计**被拒绝的越权触碰**：正常域内路径不增加任何计数，
+    // 因此"既有准入/发布语义不变"可以由此反证（稳态应为 0）。
+    //   domainLookupRejects     : lookup 命中另一个 domain 的槽位，拒绝命中且不触碰槽位
+    //   domainPublishRejects    : publish 目标槽位属于另一个 domain，拒绝创建
+    //   domainGcEraseRejects    : GC / 预算回收拒绝擦除不属于被淘汰 geometry 的槽位
+    //   domainResetPurgeRejects : domain 作用域 clear 跳过非本 domain 的条目
+    //   domainResetOwnerRejects : 整会话退役前的归属校验发现不一致槽位
+    uint64_t domainLookupRejects = 0;
+    uint64_t domainPublishRejects = 0;
+    uint64_t domainGcEraseRejects = 0;
+    uint64_t domainResetPurgeRejects = 0;
+    uint64_t domainResetOwnerRejects = 0;
 
     // Present-sampled S1 early-cache gauges. logicalReferencedBytes is a
     // conservative sum of the buffer ranges referenced by every entry. It is
@@ -2427,6 +2481,10 @@ private:
     War3ShadowPersistentGeometry geometry = {};
     uint64_t totalBytes = 0;
     uint64_t lastSeenFrame = 0;
+    // 与 registry 槽位同源写入的 domain：GC / 退役擦除槽位时无需再反查 key
+    // 即可做归属校验（槽位 domain/geometryId 与本条目不一致 ⇒ 拒绝擦除）。
+    dxvk::war3::shadow::ShadowGeometryDomain domain =
+        dxvk::war3::shadow::ShadowGeometryDomain::Generic;
   };
   struct War3ShadowPersistentExpiryEntry {
     uint64_t lastSeenFrame = 0;
@@ -2498,6 +2556,10 @@ private:
   // no frame-ring Rc is ever retained across frames and no per-object Vulkan
   // buffer is created.
   struct War3Stage13RetainedCasterEntry {
+    // 显式 domain：本容器只承载 Stage13Exact。域作用域 clear（不可用相机 /
+    // Stage13 tombstone）必须按该字段校验归属，不得顺手清掉别的 domain。
+    dxvk::war3::shadow::ShadowGeometryDomain domain =
+        dxvk::war3::shadow::ShadowGeometryDomain::Stage13Exact;
     War3ShadowCasterDraw draw = {};
     std::vector<unsigned char> positionBytes;
     uint64_t contentHash = 0u;
@@ -2557,6 +2619,11 @@ private:
     Rc<DxvkBuffer> buffer;
     VkDeviceSize capacity = 0u;
     VkDeviceSize used = 0u;
+    // Allocation/retention intent, not geometry validity or a GPU reuse lease.
+    war3::render::War3Stage11PageLifetime lifetime =
+        war3::render::War3Stage11PageLifetime::Unknown;
+    uint64_t mapEpoch = 0u;
+    uint64_t deviceEpoch = 0u;
   };
   enum class War3Stage11SnapshotAllocationResult : uint8_t {
     Success,
@@ -2570,6 +2637,9 @@ private:
   uint64_t m_war3Stage11SnapshotNextPageId = 1u;
   uint64_t m_war3Stage11SnapshotResidentBytes = 0u;
   uint64_t m_war3Stage11SnapshotReclaimedPages = 0u;
+  const bool m_war3Stage11CensusEnabled = war3::stage11_census::Enabled();
+  war3::stage11_census::Schedule m_war3Stage11CensusSchedule;
+  void War3SampleStage11BudgetAtPresent();
   // Phase 7.55 v4：draw-time VB position cache（GPU copy 自有 buffer 版本）。
   // ring buffer 问题：保存 Rc<DxvkBuffer> 引用不够——War3 后续 draw 会覆盖
   // 同一 buffer 的不同 offset，cache 里的引用 read 时拿到的是错乱数据。
@@ -2725,7 +2795,10 @@ private:
     // 已分配的 buffer 容量（bytes），用于复用避免反复 createBuffer。
     VkDeviceSize positionCapacity = 0u;
     VkDeviceSize indexCapacity = 0u;
+    // Last complete capture/reuse, not the last allocation attempt. Failed
+    // attempts must not keep refreshing the dynamic cache GC lifetime.
     uint64_t frameSerial = 0u;
+    uint64_t lastAttemptFrameSerial = 0u;
     // Observe-only cost prediction: ordinal of this full cache key's capture
     // within frameSerial, and the ordinal which the previous exact Stage11
     // submission selected. Neither field authorizes geometry reuse.
@@ -2767,7 +2840,8 @@ private:
     // 上次被消费端（producer/fast-append/consumer）实际复用的帧号。
     // 静态几何 LRU 淘汰时按此排序，保证"最近还在看的桥/斜坡"优先保留。
     uint64_t lastAccessFrameSerial = 0u;
-    // 该 entry 持有的 GPU buffer 总字节（pos + uv + idx），用于字节上限统计。
+    // Logical retained slice capacity, including failed captures, excluding UV
+    // aliases. Not whole-page residency, live geometry size or physical VRAM.
     uint64_t ownedGpuBytes = 0u;
     // Phase 7.70：同帧重复捕获去重指纹。
     // 同一 renderablePart 在一帧里常被多次 draw（sub-mesh、layer pass、补光），
@@ -2988,11 +3062,15 @@ private:
                                         const War3ShadowPersistentUpload& upload,
                                         Rc<DxvkBuffer>& outStorage,
                                         DxvkResourceBufferInfo& outInfo);
+  // 2026-09-18 T7/U5：registry 的三个入口都必须携带显式 domain。
+  // 调用方不得省略 domain 直接触达容器（容器是私有成员，唯一的读写口就是这里）。
   bool War3TryFindShadowPersistentGeometry(
+      dxvk::war3::shadow::ShadowGeometryDomain domain,
       const War3ShadowGeometryRegistryKey& key,
       uint32_t& outGeometryId,
       const War3ShadowPersistentGeometry*& outGeometry);
   bool War3FindOrCreateShadowPersistentGeometry(
+      dxvk::war3::shadow::ShadowGeometryDomain domain,
       const War3ShadowGeometryRegistryKey& key,
       const War3ShadowPersistentGeometry& candidate,
       const std::array<War3ShadowPersistentUpload, 4>& uploads,
@@ -3000,6 +3078,7 @@ private:
       const War3ShadowPersistentGeometry*& outGeometry,
       bool& outCreatedNew);
   bool War3CreateShadowPersistentGeometryAfterMiss(
+      dxvk::war3::shadow::ShadowGeometryDomain domain,
       const War3ShadowGeometryRegistryKey& key,
       const War3ShadowPersistentGeometry& candidate,
       const std::array<War3ShadowPersistentUpload, 4>& uploads,
@@ -3021,6 +3100,7 @@ private:
   void War3GcS1GenerationProofObservations();
   War3Stage11SnapshotAllocationResult War3AllocateStage11Snapshot(
       VkDeviceSize requiredBytes,
+      war3::render::War3Stage11PageLifetime lifetime,
       std::shared_ptr<War3Stage11SnapshotPage>& outPage,
       VkDeviceSize& outOffset, VkDeviceSize& outCapacity);
   void War3CollectUnusedStage11SnapshotPages();

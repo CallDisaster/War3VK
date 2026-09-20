@@ -4,6 +4,10 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 DEVICE_CPP = (ROOT / "src/d3d9/d3d9_device.cpp").read_text(encoding="utf-8")
+# M1 迁移：这个运行时配置 getter（含 env 字面量）已迁到语义模块。
+SEMANTIC_CPP = (
+    ROOT / "src/d3d9/war3/semantic/war3_device_semantic_predicates.cpp"
+).read_text(encoding="utf-8")
 PERF_CPP = (
     ROOT / "src/d3d9/war3/tools/war3_perf_monitor.cpp"
 ).read_text(encoding="utf-8")
@@ -13,7 +17,7 @@ class ShadowAlphaBlendFailClosedStaticTest(unittest.TestCase):
     def test_alpha_blend_rejection_is_default_on_and_independent(self):
         self.assertIn(
             'War3GetEnvU32("DXVK_WAR3_SEMANTIC_REJECT_ALPHA_BLEND_CASTER", 1u)',
-            DEVICE_CPP,
+            SEMANTIC_CPP,
         )
 
     def test_default_policy_does_not_resolve_material_during_preselection(self):

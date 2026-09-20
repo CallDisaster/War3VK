@@ -2,6 +2,7 @@
 
 #extension GL_EXT_nonuniform_qualifier : require
 #extension GL_EXT_scalar_block_layout : require
+#extension GL_GOOGLE_include_directive : enable
 
 // 阴影可见性预计算（当前帧）
 //
@@ -145,18 +146,9 @@ float casterMaskValue(uint cascadeIndex, vec2 uv) {
     vec3(uv, float(cascadeIndex))).r;
 }
 
-bool isTerrainMaskedOccluder(uint cascadeIndex, vec2 uv, float refDepth) {
-  if (ubo.u_viewportZ.z <= 0.5)
-    return false;
-  if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0)
-    return false;
-
-  float blockerDepth = shadowMapDepth(cascadeIndex, uv);
-  float eps = max(ubo.u_viewportZ.w, 0.0);
-  if (refDepth <= blockerDepth + eps)
-    return false;
-  return casterMaskValue(cascadeIndex, uv) > 0.5;
-}
+#define WAR3_SHADOW_COMMON_PART 1
+#include "war3_shadow_common.glsl"
+#undef WAR3_SHADOW_COMMON_PART
 
 const vec2 kPoisson16[16] = vec2[](
   vec2(-0.94201624, -0.39906216),
@@ -177,50 +169,9 @@ const vec2 kPoisson16[16] = vec2[](
   vec2(-0.97484398, -0.75648379)
 );
 
-const vec2 kPoisson25[25] = vec2[](
-  vec2(-0.978698, -0.088412),
-  vec2(-0.826476,  0.623303),
-  vec2(-0.695914, -0.675318),
-  vec2(-0.243678,  0.914799),
-  vec2(-0.073406, -0.879112),
-  vec2( 0.265552, -0.421003),
-  vec2( 0.347605,  0.172336),
-  vec2( 0.850872,  0.325923),
-  vec2( 0.980188, -0.256911),
-  vec2( 0.489165, -0.732877),
-  vec2(-0.382158, -0.159902),
-  vec2(-0.143106,  0.196586),
-  vec2( 0.087301,  0.520475),
-  vec2( 0.179114, -0.156230),
-  vec2( 0.256418,  0.873281),
-  vec2(-0.408780,  0.551319),
-  vec2(-0.782120, -0.272922),
-  vec2(-0.625204,  0.111715),
-  vec2( 0.413259, -0.411552),
-  vec2( 0.912811,  0.002185),
-  vec2( 0.480792,  0.642580),
-  vec2(-0.177945, -0.632366),
-  vec2(-0.701787, -0.511294),
-  vec2( 0.020200, -0.310701),
-  vec2( 0.693711, -0.211191)
-);
-
-vec2 rotateVec2(vec2 v, vec2 rot) {
-  return vec2(v.x * rot.x - v.y * rot.y, v.x * rot.y + v.y * rot.x);
-}
-
-float computeCascadeBiasScale(int cascadeIndex, int cascadeCount, float scaleParam) {
-  float t = (cascadeCount > 1) ? float(cascadeIndex) / float(cascadeCount - 1) : 0.0;
-  // 与 receiver.frag 保持一致：远级联偏置放大收敛，减少脚底阴影被“抬离”。
-  float target = 1.0 + 2.0 * t;
-  float k = clamp(scaleParam, 0.0, 1.0);
-  return mix(1.0, target, k);
-}
-
-float computeCascadePcfRadius(float baseRadiusTexel, int cascadeIndex, int cascadeCount, float scaleParam) {
-  float scale = computeCascadeBiasScale(cascadeIndex, cascadeCount, scaleParam);
-  return baseRadiusTexel / max(scale, 1e-6);
-}
+#define WAR3_SHADOW_COMMON_PART 2
+#include "war3_shadow_common.glsl"
+#undef WAR3_SHADOW_COMMON_PART
 
 bool computeReceiverPlaneDepthGradient(vec4 lightClip, mat4 lightViewProj,
                                        vec3 worldDx, vec3 worldDy,
@@ -479,40 +430,9 @@ vec3 computeViewNormal(vec3 viewPos, vec3 viewDx, vec3 viewDy) {
   return normV;
 }
 
-vec3 computeWorldUpInView() {
-  vec3 worldUpV = (vec4(0.0, 0.0, 1.0, 0.0) * ubo.u_view).xyz;
-  float upLen2 = dot(worldUpV, worldUpV);
-  return (upLen2 > 1e-12)
-      ? (worldUpV * inversesqrt(upLen2))
-      : vec3(0.0, 1.0, 0.0);
-}
-
-float computeWallReceiverFactor(vec3 normV) {
-  float upDot = abs(dot(normV, computeWorldUpInView()));
-  return smoothstep(0.15, 0.75, 1.0 - upDot);
-}
-
-float computeReceiverGrazingFactor(vec3 normV, vec3 viewPos) {
-  float viewLen2 = dot(viewPos, viewPos);
-  if (viewLen2 <= 1e-8)
-    return 0.0;
-
-  vec3 viewDirV = -viewPos * inversesqrt(viewLen2);
-  float facing = abs(dot(normV, viewDirV));
-  return 1.0 - smoothstep(0.25, 0.65, facing);
-}
-
-float computeLightGrazingFactor(vec3 normV, vec3 lightDirV) {
-  float ndotl = abs(dot(normV, lightDirV));
-  return 1.0 - smoothstep(0.25, 0.72, ndotl);
-}
-
-float computeWallStabilityFactor(vec3 normV, vec3 viewPos, vec3 lightDirV) {
-  float wallFactor = computeWallReceiverFactor(normV);
-  float viewFactor = computeReceiverGrazingFactor(normV, viewPos);
-  float lightFactor = computeLightGrazingFactor(normV, lightDirV);
-  return wallFactor * max(viewFactor, lightFactor);
-}
+#define WAR3_SHADOW_COMMON_PART 3
+#include "war3_shadow_common.glsl"
+#undef WAR3_SHADOW_COMMON_PART
 
 float computeWallFilterWeight(float wallFactor, float wallStabilityFactor,
                               float lightGrazingFactor,

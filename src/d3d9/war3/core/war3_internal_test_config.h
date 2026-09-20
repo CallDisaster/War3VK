@@ -1304,6 +1304,8 @@ inline constexpr bool kNativeShadowDisableShadowCaptureWhenMode1 = false;
 // 2026-07-08 实机确认建筑阴影应在 UnitUI buildingShadow 写入点治理；
 // StaticStampPath 默认退役，仅保留给后续专项诊断。
 inline constexpr bool kNativeShadowStaticStampPathHookEnabled = false;
+// P2 批次 0：策略分支已入库，但默认阻断保持 false（用户裁定未下，且 hook 未安装）。
+inline constexpr bool kNativeShadowBlockStaticStampPathByDefault = false;
 
 // mode=1 时是否屏蔽 ShadowPath_StaticStamp_Toggle 的 enable 写入。
 inline constexpr bool kNativeShadowBlockStaticStampPathWhenMode1 = true;
@@ -1547,6 +1549,10 @@ inline constexpr uint32_t kNativeShadowBlockedCallbackRvasCount =
 // 2026-07-08 后默认退役，避免误伤贴花/施工落地纹理；生产主路径改为
 // CUnitUIManager_RecordSetStructureShadow + ListB legacy blob removal。
 inline constexpr bool kNativeShadowRegisterImageHookEnabled = false;
+// P2 批次 0：DecideRegisterImage 默认治理分支已入库，但默认阻断保持 false
+// （用户裁定未下，且 RegisterImage hook 未安装）。
+inline constexpr bool kNativeShadowRegisterBlockStaticStampByDefault = false;
+inline constexpr bool kNativeShadowRegisterBlockShadowTextureKeyByDefault = false;
 
 // mode>=1 时是否拦截 StaticStamp 来源（0x74DB30）注册
 inline constexpr bool kNativeShadowBlockStaticStampRegisterWhenMode1 = true;

@@ -41,6 +41,8 @@ struct NativeD3D9BackendSummary {
   uint64_t canonicalPublishCount = 0;
   uint64_t canonicalPublishRejectNotReadyCount = 0;
   uint64_t canonicalPublishRejectNoPositionsCount = 0;
+  uint64_t canonicalSkippedPathBlockerCount = 0;
+  uint64_t canonicalSkippedPathBlockerGeometryMarkerCount = 0;
   uint64_t geometryRejectCount = 0;
   uint64_t paletteRejectCount = 0;
   uint64_t materialRejectCount = 0;
@@ -99,6 +101,8 @@ private:
   // 改为 atomic 既消除竞争，又不给 reject 快退路径引入锁（relaxed 即可，纯统计）。
   std::atomic<uint64_t> m_canonicalPublishRejectNotReadyCount{0};
   std::atomic<uint64_t> m_canonicalPublishRejectNoPositionsCount{0};
+  uint64_t m_canonicalSkippedPathBlockerCount = 0;
+  uint64_t m_canonicalSkippedPathBlockerGeometryMarkerCount = 0;
 };
 
 } // namespace dxvk::war3::shadow

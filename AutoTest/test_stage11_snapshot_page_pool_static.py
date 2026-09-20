@@ -97,6 +97,35 @@ class Stage11SnapshotPagePoolStaticTest(unittest.TestCase):
         self.assertIn("m_war3Stage11SnapshotPages.erase(it)", collect)
         self.assertNotIn("->used = 0", collect)
 
+    def test_publication_owns_scalar_commit_and_does_not_swallow_gpu_errors(self):
+        allocator = self.body("D3D9DeviceEx::War3AllocateStage11Snapshot(")
+        self.assertIn("War3PublishStage11SnapshotPage(", allocator)
+        self.assertNotIn("m_war3Stage11SnapshotResidentBytes +=", allocator)
+        self.assertNotIn("m_war3Stage11SnapshotNextPageId++", allocator)
+        self.assertLess(allocator.index("createdPage = publication == War3Stage11PagePublication::Success"),
+                        allocator.index("++m_war3DrawTimeVBCacheAllocBudgetThisFrame"))
+        self.assertIn("if (createdPage) {\n        ++m_war3DrawTimeVBCacheAllocBudgetThisFrame", allocator)
+        self.assertIn("publicationFailure = uint64_t(publication)", allocator)
+        self.assertIn("War3Stage11SnapshotAllocationResult::AllocationFailure,\n                    publicationFailure", allocator)
+        self.assertLess(POLICY.index("pages.push_back(std::move(page))"),
+                        POLICY.index("residentBytes += pageBytes"))
+        self.assertIn("catch (const std::bad_alloc&)", POLICY)
+        self.assertNotIn("catch (...)" , POLICY)
+        # Only explicitly typed capacity failures may borrow an existing tail;
+        # arbitrary GPU errors, device loss and allocator bad_alloc propagate.
+        self.assertEqual(allocator.count("catch ("), 1)
+        self.assertIn("catch (const DxvkBufferAllocationError&)", allocator)
+        self.assertIn("if (m_dxvkDevice->getDeviceStatus() != VK_SUCCESS)\n        throw;", allocator)
+
+    def test_failure_evidence_preserves_the_actual_reason_and_budget(self):
+        allocator = self.body("D3D9DeviceEx::War3AllocateStage11Snapshot(")
+        self.assertEqual(allocator.count('"snapshot-alloc/v1"'), 1)
+        for reason in ("InvalidRange", "ResidentCapacity", "PageCreateBudget", "AllocationFailure"):
+            self.assertIn("fail(War3Stage11SnapshotAllocationResult::"+reason, allocator)
+        self.assertIn("m_war3Stage11SnapshotResidentBytes, used", allocator)
+        self.assertIn("publication, m_war3Stage11SnapshotNextPageId", allocator)
+        self.assertIn("const auto session = war3::tools::evidence::ActiveSession()", allocator)
+
     def test_runtime_and_performance_diagnostics_are_wired(self):
         fields = (
             "drawTimeSnapshotPageResidentBytes",

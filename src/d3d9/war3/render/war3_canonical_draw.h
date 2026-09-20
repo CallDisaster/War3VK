@@ -37,6 +37,7 @@ enum class CanonicalPaletteSource : uint8_t {
   PacketRuntimePalette = 1,
   CurrentDrawCapturedPalette = 2,
   SubmitTimeLivePalette = 3,
+  OwnedPartWorldPalette = 4,
 };
 
 enum class CanonicalWorldTransformSource : uint8_t {
@@ -302,6 +303,8 @@ struct CanonicalShadowBuildInputs {
   uint64_t effectiveRuntimeGroupPaletteHash = 0u;
   uint32_t effectiveMaxVertexGroupSlot = 0u;
   bool liveRuntimeGroupPaletteReady = false;
+  skin::Selection selectedPalette = {};
+  bool hasSelectedPalette = false;
   const std::vector<uint8_t>* authoritativeGroupSlots = nullptr;
   bool authoritativeGroupSlotsReady = false;
   const std::vector<float>* packetPositions = nullptr;

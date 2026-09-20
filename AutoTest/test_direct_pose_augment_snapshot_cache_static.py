@@ -61,7 +61,7 @@ assert "m_mutationGeneration.load(std::memory_order_acquire)" in lookup
 builder = body(
     DEVICE,
     "bool War3TryBuildShadowPacketFromCurrentDrawRecord(",
-    "dxvk::war3::render::ObjectKind War3ResolveSemanticPacketObjectKindFast",
+    "bool War3LooksSubmitEligibleForDirectCurrentDrawFast(",
 )
 payload_gate = builder.index("if (needPoseMatrixPayload)")
 cache_gate = builder.index("else if (poseAugmentSnapshotCache != nullptr)")

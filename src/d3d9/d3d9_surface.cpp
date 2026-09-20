@@ -3,6 +3,7 @@
 #include "d3d9_swapchain.h"
 
 #include "d3d9_device.h"
+#include "war3/tools/war3_frame_timeline.h"
 
 #include "../util/util_win32_compat.h"
 
@@ -182,6 +183,8 @@ namespace dxvk {
 
     D3DLOCKED_BOX lockedBox;
 
+    const uint64_t backbufferLockBegin = desc.IsBackBuffer
+      ? war3::timeline::BackbufferLockBegin() : 0;
     HRESULT hr = m_parent->LockImage(
       m_texture,
       m_face, m_mipLevel,
@@ -189,6 +192,10 @@ namespace dxvk {
       pRect != nullptr ? &box : nullptr,
       Flags);
 
+    if (backbufferLockBegin)
+      war3::timeline::BackbufferLockEnd(this,
+        uintptr_t(__builtin_return_address(0)), Flags, pRect != nullptr, hr,
+        backbufferLockBegin);
     if (FAILED(hr)) return hr;
 
     pLockedRect->pBits = lockedBox.pBits;

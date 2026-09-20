@@ -1,6 +1,7 @@
 // war3_render_objects.cpp - 渲染对象追踪模块实现
 
 #include "war3_render_objects.h"
+#include "../tools/war3_data_collection_tree.h"
 #include "../model/war3_model_hook.h"
 #include "../model/war3_model_registry.h"
 #include "war3_render_state.h"
@@ -379,6 +380,7 @@ void RenderObjectRegistry::endFrame() {
 
 void RenderObjectRegistry::registerWorldObject(void *worldObjectEntry,
                                                void *unitPtr, int groupIdx) {
+  WARVK_DATA_SCOPE(InstanceWrite);
   if (!worldObjectEntry)
     return;
 
@@ -404,6 +406,7 @@ void RenderObjectRegistry::registerWorldObject(void *worldObjectEntry,
 void RenderObjectRegistry::registerWorldObjectsBatch(
     const std::vector<RenderObjectBatchItem> &items,
     RenderObjectBatchResolveMode mode) {
+  WARVK_DATA_SCOPE(InstanceWrite);
   if (items.empty())
     return;
 
@@ -544,6 +547,7 @@ void RenderObjectRegistry::registerWorldObjectsBatch(
 
 void RenderObjectRegistry::mapSceneNode(void *worldObjectEntry,
                                          void *sceneNode) {
+  WARVK_DATA_SCOPE(InstanceWrite);
   if (!worldObjectEntry || !sceneNode)
     return;
 
@@ -560,6 +564,7 @@ void RenderObjectRegistry::mapSceneNode(void *worldObjectEntry,
 
 bool RenderObjectRegistry::queryBySceneNode(void *sceneNode,
                                             RenderObjectInfo &out) const {
+  WARVK_DATA_SCOPE(InstanceQuery);
   if (!sceneNode)
     return false;
 
@@ -587,6 +592,7 @@ RenderObjectRegistry::findBySceneNode(void *sceneNode) const {
 
 bool RenderObjectRegistry::queryByEntry(void *worldObjectEntry,
                                         RenderObjectInfo &out) const {
+  WARVK_DATA_SCOPE(InstanceQuery);
   if (!worldObjectEntry)
     return false;
 
@@ -712,6 +718,7 @@ size_t RenderObjectRegistry::getSceneNodeMappingCount() const {
 }
 
 void RenderObjectRegistry::resolveObjectInfo(RenderObjectInfo &info) const {
+  WARVK_DATA_SCOPE(InstanceQuery);
   game::UnitWrapper unit(info.unitPtr);
 
   if (!unit.IsValid())

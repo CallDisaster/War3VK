@@ -11,6 +11,8 @@
 
 namespace war3example {
 void RegisterUserExampleModule();
+bool IsNativeColorSafeCallback(void (*callback)(war3shader::RenderEventID,
+    const war3shader::RenderContext*, void*));
 }
 
 namespace war3module {
@@ -94,6 +96,16 @@ bool HasModules() {
     EnsureBuiltinModulesRegistered();
     std::lock_guard<std::mutex> lock(g_mutex);
     return !g_modules.empty();
+}
+
+bool HasNativeColorWriteModules() {
+    EnsureBuiltinModulesRegistered();
+    std::lock_guard<std::mutex> lock(g_mutex);
+    for (const auto& module : g_modules)
+        if (module.callbacks.onRenderEvent &&
+            !war3example::IsNativeColorSafeCallback(module.callbacks.onRenderEvent))
+            return true;
+    return false;
 }
 
 void InitializeModules() {

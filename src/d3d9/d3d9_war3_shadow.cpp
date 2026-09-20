@@ -17,9 +17,20 @@
 #include "war3/render/war3_shadow_runtime_bridge.h"
 #include "war3/render/war3_union_consumer_visibility.h"
 #include "war3/shader/war3_shader_manager.h"
+// 2026-09-17 上级裁定（Step 1③，D 点）：renderFrame 域与 R/S 点同源（当前渲染帧）。
+#include "war3/state/war3_render_state.h"
 #include "war3/tools/war3_diagnostics_hub.h"
 #include "war3/tools/war3_perf_monitor.h"
+#include "war3/tools/war3_frame_evidence.h"
+// 2026-09-17 上级裁定（Step 1③，C/D 点）：对象级 palette 证据采集支持 + 发射器入口。
+#include "war3/tools/war3_palette_object_capture.h"
+#include "war3/tools/war3_palette_object_evidence_sink.h"
+#include "war3/tools/war3_frame_inputs.h"
 #include "war3_shader_api.h"
+
+// Shadow caster push-constant flag/metadata constants shared with
+// subprojects/war3fx/shaders/war3_shadow_caster_vert.vert.
+#include "../../subprojects/war3fx/shaders/war3_shadow_caster_interface.h"
 
 #include <sstream>
 
@@ -198,23 +209,31 @@ struct ShadowCasterPushConstants {
   Vector4 pointLightPosRange; // xyz=point light position, w=range for linear cube depth
 };
 
-constexpr uint32_t kShadowCasterFlagUseBlend = 0x1u;
-constexpr uint32_t kShadowCasterFlagIndexedBlend = 0x2u;
-constexpr uint32_t kShadowCasterFlagAlphaTest = 0x4u;
-constexpr uint32_t kShadowCasterFlagHashAlpha = 0x8u;
-constexpr uint32_t kShadowCasterFlagStage1Terrain = 0x10u;
-constexpr uint32_t kShadowCasterFlagPointShadowLinearDepth = 0x20u;
-constexpr uint32_t kShadowCasterFlagGpuSkinDirectInput = 0x40u;
-constexpr uint32_t kShadowCasterFlagGpuSkinNoFallback = 0x80u;
-constexpr uint32_t kShadowCasterGpuSkinOutputFormatShift = 8u;
-constexpr uint32_t kShadowCasterGpuSkinLayoutGenerationShift = 12u;
-constexpr uint32_t kShadowCasterGpuSkinUvLayerCountShift = 16u;
-constexpr uint32_t kShadowCasterGpuSkinMetadataMask = 0x000fff00u;
+constexpr uint32_t kShadowCasterFlagUseBlend = WAR3_SHADOW_CASTER_FLAG_USE_BLEND;
+constexpr uint32_t kShadowCasterFlagIndexedBlend = WAR3_SHADOW_CASTER_FLAG_INDEXED_BLEND;
+constexpr uint32_t kShadowCasterFlagAlphaTest = WAR3_SHADOW_CASTER_FLAG_ALPHA_TEST;
+constexpr uint32_t kShadowCasterFlagHashAlpha = WAR3_SHADOW_CASTER_FLAG_HASH_ALPHA;
+constexpr uint32_t kShadowCasterFlagStage1Terrain = WAR3_SHADOW_CASTER_FLAG_STAGE1_TERRAIN;
+constexpr uint32_t kShadowCasterFlagPointShadowLinearDepth = WAR3_SHADOW_CASTER_FLAG_POINT_SHADOW_LINEAR_DEPTH;
+constexpr uint32_t kShadowCasterFlagGpuSkinDirectInput = WAR3_SHADOW_CASTER_FLAG_GPU_SKIN_DIRECT_INPUT;
+constexpr uint32_t kShadowCasterFlagGpuSkinNoFallback = WAR3_SHADOW_CASTER_FLAG_GPU_SKIN_NO_FALLBACK;
+constexpr uint32_t kShadowCasterGpuSkinOutputFormatShift = WAR3_SHADOW_CASTER_GPU_SKIN_OUTPUT_FORMAT_SHIFT;
+constexpr uint32_t kShadowCasterGpuSkinLayoutGenerationShift = WAR3_SHADOW_CASTER_GPU_SKIN_LAYOUT_GENERATION_SHIFT;
+constexpr uint32_t kShadowCasterGpuSkinUvLayerCountShift = WAR3_SHADOW_CASTER_GPU_SKIN_UV_LAYER_COUNT_SHIFT;
+constexpr uint32_t kShadowCasterGpuSkinMetadataMask = WAR3_SHADOW_CASTER_GPU_SKIN_METADATA_MASK;
 constexpr uint8_t kPointShadowCompleteFaceMask = 0x3fu;
 
 static_assert((kShadowCasterFlagGpuSkinDirectInput & 0x3fu) == 0u);
 static_assert((kShadowCasterFlagGpuSkinNoFallback & 0x7fu) == 0u);
 static_assert((kShadowCasterGpuSkinMetadataMask & 0xffu) == 0u);
+// Wire values are fixed by the GPU-skin VS-B1 contract; the shared header
+// is the only definition site for both the CPU packer and the shader.
+static_assert(kShadowCasterFlagGpuSkinDirectInput == 0x40u);
+static_assert(kShadowCasterFlagGpuSkinNoFallback == 0x80u);
+static_assert(kShadowCasterGpuSkinOutputFormatShift == 8u);
+static_assert(kShadowCasterGpuSkinLayoutGenerationShift == 12u);
+static_assert(kShadowCasterGpuSkinUvLayerCountShift == 16u);
+static_assert(kShadowCasterGpuSkinMetadataMask == 0x000fff00u);
 
 constexpr uint32_t PackShadowCasterGpuSkinMetadata(
     uint32_t outputFormat,
@@ -234,6 +253,8 @@ constexpr uint32_t PackShadowCasterGpuSkinMetadata(
 }
 
 static_assert(PackShadowCasterGpuSkinMetadata(2u, 1u, 1u) == 0x00011200u);
+static_assert(PackShadowCasterGpuSkinMetadata(2u, 1u, 1u) ==
+              WAR3_SHADOW_CASTER_GPU_SKIN_FORMAT2_LAYOUT1_UV1);
 
 struct ShadowGpuSkinDirectDecision {
   bool requested = false;
@@ -2337,7 +2358,7 @@ Rc<DxvkSampler> War3ShadowReceiverPass::getFallbackSampler(bool useMip,
 }
 
 const DxvkPipelineLayout *War3ShadowReceiverPass::createPipelineLayout() const {
-  std::array<DxvkDescriptorSetLayoutBinding, 14> bindings = {
+  std::array<DxvkDescriptorSetLayoutBinding, 17> bindings = {
       DxvkDescriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
                                      VK_SHADER_STAGE_FRAGMENT_BIT), // 0: color
       DxvkDescriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
@@ -2377,6 +2398,15 @@ const DxvkPipelineLayout *War3ShadowReceiverPass::createPipelineLayout() const {
       DxvkDescriptorSetLayoutBinding(
           VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
           VK_SHADER_STAGE_FRAGMENT_BIT), // 13: A1 Hi-Z min/max pyramid
+      DxvkDescriptorSetLayoutBinding(
+          VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
+          VK_SHADER_STAGE_FRAGMENT_BIT), // 14: native FFP without A
+      DxvkDescriptorSetLayoutBinding(
+          VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
+          VK_SHADER_STAGE_FRAGMENT_BIT), // 15: native FFP without B
+      DxvkDescriptorSetLayoutBinding(
+          VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
+          VK_SHADER_STAGE_FRAGMENT_BIT), // 16: native FFP without both
   };
   return m_device->createBuiltInPipelineLayout(
       DxvkPipelineLayoutFlag::UsesSamplerHeap, VK_SHADER_STAGE_FRAGMENT_BIT,
@@ -4581,6 +4611,14 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
         query.generations.boundsFrameGeneration = draw.boundsFrameSerial;
         query.generations.cameraFrameGeneration = input.frameSerial;
         query.generations.consumerStateFrameGeneration = input.frameSerial;
+        // Three independent epoch carriers: current pipeline, retained draw,
+        // and pass lifecycle. Equality of frame serials cannot replace this.
+        query.generations.currentMapGeneration = input.mapEpoch;
+        query.generations.candidateMapGeneration = draw.mapEpoch;
+        query.generations.consumerMapGeneration = m_shadowMapEpoch;
+        query.generations.currentDeviceGeneration = input.deviceEpoch;
+        query.generations.candidateDeviceGeneration = draw.deviceEpoch;
+        query.generations.consumerDeviceGeneration = m_shadowDeviceEpoch;
         query.generations.resourceGeneration = m_shadowMapResourceGeneration;
         query.generations.expectedResourceGeneration =
             m_shadowMapResourceGeneration;
@@ -4742,6 +4780,39 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
   uint32_t csmDescriptorDirectBypassCount = 0u;
   uint32_t csmDescriptorDirectClearBindCount = 0u;
   uint32_t csmDescriptorVerifierMismatchCount = 0u;
+
+  uint64_t inputEvidenceBatch = 0;
+  if (war3::tools::evidence::InputsEnabled() && war3::tools::evidence::ActiveSession()) {
+    try {
+      if (!m_inputEvidence) m_inputEvidence = war3::tools::evidence::InputCapture::Create(m_device);
+      if (m_inputEvidence) inputEvidenceBatch = m_inputEvidence->capture(ctx,
+          {uint64_t(reinterpret_cast<uintptr_t>(m_device.ptr())),input.frameSerial,input.mapEpoch,input.deviceEpoch},
+          m_volumeSunRenderPathActive,m_shadowMapRenderSerial,replayDraws,sortedDrawIndices,
+          m_vertexBlendPaletteMapPtr,size_t(paletteDesc.buffer.size),objectBase,
+          m_shadowMatrixSceneKey,m_shadowMatrixUploadSerial,paletteDesc.buffer);
+    } catch (...) { /* diagnostics never replace a rendering outcome */ }
+  }
+
+  // 2026-09-17 上级裁定（Step 1③，D 点，前置）：子门判定是这里的第一条语句；
+  // 关闭时下面整段不执行（不扫级联、不构造键、不查表）。
+  // 只在**第一个可录制的级联**发一次 D 事件，避免同一对象每帧重复计数：
+  // c == 0/1 的对象级剔除恒不生效（consumeTerrainCascade / consumeObjectCascade
+  // 都要求 c >= 2，见上面的 actualVisible 判定），因此第一个有 layer view 的级联
+  // 记录到的 draw 就等于「本帧至少记录了一次该 caster 的绘制命令」；若 0/1 层 view
+  // 都缺失则本帧不发 D（宁可少报，不得把没记录命令的级联当成已绘制）。
+  const bool paletteObjectEvidenceOn =
+      war3::tools::evidence::PaletteObjectEvidenceEnabled();
+  uint32_t paletteObjectDrawnCascade = 4u;
+  if (paletteObjectEvidenceOn) {
+    for (uint32_t paletteObjectCascade = 0u;
+         paletteObjectCascade < cascadeCount && paletteObjectCascade < 4u;
+         ++paletteObjectCascade) {
+      if (m_shadowMapLayerViews[paletteObjectCascade]) {
+        paletteObjectDrawnCascade = paletteObjectCascade;
+        break;
+      }
+    }
+  }
 
   for (uint32_t c = 0; c < cascadeCount; c++) {
     war3::tools::SetGpuFlightBreadcrumb(
@@ -5110,6 +5181,31 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
         }
       }
 
+      static const bool recordActualDraws=war3::tools::evidence::DrawsEnabled();
+      if(recordActualDraws) if(auto token=war3::tools::evidence::ActiveSession()) {
+        namespace ev=war3::tools::evidence;
+        ev::Event event{};event.kind=ev::Kind::DirectionalDraw;
+        event.key={uint64_t(reinterpret_cast<uintptr_t>(m_device.ptr())),input.frameSerial,input.mapEpoch,input.deviceEpoch};
+        event.data={idx,c,uint64_t(prep.pipeline.pipeline),uint64_t(vb0),vb0Off,vb0Size,
+          uint64_t(draw.indexInfo.buffer),draw.indexInfo.offset,draw.indexInfo.size,
+          uint64_t(prep.alphaImageView),uint64_t(draw.shadowExactGeometryKeyHash),draw.rawcode};
+        for(uint32_t row=0;row<4;++row){const float values[]={pc.mvp[row].x,pc.mvp[row].y,pc.mvp[row].z,pc.mvp[row].w};
+          for(uint32_t col=0;col<4;++col)std::memcpy(&event.bits[row*4+col],&values[col],sizeof(float));}
+        event.bits[16]=pc.flags;std::memcpy(&event.bits[17],&pc.alphaRef,sizeof(float));
+        event.bits[18]=pc.samplerIndex;event.bits[19]=pc.paletteOffset;event.bits[20]=pc.blendCount;
+        event.bits[21]=draw.indexed?1:0;event.bits[22]=draw.indexed?draw.indexCount:draw.vertexCount;
+        event.bits[23]=draw.indexed?draw.firstIndex:draw.firstVertex;event.bits[24]=uint32_t(draw.vertexOffset);
+        event.bits[25]=uint32_t(draw.indexType);event.bits[26]=draw.jHandle;event.bits[27]=uint32_t(draw.stage);
+        event.bits[28]=uint32_t(vb0Stride);event.bits[29]=draw.positionOffset;event.bits[30]=draw.uvOffset;
+        event.bits[31]=uint32_t(draw.uvFormat);event.bits[32]=draw.paletteIndex;event.bits[33]=gpuSkinDirect?1:0;
+        event.bits[34]=m_volumeSunRenderPathActive?1:0;
+        event.bits[35]=uint32_t(m_shadowMap->handle());event.bits[36]=uint32_t(uint64_t(m_shadowMap->handle())>>32);
+        event.bits[37]=m_shadowMapResolution;event.bits[38]=uint32_t(m_shadowMapRenderSerial);
+        event.bits[39]=uint32_t(m_shadowMapRenderSerial>>32);
+        event.bits[40]=uint32_t(inputEvidenceBatch);
+        event.bits[41]=uint32_t(inputEvidenceBatch>>32);
+        ev::Record(token,event);
+      }
       if (draw.indexed) {
         const bool ibDirty = boundIb != draw.indexInfo.buffer ||
                              boundIbOffset != draw.indexInfo.offset ||
@@ -5131,6 +5227,59 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
       } else {
         ctx->cmdDraw(draw.vertexCount, 1, draw.firstVertex, 0);
         cascadeTriangles += uint64_t(draw.vertexCount / 3u);
+      }
+
+      // 2026-09-17 上级裁定（Step 1③，D 点）：**绘制命令已记录**。
+      // 语义仅此而已：不是 GPU 执行、不是像素正确性、也不是「阴影已恢复」。
+      // C（剔除）：本采集点**不产生**任何剔除证据；"would-cull"
+      // （boundsPolicy.mayCull / objectBoundsWouldCullCount）只是观察，不得当作实际剔除；
+      // 被真实剔除的 caster 不会走到这里（本帧只在 c==paletteObjectDrawnCascade 记录一次）。
+      if (paletteObjectEvidenceOn && c == paletteObjectDrawnCascade) {
+        const uint64_t paletteObjectSession =
+            war3::tools::evidence::ActiveSession();
+        if (paletteObjectSession != 0u) {
+          const auto paletteObjectKey =
+              war3::tools::evidence::MakePaletteObjectKey(
+                  draw.shadowRenderablePart, draw.shadowRuntimeModelPtr,
+                  draw.jHandle, draw.rawcode, paletteObjectSession,
+                  draw.mapEpoch);
+          // native 帧域只在该 caster 携带 Selection（InputsEnabled() 时由 S 侧写入）时可得，
+          // 否则记 0 + nativeUnknown=true。
+          const auto paletteObjectFrames =
+              war3::tools::evidence::MakePaletteObjectFrames(
+                  uint64_t(
+                      dxvk::war3::state::RenderState::instance().getFrameIndex()),
+                  draw.shadowRecordFrameSerial,
+                  uint64_t(draw.paletteDiagnostics.frameTag),
+                  // 阶段 E：nativeKnown **只读按值携带的原因**（不得由 frameTag 反推：
+                  // packet 回退时 frameTag 是 packet 的 tag，非零 ⇒ 反推会把 packet 的帧谎报成 native 帧已知）。
+                  dxvk::war3::render::palette_object::Verdict(draw.paletteDiagnostics.verdict) ==
+                      dxvk::war3::render::palette_object::NativeFrameVerdict::KnownCurrent,
+                  // 2026-09-18 P0-5（复审修正）：**必须先归一化 0**。
+                  // `draw.shadowRecordFrameSerial` 只有 d3d9_device.cpp:21527 一条生产者路径会写，
+                  // 其余 6+ 条 append 路径（含 draw-time producer）保持默认 **0**；
+                  // 而 0 是记录器**明令禁止**的冒充值（会与「第一次尝试」混淆并错误重置 attemptStage）
+                  // ⇒ 拿不到真实序号时如实传**未知哨兵**，绝不注入伪已知的 0。
+                  draw.shadowRecordFrameSerial == 0u
+                      ? dxvk::war3::tools::evidence::kPaletteObjectUnknownAttempt
+                      : draw.shadowRecordFrameSerial);
+          // 上级 03:58：来源取**该次 draw 实际携带的按值诊断来源**，不得从最近一次 Served 推测；
+          // native override 清空了语义 palette 时必须记 None + flag（本次 draw 未消费语义 palette）。
+          const war3::tools::evidence::PaletteObjectSource paletteObjectDrawSource =
+              war3::tools::evidence::MapPaletteObjectSource(
+                  uint32_t(draw.paletteDiagnostics.source));
+          war3::tools::evidence::PaletteObjectRecorder().NoteDrawn(
+              paletteObjectKey, paletteObjectDrawSource,
+              war3::tools::evidence::PaletteObjectHitKey(
+                  paletteObjectDrawSource, draw.paletteDiagnostics.slot,
+                  draw.paletteDiagnostics.captureSerial,
+                  draw.paletteDiagnostics.publicationTicket),
+              paletteObjectFrames,
+              // 阶段 E：「被 native override 清空」是**独立原因**，与「不是 live native」不是一回事
+              // （packet 回退也不是清空）⇒ 只认 NativeOverrideCleared。
+              // 2026-09-19：前件冗余（overrideCleared 时 Verdict 必为 Unknown），按其含义只保留该标志。
+              draw.paletteDiagnostics.verdict.overrideCleared);
+        }
       }
 
       if (gpuSkinDirect) {
@@ -6298,13 +6447,13 @@ void War3ShadowReceiverPass::beginPointShadowPersistentPrepare(
         PointShadowPersistentBeginRejectReason::WorkerPrepareDisabled);
     return;
   }
-  if (!input.settings) {
+  if (!input.ShadowSettings()) {
     rejectAdmission(PointShadowPersistentBeginRejectReason::MissingSettings);
     return;
   }
-  if (!input.settings->shadows.pointLightsEnabled ||
-      !input.settings->shadows.pointShadowEnabled ||
-      input.settings->shadows.pointShadowMaxLights == 0u) {
+  if (!input.ShadowSettings()->shadows.pointLightsEnabled ||
+      !input.ShadowSettings()->shadows.pointShadowEnabled ||
+      input.ShadowSettings()->shadows.pointShadowMaxLights == 0u) {
     rejectAdmission(PointShadowPersistentBeginRejectReason::PointShadowDisabled);
     return;
   }
@@ -6410,7 +6559,7 @@ void War3ShadowReceiverPass::beginPointShadowPersistentPrepare(
         lightSnapshot.generation,
     };
     auto &payload = request.payload;
-    payload.settings = FreezePointShadowSettings(*input.settings);
+    payload.settings = FreezePointShadowSettings(*input.ShadowSettings());
     payload.hasAnyLight = lightSnapshot.hasAny;
     payload.shadowLightCount = lightSnapshot.shadowCount;
     payload.dynamicPoseSignature =
@@ -6563,7 +6712,7 @@ War3ShadowReceiverPass::tryCollectPointShadowPersistentProposal(
     const std::vector<const War3ShadowCasterDraw *> *replayDraws) {
   using namespace war3::render;
   if (!m_pointShadowPersistentPending || !m_pointShadowPersistentWorker ||
-      !replayDraws || !input.settings)
+      !replayDraws || !input.ShadowSettings())
     return std::nullopt;
   if (m_pointShadowPersistentPendingGeneration.frameSerial !=
           input.frameSerial ||
@@ -6611,7 +6760,7 @@ War3ShadowReceiverPass::tryCollectPointShadowPersistentProposal(
     return rejectAndRecycle();
 
   const War3PointShadowCpuPlanSettings currentSettings =
-      FreezePointShadowSettings(*input.settings);
+      FreezePointShadowSettings(*input.ShadowSettings());
   if (!PointShadowSettingsExact(currentSettings,
                                  m_pointShadowPersistentExpectedSettings) ||
       PointShadowPolicySeal(currentSettings) !=
@@ -6980,6 +7129,26 @@ bool War3ShadowReceiverPass::pointShadowPersistentProposalMatchesCanonical(
   return true;
 }
 
+static std::vector<uint32_t> NativeEmitterReplayIndices(
+    const War3PipelineInput& input,
+    const std::vector<const War3ShadowCasterDraw*>* draws) {
+  std::vector<uint32_t> result;
+  if (!input.nativeLightCount || !draws) return result;
+  for (uint32_t index : input.nativeEmitterFallbackIndices) {
+    if (index >= input.scene.shadowFallbacks.size()) continue;
+    const auto* emitter = &input.scene.shadowFallbacks[index].snapshot;
+    const auto it = std::find(draws->begin(), draws->end(), emitter);
+    if (it != draws->end()) result.push_back(uint32_t(it - draws->begin()));
+  }
+  for (uint32_t index : input.nativeEmitterCasterIndices) {
+    if (index >= input.scene.shadowCasters.size()) continue;
+    const auto* emitter = &input.scene.shadowCasters[index];
+    const auto it = std::find(draws->begin(), draws->end(), emitter);
+    if (it != draws->end()) result.push_back(uint32_t(it - draws->begin()));
+  }
+  return result;
+}
+
 void War3ShadowReceiverPass::beginPointShadowCpuPrepare(
     const War3PipelineInput &input,
     const War3PointLightFrameSnapshot &lightSnapshot,
@@ -6997,16 +7166,16 @@ void War3ShadowReceiverPass::beginPointShadowCpuPrepare(
   // needs synchronous preparation.
   m_pointShadowCpuPlan.lightGeneration = lightSnapshot.generation;
   m_pointShadowCpuPlan.lightFrameSerial = lightSnapshot.frameSerial;
-  if (War3WorkerPrepareEnabled() &&
+  if (!input.nativeLightCount && War3WorkerPrepareEnabled() &&
       PointShadowPersistentMode() != War3PointShadowPersistentMode::Off) {
     beginPointShadowPersistentPrepare(input, lightSnapshot, replayDraws);
     return;
   }
   if (!War3WorkerPrepareEnabled() || !replayDraws || replayDraws->empty())
     return;
-  if (!input.settings || !input.settings->shadows.pointLightsEnabled ||
-      !input.settings->shadows.pointShadowEnabled ||
-      input.settings->shadows.pointShadowMaxLights == 0u ||
+  if (!input.ShadowSettings() || !input.ShadowSettings()->shadows.pointLightsEnabled ||
+      !input.ShadowSettings()->shadows.pointShadowEnabled ||
+      input.ShadowSettings()->shadows.pointShadowMaxLights == 0u ||
       !lightSnapshot.hasAny)
     return;
 
@@ -7019,8 +7188,9 @@ void War3ShadowReceiverPass::beginPointShadowCpuPrepare(
   // 而 preparePointShadowCpuPlan 只读 settings、3 个 shadowStats 字段与
   // palette hash。现改为构造小 POD 并 move 进 lambda，每帧省两次 MB 级深拷贝。
   War3PointShadowCpuPlanInput workerInput;
-  if (input.settings)
-    workerInput.settings = *input.settings;
+  workerInput.nativeEmitterReplayIndices = NativeEmitterReplayIndices(input, replayDraws);
+  if (input.ShadowSettings())
+    workerInput.settings = *input.ShadowSettings();
   workerInput.frameSerial = input.frameSerial;
   workerInput.dynamicPoseSignature = input.scene.shadowStats.dynamicPoseSignature;
   workerInput.dynamicPoseCount = input.scene.shadowStats.dynamicPoseCount;
@@ -7419,6 +7589,9 @@ bool War3ShadowReceiverPass::preparePointShadowCpuPlan(
     m_pointShadowCasterIndicesScratch.reserve(replayDraws.size());
     for (uint32_t drawIdx = 0; drawIdx < replayDraws.size(); ++drawIdx) {
       const auto &draw = *replayDraws[drawIdx];
+      if (light.id == -1 && std::find(input.nativeEmitterReplayIndices.begin(),
+          input.nativeEmitterReplayIndices.end(), drawIdx) != input.nativeEmitterReplayIndices.end())
+        continue;
       if (draw.positionInfo.buffer == VK_NULL_HANDLE ||
           draw.positionInfo.size == 0)
         continue;
@@ -7575,7 +7748,8 @@ bool War3ShadowReceiverPass::preparePointShadowCpuPlan(
 void War3ShadowReceiverPass::renderPointShadow(
     const Rc<DxvkCommandList> &ctx, const War3PipelineInput &input,
     const War3PointLightFrameSnapshot &lightSnapshot,
-    const std::vector<const War3ShadowCasterDraw *> *replayDrawsOverride) {
+    const std::vector<const War3ShadowCasterDraw *> *replayDrawsOverride,
+    const War3RenderSettings* canonicalFallbackSettings) {
   if (!validateShadowProducerCompleteness(input, "point-shadow")) {
     invalidatePointShadowPublishedState();
     return;
@@ -7601,7 +7775,8 @@ void War3ShadowReceiverPass::renderPointShadow(
 
   waitPointShadowCpuPrepare();
   const War3PointShadowPersistentMode persistentMode =
-      PointShadowPersistentMode();
+      (canonicalFallbackSettings || input.nativeLightCount)
+        ? War3PointShadowPersistentMode::Off : PointShadowPersistentMode();
   std::optional<PointShadowPersistentResultPayload> persistentProposal;
   if (persistentMode != War3PointShadowPersistentMode::Off) {
     persistentProposal = tryCollectPointShadowPersistentProposal(
@@ -7620,7 +7795,7 @@ void War3ShadowReceiverPass::renderPointShadow(
     }
   }
   const bool planNamesCurrentSnapshot =
-      m_pointShadowCpuPlan.ready &&
+      !canonicalFallbackSettings && m_pointShadowCpuPlan.ready &&
       m_pointShadowCpuPlan.lightGeneration == lightSnapshot.generation &&
       m_pointShadowCpuPlan.lightFrameSerial == lightSnapshot.frameSerial;
   // Worker_Prepare normally refreshes the plan while CSM records. Point-only
@@ -7631,8 +7806,12 @@ void War3ShadowReceiverPass::renderPointShadow(
     // 同步兜底路径：同样用小 POD 避免 War3PipelineInput 深拷贝（每次仅
     // settings 值拷贝 + palette hash 收集，远小于 scene 深拷贝）。
     War3PointShadowCpuPlanInput syncInput;
-    if (input.settings)
-      syncInput.settings = *input.settings;
+    if (!canonicalFallbackSettings)
+      syncInput.nativeEmitterReplayIndices = NativeEmitterReplayIndices(input, replayDrawsOverride);
+    if (canonicalFallbackSettings)
+      syncInput.settings = *canonicalFallbackSettings;
+    else if (input.ShadowSettings())
+      syncInput.settings = *input.ShadowSettings();
     syncInput.frameSerial = input.frameSerial;
     syncInput.dynamicPoseSignature =
         input.scene.shadowStats.dynamicPoseSignature;
@@ -7764,7 +7943,8 @@ void War3ShadowReceiverPass::renderPointShadow(
 
   War3RenderSettings defaultSettings = {};
   const War3RenderSettings *settings =
-      input.settings ? input.settings.get() : &defaultSettings;
+      canonicalFallbackSettings ? canonicalFallbackSettings :
+      (input.ShadowSettings() ? input.ShadowSettings().get() : &defaultSettings);
   const bool alphaShadowHashed = settings->shadows.alphaShadowHashed;
 
   std::vector<War3ShadowCasterDraw> resolvedReplayStorage;
@@ -8618,7 +8798,9 @@ void War3ShadowReceiverPass::renderPointShadow(
 }
 
 void War3ShadowReceiverPass::drawReceiver(const Rc<DxvkCommandList> &ctx,
-                                          const Rc<DxvkImageView> &dstView) {
+                                          const Rc<DxvkImageView> &dstView,
+                                          const std::array<Rc<DxvkImageView>, 3> &nativeBaselines,
+                                          uint32_t nativeSlot, uint32_t nativeCount) {
   if (!m_colorCopyView || !m_depthCopyView || !m_shadowMapSampleView ||
       !m_shadowUniformBuffer)
     return;
@@ -8686,7 +8868,37 @@ void War3ShadowReceiverPass::drawReceiver(const Rc<DxvkCommandList> &ctx,
         m_device->createBuffer(bufInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
   }
 
-  const LightUniform lightUbo = m_pointLightFrameUniform;
+  LightUniform lightUbo = m_pointLightFrameUniform;
+  lightUbo.pad[0] = nativeBaselines[0] && nativeBaselines[1] && nativeBaselines[2] &&
+      nativeCount > 0 && nativeCount <= 2 && nativeSlot < lightUbo.count &&
+      nativeCount <= lightUbo.count-nativeSlot ? nativeSlot + 1u : 0u;
+  lightUbo.pad[2] = lightUbo.pad[0] ? nativeCount : 0u;
+  // Explicit diagnostic only, consumed exclusively by debug view 6.
+  static const bool pointDistanceDiagnostic = env::getEnvVar("DXVK_WAR3_POINT_SHADOW_DEBUG_DISTANCE") == "1";
+  lightUbo.pad[1] = pointDistanceDiagnostic ? 1u : 0u;
+  if (lightUbo.pad[0]) {
+    for (const auto& nativeBaseline : nativeBaselines) {
+    // beginExternalRendering ends the prior DXVK command list and restores
+    // the image's declared GENERAL layout. Publish its MRT writes for reads;
+    // leave GENERAL intact for the next transaction's DXVK-owned reuse.
+    VkImageMemoryBarrier2 barrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    barrier.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    barrier.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    barrier.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    barrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = nativeBaseline->image()->handle();
+    barrier.subresourceRange = nativeBaseline->imageSubresources();
+    VkDependencyInfo dependency = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    dependency.imageMemoryBarrierCount = 1;
+    dependency.pImageMemoryBarriers = &barrier;
+    ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &dependency);
+    ctx->track(nativeBaseline->image(), DxvkAccess::Read);
+    }
+  }
   static bool s_loggedLightCount = false;
   if (!s_loggedLightCount) {
     s_loggedLightCount = true;
@@ -8809,7 +9021,12 @@ void War3ShadowReceiverPass::drawReceiver(const Rc<DxvkCommandList> &ctx,
   ctx->cmdSetViewport(1, &viewport);
   ctx->cmdSetScissor(1, &scissor);
 
-  std::array<DxvkDescriptorWrite, 14> descriptors = {};
+  std::array<DxvkDescriptorWrite, 17> descriptors = {};
+  for (uint32_t i=0; i<3; ++i) {
+    descriptors[14+i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    descriptors[14+i].descriptor = nativeBaselines[i]
+        ? nativeBaselines[i]->getDescriptor() : m_depthCopyView2D->getDescriptor();
+  }
   descriptors[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
   descriptors[0].descriptor = m_colorCopyView->getDescriptor();
 
@@ -9045,6 +9262,36 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
 
   // Phase 7.2: 每帧重置对账计数器
   reconciliation = {};
+  const auto evidenceSession=war3::tools::evidence::ActiveSession();
+  [[maybe_unused]] auto evidenceSummary=MakeWar3ScopeExit([&,evidenceSession]() noexcept {
+    if (!evidenceSession) return;
+    namespace ev=war3::tools::evidence;
+    const auto& rec=reconciliation;
+    ev::Event state{};state.kind=ev::Kind::ShadowState;
+    state.key={uint64_t(reinterpret_cast<uintptr_t>(m_device.ptr())),
+      input.frameSerial,input.mapEpoch,input.deviceEpoch};
+    state.data={rec.shadowCastersCount,rec.replayDrawsCount,rec.shadowMapPreparedDrawCount,
+      rec.shadowMapDrawnCasters,rec.cascadeCulledCount,rec.shadowHistoryValidBefore,
+      rec.shadowHistoryValidAfter,rec.shadowHistoryAdvancedThisFrame,rec.shadowReceiverSampleSource,
+      rec.shadowTaaMode,rec.shadowMapRenderSerial,rec.shadowHistoryInvalidationMask};
+    state.bits[0]=rec.receiverDrawExecutedThisFrame;state.bits[1]=rec.shadowVisibilityExecutedThisFrame;
+    state.bits[2]=rec.shadowHistoryWriteExecutedThisFrame;state.bits[3]=rec.replayValidationRejectedCount;
+    state.bits[4]=rec.replayValidationLastReason;state.bits[5]=rec.shadowMapCascade0DrawnCount;
+    state.bits[6]=rec.shadowMapCascade1DrawnCount;state.bits[7]=rec.shadowMapCascade2DrawnCount;
+    state.bits[8]=rec.shadowMapCascade3DrawnCount;
+    ev::Record(evidenceSession,state);
+    for(uint32_t cascade=0;cascade<(std::min)(m_csmData.cascadeCount,4u);++cascade){
+      ev::Event csm{};csm.kind=ev::Kind::CsmState;csm.key=state.key;
+      csm.data={cascade,m_csmData.cascadeCount,rec.receiverHasCompleteShadowMap,
+        rec.shadowMapRenderSerial,rec.shadowMapImagePtr,rec.shadowMapSampleViewPtr,
+        rec.shadowCurrentImagePtr,rec.shadowHistoryReadImagePtr,rec.shadowHistoryWriteImagePtr,
+        rec.shadowHistoryReadIndex,rec.shadowHistoryWriteIndex,rec.shadowReceiverSampleSource};
+      const auto& matrix=m_csmData.cascades[cascade].lightViewProj;
+      for(uint32_t row=0;row<4;++row){const float v[]={matrix[row].x,matrix[row].y,matrix[row].z,matrix[row].w};
+        for(uint32_t col=0;col<4;++col)std::memcpy(&csm.bits[row*4+col],&v[col],sizeof(float));}
+      ev::Record(evidenceSession,csm);
+    }
+  });
   reconciliation.shadowMapRenderSerial = m_shadowMapRenderSerial;
   if (input.mapEpoch == 0u || input.deviceEpoch == 0u ||
       input.mapEpoch != m_shadowMapEpoch ||
@@ -9123,10 +9370,10 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
           war3::runtime::War3RuntimeModule::ShadowTaa);
   const War3ShadowTaaMode shadowTaaRequestedMode =
       ResolveShadowTaaRequestedMode(
-          input.settings != nullptr ? &input.settings->shadows : nullptr);
+          input.ShadowSettings() != nullptr ? &input.ShadowSettings()->shadows : nullptr);
   const uint64_t shadowTaaSettingsRevision =
-      input.settings != nullptr
-          ? input.settings->shadows.shadowTaaSettingsRevision
+      input.ShadowSettings() != nullptr
+          ? input.ShadowSettings()->shadows.shadowTaaSettingsRevision
           : 0u;
   if (!m_shadowTaaModeInitialized) {
     m_shadowTaaModeInitialized = true;
@@ -9665,7 +9912,7 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
 
   War3RenderSettings defaultSettings = {};
   const War3RenderSettings *settings =
-      input.settings ? input.settings.get() : &defaultSettings;
+      input.ShadowSettings() ? input.ShadowSettings().get() : &defaultSettings;
   const bool linearShadowFilter =
       settings->shadows.filterMode == War3ShadowFilterMode::Linear;
   if (!linearShadowFilter) {
@@ -10301,11 +10548,12 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
   const bool debugShadow =
       mutableSettings.shadows.debugMode != War3ShadowDebugMode::None;
   bool hasSunShadow =
-      (mutableSettings.shadows.strength > 0.001f) || debugShadow;
+      (mutableSettings.sun.enabled &&
+       mutableSettings.shadows.strength > 0.001f) || debugShadow;
   // 点光总开关关闭时只读 atomic 计数，不构建快照，确保零额外 CPU 影响 CSM。
   m_pointLightsEnabled = settings->shadows.pointLightsEnabled;
   m_hasPointLights =
-      m_pointLightsEnabled && War3LightManager::Instance().HasActiveLights();
+      m_pointLightsEnabled && (input.nativeLightCount != 0 || War3LightManager::Instance().HasActiveLights());
   bool hasPointShadow =
       m_pointLightsEnabled && mutableSettings.shadows.pointShadowEnabled &&
       mutableSettings.shadows.pointShadowMaxLights > 0 && m_hasPointLights;
@@ -10335,7 +10583,8 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
   const bool needOutlinePass =
       outlineEnabled && War3RenderState::HasOutlineHandles();
   const float activeShadowStrengthForGates =
-      shadowsEnabled ? mutableSettings.shadows.strength : 0.0f;
+      shadowsEnabled && mutableSettings.sun.enabled
+          ? mutableSettings.shadows.strength : 0.0f;
   reconciliation.receiverComputedShadowStrengthMilli =
       strengthToMilli(mutableSettings.shadows.strength);
   reconciliation.receiverActiveStrengthMilli =
@@ -10541,23 +10790,26 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
   }
   const Vector4 pointLightCameraPosForFrame = m_pointLightCameraPos;
   War3PointLightFrameSnapshot pointLightSnapshot = {};
-  m_pointLightFrameUniform = {};
-  m_pointRayEligibleLightCount = 0u;
-  if (m_pointLightsEnabled && War3LightManager::Instance().HasActiveLights()) {
+  if (input.nativeLightCount && input.nativeLightBaselines[0]) {
+    pointLightSnapshot = input.nativeLightSnapshot;
+  } else if (m_pointLightsEnabled && War3LightManager::Instance().HasActiveLights()) {
     pointLightSnapshot = War3LightManager::Instance().GetFrameSnapshot(
         input.frameSerial, pointLightCameraPosForFrame);
   }
   // Freeze direct-light ordering and point-shadow ordering to the exact same
   // manager generation for the full pass. Manager writes become visible on the
   // following frame instead of moving a light between cube recording and draw.
-  m_hasPointLights = m_pointLightsEnabled && pointLightSnapshot.hasAny;
-  if (m_hasPointLights) {
+  const auto freezePointUniform = [&](const War3PointLightFrameSnapshot& snapshot) {
+    m_pointLightFrameUniform = {};
+    m_pointRayEligibleLightCount = 0u;
+    m_hasPointLights = m_pointLightsEnabled && snapshot.hasAny;
+    if (!m_hasPointLights) return;
     m_pointLightFrameUniform.count =
-        std::min<uint32_t>(pointLightSnapshot.count, 16u);
+        std::min<uint32_t>(snapshot.count, 16u);
     m_pointRayEligibleLightCount = std::min<uint32_t>(
-        pointLightSnapshot.shadowCount, m_pointLightFrameUniform.count);
+        snapshot.shadowCount, m_pointLightFrameUniform.count);
     for (uint32_t i = 0u; i < m_pointLightFrameUniform.count; ++i) {
-      const War3PointLight &source = pointLightSnapshot.lights[i];
+      const War3PointLight &source = snapshot.lights[i];
       m_pointLightFrameUniform.lights[i].pos = source.position;
       m_pointLightFrameUniform.lights[i].color = source.color;
 
@@ -10572,7 +10824,8 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
           Vector4(source.params.x, viewPosition.x, viewPosition.y,
                   viewPosition.z);
     }
-  }
+  };
+  freezePointUniform(pointLightSnapshot);
   hasPointShadow =
       m_pointLightsEnabled && mutableSettings.shadows.pointShadowEnabled &&
       mutableSettings.shadows.pointShadowMaxLights > 0u && m_hasPointLights;
@@ -10583,7 +10836,8 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
 
   const auto debugModeEnum = mutableSettings.shadows.debugMode;
   const float activeShadowStrength =
-      shadowsEnabled ? mutableSettings.shadows.strength : 0.0f;
+      shadowsEnabled && mutableSettings.sun.enabled
+          ? mutableSettings.shadows.strength : 0.0f;
   const bool debugNeedsDirectionalShadowMap =
       debugModeEnum == War3ShadowDebugMode::ShadowFactor ||
       debugModeEnum == War3ShadowDebugMode::ShadowHistory ||
@@ -11125,6 +11379,57 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
     renderPointShadow(ctx, input, pointLightSnapshot, &replayDraws);
   }
 
+  // The alternate color is never committed with missing, budget-truncated or
+  // stale cube faces. RT0 still contains every native contribution on failure.
+  auto* nativeReceiverOverride = war3::ShaderManager::get().getMaterial(war3shader::RenderStageId::Shadow);
+  bool nativeCommit = input.nativeLightCount && input.nativeLightBaselines[0] &&
+    input.nativeLightBaselines[1] && input.nativeLightBaselines[2];
+  if (nativeCommit) {
+    nativeCommit = semanticReceiverPointLightsAllowed && needReceiverPass &&
+      !(nativeReceiverOverride && nativeReceiverOverride->isCompiled()) &&
+      input.lighting && !input.lighting->nativeColorExternalWriteHazard &&
+      pointShadowPublishedStateMatchesCurrentPlan() &&
+      m_pointShadowPublishedFrameSerial == input.frameSerial &&
+      m_pointShadowPublishedLightGeneration == pointLightSnapshot.generation &&
+      m_pointShadowPublishedLightCount == pointLightSnapshot.shadowCount &&
+      m_pointShadowReadyCount >= pointLightSnapshot.shadowCount;
+    for (uint32_t i=0; i<pointLightSnapshot.shadowCount && i<kMaxPointShadowLights; ++i)
+      nativeCommit = nativeCommit && m_pointShadowReady[i] &&
+        m_pointShadowFaceValidMask[i] == 0x3fu;
+    for (auto dropped : m_pointShadowCpuPlan.faceDroppedCount)
+      nativeCommit = nativeCommit && dropped == 0;
+    static const bool forceNativeFallback =
+      env::getEnvVar("DXVK_WAR3_NATIVE_MODEL_LIGHT_FORCE_FALLBACK") == "1";
+    nativeCommit = nativeCommit && !forceNativeFallback;
+    if (!nativeCommit) {
+      if (input.frameSerial % 120 == 1)
+        Logger::info(str::format("NativeModelLights receiver fallback frame=", input.frameSerial,
+          " requested=", pointLightSnapshot.shadowCount, " ready=", m_pointShadowReadyCount,
+          " published=", m_pointShadowPublishedFrameSerial));
+      // Restore the exact frozen author channel, not a fresh manager query.
+      // One bounded canonical shadow attempt uses original author settings and
+      // the same replay references; no deep scene copy or automatic-light leak.
+      War3PointLightFrameSnapshot author;
+      author.frameSerial = input.frameSerial;
+      author.generation = input.nativeLightAuthorGeneration;
+      author.shadowCount = pointLightSnapshot.shadowCount - input.nativeLightCount;
+      for (uint32_t i=0; i<pointLightSnapshot.count; ++i)
+        if (pointLightSnapshot.lights[i].id > 0)
+          author.lights[author.count++] = pointLightSnapshot.lights[i];
+      author.hasAny = author.count != 0;
+      m_pointLightsEnabled = input.settings && input.settings->shadows.pointLightsEnabled;
+      freezePointUniform(author);
+      hasPointShadow = input.settings && input.settings->shadows.pointShadowEnabled &&
+        author.shadowCount != 0;
+      m_pointShadowEnabled = hasPointShadow;
+      if (hasPointShadow)
+        renderPointShadow(ctx, input, author, &replayDraws, input.settings.get());
+      else
+        invalidatePointShadowPublishedState();
+      pointLightSnapshot = author;
+    }
+  }
+
   VkExtent3D extent = input.colorView->mipLevelExtent(0u);
   VkExtent3D depthExtent = input.depthView->mipLevelExtent(0u);
   const bool needCopyColor = needReceiverPass;
@@ -11143,6 +11448,8 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
         war3::tools::GpuFlightBreadcrumb::ShadowCopy);
     auto perfScope = war3::War3PerfMonitor::instance().scope("ShadowCopy", ctx);
     if (needCopyColor) {
+      // Preserve the actual native material lighting. The private alternate is
+      // only an exact counterfactual for shadowing one isolated contribution.
       copyColor(ctx, input.colorView);
     }
     if (needCopyDepth) {
@@ -11851,7 +12158,18 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
           war3::War3PerfMonitor::instance().scope("ShadowReceiver", ctx);
       const uint32_t receiverDrawBefore =
           reconciliation.receiverDrawExecutedThisFrame;
-      drawReceiver(ctx, input.colorView);
+      uint32_t nativeSlot = UINT32_MAX;
+      if (nativeCommit)
+        for (uint32_t i=0; i<pointLightSnapshot.count; ++i)
+          if (pointLightSnapshot.lights[i].id == -1) nativeSlot = i;
+      drawReceiver(ctx, input.colorView,
+        nativeCommit ? input.nativeLightBaselines : std::array<Rc<DxvkImageView>,3>(),
+        nativeSlot, nativeCommit ? input.nativeLightCount : 0u);
+      if (nativeCommit && reconciliation.receiverDrawExecutedThisFrame != 0u &&
+          input.frameSerial % 120 == 1)
+        Logger::info(str::format("NativeModelLights receiver committed frame=", input.frameSerial,
+          " automatic=", input.nativeLightCount, " cubeLights=", pointLightSnapshot.shadowCount,
+          " cubeFaces=", pointLightSnapshot.shadowCount * 6u));
       if (receiverDrawBefore == 0u &&
           reconciliation.receiverDrawExecutedThisFrame != 0u &&
           reconciliation.shadowTaaMode >= 2u) {

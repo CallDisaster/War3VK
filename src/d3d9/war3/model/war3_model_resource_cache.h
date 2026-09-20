@@ -170,6 +170,22 @@ inline bool SameShadowGeosetImmutableConsumerPayload(
 using ShadowGeosetResourceSnapshot =
     std::shared_ptr<const ShadowGeosetResourceRecord>;
 
+// Identity-only projection; unlike ShadowReadyGeosetBinding this does not grant
+// geometry readiness. Own only scalar values, not vertex/index storage or leases.
+struct ShadowGeosetIdentityView {
+  void* geosetPtr = nullptr;
+  void* geosetDataPtr = nullptr;
+  void* modelResourcePtr = nullptr;
+  uint64_t modelKey = 0;
+  uint32_t geosetIndex = kInvalidShadowGeosetIndex;
+};
+
+inline ShadowGeosetIdentityView ProjectGeosetIdentity(
+    const ShadowGeosetResourceRecord& record) noexcept {
+  return {record.geosetPtr, record.geosetDataPtr, record.modelResourcePtr,
+          record.modelKey, record.geosetIndex};
+}
+
 // 面向已持有完整不可变记录的热路径消费者，提供一个只在锁内读取的小型新鲜度证明。
 // 这样无需为了证明缓存仍指向同一份内容而复制所有顶点/索引 vector。
 struct ShadowGeosetResourceStamp {
@@ -289,6 +305,8 @@ public:
   bool findGeosetByPtr(void *geosetPtr, ShadowGeosetResourceRecord &out) const;
   bool findGeosetByData(void *geosetDataPtr,
                         ShadowGeosetResourceRecord &out) const;
+  bool findGeosetIdentityByData(void* geosetDataPtr,
+                              ShadowGeosetIdentityView& out) const;
   bool findReadyGeosetBindingByPtr(
       void* geosetPtr, ShadowReadyGeosetBinding& out) const;
   bool findReadyGeosetBindingByData(

@@ -10,7 +10,7 @@ source = DEVICE.read_text(encoding="utf-8")
 builder = source.split(
     "bool War3TryBuildShadowPacketFromCurrentDrawRecord", 1
 )[1].split(
-    "dxvk::war3::render::ObjectKind War3ResolveSemanticPacketObjectKindFast", 1
+    "bool War3LooksSubmitEligibleForDirectCurrentDrawFast(", 1
 )[0]
 
 palette_install = builder.index("out.hasRuntimeGroupPalette = true;")

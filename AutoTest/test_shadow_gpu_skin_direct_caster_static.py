@@ -30,10 +30,15 @@ class ShadowGpuSkinDirectCasterTests(unittest.TestCase):
         self.assertIn("draw.gpuSkinInput.palette.getSliceInfo()", self.shadow_cpp)
 
     def test_irreversible_direct_route_skins_before_light_projection(self) -> None:
-        direct = self.caster.index("if ((p_flags & 0x40u) != 0u)")
+        direct = self.caster.index(
+            "if ((p_flags & WAR3_SHADOW_CASTER_FLAG_GPU_SKIN_DIRECT_INPUT) != 0u)"
+        )
         end = self.caster.index("// 非混合模式", direct)
         block = self.caster[direct:end]
-        self.assertIn("(p_flags & 0x80u) != 0u", block)
+        self.assertIn(
+            "(p_flags & WAR3_SHADOW_CASTER_FLAG_GPU_SKIN_NO_FALLBACK) != 0u",
+            block,
+        )
         self.assertIn("tryLoadGpuSkinDirectVertex(position, uv)", block)
         self.assertLess(
             block.index("tryLoadGpuSkinDirectVertex(position, uv)"),
@@ -46,8 +51,8 @@ class ShadowGpuSkinDirectCasterTests(unittest.TestCase):
         end = self.caster.index("void main()", load)
         block = self.caster[load:end]
         for token in (
-            "gpuSkinMetadataMask = 0x000fff00u",
-            "gpuSkinFormat2Layout1Uv1 = 0x00011200u",
+            "p_flags & WAR3_SHADOW_CASTER_GPU_SKIN_METADATA_MASK",
+            "WAR3_SHADOW_CASTER_GPU_SKIN_FORMAT2_LAYOUT1_UV1",
             "uint(gl_VertexIndex) >= p_pad1",
             "groupSlot >= p_blendCount",
             "uint groupSlotBase = normalBase + vertexCount * 12u",

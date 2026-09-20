@@ -5,6 +5,7 @@
 #include "../util/util_bit.h"
 
 #include "dxvk_device.h"
+#include "dxvk_buffer_allocation_guard.h"
 #include "dxvk_memory.h"
 #include "dxvk_sparse.h"
 
@@ -966,11 +967,17 @@ namespace dxvk {
 
     if (vr != VK_SUCCESS) {
       m_device->notifyDeviceErrorFromDriverResult(vr);
+      if (vr == VK_ERROR_OUT_OF_HOST_MEMORY || vr == VK_ERROR_OUT_OF_DEVICE_MEMORY)
+        throw DxvkBufferAllocationError(str::format("Failed to create buffer: ", vr));
       throw DxvkError(str::format("Failed to create buffer: ", vr,
         "\n  size:    ", createInfo.size,
         "\n  usage:   ", std::hex, createInfo.usage,
         "\n  flags:   ", createInfo.flags));
     }
+
+    DxvkUnboundBufferGuard unboundBuffer([&] {
+      vk->vkDestroyBuffer(vk->device(), buffer, nullptr);
+    });
 
     if (!(createInfo.flags & VK_BUFFER_CREATE_SPARSE_BINDING_BIT)) {
       VkBufferMemoryRequirementsInfo2 requirementInfo = { VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2 };
@@ -1019,7 +1026,6 @@ namespace dxvk {
     }
 
     if (!allocation) {
-      vk->vkDestroyBuffer(vk->device(), buffer, nullptr);
       return nullptr;
     }
 
@@ -1029,6 +1035,7 @@ namespace dxvk {
     allocation->m_buffer = buffer;
     allocation->m_bufferOffset = 0u;
     allocation->m_bufferAddress = 0u;
+    unboundBuffer.release(); // allocation's Rc now owns destruction on failure
 
     // Bind memory if the buffer is not sparse
     if (allocation->m_memory) {
@@ -1037,6 +1044,8 @@ namespace dxvk {
 
       if (vr != VK_SUCCESS) {
         m_device->notifyDeviceErrorFromDriverResult(vr);
+        if (vr == VK_ERROR_OUT_OF_HOST_MEMORY || vr == VK_ERROR_OUT_OF_DEVICE_MEMORY)
+          throw DxvkBufferAllocationError(str::format("Failed to bind buffer memory: ", vr));
         throw DxvkError(str::format("Failed to bind buffer memory: ", vr,
           "\n  size:    ", createInfo.size,
           "\n  usage:   ", std::hex, createInfo.usage,
@@ -1336,10 +1345,23 @@ namespace dxvk {
     DxvkDeviceMemory result = { };
     result.size = size;
 
-    if (vk->vkAllocateMemory(vk->device(), &memoryInfo, nullptr, &result.memory)) {
+    const auto tryAllocate = [&] {
+      const VkResult status = vk->vkAllocateMemory(
+          vk->device(), &memoryInfo, nullptr, &result.memory);
+      if (status == VK_SUCCESS)
+        return true;
+      m_device->notifyDeviceErrorFromDriverResult(status);
+      // Only capacity failures can enter heap cleanup / memory-type fallback.
+      // Do not erase an unknown/terminal driver error by returning nullptr.
+      if (status != VK_ERROR_OUT_OF_HOST_MEMORY &&
+          status != VK_ERROR_OUT_OF_DEVICE_MEMORY)
+        throw DxvkError(str::format("Failed to allocate device memory: ", status));
+      return false;
+    };
+    if (!tryAllocate()) {
       freeEmptyChunksInHeap(*type.heap, VkDeviceSize(-1), high_resolution_clock::time_point());
 
-      if (vk->vkAllocateMemory(vk->device(), &memoryInfo, nullptr, &result.memory))
+      if (!tryAllocate())
         return DxvkDeviceMemory();
     }
 
@@ -1382,6 +1404,15 @@ namespace dxvk {
       }
 
       if (!result.buffer) {
+        if (status != VK_SUCCESS) {
+          m_device->notifyDeviceErrorFromDriverResult(status);
+          if (status != VK_ERROR_OUT_OF_HOST_MEMORY &&
+              status != VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+            // Not yet published or charged to type.stats; no GPU consumer.
+            vk->vkFreeMemory(vk->device(), result.memory, nullptr);
+            throw DxvkError(str::format("Failed to create global buffer: ", status));
+          }
+        }
         Logger::warn(str::format("Failed to create global buffer:",
           "\n  size:  ", std::dec, size,
           "\n  usage: ", std::hex, type.bufferUsage,

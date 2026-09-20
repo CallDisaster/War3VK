@@ -95,6 +95,13 @@ bool RegisterUserExampleModuleInternal() {
 
 namespace war3example {
 
+bool IsNativeColorSafeCallback(void (*callback)(war3shader::RenderEventID,
+    const war3shader::RenderContext*, void*)) {
+    // OnRenderEvent changes post-process parameters only, never scene color.
+    // Exact function identity, not the publicly chosen module name.
+    return callback == &OnRenderEvent;
+}
+
 void RegisterUserExampleModule() {
     static bool s_registered = false;
     if (s_registered)

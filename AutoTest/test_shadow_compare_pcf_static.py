@@ -22,6 +22,9 @@ RECEIVER = (
 VISIBILITY = (
     ROOT / "subprojects/war3fx/shaders/war3_shadow_visibility.frag"
 ).read_text(encoding="utf-8")
+COMMON = (
+    ROOT / "subprojects/war3fx/shaders/war3_shadow_common.glsl"
+).read_text(encoding="utf-8")
 MOTION = (
     ROOT / "subprojects/war3fx/shaders/war3_motion_vector.frag"
 ).read_text(encoding="utf-8")
@@ -145,10 +148,11 @@ class ShadowComparePcfStaticTests(unittest.TestCase):
 
     def test_default_poisson16_is_exactly_paired_and_zero_centroid(self):
         arrays = []
+        self.assertIn("const vec2 kPoisson25", COMMON)
         for source in (RECEIVER, VISIBILITY):
             block = source[
                 source.index("const vec2 kPoisson16") :
-                source.index("const vec2 kPoisson25")
+                source.index("#define WAR3_SHADOW_COMMON_PART 2")
             ]
             points = [
                 (float(x), float(y))

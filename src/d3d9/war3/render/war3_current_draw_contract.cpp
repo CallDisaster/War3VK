@@ -1,4 +1,5 @@
 #include "war3_current_draw_contract.h"
+#include "../tools/war3_data_collection_tree.h"
 #include "war3_classified_counter.h"
 #include "war3_current_draw_group_slot_summary.h"
 #include "war3_current_draw_palette_hash.h"
@@ -1326,9 +1327,14 @@ bool DecodeCapturedPaletteForRecord(const CurrentDrawContractRecord& record,
                                     std::vector<Matrix4>& outPalette,
                                     uint32_t& outGroupCount,
                                     bool countAttempt,
-                                    uint64_t* outPaletteHash) {
+                                    uint64_t* outPaletteHash,
+                                    PaletteProvenance* outProvenance = nullptr,
+                                    skin::Selection* outSelection = nullptr) {
+  WARVK_DATA_SCOPE(PaletteDecode);
   outPalette.clear();
   outGroupCount = 0u;
+  if(outProvenance)*outProvenance=PaletteProvenance::Unknown;
+  if(outSelection)*outSelection={};
   if (outPaletteHash != nullptr)
     *outPaletteHash = 0u;
   if (countAttempt)
@@ -1371,12 +1377,27 @@ bool DecodeCapturedPaletteForRecord(const CurrentDrawContractRecord& record,
 
   const PaletteSnapshotEntry* snapshot =
       FindLocalPaletteSnapshot(record.renderablePart);
+  const auto publishSelected = [&](const PaletteSnapshotEntry& selected) {
+    if(outProvenance)*outProvenance=selected.paletteProvenance;
+    if(outSelection){
+      outSelection->source=selected.paletteProvenance==PaletteProvenance::TrustedBlendedWriter
+          ?skin::Source::CapturedWriter:selected.paletteProvenance==PaletteProvenance::RawGlobalArena
+          ?skin::Source::CapturedRawArena:skin::Source::Unknown;
+      outSelection->space=skin::Space::World;outSelection->domain=skin::Domain::VertexGroups;
+      outSelection->part=reinterpret_cast<uintptr_t>(record.renderablePart);
+      outSelection->meshPayload=reinterpret_cast<uintptr_t>(record.meshPayloadPtr);
+      outSelection->captureSerial=selected.captureSerial;outSelection->actualGroupCount=selected.matrixCount;
+      outSelection->frameTag=selected.frameTag;outSelection->slot=record.paletteSlotIndex;
+      outSelection->hash=outPaletteHash?*outPaletteHash:0;
+    }
+  };
   if (snapshot != nullptr &&
       snapshot->captureSerial == record.captureSerial &&
       snapshot->matrixCount == record.capturedPaletteCount &&
       (record.frameTag == 0u || snapshot->frameTag == 0u ||
        snapshot->frameTag == record.frameTag)) {
     decodePaletteBytes(snapshot->bytes.data());
+    publishSelected(*snapshot);
     outGroupCount = record.capturedPaletteCount;
     g_lastMissReason.store(uint32_t(CurrentDrawMissReason::None),
                            std::memory_order_relaxed);
@@ -1394,6 +1415,7 @@ bool DecodeCapturedPaletteForRecord(const CurrentDrawContractRecord& record,
           (record.frameTag == 0u || globalSnapshot.frameTag == 0u ||
            globalSnapshot.frameTag == record.frameTag)) {
         decodePaletteBytes(globalSnapshot.bytes.data());
+        publishSelected(globalSnapshot);
         outGroupCount = record.capturedPaletteCount;
         g_lastMissReason.store(uint32_t(CurrentDrawMissReason::None),
                                std::memory_order_relaxed);
@@ -1418,6 +1440,7 @@ bool DecodeCapturedPaletteForRecord(const CurrentDrawContractRecord& record,
               (record.frameTag == 0u || attrSnapshot.frameTag == 0u ||
                attrSnapshot.frameTag == record.frameTag)) {
             decodePaletteBytes(attrSnapshot.bytes.data());
+            publishSelected(attrSnapshot);
             outGroupCount = record.capturedPaletteCount;
             g_paletteAttributionSnapshotHitCount.fetch_add(
                 1u, std::memory_order_relaxed);
@@ -1949,6 +1972,7 @@ void NoteCurrentDrawPreparedSliceProbe(bool contextReady,
 
 void PublishCurrentDrawPreparedSlice(
     const CurrentDrawPreparedSliceRecord& record) {
+  WARVK_DATA_SCOPE(CurrentDrawPublish);
   if (!record.known || record.renderablePart == nullptr ||
       record.preparedCount == 0u || record.primitiveType == 0u) {
     return;
@@ -2007,6 +2031,7 @@ bool IsCurrentDrawPreparedSliceInterested(void* renderablePart,
 bool QueryCurrentDrawPreparedSlice(void* renderablePart,
                                    uint32_t layerIndex,
                                    CurrentDrawPreparedSliceRecord& out) {
+  WARVK_DATA_SCOPE(CurrentDrawQuery);
   out = {};
   g_preparedSliceQueryAttemptCount.fetch_add(1u, std::memory_order_relaxed);
   if (renderablePart == nullptr) {
@@ -2063,6 +2088,7 @@ bool QueryCurrentDrawPreparedSlice(void* renderablePart,
 
 void PublishCurrentDrawContract(const CurrentDrawContractRecord& record,
                                 uint32_t breakdownSampleWeight) {
+  WARVK_DATA_SCOPE(CurrentDrawPublish);
   const ShadowProducerPolicyContext producerContext = {
       record.stage,
       record.batchTag,
@@ -2829,6 +2855,7 @@ bool InstallCurrentDrawContractHook(uintptr_t gameBase, bool logEnabled) {
 
 bool QueryCurrentDrawContract(void* renderablePart,
                               CurrentDrawContractRecord& out) {
+  WARVK_DATA_SCOPE(CurrentDrawQuery);
   out = {};
   g_queryAttemptCount.fetch_add(1u, std::memory_order_relaxed);
 
@@ -2871,6 +2898,7 @@ bool QueryCurrentDrawGeometryContract(
     uint32_t jHandle,
     uint32_t expectedRenderFrameIndex,
     CurrentDrawContractRecord& out) {
+  WARVK_DATA_SCOPE(CurrentDrawQuery);
   out = {};
   if (renderablePart == nullptr)
     return false;
@@ -2917,6 +2945,7 @@ bool QueryCurrentDrawContractCapturedPalette(
     std::vector<Matrix4>& outPalette,
     uint32_t& outGroupCount,
     uint64_t* outPaletteHash) {
+  WARVK_DATA_SCOPE(CurrentDrawQuery);
   outPalette.clear();
   outGroupCount = 0u;
   if (outPaletteHash != nullptr)
@@ -2950,6 +2979,7 @@ bool DecodeCurrentDrawGroupSlots(const CurrentDrawContractRecord& record,
                                  const CurrentDrawImmutableGroupSlotHint*
                                      immutableHint,
                                  bool* outBorrowedImmutableHint) {
+  WARVK_DATA_SCOPE(PaletteDecode);
   outGroupSlots.clear();
   if (outBorrowedImmutableHint != nullptr)
     *outBorrowedImmutableHint = false;
@@ -3681,16 +3711,13 @@ CurrentDrawResolveStatus ResolveCurrentDrawAuthoritativeSample(
     return out.status;
   }
 
-  QueryCurrentDrawContractCapturedPalette(renderablePart, out.palette,
-                                          out.paletteCount, &out.paletteHash);
+  DecodeCapturedPaletteForRecord(out.contract,out.palette,out.paletteCount,true,
+      &out.paletteHash,&out.paletteProvenance,&out.paletteSelection);
   if (out.paletteCount != 0u && out.palette.size() >= out.paletteCount) {
     if (out.palette.size() > out.paletteCount)
       out.palette.resize(out.paletteCount);
-    // Phase 1：从 thread-local snapshot 读取 provenance。
-    const PaletteSnapshotEntry* snapshot =
-        FindLocalPaletteSnapshot(renderablePart);
-    if (snapshot != nullptr)
-      out.paletteProvenance = snapshot->paletteProvenance;
+    // Provenance comes from the exact decoded snapshot (local/global/attribution),
+    // never a second by-part lookup that might name a different snapshot.
   }
 
   if (!out.paletteReady()) {
@@ -3738,7 +3765,7 @@ CurrentDrawResolveStatus ResolveCurrentDrawAuthoritativeSampleFromRecord(
   if (trace != nullptr)
     trace->note(CurrentDrawResolveTracePhase::PaletteDecode);
   DecodeCapturedPaletteForRecord(out.contract, out.palette, out.paletteCount,
-                                 true, &out.paletteHash);
+                                 true, &out.paletteHash,&out.paletteProvenance,&out.paletteSelection);
   if (out.paletteCount != 0u && out.palette.size() >= out.paletteCount) {
     if (out.palette.size() > out.paletteCount)
       out.palette.resize(out.paletteCount);

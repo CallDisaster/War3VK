@@ -49,14 +49,19 @@ class War3VolumetricFroxelStaticTests(unittest.TestCase):
             ROOT / "WarVK/jass/warvk_constant.j"
         ).read_text(encoding="utf-8")
 
-    def test_enabled_feature_defaults_to_froxel_high_and_logs_actual_backend(self):
+    def test_enabled_feature_defaults_high_and_separates_requested_from_actual(self):
         self.assertIn("LegacyRayMarch = 0u", self.settings)
         self.assertRegex(
             self.settings,
             r"quality\s*=\s*War3VolumetricQuality::FroxelHigh",
         )
         self.assertIn("war3_volumetric_light", self.cpp)
-        self.assertIn("DXVK War3Volumetric: active backend=%u (%s)", self.cpp)
+        self.assertIn("DXVK War3Volumetric: requested backend=%u (%s)", self.cpp)
+        self.assertIn("outEffectiveBackend = static_cast<int32_t>(settings.quality)", self.cpp)
+        self.assertIn("outEffectiveBackend = 0;", self.cpp)
+        run = self.cpp[self.cpp.index("void War3VolumetricLightPass::Run("):]
+        self.assertLess(run.index("compositeVolumetricLight(ctx, input, compositeScissor)"),
+                        run.index("execution.compositeSubmitted = true"))
 
     def test_quality_tiers_and_4k_cell_budget_are_bounded(self):
         self.assertIn("kVolumetricFroxelCellBudget = 4'500'000ull", self.cpp)

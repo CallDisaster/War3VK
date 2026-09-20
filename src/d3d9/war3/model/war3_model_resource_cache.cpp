@@ -1,4 +1,5 @@
 ﻿#include "war3_model_resource_cache.h"
+#include "../tools/war3_data_collection_tree.h"
 
 #include "../../d3d9_war3_debug.h"
 #include "../core/war3_game_structs.h"
@@ -442,6 +443,7 @@ uint64_t ComputeGeosetContentHash(const ShadowGeosetResourceRecord &record) {
 }
 
 bool CaptureGeosetRecord(void *geosetPtr, ShadowGeosetResourceRecord &record) {
+  WARVK_DATA_SCOPE(GeosetCapture);
   record = {};
   if (geosetPtr == nullptr)
     return false;
@@ -609,6 +611,7 @@ bool CaptureGeosetRecord(void *geosetPtr, ShadowGeosetResourceRecord &record) {
 
 bool CaptureGeosetHeaderRecord(void *geosetPtr,
                                ShadowGeosetResourceRecord &record) {
+  WARVK_DATA_SCOPE(GeosetCapture);
   record = {};
   if (geosetPtr == nullptr)
     return false;
@@ -1048,6 +1051,7 @@ ShadowGeosetResourceRecord
 ShadowModelResourceCache::materializeGeosetDataRecordLocked(
     void* geosetDataPtr,
     const ShadowGeosetResourceSnapshot& snapshot) const {
+  WARVK_DATA_SCOPE(GeosetMaterialize);
   ShadowGeosetResourceRecord result =
       snapshot != nullptr ? *snapshot : ShadowGeosetResourceRecord{};
   const auto metadata = m_geosetDataObservation.find(geosetDataPtr);
@@ -1071,6 +1075,7 @@ ShadowModelResourceCache::materializeGeosetDataRecordLocked(
 ShadowGeosetResourceRecord
 ShadowModelResourceCache::materializeGeosetAliasRecordLocked(
     const ShadowGeosetResourceRecord& alias) const {
+  WARVK_DATA_SCOPE(GeosetMaterialize);
   // Header/failed transition records are explicit unresolved tombstones. An
   // independently Ready canonical target must not wash them back to Ready.
   if (!alias.readyForShadowConsumer() || alias.geosetDataPtr == nullptr)
@@ -1307,6 +1312,7 @@ void ShadowModelResourceCache::storeRuntimeModelRecord(
 }
 
 void ShadowModelResourceCache::recordGeosetCreate(void *geosetPtr) {
+  WARVK_DATA_SCOPE(GeosetCapture);
   ShadowGeosetResourceRecord record = {};
   if (!CaptureGeosetHeaderRecord(geosetPtr, record))
     return;
@@ -1345,6 +1351,7 @@ void ShadowModelResourceCache::recordGeosetCreate(void *geosetPtr) {
 
 void ShadowModelResourceCache::noteModelResourceBinding(void *modelResourcePtr,
                                                         uint64_t modelKey) {
+  WARVK_DATA_SCOPE(GeosetBind);
   void* rawModelResourcePtr = modelResourcePtr;
   modelResourcePtr = TryResolveDirectModelResourcePtr(modelResourcePtr);
   if (modelResourcePtr == nullptr)
@@ -1466,6 +1473,7 @@ void ShadowModelResourceCache::noteModelResourceBinding(void *modelResourcePtr,
 void ShadowModelResourceCache::noteRuntimeModelBinding(void* runtimeModelPtr,
                                                        void* modelResourcePtr,
                                                        uint64_t modelKey) {
+  WARVK_DATA_SCOPE(GeosetBind);
   if (runtimeModelPtr == nullptr)
     return;
 
@@ -1598,6 +1606,7 @@ void ShadowModelResourceCache::noteRuntimeModelBinding(void* runtimeModelPtr,
 void ShadowModelResourceCache::noteRuntimeGeosetBinding(
     void* runtimeModelPtr, uint32_t geosetIndex, void* runtimeGeosetPtr,
     void* runtimeGeosetDataPtr, void* modelResourcePtr, uint64_t modelKey) {
+  WARVK_DATA_SCOPE(GeosetBind);
   if (runtimeGeosetPtr == nullptr && runtimeGeosetDataPtr == nullptr) {
     return;
   }
@@ -1759,6 +1768,7 @@ void ShadowModelResourceCache::noteRuntimeGeosetBinding(
 
 bool ShadowModelResourceCache::findGeosetByPtr(
     void *geosetPtr, ShadowGeosetResourceRecord &out) const {
+  WARVK_DATA_SCOPE(GeosetQuery);
   out = {};
   if (geosetPtr == nullptr)
     return false;
@@ -1773,6 +1783,7 @@ bool ShadowModelResourceCache::findGeosetByPtr(
 
 bool ShadowModelResourceCache::findGeosetByData(
     void *geosetDataPtr, ShadowGeosetResourceRecord &out) const {
+  WARVK_DATA_SCOPE(GeosetQuery);
   out = {};
   if (geosetDataPtr == nullptr)
     return false;
@@ -1782,6 +1793,22 @@ bool ShadowModelResourceCache::findGeosetByData(
   if (it == m_byGeosetData.end() || it->second == nullptr)
     return false;
   out = materializeGeosetDataRecordLocked(geosetDataPtr, it->second);
+  return true;
+}
+
+bool ShadowModelResourceCache::findGeosetIdentityByData(
+    void* geosetDataPtr, ShadowGeosetIdentityView& out) const {
+  WARVK_DATA_SCOPE(GeosetQuery);
+  out = {};
+  if (geosetDataPtr == nullptr)
+    return false;
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
+  const auto it = m_byGeosetData.find(geosetDataPtr);
+  if (it == m_byGeosetData.end() || it->second == nullptr)
+    return false;
+  // The by-data materializer overlays only observation timestamps. Its exact
+  // five identity fields and hit/miss contract remain unchanged by projection.
+  out = ProjectGeosetIdentity(*it->second);
   return true;
 }
 
@@ -1860,6 +1887,7 @@ bool ShadowModelResourceCache::findReadyGeosetBindingByData(
 ShadowGeosetResourceSnapshot
 ShadowModelResourceCache::findGeosetSnapshotByData(
     void* geosetDataPtr) const {
+  WARVK_DATA_SCOPE(GeosetQuery);
   if (geosetDataPtr == nullptr)
     return {};
 
@@ -1914,6 +1942,7 @@ bool ShadowModelResourceCache::findGeosetStampByData(
 bool ShadowModelResourceCache::findGeosetStampByDataForEpoch(
     void* geosetDataPtr, uint64_t expectedMapEpoch,
     ShadowGeosetResourceStamp& out) const {
+  WARVK_DATA_SCOPE(GeosetQuery);
   out = {};
   if (geosetDataPtr == nullptr || expectedMapEpoch == 0u)
     return false;
@@ -1945,6 +1974,7 @@ bool ShadowModelResourceCache::findGeosetStampByDataForEpoch(
 
 bool ShadowModelResourceCache::hydrateGeosetByKnownPtrs(
     void* geosetPtr, void* geosetDataPtr, ShadowGeosetResourceRecord& out) {
+  WARVK_DATA_SCOPE(GeosetQuery);
   out = {};
   if (geosetPtr == nullptr && geosetDataPtr == nullptr)
     return false;
@@ -2003,6 +2033,7 @@ bool ShadowModelResourceCache::hydrateGeosetByKnownPtrs(
 bool ShadowModelResourceCache::findModelGeoset(
     void *modelResourcePtr, uint32_t geosetIndex,
     ShadowGeosetResourceRecord &out) const {
+  WARVK_DATA_SCOPE(GeosetQuery);
   out = {};
   if (modelResourcePtr == nullptr || geosetIndex == kInvalidShadowGeosetIndex)
     return false;
@@ -2045,6 +2076,7 @@ bool ShadowModelResourceCache::findModelGeoset(
 bool ShadowModelResourceCache::findRuntimeModelGeoset(
     void* runtimeModelPtr, uint32_t geosetIndex,
     ShadowGeosetResourceRecord& out) const {
+  WARVK_DATA_SCOPE(GeosetQuery);
   out = {};
   if (runtimeModelPtr == nullptr || geosetIndex == kInvalidShadowGeosetIndex)
     return false;

@@ -1,6 +1,8 @@
 // war3_model_hook.cpp - War3 runtime-model / pose 被动探针
 
 #include "war3_model_hook.h"
+#include "../tools/war3_data_collection_tree.h"
+#include "war3_native_light_bridge.h"
 
 #include "war3_model_resource_cache.h"
 #include "war3_model_registry.h"
@@ -309,6 +311,10 @@ enum class RuntimeGroupPaletteProducerKind : uint32_t {
 };
 
 struct RenderablePartPaletteBindingEntry {
+  // Protect the plain matrix array as well as its identity. A seqlock alone
+  // does not make concurrent non-atomic Matrix4 reads/writes legal C++.
+  mutable std::atomic_flag cellBusy = ATOMIC_FLAG_INIT;
+  render::skin::Selection sealedSelection = {};
   std::atomic<uintptr_t> renderablePart{0u};
   std::atomic<uint32_t> paletteSlotIndex{0xFFFFFFFFu};
   std::atomic<uint32_t> groupCount{0u};
@@ -335,6 +341,8 @@ static std::array<RenderablePartPaletteBindingEntry,
     s_renderablePartPaletteBindings = {};
 static std::atomic<uint64_t> s_renderablePartPaletteBindingSerial{0u};
 static std::atomic<uint64_t> s_renderablePartPaletteSnapshotSerial{0u};
+static std::atomic<uint64_t> s_skinPalettePublicationTicket{0u};
+static std::atomic<uint64_t> s_skinPaletteOwnerEpoch{1u};
 static std::atomic<uintptr_t> s_cachedGlobalPaletteBufBase{0u};
 // Positive pointer validation is cached in TLS because the hook is hot. Raw
 // runtime-model addresses can be reused by a later map, so ResetMapSession
@@ -2477,7 +2485,8 @@ void RecordRenderablePartPaletteBinding(
     RuntimeGroupPaletteProducerKind producerKind,
     const uint8_t* paletteBytes = nullptr,
     uint32_t paletteCount = 0u,
-    void* runtimeModel = nullptr) {
+    void* runtimeModel = nullptr,
+    uint64_t ownerEpochWitness = 0u) {
   if (renderablePart == nullptr || paletteSlotIndex == 0xFFFFFFFFu ||
       paletteSlotIndex >= 0x3A98u)
     return;
@@ -2486,6 +2495,11 @@ void RecordRenderablePartPaletteBinding(
   const size_t slot =
       (partValue >> 4u) % kRenderablePartPaletteBindingCacheSize;
   auto& entry = s_renderablePartPaletteBindings[slot];
+  render::skin::TryCell guard(entry.cellBusy);
+  if(!guard)return;
+  entry.sealedSelection={};
+  if(render::skin::ContractEnabled()&&
+     (!ownerEpochWitness||ownerEpochWitness!=s_skinPaletteOwnerEpoch.load(std::memory_order_acquire)))return;
   entry.paletteSlotIndex.store(paletteSlotIndex, std::memory_order_relaxed);
   entry.groupCount.store(groupCount, std::memory_order_relaxed);
   entry.frameTag.store(frameTag, std::memory_order_relaxed);
@@ -2525,6 +2539,23 @@ void RecordRenderablePartPaletteBinding(
       entry.paletteHash.store(paletteHash, std::memory_order_relaxed);
       entry.paletteWriteSerial.store(snapshotSerial << 1u,
                                      std::memory_order_release);
+      uint32_t afterSlot = UINT32_MAX, afterFrame = 0;
+      const bool strictCopyStable = !render::skin::ContractEnabled() ||
+          (SafeReadU32Fast(renderablePart, kRenderablePartPaletteSlotOffset, afterSlot) &&
+           afterSlot == paletteSlotIndex && TryReadCurrentPaletteFrameTag(afterFrame) &&
+           afterFrame == frameTag);
+      if(render::skin::ContractEnabled()&&strictCopyStable&&runtimeModel&&frameTag&&
+         ownerEpochWitness==s_skinPaletteOwnerEpoch.load(std::memory_order_acquire)&&
+         render::skin::GroupRange(paletteCount,groupCount)){
+        auto& selected=entry.sealedSelection;
+        selected.source=render::skin::Source::OwnedPartSnapshot;
+        selected.space=render::skin::Space::World;selected.domain=render::skin::Domain::VertexGroups;
+        selected.runtimeModel=reinterpret_cast<uintptr_t>(runtimeModel);selected.part=partValue;
+        selected.ownerEpoch=ownerEpochWitness;
+        selected.publicationTicket=render::skin::NextTicket(s_skinPalettePublicationTicket);
+        selected.hash=paletteHash;selected.slot=paletteSlotIndex;selected.actualGroupCount=paletteCount;
+        selected.frameTag=frameTag;
+      }
       g_renderablePartPaletteSnapshotCapturedCount.fetch_add(
           1u, std::memory_order_relaxed);
     }
@@ -2553,6 +2584,9 @@ void CaptureRuntimeGroupPaletteBindings(
   if (runtimeModel == 0 || !g_config.enabled)
     return;
 
+  // Capture before reading any native identity; a concurrent map reset must
+  // not let pre-reset pointers acquire a post-reset publication epoch.
+  const uint64_t ownerEpochWitness=s_skinPaletteOwnerEpoch.load(std::memory_order_acquire);
   void* partArrayPtr = nullptr;
   uint32_t partCount = 0u;
   const void* runtimeModelPtr =
@@ -2587,8 +2621,19 @@ void CaptureRuntimeGroupPaletteBindings(
     if (skipFlag != 0u)
       continue;
 
-    uint32_t slotIndex =
-        TryReadU32Fast(partPtr, kRenderablePartPaletteSlotOffset);
+    uint32_t slotIndex = UINT32_MAX;
+    if (!SafeReadU32Fast(partPtr, kRenderablePartPaletteSlotOffset, slotIndex) &&
+        !render::skin::ContractEnabled())
+      slotIndex = 0u; // Preserve the legacy helper's default only for gate=0.
+    if(render::skin::ContractEnabled()&&(slotIndex==UINT32_MAX||slotIndex>=0x3a98u)){
+      // No current slot means no current ownership proof. Never reread an
+      // old slot and re-stamp its bytes as this instance's fresh snapshot.
+      const size_t cell=(reinterpret_cast<uintptr_t>(partPtr)>>4u)%kRenderablePartPaletteBindingCacheSize;
+      auto& old=s_renderablePartPaletteBindings[cell];render::skin::TryCell guard(old.cellBusy);
+      if(guard&&old.renderablePart.load(std::memory_order_acquire)==reinterpret_cast<uintptr_t>(partPtr))
+        old.sealedSelection={};
+      continue;
+    }
 
     // Phase 7.52 根因修复：FROZEN 段里 War3 引擎的 8-帧 slot cadence 会让部分
     // renderablePart 的 +0x08 临时归为 0xFFFFFFFFu（slotIndex 未分配）。以前这里
@@ -2625,7 +2670,7 @@ void CaptureRuntimeGroupPaletteBindings(
       }
     }
 
-    uint32_t groupCount = 1u;
+    uint32_t groupCount = render::skin::ContractEnabled() && !captureSimpleFallbackSlots ? 0u : 1u;
     if (!captureSimpleFallbackSlots) {
       if (void* geosetData =
               TryReadPtrFast(partPtr, kRenderablePartGeosetDataOffset)) {
@@ -2638,7 +2683,7 @@ void CaptureRuntimeGroupPaletteBindings(
 
     const uint8_t* matrixBytes = nullptr;
     if (globalPaletteBuf != 0u && groupCount != 0u &&
-        slotIndex + groupCount <= 0x3A98u) {
+        groupCount <= 0x3A98u - slotIndex) {
       matrixBytes = reinterpret_cast<const uint8_t*>(
           globalPaletteBuf + size_t(slotIndex) * 48u);
     }
@@ -2647,7 +2692,7 @@ void CaptureRuntimeGroupPaletteBindings(
                                        producerKind, matrixBytes, groupCount,
                                        // Phase 7.51：传入 producer 侧 runtimeModel，
                                        // 让 renderablePart 反查能拿到正确的 PoseRegistry key。
-                                       const_cast<void*>(runtimeModelPtr));
+                                       const_cast<void*>(runtimeModelPtr),ownerEpochWitness);
     ++bindingSeen;
 
     if (captureSimpleFallbackSlots && matrixBytes != nullptr) {
@@ -6804,6 +6849,7 @@ void RecordSpriteFrameRuntimeModelBindingLite(void* spritePtr,
 }
 
 void RecordRuntimePose(int runtimeModel, const __m128i *poseMatrix, float scale) {
+  WARVK_DATA_SCOPE(ModelObservation);
   if (runtimeModel == 0)
     return;
 
@@ -6939,6 +6985,7 @@ bool RecordRuntimeMatrixPalette(int runtimeModel,
                                 bool allowResourceBinding,
                                 uint32_t* outMatrixCount,
                                 uint64_t* outMatrixHash) {
+  WARVK_DATA_SCOPE(ModelObservation);
   std::vector<Matrix4> matrices;
   if (!TryReadRuntimeMatrixPalette(runtimeModel, matrices))
     return false;
@@ -7038,6 +7085,7 @@ bool MarkRuntimePaletteTreeProcessedThisFrame(void* runtimeModelPtr,
 
 void RecordRuntimePaletteTree(int runtimeModel,
                               const ModelInstanceRecord* ownerHint = nullptr) {
+  WARVK_DATA_SCOPE(ModelObservation);
   if (runtimeModel == 0)
     return;
 
@@ -7128,6 +7176,7 @@ bool RuntimePaletteKnownForCurrentFrame(void* runtimeModelPtr) {
 
 void RecordRuntimePaletteTreeIfStale(int runtimeModel,
                                      const ModelInstanceRecord* ownerHint) {
+  WARVK_DATA_SCOPE(ModelObservation);
   if (runtimeModel == 0)
     return;
 
@@ -7141,6 +7190,7 @@ void RecordRuntimePaletteTreeIfStale(int runtimeModel,
 void RecordSpriteFramePoseFromSprite(int spritePtr, float dt, void* contextPtr,
                                      uint32_t updateKind,
                                      uintptr_t callerPc) {
+  WARVK_DATA_SCOPE(ModelObservation);
   if (spritePtr == 0)
     return;
 
@@ -7677,6 +7727,7 @@ char* __fastcall Hook_RuntimeInitFromModelData(char* thisPtr, void* edx,
 
   const uintptr_t callerPc = GetCallReturnAddress();
   char* result = g_trampolineRuntimeInitFromModelData(thisPtr, modelDataPtr);
+  native_light::CloneInstance(thisPtr, modelDataPtr, result);
   {
     SemanticHookPerfScope perf(render::SemanticDataPerfTag::ModelHook,
                                render::SemanticDataPerfTag::ModelRuntimeInitCopy);
@@ -8959,6 +9010,7 @@ bool InstallRuntimeWritePrimaryPresetOutputHook(uintptr_t gameBase) {
 bool QueryBlendedPaletteBySlotIndex(uint32_t slotIndex,
                                      void* outPaletteVec,
                                      uint32_t& outGroupCount) {
+  WARVK_DATA_SCOPE(PaletteCapture);
   auto& outPalette = *reinterpret_cast<std::vector<Matrix4>*>(outPaletteVec);
   outPalette.clear();
   outGroupCount = 0u;
@@ -9059,6 +9111,7 @@ bool QueryBlendedPaletteBySlotIndexExact(uint32_t slotIndex,
                                          uint32_t expectedCount,
                                          uint32_t expectedFrameTag,
                                          void* outPaletteVec) {
+  WARVK_DATA_SCOPE(PaletteCapture);
   auto& outPalette = *reinterpret_cast<std::vector<Matrix4>*>(outPaletteVec);
   outPalette.clear();
   if (!ValidateBlendedPaletteBySlotIndexExact(
@@ -9203,6 +9256,8 @@ bool QueryRenderablePartPaletteSlot(void* renderablePart,
   const size_t slot =
       (partValue >> 4u) % kRenderablePartPaletteBindingCacheSize;
   const auto& entry = s_renderablePartPaletteBindings[slot];
+  render::skin::TryCell guard(entry.cellBusy);
+  if(!guard)return false;
   if (entry.renderablePart.load(std::memory_order_acquire) != partValue) {
     g_renderablePartPaletteBindingQueryMissCount.fetch_add(
         1u, std::memory_order_relaxed);
@@ -9232,6 +9287,7 @@ bool QueryRenderablePartPaletteSnapshot(void* renderablePart,
                                         void* outPaletteVec,
                                         uint64_t* outHash,
                                         uint32_t* outFrameTag) {
+  WARVK_DATA_SCOPE(PaletteCapture);
   auto& outPalette = *reinterpret_cast<std::vector<Matrix4>*>(outPaletteVec);
   outPalette.clear();
   if (outHash != nullptr)
@@ -9255,6 +9311,8 @@ bool QueryRenderablePartPaletteSnapshot(void* renderablePart,
   const size_t slot =
       (partValue >> 4u) % kRenderablePartPaletteBindingCacheSize;
   const auto& entry = s_renderablePartPaletteBindings[slot];
+  render::skin::TryCell guard(entry.cellBusy);
+  if(!guard)return noteMiss();
   if (entry.renderablePart.load(std::memory_order_acquire) != partValue)
     return noteMiss();
 
@@ -9296,6 +9354,56 @@ bool QueryRenderablePartPaletteSnapshot(void* renderablePart,
     *outFrameTag = frameTag;
   g_renderablePartPaletteSnapshotQueryHitCount.fetch_add(
       1u, std::memory_order_relaxed);
+  return true;
+}
+
+bool IsSkinPaletteSelectionCurrent(const render::skin::Selection& selected) {
+  uint32_t frame = 0;
+  if (!TryReadCurrentPaletteFrameTag(frame) || !frame || selected.frameTag != frame)
+    return false;
+  if (selected.source == render::skin::Source::CapturedWriter)
+    return true; // Identity, exact capture serial and bytes are checked by canonical.
+  uint32_t slot = UINT32_MAX;
+  if (!selected.part || !SafeReadU32Fast(reinterpret_cast<void*>(selected.part),
+      kRenderablePartPaletteSlotOffset, slot))
+    return false;
+  if (!render::skin::OwnedSnapshotMatches(selected, selected.runtimeModel, selected.part,
+      s_skinPaletteOwnerEpoch.load(std::memory_order_acquire), slot, frame, 1u))
+    return false;
+  const auto& entry=s_renderablePartPaletteBindings[(selected.part>>4u)%kRenderablePartPaletteBindingCacheSize];
+  render::skin::TryCell guard(entry.cellBusy);
+  if (!guard) return false;
+  // A later publication for this cell supersedes the old one even within the
+  // same native frame. The submitted CPU copy remains immutable either way.
+  return entry.sealedSelection.publicationTicket == selected.publicationTicket &&
+      entry.sealedSelection.part == selected.part &&
+      entry.sealedSelection.runtimeModel == selected.runtimeModel &&
+      selected.ownerEpoch == s_skinPaletteOwnerEpoch.load(std::memory_order_acquire);
+}
+
+bool QueryOwnedRenderablePartPaletteSnapshot(void* runtimeModel,void* part,uint32_t required,
+    void* outPaletteVec,render::skin::Selection& selected) {
+  selected={};
+  if (!outPaletteVec) return false;
+  auto& out=*static_cast<std::vector<Matrix4>*>(outPaletteVec);out.clear();
+  if(!RenderablePartPaletteSnapshotEnabled()||!runtimeModel||!part||!required||required>64)return false;
+  uint32_t currentSlot=UINT32_MAX,currentFrame=0;
+  if(!SafeReadU32Fast(part,kRenderablePartPaletteSlotOffset,currentSlot)||
+     !TryReadCurrentPaletteFrameTag(currentFrame))return false;
+  const auto epoch=s_skinPaletteOwnerEpoch.load(std::memory_order_acquire);
+  const auto& entry=s_renderablePartPaletteBindings[(reinterpret_cast<uintptr_t>(part)>>4u)%kRenderablePartPaletteBindingCacheSize];
+  render::skin::TryCell guard(entry.cellBusy);if(!guard)return false;
+  const auto selection=entry.sealedSelection;
+  if(!render::skin::OwnedSnapshotMatches(selection,reinterpret_cast<uintptr_t>(runtimeModel),
+      reinterpret_cast<uintptr_t>(part),epoch,currentSlot,currentFrame,required))return false;
+  const auto count=entry.paletteCount.load(std::memory_order_relaxed);
+  if(count!=selection.actualGroupCount||count>64)return false;
+  out.assign(entry.palette.begin(),entry.palette.begin()+required);
+  uint32_t afterSlot=UINT32_MAX,afterFrame=0;
+  if(!SafeReadU32Fast(part,kRenderablePartPaletteSlotOffset,afterSlot)||
+     !TryReadCurrentPaletteFrameTag(afterFrame)||afterSlot!=currentSlot||afterFrame!=currentFrame||
+     epoch!=s_skinPaletteOwnerEpoch.load(std::memory_order_acquire)){out.clear();return false;}
+  selected=selection;selected.hash=required==count?selection.hash:HashMatrixPalette(out);
   return true;
 }
 
@@ -10100,8 +10208,8 @@ void Init(uintptr_t gameBase, bool bootstrapOnly) {
                       kShadowRuntimeModelBootstrapPromoteHookEnabled) {
       installed = InstallPromoteRuntimeModelHook(gameBase) || installed;
     }
-    if constexpr (dxvk::war3::internal::
-                      kShadowRuntimeModelBootstrapInitCopyHookEnabled) {
+    if (dxvk::war3::internal::kShadowRuntimeModelBootstrapInitCopyHookEnabled ||
+        native_light::Enabled()) {
       installed = InstallRuntimeInitFromModelDataHook(gameBase) || installed;
     }
     if constexpr (dxvk::war3::internal::
@@ -10217,6 +10325,11 @@ void Init(uintptr_t gameBase, bool bootstrapOnly) {
 }
 
 void ResetMapSession() {
+  // Publication epoch is not a native slot allocation generation. Exhaustion
+  // permanently denies strict snapshots rather than wrapping into old tokens.
+  if(!s_skinPaletteOwnerEpoch.load(std::memory_order_acquire) ||
+     !render::skin::NextTicket(s_skinPaletteOwnerEpoch))
+    s_skinPaletteOwnerEpoch.store(0, std::memory_order_release);
   // These producer-side caches are keyed by raw Warcraft pointers or palette
   // slots. Both address spaces may be reused by the next map, and the game's
   // palette frame tag may restart, so freshness checks alone cannot isolate

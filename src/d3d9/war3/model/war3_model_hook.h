@@ -509,6 +509,9 @@ bool QueryRenderablePartPaletteSnapshot(void* renderablePart,
                                         void* outPaletteVec,
                                         uint64_t* outHash = nullptr,
                                         uint32_t* outFrameTag = nullptr);
+bool QueryOwnedRenderablePartPaletteSnapshot(void* runtimeModel,void* part,uint32_t required,
+    void* outPaletteVec,render::skin::Selection& selected);
+bool IsSkinPaletteSelectionCurrent(const render::skin::Selection& selected);
 
 // Phase 7.51：从 producer hook 记录里查出这个 renderablePart 属于哪个 runtimeModel。
 // 用途：submit 端在 PoseRegistry 用 packet.renderable.runtimeModelPtr 查不到时，

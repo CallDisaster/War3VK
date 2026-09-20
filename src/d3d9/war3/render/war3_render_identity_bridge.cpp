@@ -1,4 +1,5 @@
 #include "war3_render_identity_bridge.h"
+#include "../tools/war3_data_collection_tree.h"
 
 #include "../core/war3_memory.h"
 #include "war3_render_objects.h"
@@ -50,6 +51,7 @@ static void TryFillSceneNodeFromEntry(void *worldObjectEntry,
 
 bool TryResolveRenderObjectIdentity(void *worldObjectEntry, void *sceneNodeHint,
                                     RenderObjectIdentitySnapshot &out) {
+  WARVK_DATA_SCOPE(InstanceQuery);
   out = {};
   out.worldObjectEntry = worldObjectEntry;
   out.sceneNode = sceneNodeHint;
@@ -79,6 +81,7 @@ bool TryResolveRenderObjectIdentity(void *worldObjectEntry, void *sceneNodeHint,
 
 bool TryResolveCurrentRenderObjectIdentity(void *sceneNodeHint,
                                            RenderObjectIdentitySnapshot &out) {
+  WARVK_DATA_SCOPE(InstanceQuery);
   auto &renderer = War3Renderer::instance();
   void *worldObjectEntry = renderer.GetCurrentWorldObjectEntry();
   void *sceneNode = sceneNodeHint != nullptr ? sceneNodeHint

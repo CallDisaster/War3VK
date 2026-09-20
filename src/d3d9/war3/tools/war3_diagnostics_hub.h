@@ -44,6 +44,10 @@ struct War3RuntimeStatusModuleSnapshot {
 struct War3RuntimeStatusPerfSnapshot {
   bool enabled = false;
   bool recording = false;
+  bool frameAnchorValid = false;
+  uint64_t businessFrameSerial = 0;
+  uint64_t perfFrameEpoch = 0;
+  uint64_t producerAccumulationEpoch = 0;
 };
 
 struct War3RuntimeStatusProfileSnapshot {
@@ -538,9 +542,26 @@ struct War3RuntimeStatusShadowSnapshot {
   uint64_t semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeBlendedCacheCount = 0;
   uint64_t semanticSceneSubmittedSkinnedPaletteSourceSubmitTimePublishedRegistryCount = 0;
   uint64_t semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeCModelFallbackCount = 0;
+  uint64_t semanticSceneSubmittedSkinnedPaletteSourceOwnedPartSnapshotCount = 0;
   uint64_t semanticSceneSubmittedSkinnedPaletteStablePartSampleCount = 0;
   uint64_t semanticSceneSubmittedSkinnedPaletteHashChurnCount = 0;
   uint64_t semanticSceneSubmittedSkinnedPaletteSourceChurnCount = 0;
+  // 2026-09-16 P0 palette 缝隙修复度量（device=Gap A / shadowCore=Gap B）。
+  uint64_t semanticSceneSkinnedPaletteSlotCacheDeviceServedAfterConfirmCount = 0;
+  uint64_t semanticSceneSkinnedPaletteSlotCacheDeviceRejectedStaleCount = 0;
+  // 2026-09-17 上级裁定（线程修复方案 B 第一部分）：构建推进边界线程见证。
+  uint64_t semanticBuildOffThreadRefusedCount = 0;
+  uint64_t semanticBuildOwnerUnestablishedRefusedCount = 0;
+  uint64_t semanticBuildDirectAdvanceRefusedCount = 0;
+  uint64_t semanticSceneSkinnedPaletteSlotCacheShadowCoreServedAfterConfirmCount = 0;
+  uint64_t semanticSceneSkinnedPaletteSlotCacheShadowCoreRejectedStaleCount = 0;
+  uint64_t semanticSceneSkinnedPaletteSlotCacheShadowCoreProducerSnapshotFallbackCount = 0;
+  // 2026-09-17 Gap B 补强（同链路导出）。
+  uint64_t semanticSceneSkinnedPaletteSlotCacheShadowCoreFrameProofServedCount = 0;
+  uint64_t semanticSceneSkinnedPaletteSlotCacheShadowCoreGroupShortRejectedCount = 0;
+  uint64_t semanticSceneSkinnedPaletteSlotCacheShadowCoreBindingFrameStaleRejectedCount = 0;
+  uint64_t semanticSceneSkinnedPaletteSlotCacheShadowCoreSlotRangeStaleRejectedCount = 0;
+  uint64_t semanticSceneSkinnedPaletteSlotCacheShadowCoreSnapshotFrameStaleRejectedCount = 0;
   uint64_t semanticSceneSubmittedSkinnedPaletteSlotIndexChurnCount = 0;
   uint64_t semanticSceneSubmittedSkinnedPaletteHashUniqueInWindowMax = 0;
   uint64_t semanticSceneSubmittedSkinnedPaletteSlotIndexUniqueInWindowMax = 0;
@@ -563,6 +584,14 @@ struct War3RuntimeStatusShadowSnapshot {
   uint64_t semanticSceneSubmittedSkinnedPaletteStaleRestoreSubmittedCount = 0;
   uint64_t semanticSceneSubmittedSkinnedPaletteAfterStaleRestoreLargeDeltaCount = 0;
   uint64_t semanticSceneSubmittedSkinnedPaletteLiveToLiveLargeDeltaCount = 0;
+  // 2026-09-17 活跃路径纯计数（上级 Q-B 条件批准；无条件编译，不设默认关闭门控）。
+  // 只证明"路径到达 / 提交数量"，不构成来源归属或对象级关联的证据。
+  // 口径：当帧值；device 侧在 m_war3Scene.shadowStats 每帧整体重建，经
+  //   NoteShadowSceneStats 在 Present 安全点发布；写入者只有渲染所有者线程。
+  uint64_t semanticSceneAppendEntrySkinnedCount = 0;
+  uint64_t semanticSceneCanonicalGateRejectSkinnedCount = 0;
+  uint64_t semanticSceneDrawTimeProducerSubmittedSkinnedCount = 0;
+  uint64_t semanticSceneDirectCurrentDrawSubmittedSkinnedCount = 0;
   uint64_t semanticSceneDirectManifestObjectCount = 0;
   uint64_t semanticSceneDirectManifestObservedPartCount = 0;
   uint64_t semanticSceneDirectManifestShadowEligiblePartCount = 0;

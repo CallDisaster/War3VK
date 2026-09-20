@@ -91,12 +91,15 @@ class WarVKJapiV1IntegratedStaticTests(unittest.TestCase):
             r'"([birds]*)",\s*[^,]+,\s*(true|false)\}',
             self.runtime,
         )
-        self.assertEqual(len(rows), 106)
+        self.assertEqual(len(rows), 109)
         cpp_commands = {
             name: (carrier, signature)
             for name, carrier, signature, _required in rows
         }
-        self.assertEqual(len(cpp_commands), 106)
+        self.assertEqual(len(cpp_commands), 109)
+        self.assertEqual(cpp_commands['modelPointLights.setEnabled'], ('Preloader','sbb'))
+        self.assertEqual(cpp_commands['modelPointLights.count'], ('Hotkey','s'))
+        self.assertEqual(cpp_commands['modelPointLights.registered'], ('Hotkey','s'))
 
         self.assertNotIn("JapiFunc", self.jass)
         self.assertNotRegex(self.jass, r"(?m)^\s*native\s+WarVK")

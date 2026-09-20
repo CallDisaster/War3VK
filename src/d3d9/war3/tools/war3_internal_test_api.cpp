@@ -1,8 +1,13 @@
 #include "war3_internal_test_api.h"
+#include "war3_async_screenshot.h"
+#include "../../d3d9_window.h"
+#include "war3_frame_history.h"
+#include "../hooks/war3_native_capture.h"
 
 #include "../../d3d9_device.h"
 #include "../../d3d9_war3_debug.h"
 #include "../../d3d9_war3_settings.h"
+#include "../../d3d9_war3_volumetric_light.h"
 
 #include "../gpu_skin/war3_gpu_skin_native_bridge.h"
 #include "../core/war3_internal_test_config.h"
@@ -290,6 +295,59 @@ bool ProcessPendingInternalTestRequest(uint64_t frameIndex,
     response["marker"] = marker;
     response["frameIndex"] = frameIndex;
     result.ok = true;
+  } else if (state->request.command == "native_frame_sync.status") {
+    const auto s = ::dxvk::war3::hooks::QueryNativeFrameSyncStatus();
+    response["persistent"] = s.persistent;
+    response["installed"] = s.installed;
+    response["ownerAtQuery"] = s.owner;
+    response["consoleAttached"] = ::GetConsoleWindow() != nullptr;
+    response["calls"] = s.calls;
+    response["elided"] = s.elided;
+    response["retained"] = s.retained;
+    response["presents"] = s.presents;
+    response["queryTicks"] = std::to_string(s.queryTicks);
+    response["frequency"] = s.frequency;
+    result.ok = true;
+  } else if (state->request.command == "frame_history.test_shortcut") {
+    result.ok=::dxvk::TestFrameHistoryWindowShortcut();
+    response["route"]="installed-window-proc-private-test-message";
+    const auto recorder=QueryFrameHistoryHud();
+    response["notice"]=recorder.notice;
+    response["recorderState"]=recorder.state;
+    response["selfContained"]=recorder.selfContained;
+    response["bufferedMs"]=recorder.bufferedMs;
+    response["requiredMs"]=recorder.requiredMs;
+    response["recorderError"]=recorder.error;
+    response["globalInputUsed"]=false;
+    if(!result.ok)result.error="installed window route unavailable";
+  } else if (state->request.command == "screenshot.flicker_burst") {
+    result.ok = ::dxvk::war3::tools::ArmAsyncScreenshotBurstForTest();
+    if (!result.ok) result.error = "burst requires owner/gate and all three free slots";
+    response["requestedConsecutiveFrames"] = 3;
+    response["saved"] = false;
+    response["globalInputUsed"] = false;
+    response["completion"] = "verify-three-files-and-consecutive-present-ordinals";
+  } else if (state->request.command == "screenshot.native_async") {
+    const auto count = payload.value("count", json(1));
+    if (!count.is_number_integer() || count.is_boolean() ||
+        count < 1 || count > 4) {
+      result.ok = false;
+      result.error = "screenshot count must be an integer in [1,4]";
+    } else {
+      uint32_t dispatched = 0;
+      for (uint32_t n = 0; n < count.get<uint32_t>(); ++n) {
+        if (!::dxvk::war3::hooks::InvokeNativeScreenshotEventForTest()) break;
+        ++dispatched;
+      }
+      result.ok = dispatched == count.get<uint32_t>();
+      if (!result.ok) result.error = "native screenshot hook/gate/owner unavailable";
+      response["dispatched"] = dispatched;
+      response["frameIndex"] = frameIndex;
+      response["saved"] = false;
+      response["completion"] = "verify-new-file-and-worker-log";
+      response["globalInputUsed"] = false;
+    }
+
   } else if (state->request.command == "autotest.waypoint") {
     const bool active = payload.value("active", true);
     if (!active) {
@@ -732,6 +790,49 @@ bool ProcessPendingInternalTestRequest(uint64_t frameIndex,
         static_cast<unsigned long long>(frameIndex));
     if (!applied)
       result.error = "GPU skin outline test mode actuation failed";
+  } else if (state->request.command == "jass.public_api") {
+    const auto test = dxvk::war3::hooks::InvokeJassPublicApiForTest(
+        payload.value("carrier", std::string()),
+        payload.value("payload", std::string()));
+    response["evidenceKind"] = "native-carrier-not-jass-bytecode";
+    response["invoked"] = test.invoked;
+    response["errorCode"] = test.errorCode;
+    response["integer"] = test.integer;
+    response["text"] = test.text;
+    // A rejected API is a successfully observed test command, not API success.
+    response["apiAccepted"] = test.invoked && test.errorCode == 0;
+    result.ok = test.invoked;
+    result.error = test.error;
+  } else if (state->request.command == "visual.snapshot") {
+    War3RenderSettings settings;
+    result.ok = dxvk::war3::GetSettingsSnapshot(settings);
+    if (!result.ok) {
+      result.error = "settings mailbox unavailable";
+    } else {
+      const auto& vol = settings.postFx.volumetricLight;
+      response["settingsEvidence"] = "author-pending-not-gpu-completion";
+      response["sunEnabled"] = settings.sun.enabled;
+      response["sunIntensity"] = settings.sun.intensity;
+      response["sunColor"] = {settings.sun.color.x, settings.sun.color.y, settings.sun.color.z};
+      response["csmEnabled"] = settings.shadows.enabled;
+      response["postFxEnabled"] = settings.postFx.enabled;
+      response["volumetricEnabled"] = vol.enabled;
+      response["requestedBackend"] = static_cast<uint32_t>(vol.quality);
+      response["globalMediumEnabled"] = vol.globalMediumEnabled;
+      response["density"] = vol.density;
+      response["heightFogEnabled"] = vol.heightFogEnabled;
+      response["heightFog"] = {vol.heightFogBase, vol.heightFogFalloff, vol.heightFogStrength};
+      response["fogCount"] = War3FogVolumeManager::Instance().GetVolumeCount();
+      response["fogGeneration"] = War3FogVolumeManager::Instance().GetGeneration();
+      const auto execution = QueryWar3VolumetricExecutionDiagnostics();
+      response["execution"] = {
+          {"frameSerial", execution.frameSerial}, {"mapEpoch", execution.mapEpoch},
+          {"deviceEpoch", execution.deviceEpoch}, {"requestedBackend", execution.requestedBackend},
+          {"effectiveBackend", execution.effectiveBackend}, {"stage", execution.stage},
+          {"compositeSubmitted", execution.compositeSubmitted},
+          {"fogVolumes", execution.fogVolumes}, {"width", execution.width},
+          {"height", execution.height}, {"observedFrames", execution.observedFrames}};
+    }
   } else if (state->request.command == "jass.bridge_selftest") {
     const bool displayText = payload.value("displayText", false);
     const auto test =
@@ -851,6 +952,15 @@ bool ProcessPendingInternalTestRequest(uint64_t frameIndex,
             ? "shadow map reset request serial did not advance"
             : "GPU skin bridge reset generation did not advance";
     }
+  } else if (state->request.command == "game.end_for_exit_test") {
+    // Separate exact opt-in. Not part of the public author API or normal exit.
+    if (env::getEnvVar("DXVK_WAR3_INTERNAL_EXIT_TEST") != "1") {
+      result.error = "native exit test not enabled";
+    } else {
+      result.ok = hooks::EndJassGameForExitTest(result.error);
+    }
+    response["stockEndGameInvoked"] = result.ok;
+    response["processExitProven"] = false;
   } else if (state->request.command == "shutdown.session") {
     response["accepted"] = true;
     response["softOnly"] = true;

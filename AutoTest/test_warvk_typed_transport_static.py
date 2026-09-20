@@ -24,14 +24,23 @@ class WarVkTypedTransportStaticTest(unittest.TestCase):
         for signature in (
             "(Hhashtable;III)V",
             "(Hhashtable;IIR)V",
-            "(Hhashtable;II)I",
-            "(Hhashtable;II)R",
+            "(Hhashtable;II)I;",
+            "(Hhashtable;II)R;",
         ):
             self.assertIn(signature, self.bridge_cpp)
         self.assertIn("CoreCarriers[]", self.bridge_cpp)
         self.assertIn("TypedCarriers[]", self.bridge_cpp)
         self.assertIn("optional typed carriers unavailable", self.bridge_cpp)
         self.assertIn("string v1 remains active", self.bridge_cpp)
+
+    def test_127a_load_metadata_is_exact_not_a_prefix_or_relaxed_parser(self):
+        signatures = self.bridge_cpp.split("const char *ExpectedCarrierSignature", 1)[1].split("uint32_t ExpectedCarrierParameterCount", 1)[0]
+        self.assertIn('return "(Hhashtable;II)I;";', signatures)
+        self.assertIn('return "(Hhashtable;II)R;";', signatures)
+        matcher = self.bridge_cpp.split("bool SignatureMatchesCarrier", 1)[1].split("bool WriteNativeFuncPtr", 1)[0]
+        self.assertIn("IsReadableRange(sigPtr, length + 1u)", matcher)
+        self.assertIn("std::memcmp(sigPtr, expected, length + 1u) == 0", matcher)
+        self.assertNotIn("strncmp", matcher)
 
     def test_non_capability_calls_forward_to_warcraft(self):
         for original in (

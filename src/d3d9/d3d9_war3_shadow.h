@@ -31,6 +31,7 @@ namespace dxvk {
     }
 
     class D3D9DeviceEx;
+    namespace war3::tools::evidence { class InputCapture; }
     struct War3PointLightFrameSnapshot;
 
     /**
@@ -123,6 +124,7 @@ namespace dxvk {
         uint32_t dynamicPoseCount = 0;
         uint32_t dynamicSkinnedOutputCount = 0;
         std::vector<uint64_t> paletteHashes;
+        std::vector<uint32_t> nativeEmitterReplayIndices;
         /** 仅在 replayDraws == nullptr 的兜底路径用于 BuildShadowReplayDraws；
          *  worker 路径总是带 draws，不需要此指针；同步路径指向真实 scene，
          *  其生命周期覆盖本次同步调用。 */
@@ -605,6 +607,7 @@ namespace dxvk {
 
         D3D9DeviceEx* m_parent = nullptr; // D3D9DeviceEx 指针
         Rc<DxvkDevice> m_device;
+        std::shared_ptr<war3::tools::evidence::InputCapture> m_inputEvidence;
         
         // Shadow Map Resources (D3D9)
         Com<IDirect3DTexture9> m_shadowTexture;
@@ -1234,12 +1237,16 @@ namespace dxvk {
             const War3PointShadowCpuPlanInput& input,
             const War3PointLightFrameSnapshot& lightSnapshot,
             const std::vector<const War3ShadowCasterDraw*>* replayDraws);
-        void renderPointShadow(const Rc<DxvkCommandList>& ctx,
-                               const War3PipelineInput& input,
-                               const War3PointLightFrameSnapshot& lightSnapshot,
-                               const std::vector<const War3ShadowCasterDraw*>* replayDraws = nullptr); // [NEW] 点光源阴影
+          void renderPointShadow(const Rc<DxvkCommandList>& ctx,
+                                 const War3PipelineInput& input,
+                                 const War3PointLightFrameSnapshot& lightSnapshot,
+                                 const std::vector<const War3ShadowCasterDraw*>* replayDraws = nullptr,
+                                 const War3RenderSettings* canonicalFallbackSettings = nullptr);
         void drawReceiver(const Rc<DxvkCommandList>& ctx,
-                          const Rc<DxvkImageView>& dstView);
+                          const Rc<DxvkImageView>& dstView,
+                          const std::array<Rc<DxvkImageView>, 3>& nativeBaselines = {},
+                          uint32_t nativeSlot = UINT32_MAX,
+                          uint32_t nativeCount = 0);
         
         // [NEW] 单位被遮挡描边
         void renderUnitOutline(const Rc<DxvkCommandList>& ctx,

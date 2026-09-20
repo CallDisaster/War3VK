@@ -749,6 +749,7 @@ namespace dxvk {
       uint32_t COLOR[2];
       uint32_t FOG;
     } out;
+    uint32_t alternateColor[3][2] = {};
   };
 
   enum D3D9FFPSMembers {
@@ -780,6 +781,8 @@ namespace dxvk {
   };
 
   struct D3D9FFPixelData {
+    uint32_t alternateColor[3][2] = {};
+    uint32_t alternateOutput[3] = {};
     uint32_t constantBuffer;
     uint32_t sharedState;
 
@@ -840,6 +843,7 @@ namespace dxvk {
     void setupVS();
 
     void compilePS();
+    uint32_t compilePSColor(uint32_t diffuse, uint32_t specular);
 
     void setupPS();
 
@@ -1032,8 +1036,7 @@ namespace dxvk {
       m_module.decorateBuiltIn(ptr, builtin);
     }
 
-    bool diffuseOrSpec = semantic == DxsoSemantic{ DxsoUsage::Color, 0 }
-                      || semantic == DxsoSemantic{ DxsoUsage::Color, 1 };
+    bool diffuseOrSpec = semantic.usage == DxsoUsage::Color && semantic.usageIndex < 8;
 
     if (diffuseOrSpec && input)
       m_flatShadingMask |= 1u << slot;
@@ -1341,6 +1344,8 @@ namespace dxvk {
       uint32_t diffuseValue  = m_module.constvec4f32(0.0f, 0.0f, 0.0f, 0.0f);
       uint32_t specularValue = m_module.constvec4f32(0.0f, 0.0f, 0.0f, 0.0f);
       uint32_t ambientValue  = m_module.constvec4f32(0.0f, 0.0f, 0.0f, 0.0f);
+      std::array<uint32_t,3> alternateDiffuse = {diffuseValue,diffuseValue,diffuseValue};
+      std::array<uint32_t,3> alternateSpecular = {specularValue,specularValue,specularValue};
 
       for (uint32_t i = 0; i < m_vsKey.Data.Contents.LightCount; i++) {
         uint32_t light_ptr_t = m_module.defPointerType(m_vs.lightType, spv::StorageClassUniform);
@@ -1362,6 +1367,19 @@ namespace dxvk {
         uint32_t ambient   = LoadLightItem(m_vec4Type,   2);
         uint32_t position  = LoadLightItem(m_vec4Type,   3);
         uint32_t direction = LoadLightItem(m_vec4Type,   4);
+        std::array<uint32_t,3> keepNative = {};
+        if (m_vsKey.Data.Contents.NativeLightSplit) {
+          const uint32_t w = 3;
+          const uint32_t marker = m_module.opCompositeExtract(m_floatType, direction, 1, &w);
+          const auto markerBits = m_module.opConvertFtoU(m_uint32Type, marker);
+          for (uint32_t endpoint=0; endpoint<3; ++endpoint) {
+          const auto removed = m_module.opBitwiseAnd(m_uint32Type, markerBits, m_module.constu32(endpoint+1));
+          const auto keep = m_module.opIEqual(m_boolType, removed, m_module.constu32(0));
+          const std::array<uint32_t, 4> components = {keep, keep, keep, keep};
+          keepNative[endpoint] = m_module.opCompositeConstruct(m_module.defVectorType(m_boolType, 4),
+            components.size(), components.data());
+          }
+        }
         uint32_t type      = LoadLightItem(m_uint32Type, 5);
         uint32_t range     = LoadLightItem(m_floatType,  6);
         uint32_t falloff   = LoadLightItem(m_floatType,  7);
@@ -1447,6 +1465,15 @@ namespace dxvk {
         ambientValue  = m_module.opFAdd(m_vec4Type, ambientValue,  lightAmbient);
         diffuseValue  = m_module.opFAdd(m_vec4Type, diffuseValue,  lightDiffuse);
         specularValue = m_module.opFAdd(m_vec4Type, specularValue, lightSpecular);
+        if (m_vsKey.Data.Contents.NativeLightSplit) {
+          const auto zero = m_module.constvec4f32(0, 0, 0, 0);
+          for (uint32_t endpoint=0; endpoint<3; ++endpoint) {
+            alternateDiffuse[endpoint] = m_module.opFAdd(m_vec4Type, alternateDiffuse[endpoint],
+              m_module.opSelect(m_vec4Type, keepNative[endpoint], lightDiffuse, zero));
+            alternateSpecular[endpoint] = m_module.opFAdd(m_vec4Type, alternateSpecular[endpoint],
+              m_module.opSelect(m_vec4Type, keepNative[endpoint], lightSpecular, zero));
+          }
+        }
       }
 
       uint32_t mat_diffuse  = PickSource(m_vsKey.Data.Contents.DiffuseSource,  m_vs.constants.materialDiffuse);
@@ -1477,10 +1504,34 @@ namespace dxvk {
         ? finalColor1
         : m_vs.in.COLOR[1]
       );
+      if (m_vsKey.Data.Contents.NativeLightSplit) {
+        for (uint32_t endpoint=0; endpoint<3; ++endpoint) {
+        auto alternate = m_module.opFFma(m_vec4Type, mat_ambient, m_vs.constants.globalAmbient, mat_emissive);
+        alternate = m_module.opFFma(m_vec4Type, mat_ambient, ambientValue, alternate);
+        alternate = m_module.opFFma(m_vec4Type, mat_diffuse, alternateDiffuse[endpoint], alternate);
+        alternate = m_module.opVectorShuffle(m_vec4Type, alternate, mat_diffuse, alphaSwizzle.size(), alphaSwizzle.data());
+        alternate = m_module.opFClamp(m_vec4Type, alternate,
+          m_module.constvec4f32(0,0,0,0), m_module.constvec4f32(1,1,1,1));
+        auto spec = m_module.opFMul(m_vec4Type, mat_specular, alternateSpecular[endpoint]);
+        spec = m_module.opFClamp(m_vec4Type, spec,
+          m_module.constvec4f32(0,0,0,0), m_module.constvec4f32(1,1,1,1));
+        spec = m_module.opVectorShuffle(m_vec4Type, spec, finalColor1,
+          alphaSwizzle.size(), alphaSwizzle.data());
+        m_module.opStore(m_vs.alternateColor[endpoint][0], alternate);
+        m_module.opStore(m_vs.alternateColor[endpoint][1],
+          m_vsKey.Data.Contents.SpecularEnabled ? spec : m_vs.in.COLOR[1]);
+        }
+      }
     }
     else {
       m_module.opStore(m_vs.out.COLOR[0], m_vs.in.COLOR[0]);
       m_module.opStore(m_vs.out.COLOR[1], m_vs.in.COLOR[1]);
+      if (m_vsKey.Data.Contents.NativeLightSplit) {
+        for (uint32_t endpoint=0; endpoint<3; ++endpoint) {
+          m_module.opStore(m_vs.alternateColor[endpoint][0], m_vs.in.COLOR[0]);
+          m_module.opStore(m_vs.alternateColor[endpoint][1], m_vs.in.COLOR[1]);
+        }
+      }
     }
 
     D3D9FogContext fogCtx;
@@ -1865,6 +1916,12 @@ namespace dxvk {
 
     m_vs.out.COLOR[0] = declareIO(false, DxsoSemantic{ DxsoUsage::Color, 0 });
     m_vs.out.COLOR[1] = declareIO(false, DxsoSemantic{ DxsoUsage::Color, 1 });
+    if (m_vsKey.Data.Contents.NativeLightSplit) {
+      for (uint32_t endpoint=0; endpoint<3; ++endpoint) {
+        m_vs.alternateColor[endpoint][0] = declareIO(false, DxsoSemantic{ DxsoUsage::Color, 2+2*endpoint });
+        m_vs.alternateColor[endpoint][1] = declareIO(false, DxsoSemantic{ DxsoUsage::Color, 3+2*endpoint });
+      }
+    }
 
     m_vs.out.FOG      = declareIO(false, DxsoSemantic{ DxsoUsage::Fog,   0 });
   }
@@ -1872,9 +1929,20 @@ namespace dxvk {
 
   void D3D9FFShaderCompiler::compilePS() {
     setupPS();
+    const auto primary = compilePSColor(m_ps.in.COLOR[0], m_ps.in.COLOR[1]);
+    m_module.opStore(m_ps.out.COLOR, primary);
+    if (m_fsKey.Stages[0].Contents.NativeLightSplit) {
+      for (uint32_t endpoint=0; endpoint<3; ++endpoint) {
+      auto alternate = compilePSColor(m_ps.alternateColor[endpoint][0], m_ps.alternateColor[endpoint][1]);
+      const std::array<uint32_t,4> swizzle = {0,1,2,7};
+      alternate = m_module.opVectorShuffle(m_vec4Type, alternate, primary, swizzle.size(), swizzle.data());
+      m_module.opStore(m_ps.alternateOutput[endpoint], alternate);
+      }
+    }
+    alphaTestPS();
+  }
 
-    uint32_t diffuse  = m_ps.in.COLOR[0];
-    uint32_t specular = m_ps.in.COLOR[1];
+  uint32_t D3D9FFShaderCompiler::compilePSColor(uint32_t diffuse, uint32_t specular) {
 
     // Current starts of as equal to diffuse.
     uint32_t current = diffuse;
@@ -2368,9 +2436,8 @@ namespace dxvk {
     }
 
     if (m_fsKey.Stages[0].Contents.GlobalSpecularEnable) {
-      uint32_t specular = m_module.opFMul(m_vec4Type, m_ps.in.COLOR[1], m_module.constvec4f32(1.0f, 1.0f, 1.0f, 0.0f));
-
-      current = m_module.opFAdd(m_vec4Type, current, specular);
+      const auto contribution = m_module.opFMul(m_vec4Type, specular, m_module.constvec4f32(1.0f, 1.0f, 1.0f, 0.0f));
+      current = m_module.opFAdd(m_vec4Type, current, contribution);
     }
 
     D3D9FogContext fogCtx;
@@ -2387,9 +2454,7 @@ namespace dxvk {
     fogCtx.SpecUBO     = m_specUbo;
     current = DoFixedFunctionFog(m_spec, m_module, fogCtx);
 
-    m_module.opStore(m_ps.out.COLOR, current);
-
-    alphaTestPS();
+    return current;
   }
 
   void D3D9FFShaderCompiler::setupPS() {
@@ -2416,11 +2481,20 @@ namespace dxvk {
 
     m_ps.in.COLOR[0] = declareIO(true, DxsoSemantic{ DxsoUsage::Color, 0 });
     m_ps.in.COLOR[1] = declareIO(true, DxsoSemantic{ DxsoUsage::Color, 1 });
+    if (m_fsKey.Stages[0].Contents.NativeLightSplit) {
+      for (uint32_t endpoint=0; endpoint<3; ++endpoint) {
+        m_ps.alternateColor[endpoint][0] = declareIO(true, DxsoSemantic{ DxsoUsage::Color, 2+2*endpoint });
+        m_ps.alternateColor[endpoint][1] = declareIO(true, DxsoSemantic{ DxsoUsage::Color, 3+2*endpoint });
+      }
+    }
 
     m_ps.in.FOG      = declareIO(true, DxsoSemantic{ DxsoUsage::Fog, 0 });
     m_ps.in.POS      = declareIO(true, DxsoSemantic{ DxsoUsage::Position, 0 }, spv::BuiltInFragCoord);
 
     m_ps.out.COLOR   = declareIO(false, DxsoSemantic{ DxsoUsage::Color, 0 });
+    if (m_fsKey.Stages[0].Contents.NativeLightSplit)
+      for (uint32_t endpoint=0; endpoint<3; ++endpoint)
+        m_ps.alternateOutput[endpoint] = declareIO(false, DxsoSemantic{ DxsoUsage::Color, endpoint+1 });
 
     // Constant Buffer for PS.
     std::array<uint32_t, uint32_t(D3D9FFPSMembers::MemberCount)> members = {

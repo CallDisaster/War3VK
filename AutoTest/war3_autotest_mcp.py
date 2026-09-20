@@ -31,7 +31,27 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from mcp.server.fastmcp import FastMCP
+try:
+    from mcp.server.fastmcp import FastMCP
+except ModuleNotFoundError:
+    # mcp 2.x removed/renamed FastMCP. Keep this module importable so static
+    # tests and offline analyzers can reuse its helpers; only actually serving
+    # MCP requires the real package (pin 'mcp<2').
+    class FastMCP:  # type: ignore[no-redef]
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self._unavailable = True
+
+        def tool(self, *args: Any, **kwargs: Any):
+            def _decorator(fn):
+                return fn
+
+            return _decorator
+
+        def run(self, *args: Any, **kwargs: Any) -> None:
+            raise ModuleNotFoundError(
+                "mcp.server.fastmcp is required to run the MCP server; "
+                "installed mcp is incompatible (pin 'mcp<2')."
+            )
 
 from autotest_sessions import (
     AutoTestSession,
@@ -7931,6 +7951,8 @@ def wait_for_game_ready(
     auto_continue_loading: bool = False,
     continue_key: str = "RIGHT",
     continue_interval_sec: int = 12,
+    continue_max_pulses: Optional[int] = None,
+    require_control_plane_for_continue: bool = False,
 ) -> Dict[str, Any]:
     """
     等待“正式进入游戏”：
@@ -7985,22 +8007,46 @@ def wait_for_game_ready(
             },
             timeout_sec=max(2.0, request_timeout + 2.0),
         )
-        if pipe_ready.get("transportOk"):
-            if pipe_ready.get("ok"):
+        transport_ok = pipe_ready.get("transportOk")
+        wait_ok = pipe_ready.get("ok")
+        if require_control_plane_for_continue:
+            valid_transport = transport_ok is True
+            valid_wait_result = wait_ok is True
+            malformed_wait_result = (
+                transport_ok is True and wait_ok is not True and wait_ok is not False)
+        else:
+            valid_transport = bool(transport_ok)
+            valid_wait_result = bool(wait_ok)
+            malformed_wait_result = False
+        if valid_transport:
+            if valid_wait_result:
+                break
+            if malformed_wait_result:
+                if auto_continue_loading and target_alive():
+                    time.sleep(0.2)
+                    continue
                 break
             runtime_status = dict(
                 ((pipe_ready.get("result", {}) or {}).get("runtimeStatus", {})) or {}
             )
             runtime = dict(runtime_status.get("runtime", {}) or {})
             now = time.time()
+            if require_control_plane_for_continue:
+                continue_evidence = (
+                    runtime.get("jassReady") is True
+                    and runtime.get("gameStarted") is False)
+            else:
+                continue_evidence = (
+                    bool(runtime.get("jassReady", False))
+                    and not bool(runtime.get("gameStarted", False)))
             can_continue = (
                 auto_continue_loading
                 and target_alive()
-                and bool(runtime.get("jassReady", False))
-                and not bool(runtime.get("gameStarted", False))
+                and continue_evidence
                 and (now - pipe_wait_t0) >= 10.0
                 and (last_continue_at <= 0.0 or
                      (now - last_continue_at) >= max(5, int(continue_interval_sec)))
+                and (continue_max_pulses is None or len(continue_pulses) < int(continue_max_pulses))
             )
             if can_continue:
                 pulse = _post_war3_key_pulse(
@@ -8026,10 +8072,12 @@ def wait_for_game_ready(
         now = time.time()
         can_continue_without_pipe = (
             auto_continue_loading
+            and not require_control_plane_for_continue
             and target_alive()
             and (now - pipe_wait_t0) >= 10.0
             and (last_continue_at <= 0.0 or
                  (now - last_continue_at) >= max(5, int(continue_interval_sec)))
+            and (continue_max_pulses is None or len(continue_pulses) < int(continue_max_pulses))
         )
         if can_continue_without_pipe:
             pulse = _post_war3_key_pulse(
@@ -8047,9 +8095,15 @@ def wait_for_game_ready(
             break
         time.sleep(0.2)
 
-    if pipe_ready.get("transportOk"):
+    if require_control_plane_for_continue:
+        final_transport_ok = pipe_ready.get("transportOk") is True
+        final_wait_ok = pipe_ready.get("ok") is True
+    else:
+        final_transport_ok = bool(pipe_ready.get("transportOk"))
+        final_wait_ok = bool(pipe_ready.get("ok"))
+    if final_transport_ok:
         runtime_status = dict(((pipe_ready.get("result", {}) or {}).get("runtimeStatus", {})) or {})
-        if pipe_ready.get("ok"):
+        if final_wait_ok:
             return {
                 "ok": True,
                 "mode": "control-plane",

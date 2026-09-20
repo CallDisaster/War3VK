@@ -34,9 +34,16 @@ class CpuSkinMtControllerContractStaticTests(unittest.TestCase):
         ):
             with self.subTest(gate=gate):
                 self.assertIn(gate, self.header)
-        self.assertNotIn("war3_cpu_skin_mt_controller_contract.cpp", self.meson)
-        self.assertNotIn(
-            "war3_cpu_skin_mt_controller_contract_test.cpp", self.meson
+        # 2026-09-16: the contract test is now registered as a meson test
+        # target (merge from A-tree architecture-review follow-up), but the
+        # contract model must stay out of the production DLL source list
+        # (d3d9_src).
+        dll_region = self.meson.split("d3d9_src = [", 1)[1].split(
+            "d3d9_dll = shared_library", 1
+        )[0]
+        self.assertNotIn("war3_cpu_skin_mt_controller_contract.cpp", dll_region)
+        self.assertIn(
+            "'war3_cpu_skin_mt_controller_contract',", self.meson
         )
 
     def test_producer_result_is_destination_free(self) -> None:

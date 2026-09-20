@@ -27,8 +27,12 @@ copy_body = VISIBLE.split(
 assert "queryPtr(registry, renderablePart, layerIndex)" in copy_body
 assert "out = *record;" in copy_body
 
-selection = DEVICE.split("uint64_t War3SemanticDirectRecordSelectionKey(", 1)[1].split(
-    "uint64_t War3ProducerClaimObserveObjectKey", 1
+# M1 迁移：记录级 selector 已迁到语义模块（内容与判定顺序不变）。
+SEMANTIC = (
+    ROOT / "src/d3d9/war3/semantic/war3_device_semantic_predicates.cpp"
+).read_text(encoding="utf-8")
+selection = SEMANTIC.split("uint64_t War3SemanticDirectRecordSelectionKey(", 1)[1].split(
+    "struct War3SemanticUnitValidationCacheEntry", 1
 )[0]
 assert "visibleQueryCache->queryPtr(" in selection
 assert "*outVisibleHint = visible;" in selection

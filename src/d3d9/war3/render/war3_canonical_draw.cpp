@@ -159,7 +159,15 @@ bool BuildCanonicalShadowDrawItem(const CanonicalShadowBuildInputs& inputs,
       skin.paletteRef = inputs.effectiveRuntimeGroupPalette;
     skin.paletteCount = uint32_t(inputs.effectiveRuntimeGroupPalette->size());
     skin.paletteHash = inputs.effectiveRuntimeGroupPaletteHash;
-    if (inputs.currentDrawSample != nullptr &&
+    if (inputs.hasSelectedPalette) {
+      // Payload readiness does not say where the replacement bytes came from.
+      if (inputs.selectedPalette.source == skin::Source::OwnedPartSnapshot)
+        skin.paletteSource = CanonicalPaletteSource::OwnedPartWorldPalette;
+      else if (skin::IsCaptured(inputs.selectedPalette))
+        skin.paletteSource = CanonicalPaletteSource::CurrentDrawCapturedPalette;
+      else
+        skin.paletteSource = CanonicalPaletteSource::SubmitTimeLivePalette;
+    } else if (inputs.currentDrawSample != nullptr &&
         inputs.currentDrawSample->status == CurrentDrawResolveStatus::Ready &&
         inputs.authoritativeGroupSlotsReady &&
         inputs.effectiveRuntimeGroupPaletteHash != 0u) {
@@ -207,7 +215,9 @@ bool BuildCanonicalShadowDrawItem(const CanonicalShadowBuildInputs& inputs,
 
   auto& world = instance.worldTransform;
   if (skin.skinned &&
-      skin.paletteSource == CanonicalPaletteSource::CurrentDrawCapturedPalette) {
+      (skin.paletteSource == CanonicalPaletteSource::CurrentDrawCapturedPalette ||
+       skin.paletteSource == CanonicalPaletteSource::OwnedPartWorldPalette) &&
+      (!inputs.hasSelectedPalette || inputs.selectedPalette.space == skin::Space::World)) {
     world.valid = true;
     world.matrix = Matrix4();
     world.source = CanonicalWorldTransformSource::CurrentDrawPaletteWorld;
@@ -249,7 +259,11 @@ bool BuildCanonicalShadowDrawItem(const CanonicalShadowBuildInputs& inputs,
   } else if (!world.valid) {
     out.readinessReason = CanonicalShadowReadinessReason::NoWorldTransform;
   } else if (out.legacyPath == shadow::ShadowDrawPath::Skinned) {
-    if (!skin.paletteReady() ||
+    if ((inputs.hasSelectedPalette &&
+         !skin::Usable(inputs.selectedPalette,
+             reinterpret_cast<uintptr_t>(packet.renderable.renderablePart),
+             skin.maxVertexGroupSlot < 256u ? skin.maxVertexGroupSlot + 1u : 0u,
+             skin.paletteHash)) || !skin.paletteReady() ||
         skin.maxVertexGroupSlot >= skin.paletteVec().size()) {
       out.readinessReason = CanonicalShadowReadinessReason::NoPalette;
     } else if (skin.usesExplicitBlendContract()) {

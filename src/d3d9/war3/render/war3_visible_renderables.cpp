@@ -1,4 +1,5 @@
 #include "war3_visible_renderables.h"
+#include "../tools/war3_data_collection_tree.h"
 
 #include "war3_shadow_lifecycle.h"
 #include "../../d3d9_war3_debug.h"
@@ -916,6 +917,7 @@ bool TryResolveGeosetFromArray(void *ownerPtr, size_t countOffset,
 }
 
 void ResolveGeosetMetadata(VisibleRenderableRecord &record) {
+  WARVK_DATA_SCOPE(GeosetQuery);
   auto& resourceCache = model::ShadowModelResourceCache::instance();
   if (record.modelResourcePtr != nullptr) {
     record.modelResourcePtr =
@@ -927,9 +929,9 @@ void ResolveGeosetMetadata(VisibleRenderableRecord &record) {
   record.runtimeGeosetPtr = nullptr;
   record.runtimeGeosetDataPtr = nullptr;
 
-  model::ShadowGeosetResourceRecord directGeosetRecord = {};
+  model::ShadowGeosetIdentityView directGeosetRecord = {};
   if (record.meshData != nullptr &&
-      resourceCache.findGeosetByData(record.meshData, directGeosetRecord)) {
+      resourceCache.findGeosetIdentityByData(record.meshData, directGeosetRecord)) {
     record.runtimeGeosetDataPtr = record.meshData;
     if (directGeosetRecord.geosetPtr != nullptr)
       record.runtimeGeosetPtr = directGeosetRecord.geosetPtr;
@@ -2035,6 +2037,7 @@ VisibleRenderableRegistry::snapshotForThread() const {
 }
 
 void VisibleRenderableRegistry::beginFrame() {
+  WARVK_DATA_SCOPE(RegistryMaintenance);
   m_renderThreadId = std::this_thread::get_id();
   const uint32_t published = m_publishedIndex.load(std::memory_order_relaxed);
   m_writeIndex = (published + 1u) % kSnapshotCount;
@@ -2178,6 +2181,7 @@ void VisibleRenderableRegistry::beginFrame() {
 }
 
 void VisibleRenderableRegistry::endFrame() {
+  WARVK_DATA_SCOPE(VisibleFinalize);
   Snapshot &snap = m_snapshots[m_writeIndex];
 
   // Phase 7.96：桥/斜坡/升降机等地形结构附近 War3 引擎会 dispatch 大量对象，
@@ -2276,6 +2280,7 @@ void VisibleRenderableRegistry::endFrame() {
 void VisibleRenderableRegistry::registerMainQueueRange(
     void *batchArray, uint32_t before, uint32_t after,
     const RenderObjectIdentitySnapshot &identity) {
+  WARVK_DATA_SCOPE(VisiblePublish);
   if constexpr (!dxvk::war3::internal::kNativeVisibleRenderableRegistryEnabled) {
     return;
   }
@@ -2386,6 +2391,7 @@ void VisibleRenderableRegistry::registerMainQueueRange(
 
 bool VisibleRenderableRegistry::registerSemanticCandidate(
     const VisibleRenderableRecord &candidate) {
+  WARVK_DATA_SCOPE(VisiblePublish);
   if constexpr (!dxvk::war3::internal::kNativeVisibleRenderableRegistryEnabled) {
     return false;
   }
@@ -2781,6 +2787,7 @@ void VisibleRenderableRegistry::registerTransparentEntry(
     void *payload, uint32_t transparentType, uint32_t queueSlot,
     uint32_t sortKey, float distanceSq,
     const RenderObjectIdentitySnapshot &identity) {
+  WARVK_DATA_SCOPE(VisiblePublish);
   if constexpr (!dxvk::war3::internal::kNativeVisibleRenderableRegistryEnabled) {
     return;
   }
@@ -2840,6 +2847,7 @@ void VisibleRenderableRegistry::registerTransparentEntry(
 
 bool VisibleRenderableRegistry::queryByPayload(void *payload,
                                                VisibleRenderableRecord &out) const {
+  WARVK_DATA_SCOPE(VisibleQuery);
   out = {};
   if (!payload)
     return false;
@@ -2865,6 +2873,7 @@ bool VisibleRenderableRegistry::queryByPayload(void *payload,
 
 bool VisibleRenderableRegistry::queryByRenderablePart(
     void *renderablePart, VisibleRenderableRecord &out) const {
+  WARVK_DATA_SCOPE(VisibleQuery);
   out = {};
   if (!renderablePart)
     return false;
@@ -2898,6 +2907,7 @@ bool VisibleRenderableRegistry::queryByRenderablePart(
 bool VisibleRenderableRegistry::queryByRenderablePartAndLayer(
     void *renderablePart, uint32_t layerIndex,
     VisibleRenderableRecord &out) const {
+  WARVK_DATA_SCOPE(VisibleQuery);
   out = {};
   if (!renderablePart)
     return false;
@@ -3161,6 +3171,7 @@ bool VisibleRenderableRegistry::queryFirstForDirectPacket(
 
 bool VisibleRenderableRegistry::queryByWorldObjectEntry(
     void *worldObjectEntry, VisibleRenderableRecord &out) const {
+  WARVK_DATA_SCOPE(VisibleQuery);
   out = {};
   if (!worldObjectEntry)
     return false;
@@ -3186,6 +3197,7 @@ bool VisibleRenderableRegistry::queryByWorldObjectEntry(
 
 bool VisibleRenderableRegistry::queryByHandle(uint32_t jHandle,
                                               VisibleRenderableRecord &out) const {
+  WARVK_DATA_SCOPE(VisibleQuery);
   out = {};
   if (jHandle == 0u)
     return false;
@@ -3211,6 +3223,7 @@ bool VisibleRenderableRegistry::queryByHandle(uint32_t jHandle,
 
 bool VisibleRenderableRegistry::queryBySceneNode(void *sceneNode,
                                                  VisibleRenderableRecord &out) const {
+  WARVK_DATA_SCOPE(VisibleQuery);
   out = {};
   if (!sceneNode)
     return false;
@@ -3237,6 +3250,7 @@ bool VisibleRenderableRegistry::queryBySceneNode(void *sceneNode,
 
 bool VisibleRenderableRegistry::queryByRuntimeModel(
     void *runtimeModelPtr, VisibleRenderableRecord &out) const {
+  WARVK_DATA_SCOPE(VisibleQuery);
   out = {};
   if (!runtimeModelPtr)
     return false;
@@ -3271,6 +3285,7 @@ void VisibleRenderableRegistry::refreshShadowManifestFromCurrentDraw(
     const std::vector<CurrentDrawContractRecord>& firstRecords,
     const std::vector<CurrentDrawContractRecord>& secondRecords,
     uint64_t frameNumber) {
+  WARVK_DATA_SCOPE(SnapshotPublish);
   if (m_shadowManifestMapEpoch == 0u) {
     clearShadowManifest();
     return;

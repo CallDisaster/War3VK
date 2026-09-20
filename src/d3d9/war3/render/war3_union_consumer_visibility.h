@@ -62,6 +62,11 @@ enum class War3UnionVisibilityRejectReason : uint8_t {
   DegenerateClipW,
   NonFiniteProjection,
   ConsumeNotAdmitted,
+  NonOrthographicProjection,
+  MapGenerationUnknown,
+  MapGenerationMismatch,
+  DeviceGenerationUnknown,
+  DeviceGenerationMismatch,
 };
 
 enum War3UnionVisibilityProofBits : uint32_t {
@@ -104,6 +109,15 @@ struct War3UnionGenerationProof {
   uint64_t boundsFrameGeneration = 0u;
   uint64_t cameraFrameGeneration = 0u;
   uint64_t consumerStateFrameGeneration = 0u;
+  // Map/device identity are deliberately separate from frame and resource
+  // generations.  Each source must be supplied independently by the caller;
+  // copying current into candidate/consumer is not an admissible proof.
+  uint64_t currentMapGeneration = 0u;
+  uint64_t candidateMapGeneration = 0u;
+  uint64_t consumerMapGeneration = 0u;
+  uint64_t currentDeviceGeneration = 0u;
+  uint64_t candidateDeviceGeneration = 0u;
+  uint64_t consumerDeviceGeneration = 0u;
   uint64_t resourceGeneration = 0u;
   uint64_t expectedResourceGeneration = 0u;
 };

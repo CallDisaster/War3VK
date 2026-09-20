@@ -32,6 +32,7 @@
 #include "war3/memory/war3_storm_hook.h"
 #include "war3/memory/war3_tlsf_pool.h"
 #include "war3/model/war3_model_hook.h"
+#include "war3/model/war3_native_light_bridge.h"
 #include "war3/native/war3_native_hooks.h"
 #include "war3/platform/war3_module_api.h"
 #include "war3/platform/war3_runtime_bootstrap.h"
@@ -833,6 +834,8 @@ void War3Hook::InstallHooks(IDirect3DDevice9 *device) {
   // Bootstrap 只做“最早期可安全安装”的生命周期/JASS 入口。
   dxvk::war3::hooks::War3HookJass::Install(gameInfo.base);
   dxvk::war3::hooks::War3HookLifecycle::Install(gameInfo.base);
+  if (!bootstrapMinimal)
+    war3::native_light::Install(gameInfo.base);
   if constexpr (dxvk::war3::internal::kWar3ModelHookEnabled &&
                 dxvk::war3::internal::kShadowRuntimeModelBootstrapHookEnabled) {
     // owner/source provenance 现在已经收敛到“可能发生在 ActivateWar3Runtime

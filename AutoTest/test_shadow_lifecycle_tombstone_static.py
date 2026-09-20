@@ -113,7 +113,20 @@ class ShadowLifecycleTombstoneStaticTest(unittest.TestCase):
         self.assertIn("m_war3DrawTimeVBCache.erase", DEVICE_CPP)
         self.assertIn("RetirePayloadsForTombstone(", DEVICE_CPP)
         self.assertIn("ClearPayloadsForLifecycleOverflow()", DEVICE_CPP)
-        self.assertIn("m_war3Stage13RetainedCasters.clear()", DEVICE_CPP)
+        # 2026-09-18 T7/U5：Stage13 清理由无条件 clear() 改为 domain 作用域的
+        # owner-check 循环（只清 Stage13Exact 条目），语义等价：本分支照旧清空
+        # Stage13 retention，但不再可能顺手清掉别的 domain 的条目。
+        self.assertIn("tombstone.identity.producerStage == 13", DEVICE_CPP)
+        self.assertNotIn("m_war3Stage13RetainedCasters.clear()", DEVICE_CPP)
+        stage13_clear = DEVICE_CPP[
+            DEVICE_CPP.index("tombstone.identity.producerStage == 13"):
+            DEVICE_CPP.index("tombstone.identity.producerStage == 1)")
+        ]
+        self.assertIn("m_war3Stage13RetainedCasters.erase(retainedIt)", stage13_clear)
+        self.assertIn(
+            "dxvk::war3::shadow::ShadowGeometryDomain::Stage13Exact, 0u,",
+            stage13_clear,
+        )
         self.assertIn("m_war3S1TerrainCasterStash.clear()", DEVICE_CPP)
 
 

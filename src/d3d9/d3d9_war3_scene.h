@@ -5,6 +5,8 @@
 #include "war3/render/war3_shadow_palette_storage.h"
 #include "war3/render/war3_shadow_replay_binding_policy.h"
 #include "war3/gpu_skin/war3_gpu_skin_types.h"
+#include "war3/render/war3_palette_object_diagnostics.h"
+#include "war3/render/war3_skin_palette_selection.h"
 
 #include "../dxvk/dxvk_buffer.h"
 #include "../dxvk/dxvk_image.h"   // 用于 Rc<DxvkImageView> (Alpha测试阴影)
@@ -398,6 +400,36 @@ namespace dxvk {
         // Metadata-only producer evidence. These fields are diagnostic and
         // cannot be used to manufacture/replay geometry.
         void* shadowRenderablePart = nullptr;
+        // 2026-09-17 对象级证据（Step 1③，C/D 点）：把对象级证据的通行键（runtimeModelPtr）
+        // 与 record 帧域按值带到 CSM 绘制点。与 shadowRenderablePart 同性质：
+        // **诊断用副本**，不参与任何判定 / 准入 / 回退 / 回放，也不改变既有字段语义。
+        void* shadowRuntimeModelPtr = nullptr;
+        uint64_t shadowRecordFrameSerial = 0u;
+        // Diagnostic only: producer, runtime model, cache outcome, source frame,
+        // material state, packet frame, immutable generation and exact slice.
+        // Never consulted by production admission or replay.
+        std::array<uint64_t, 16> inputEvidenceProvenance = {};
+        // Additive evidence field; do not repurpose the frozen provenance array.
+        war3::render::skin::Selection inputSkinSelection = {};
+  // 2026-09-17 上级裁定：对象级证据 **D 点**必须有**独立的小型按值诊断载荷**。
+  // 原实现让 D 点读 inputSkinSelection，而它只在 InputsEnabled()（高内存原始输入取证）下赋值，
+  // 因此正常录制里 D 的来源/帧标签恒不可得。这里无条件复制 5 个小字段（仅诊断，不参与任何判定）。
+  struct PaletteObjectDiagnostics {
+    // 2026-09-18 阶段 E：**原因按值携带**。旧实现只由 frameTag 反推 —— packet 回退时
+    // selectedPalette 带的是 **packet 的** tag（非零）⇒ 会把「packet 的帧」谎报成「native 帧已知」。
+    // 现在在**真实分支**赋值并整值携带，D 点只读本字段，**不得**再由 frameTag 反推。
+    // 2026-09-19 上级裁定：**动作 / 帧证据 / 被描述的选择身份**分离，交由
+    // palette_object::Verdict 用**唯一**规则解释（S 点与 D 点消费同一份描述）。
+    // 旧实现把三件事挤进一个 cause 枚举，导致「没有非零标签」被写成「发生了 packet 回退」。
+    uint64_t captureSerial = 0u;
+    uint64_t publicationTicket = 0u;
+    uint32_t source = 0u;      // war3::render::skin::Source 序号
+    uint32_t slot = UINT32_MAX;
+    uint32_t frameTag = 0u;
+    dxvk::war3::render::palette_object::Diagnostics verdict = {};  } paletteDiagnostics;
+        // Non-wrapping native-light owner generation, NOT an address. Only a
+        // reviewed exact model owner can annotate its own submitted geometry.
+        uint64_t nativeLightEmitterGeneration = 0;
         uint32_t shadowLayerIndex = 0u;
         uint64_t shadowMetadataKeyHash = 0u;
         // Collision-resistant current-frame geometry identity.  Kept
@@ -1429,6 +1461,7 @@ namespace dxvk {
         uint32_t semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeBlendedCacheCount = 0;// QueryBlendedPaletteBySlotIndex
         uint32_t semanticSceneSubmittedSkinnedPaletteSourceSubmitTimePublishedRegistryCount = 0;
         uint32_t semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeCModelFallbackCount = 0;
+        uint32_t semanticSceneSubmittedSkinnedPaletteSourceOwnedPartSnapshotCount = 0;
         // Phase 7.48：per-frame submitted skinned palette 聚合诊断。
         // 目的：区分"指标错觉"（lastSubmittedPaletteHash 只是最后一个 caster）
         // 与"真冻结"（整帧所有 caster palette 都锁住）。
@@ -1492,6 +1525,24 @@ namespace dxvk {
         uint32_t semanticSceneSubmittedSkinnedPaletteStaleRestoreSubmittedCount = 0;
         uint32_t semanticSceneSubmittedSkinnedPaletteAfterStaleRestoreLargeDeltaCount = 0;
         uint32_t semanticSceneSubmittedSkinnedPaletteLiveToLiveLargeDeltaCount = 0;
+        // 2026-09-17 活跃路径纯计数（上级 Q-B 条件批准；无条件编译，不设默认关闭门控）。
+        // 只证明"路径到达 / 提交数量"，不构成来源归属或对象级关联的证据。
+        // 口径：当帧值，与既有 palette 分类桶同源（m_war3Scene.shadowStats 每帧随
+        //   `m_war3Scene = War3FrameScene{}` 整体重建），并随 NoteShadowSceneStats 在
+        //   Present 安全点发布；写入者只有渲染所有者线程的 append/submit 链，
+        //   无跨线程查询、无日志、无分配、无原子。
+        // ① append 入口（ShadowProducerPolicyAllows 之后、canonical 构建之前）的
+        //    skinned 分母；`skinned` 仅表示 packet.path == ShadowDrawPath::Skinned。
+        uint32_t semanticSceneAppendEntrySkinnedCount = 0;
+        // ④-b canonical 就绪门 `!canonicalItem.readyForShadowConsumer()` 拒绝分支的
+        //    skinned 分母（skinned-only，与 currentDrawResolveStatus 无关）。
+        uint32_t semanticSceneCanonicalGateRejectSkinnedCount = 0;
+        // ⑥-a War3TryPopulateDrawTimeSemanticProducer 的提交分母（与既有
+        //    `semanticSceneSubmittedSkinned++` 同点，沿用其 Unit 分支语义）。
+        uint32_t semanticSceneDrawTimeProducerSubmittedSkinnedCount = 0;
+        // ⑥-b 第二条 draw-time 路径 War3TryPopulateDirectCurrentDrawGrouped 的
+        //    fast-append 发布段提交分母（与既有 `semanticSceneSubmittedSkinned++` 同点）。
+        uint32_t semanticSceneDirectCurrentDrawSubmittedSkinnedCount = 0;
         // Phase 7.30 Action B：attribution-key snapshot 命中次数。
         // 只在"per-thread cache miss + global byPart miss"后走 attribution
         // 表的 hit 才计；可直接反映"renderablePart 换地址时 snapshot 被救

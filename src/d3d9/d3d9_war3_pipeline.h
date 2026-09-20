@@ -2,6 +2,7 @@
 
 #include "d3d9_war3_scene.h"
 #include "d3d9_war3_settings.h"
+#include "d3d9_war3_light.h"
 #include "war3/render/war3_render_state.h"
 
 #include "../dxvk/dxvk_device.h"
@@ -36,6 +37,7 @@ namespace dxvk {
     // shadow pass may resolve the authored day/night cycle and later passes
     // consume that result without mutating the immutable authored snapshot.
     struct War3FrameLightingState {
+        bool nativeColorExternalWriteHazard = false;
         Vector4 sunDirection = Vector4(0.0f, 0.0f, -1.0f, 0.0f);
         Vector4 sunColor = Vector4(1.0f, 1.0f, 1.0f, 0.0f);
         float renderTimeHours = 12.0f;
@@ -60,6 +62,20 @@ namespace dxvk {
     struct War3PipelineInput {
         Rc<DxvkImageView> colorView;
         Rc<DxvkImageView> depthView; // 预留
+        // Private transactional baseline. No native pointer or JAPI handle
+        // ownership escapes the render thread. Only ShadowReceiver consumes it.
+        std::array<Rc<DxvkImageView>, 3> nativeLightBaselines;
+        War3PointLightFrameSnapshot nativeLightSnapshot;
+        uint32_t nativeLightCount = 0;
+        uint64_t nativeLightAuthorGeneration = 0;
+        // Frozen indices, not native pointers. Only the emitter's own light
+        // excludes these same-frame exact-owner fallback casters.
+        std::vector<uint32_t> nativeEmitterFallbackIndices;
+        std::vector<uint32_t> nativeEmitterCasterIndices;
+        std::shared_ptr<const War3RenderSettings> nativeLightSettings;
+        const std::shared_ptr<const War3RenderSettings>& ShadowSettings() const {
+            return nativeLightSettings ? nativeLightSettings : settings;
+        }
         War3FrameScene scene;        // 本帧捕获的世界数据（阴影/光照/后处理共享）
         uint32_t frameIndex = 0;     // Synchronization: 0..2 ring-buffer slot only
         // Monotonic D3D9 presentation-frame identity. Never use frameIndex for

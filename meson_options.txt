@@ -4,6 +4,12 @@ option('enable_d3d9',  type : 'boolean', value : true, description: 'Build D3D9'
 option('enable_d3d10', type : 'boolean', value : true, description: 'Build D3D10')
 option('enable_d3d11', type : 'boolean', value : true, description: 'Build D3D11')
 option('build_id',     type : 'boolean', value : false)
+option('warvk_data_collection_tree_dev', type : 'boolean', value : false,
+  description : 'Coherent opt-in data collection call tree; diagnostic overlay, not additive frame CPU')
+option('warvk_internal_frame_recorder', type : 'boolean', value : false,
+  description : 'Internal diagnostic build: default-on bounded frame recorder/HUD/raw inputs; explicit environment zero disables it')
+option('warvk_skin_palette_contract_candidate', type : 'boolean', value : false,
+  description : 'Internal candidate: make strict skin-palette publication contract the process default')
 option('warvk_shadow_observers_dev', type : 'boolean', value : false,
   description : 'Enable AutoTest/development-only WarVK shadow Observe routes; Consume remains unavailable')
 option('warvk_rts_shadow_candidate_dev', type : 'boolean', value : false,

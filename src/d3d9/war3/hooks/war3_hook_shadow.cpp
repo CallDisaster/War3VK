@@ -116,6 +116,9 @@ std::atomic<uint64_t> g_registerImageObjectBridgeCount{0};
 std::atomic<uint64_t> g_registerImageFromPointCount{0};
 std::atomic<uint64_t> g_registerImageFromTwoPointsCount{0};
 std::atomic<uint64_t> g_registerImageUnknownSourceCount{0};
+std::atomic<uint64_t> g_shadowPathStaticStampEnterCount{0};
+std::atomic<uint64_t> g_shadowPathStaticStampBlockedCount{0};
+std::atomic<uint64_t> g_shadowPathStaticStampPassthroughCleanupCount{0};
 std::atomic<uint64_t> g_cunitUiRecordSetUnitShadowEnterCount{0};
 std::atomic<uint64_t> g_cunitUiRecordSetUnitShadowBlockedCount{0};
 std::atomic<uint64_t> g_cunitUiRecordSetStructureShadowEnterCount{0};
@@ -944,14 +947,26 @@ void __fastcall Hook_ShadowPath_StaticStamp_Toggle(void* thisPtr,
                                                    int shadowObjectPtr,
                                                    int enable) {
   (void)edx;
+  g_shadowPathStaticStampEnterCount.fetch_add(1, std::memory_order_relaxed);
   const uint32_t mode = War3RenderState::GetNativeShadowMode();
   bool blocked = false;
   const char* reason = "PassThrough";
 
   // Only suppress new static-stamp writes. Disable calls must pass through so
   // War3 can clear existing stamps instead of leaving stale mask bits behind.
+  if (enable == 0) {
+    g_shadowPathStaticStampPassthroughCleanupCount.fetch_add(
+        1, std::memory_order_relaxed);
+    CallShadowPathStaticStampToggleOriginal(thisPtr, shadowObjectPtr, enable);
+    return;
+  }
+
   if (enable != 0) {
-    if (mode >= 2u &&
+    if constexpr (
+        dxvk::war3::internal::kNativeShadowBlockStaticStampPathByDefault) {
+      blocked = true;
+      reason = "Default_BlockStaticStampPathEnable";
+    } else if (mode >= 2u &&
         dxvk::war3::internal::kNativeShadowBlockStaticStampPathWhenMode2) {
       blocked = true;
       reason = "Mode>=2_BlockStaticStampPathEnable";
@@ -974,8 +989,11 @@ void __fastcall Hook_ShadowPath_StaticStamp_Toggle(void* thisPtr,
     }
   }
 
-  if (blocked)
+  if (blocked) {
+    g_shadowPathStaticStampBlockedCount.fetch_add(1,
+                                                 std::memory_order_relaxed);
     return;
+  }
 
   CallShadowPathStaticStampToggleOriginal(thisPtr, shadowObjectPtr, enable);
 }
@@ -2109,6 +2127,51 @@ uint32_t QueryShadowProjectorObservedFourCCSampleAt(uint32_t idx) {
   if (idx >= g_projectorObservedFourCCSamples.size())
     return 0u;
   return g_projectorObservedFourCCSamples[idx].load(std::memory_order_relaxed);
+}
+
+uint64_t QueryShadowRegisterImageEnterCount() {
+  return g_registerImageEnterCount.load(std::memory_order_relaxed);
+}
+uint64_t QueryShadowRegisterImageBlockedCount() {
+  return g_registerImageBlockedCount.load(std::memory_order_relaxed);
+}
+uint64_t QueryShadowRegisterImageStaticStampCount() {
+  return g_registerImageStaticStampCount.load(std::memory_order_relaxed);
+}
+uint64_t QueryShadowRegisterImageEmitterStampCount() {
+  return g_registerImageEmitterStampCount.load(std::memory_order_relaxed);
+}
+uint64_t QueryShadowRegisterImageSelectionCount() {
+  return g_registerImageSelectionCount.load(std::memory_order_relaxed);
+}
+uint64_t QueryShadowRegisterImageOcclusionCount() {
+  return g_registerImageOcclusionCount.load(std::memory_order_relaxed);
+}
+uint64_t QueryShadowRegisterImageWithParamsCount() {
+  return g_registerImageWithParamsCount.load(std::memory_order_relaxed);
+}
+uint64_t QueryShadowRegisterImageObjectBridgeCount() {
+  return g_registerImageObjectBridgeCount.load(std::memory_order_relaxed);
+}
+uint64_t QueryShadowRegisterImageFromPointCount() {
+  return g_registerImageFromPointCount.load(std::memory_order_relaxed);
+}
+uint64_t QueryShadowRegisterImageFromTwoPointsCount() {
+  return g_registerImageFromTwoPointsCount.load(std::memory_order_relaxed);
+}
+uint64_t QueryShadowRegisterImageUnknownSourceCount() {
+  return g_registerImageUnknownSourceCount.load(std::memory_order_relaxed);
+}
+
+uint64_t QueryShadowPathStaticStampEnterCount() {
+  return g_shadowPathStaticStampEnterCount.load(std::memory_order_relaxed);
+}
+uint64_t QueryShadowPathStaticStampBlockedCount() {
+  return g_shadowPathStaticStampBlockedCount.load(std::memory_order_relaxed);
+}
+uint64_t QueryShadowPathStaticStampPassthroughCleanupCount() {
+  return g_shadowPathStaticStampPassthroughCleanupCount.load(
+      std::memory_order_relaxed);
 }
 
 // Phase 7.116：DispatchToShape 永久 atomic 读取器。

@@ -732,14 +732,26 @@ class Stage11ExactIndexBlockerStaticTests(unittest.TestCase):
         for token in (
             "War3MarkDrawTimeExactRejectedCurrentFrame(vbCacheKey)",
             "entry.captureComplete = false;",
-            "entry.positionBuffer = nullptr;",
-            "entry.positionInfo = {};",
-            "entry.positionCapacity = 0u;",
+            "war3::render::War3ReleaseDrawTimePositionBacking(entry);",
             "entry.gpuSkinLeaseBacked = false;",
             "entry.gpuSkinInput = {};",
-            "if (entry.uvSharesPositionBuffer)",
         ):
             self.assertIn(token, settlement)
+        # The shared transition preserves the original clearing contract and
+        # additionally drops the retained Page/pin/offset and UV-alias owners.
+        lifetime = (ROOT / "src/d3d9/war3/render/war3_draw_time_snapshot_lifetime.h").read_text(
+            encoding="utf-8")
+        release = source_block(lifetime, "void War3ReleaseDrawTimePositionBacking(",
+                               "// Owner-thread, stack-only transaction")
+        self.assertIn("if (entry.uvSharesPositionBuffer)", release)
+        for prefix in ("position", "uv"):
+            for field in ("Buffer = nullptr;", "Info = {};", "Capacity = 0u;",
+                          "PinnedAllocation = nullptr;", "SnapshotPage.reset();",
+                          "SnapshotOffset = 0u;"):
+                self.assertIn("entry." + prefix + field, release)
+        self.assertIn("entry.uvSharesPositionBuffer = false;", release)
+        self.assertLess(settlement.index("entry.captureComplete = false;"),
+                        settlement.index("War3ReleaseDrawTimePositionBacking(entry)"))
 
     def test_unmapped_index_domain_uses_only_bounded_full_vb_fallback(
         self,

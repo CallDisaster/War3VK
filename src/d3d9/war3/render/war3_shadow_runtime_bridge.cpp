@@ -1,4 +1,6 @@
 #include "war3_shadow_runtime_bridge.h"
+#include "war3_shadow_display_stats.h"
+#include "../tools/war3_data_collection_tree.h"
 #include "../tools/war3_perf_monitor.h"
 
 #include "../../d3d9_war3_hook.h"
@@ -56,6 +58,10 @@ namespace dxvk::war3_diag {
   uint64_t QueryShadowAppendTotal();
   uint64_t QueryShadowAppendUnique();
   uint32_t QueryShadowAppendRawcodeAt(uint32_t idx);
+  // 2026-09-16 P0 Gap A：device 侧 palette 记忆槽位复核计数
+  //（d3d9_device.cpp 实现）。
+  uint64_t QueryDevicePaletteSlotCacheServedAfterConfirmCount();
+  uint64_t QueryDevicePaletteSlotCacheRejectedStaleCount();
 }
 
 namespace dxvk::war3::render {
@@ -5144,6 +5150,24 @@ void NoteShadowRuntimeSpriteFramePose(void* runtimeModelPtr, void* spritePtr,
       worldTransform, matrixCount, matrixHash);
 }
 
+ShadowDisplayStats QueryShadowDisplayStats() {
+  std::shared_lock<std::shared_mutex> lock(g_shadowSceneStatsMutex);
+  ShadowDisplayStats result;
+  result.producerFrame = g_shadowSceneStats.producerSealFrameSerial;
+  result.mapRenderSerial = g_shadowSceneStats.semanticSceneShadowMapRenderSerial;
+  result.hasCompleteMap = g_shadowSceneStats.semanticSceneReceiverHasCompleteShadowMap;
+  result.mapExecuted = g_shadowSceneStats.semanticSceneShadowMapExecutedThisFrame;
+  result.receiverExecuted = g_shadowSceneStats.semanticSceneReceiverDrawExecutedThisFrame;
+  result.earlyReturnReason = g_shadowSceneStats.semanticSceneReceiverRunEarlyReturnReason;
+  result.prepared = g_shadowSceneStats.semanticSceneShadowMapPreparedDrawCount;
+  result.terrainDoodadPrepared = g_shadowSceneStats.semanticSceneShadowMapTerrainDoodadPreparedCount;
+  result.cascadeDrawn[0] = g_shadowSceneStats.semanticSceneShadowMapCascade0DrawnCount;
+  result.cascadeDrawn[1] = g_shadowSceneStats.semanticSceneShadowMapCascade1DrawnCount;
+  result.cascadeDrawn[2] = g_shadowSceneStats.semanticSceneShadowMapCascade2DrawnCount;
+  result.cascadeDrawn[3] = g_shadowSceneStats.semanticSceneShadowMapCascade3DrawnCount;
+  return result;
+}
+
 ShadowProducerRuntimeDiagnostics QueryShadowProducerRuntimeDiagnostics() {
   ShadowProducerRuntimeDiagnostics summary = {};
   std::shared_lock<std::shared_mutex> lock(g_shadowSceneStatsMutex);
@@ -6732,6 +6756,7 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
         .semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeCModelFallbackCount =
         g_shadowSceneStats
             .semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeCModelFallbackCount;
+    summary.semanticSceneSubmittedSkinnedPaletteSourceOwnedPartSnapshotCount = g_shadowSceneStats.semanticSceneSubmittedSkinnedPaletteSourceOwnedPartSnapshotCount;
     summary.semanticSceneSubmittedSkinnedPaletteStablePartSampleCount =
         g_shadowSceneStats
             .semanticSceneSubmittedSkinnedPaletteStablePartSampleCount;
@@ -6740,6 +6765,54 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
     summary.semanticSceneSubmittedSkinnedPaletteSourceChurnCount =
         g_shadowSceneStats
             .semanticSceneSubmittedSkinnedPaletteSourceChurnCount;
+    // 2026-09-17 活跃路径纯计数（同链路导出；只证明路径到达/提交数量）。
+    summary.semanticSceneAppendEntrySkinnedCount =
+        g_shadowSceneStats.semanticSceneAppendEntrySkinnedCount;
+    summary.semanticSceneCanonicalGateRejectSkinnedCount =
+        g_shadowSceneStats.semanticSceneCanonicalGateRejectSkinnedCount;
+    summary.semanticSceneDrawTimeProducerSubmittedSkinnedCount =
+        g_shadowSceneStats.semanticSceneDrawTimeProducerSubmittedSkinnedCount;
+    summary.semanticSceneDirectCurrentDrawSubmittedSkinnedCount =
+        g_shadowSceneStats.semanticSceneDirectCurrentDrawSubmittedSkinnedCount;
+    // 2026-09-16 P0 palette 缝隙修复度量：device(Gap A)/shadow-core(Gap B)
+    // 记忆槽位复核计数，直接拉 atomic getter（进程累计值）。
+    summary.semanticSceneSkinnedPaletteSlotCacheDeviceServedAfterConfirmCount =
+        ::dxvk::war3_diag::
+            QueryDevicePaletteSlotCacheServedAfterConfirmCount();
+    summary.semanticSceneSkinnedPaletteSlotCacheDeviceRejectedStaleCount =
+        ::dxvk::war3_diag::QueryDevicePaletteSlotCacheRejectedStaleCount();
+    // 2026-09-17 上级裁定（线程修复方案 B 第一部分）：构建推进边界线程见证
+    // （进程累计值，直接拉 atomic getter；与 A5 拒绝计数不同分母）。
+    summary.semanticBuildOffThreadRefusedCount =
+        shadow::QuerySemanticBuildOffThreadRefusedCount();
+    summary.semanticBuildOwnerUnestablishedRefusedCount =
+        shadow::QuerySemanticBuildOwnerUnestablishedRefusedCount();
+    summary.semanticBuildDirectAdvanceRefusedCount =
+        shadow::QuerySemanticBuildDirectAdvanceRefusedCount();
+    summary
+        .semanticSceneSkinnedPaletteSlotCacheShadowCoreServedAfterConfirmCount =
+        shadow::QueryPaletteSlotCacheServedAfterConfirmCount();
+    summary.semanticSceneSkinnedPaletteSlotCacheShadowCoreRejectedStaleCount =
+        shadow::QueryPaletteSlotCacheRejectedStaleCount();
+    summary
+        .semanticSceneSkinnedPaletteSlotCacheShadowCoreProducerSnapshotFallbackCount =
+        shadow::QueryPaletteSlotCacheProducerSnapshotFallbackCount();
+    // 2026-09-17 Gap B 补强计数（同链路导出）。
+    summary
+        .semanticSceneSkinnedPaletteSlotCacheShadowCoreFrameProofServedCount =
+        shadow::QueryPaletteSlotCacheFrameProofServedCount();
+    summary
+        .semanticSceneSkinnedPaletteSlotCacheShadowCoreGroupShortRejectedCount =
+        shadow::QueryPaletteSlotCacheGroupShortRejectCount();
+    summary
+        .semanticSceneSkinnedPaletteSlotCacheShadowCoreBindingFrameStaleRejectedCount =
+        shadow::QueryPaletteSlotCacheBindingFrameStaleRejectCount();
+    summary
+        .semanticSceneSkinnedPaletteSlotCacheShadowCoreSlotRangeStaleRejectedCount =
+        shadow::QueryPaletteSlotCacheSlotRangeStaleRejectCount();
+    summary
+        .semanticSceneSkinnedPaletteSlotCacheShadowCoreSnapshotFrameStaleRejectedCount =
+        shadow::QueryPaletteSlotCacheSnapshotFrameStaleRejectCount();
     summary.semanticSceneSubmittedSkinnedPaletteSlotIndexChurnCount =
         g_shadowSceneStats
             .semanticSceneSubmittedSkinnedPaletteSlotIndexChurnCount;
@@ -7741,6 +7814,36 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
         ::dxvk::war3::hooks::QueryDispatchToShapeFromShadowSetupCount();
     summary.dispatchToShapeFromOtherCallerCount =
         ::dxvk::war3::hooks::QueryDispatchToShapeFromOtherCallerCount();
+    // P2 批次 0：RegisterImage / StaticStampPath producer 治理。
+    summary.registerImageEnterCount =
+        ::dxvk::war3::hooks::QueryShadowRegisterImageEnterCount();
+    summary.registerImageBlockedCount =
+        ::dxvk::war3::hooks::QueryShadowRegisterImageBlockedCount();
+    summary.registerImageStaticStampCount =
+        ::dxvk::war3::hooks::QueryShadowRegisterImageStaticStampCount();
+    summary.registerImageEmitterStampCount =
+        ::dxvk::war3::hooks::QueryShadowRegisterImageEmitterStampCount();
+    summary.registerImageSelectionCount =
+        ::dxvk::war3::hooks::QueryShadowRegisterImageSelectionCount();
+    summary.registerImageOcclusionCount =
+        ::dxvk::war3::hooks::QueryShadowRegisterImageOcclusionCount();
+    summary.registerImageWithParamsCount =
+        ::dxvk::war3::hooks::QueryShadowRegisterImageWithParamsCount();
+    summary.registerImageObjectBridgeCount =
+        ::dxvk::war3::hooks::QueryShadowRegisterImageObjectBridgeCount();
+    summary.registerImageFromPointCount =
+        ::dxvk::war3::hooks::QueryShadowRegisterImageFromPointCount();
+    summary.registerImageFromTwoPointsCount =
+        ::dxvk::war3::hooks::QueryShadowRegisterImageFromTwoPointsCount();
+    summary.registerImageUnknownSourceCount =
+        ::dxvk::war3::hooks::QueryShadowRegisterImageUnknownSourceCount();
+    summary.staticStampPathEnterCount =
+        ::dxvk::war3::hooks::QueryShadowPathStaticStampEnterCount();
+    summary.staticStampPathBlockedCount =
+        ::dxvk::war3::hooks::QueryShadowPathStaticStampBlockedCount();
+    summary.staticStampPathCleanupCount =
+        ::dxvk::war3::hooks::
+            QueryShadowPathStaticStampPassthroughCleanupCount();
     // Phase 7.108：ShadowProjector 永久统计。
     summary.projectorAddFromObjectEnterCount =
         ::dxvk::war3::hooks::QueryShadowProjectorAddFromObjectEnterCount();
@@ -8217,6 +8320,10 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
       semanticCore.resolve.skippedNoPoseLookupMiss;
   summary.semanticCoreSkippedNoRuntimeGroupPalette =
       semanticCore.resolve.skippedNoRuntimeGroupPalette;
+  summary.semanticCoreSkippedPathBlocker =
+      semanticCore.resolve.skippedPathBlocker;
+  summary.semanticCoreSkippedPathBlockerGeometryMarker =
+      semanticCore.resolve.skippedPathBlockerGeometryMarker;
   summary.semanticCoreAttachmentRigidResolved =
       semanticCore.resolve.attachmentRigidResolved;
   summary.semanticCoreAttachmentRigidSupplementalAttachmentCount =
@@ -8481,6 +8588,10 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
         nativeSummary.canonicalPublishRejectNotReadyCount;
     summary.nativeD3D9BackendCanonicalPublishRejectNoPositionsCount =
         nativeSummary.canonicalPublishRejectNoPositionsCount;
+    summary.nativeD3D9BackendCanonicalSkippedPathBlockerCount =
+        nativeSummary.canonicalSkippedPathBlockerCount;
+    summary.nativeD3D9BackendCanonicalSkippedPathBlockerGeometryMarkerCount =
+        nativeSummary.canonicalSkippedPathBlockerGeometryMarkerCount;
     summary.nativeD3D9BackendGeometryRejectCount =
         nativeSummary.geometryRejectCount;
     summary.nativeD3D9BackendPaletteRejectCount =
@@ -9673,6 +9784,7 @@ bool AugmentShadowSemanticContext(
     dxvk::War3ShadowSemanticContext& semantic,
     const RenderObjectInfo* currentObj,
     const ShadowSemanticAugmentTrace* trace) {
+  WARVK_DATA_SCOPE(SemanticAugment);
   // 该函数可在每个 caster/draw 路径调用；默认 detail scope 为零开销空对象。
   auto augmentDetailScope = dxvk::war3::War3PerfMonitor::instance()
       .cpuDetailScope("Semantic/AugmentShadowContext");

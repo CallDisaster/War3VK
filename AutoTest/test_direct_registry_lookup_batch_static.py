@@ -79,7 +79,7 @@ assert [render_direct.index(token) for token in render_priority] == sorted(
 builder = body(
     DEVICE,
     "bool War3TryBuildShadowPacketFromCurrentDrawRecord",
-    "dxvk::war3::render::ObjectKind War3ResolveSemanticPacketObjectKindFast",
+    "bool War3LooksSubmitEligibleForDirectCurrentDrawFast(",
 )
 assert builder.count("instanceRegistry.findFirstForDirectPacketView(") == 3
 assert "instanceRegistry.findFirstForDirectPacket(" not in builder

@@ -17,6 +17,12 @@
 #include "../shader/war3_shader_manager.h"
 #include "../tools/war3_perf_monitor.h"
 #include "../tools/war3_diagnostics_hub.h"
+#include "../tools/war3_frame_history.h"
+#include "../tools/war3_frame_evidence.h"
+#include "../render/war3_shadow_runtime_bridge.h"
+#include "../render/war3_shadow_display_stats.h"
+#include "../render/war3_stage11_snapshot_page_policy.h"
+#include "../memory/war3_shadow_arena_stats.h"
 
 #include <algorithm>
 
@@ -72,6 +78,7 @@ void War3Imgui::initialize(HWND hwnd, D3D9DeviceEx *device) {
 }
 
 void War3Imgui::shutdown() {
+  m_renderStatsRefresh.reset();
   if (!m_initialized)
     return;
 
@@ -120,7 +127,7 @@ void War3Imgui::newFrame() {
 
   war3shader::internal::SetImGuiContext(ImGui::GetCurrentContext());
   war3shader::internal::BeginUiFrame();
-  war3shader::internal::DispatchUiCallbacks();
+  if(m_visible)war3shader::internal::DispatchUiCallbacks();
 }
 
 void War3Imgui::endFrame() {
@@ -131,6 +138,9 @@ void War3Imgui::endFrame() {
 
 void War3Imgui::render(bool inScene) {
   if (!m_initialized || m_hasRendered || !m_visible)
+    return;
+  // Keep console pixels outside the recorder's final-color history capture.
+  if (inScene && tools::evidence::Enabled())
     return;
   m_hasRendered = true;
 
@@ -165,11 +175,60 @@ void War3Imgui::render(bool inScene) {
   war3shader::internal::EndUiFrame();
 }
 
+void War3Imgui::drawFrameRecorderPanel() {
+  if (!ImGui::CollapsingHeader("帧取证 (Ctrl+Shift+C)"))
+    return;
+
+  // Display-only snapshot: capture and resource lifetime remain recorder-owned.
+  const auto recorder = tools::QueryFrameHistoryHud();
+  ImGui::TextWrapped("Ctrl+F1 或窗口关闭按钮仅隐藏控制台，不停止采集、不释放取证内存。");
+  ImGui::TextWrapped("完全停用取证：启动前设置 DXVK_WAR3_FRAME_EVIDENCE=0，并重新启动游戏。");
+  if (!recorder.enabled) {
+    ImGui::TextDisabled("本进程的帧取证已关闭；修改环境变量需要重新启动。");
+    return;
+  }
+  if (tools::evidence::InternalRecorderBuild())
+    ImGui::TextUnformatted("内部诊断构建：默认开启取证（有内存/显存开销）");
+  switch (recorder.state) {
+  case 0:
+    ImGui::TextUnformatted(recorder.selfContained ? "内置采集：等待进入地图" : "外部控制模式：等待采集程序");
+    break;
+  case 1:
+    ImGui::TextUnformatted("正在准备显存缓冲，请稍候");
+    break;
+  case 2:
+    ImGui::TextColored(recorder.bufferedMs >= recorder.requiredMs ? ImVec4(.4f, 1.f, .4f, 1) : ImVec4(1.f, .8f, .2f, 1),
+        "采集中：%.2f 秒 / 目标 %.2f 秒", recorder.bufferedMs / 1000.0f, recorder.requiredMs / 1000.0f);
+    break;
+  case 3:
+    ImGui::TextUnformatted("已触发：保留后续帧");
+    break;
+  case 4: case 5:
+    ImGui::Text("正在保存图片 %u / %u，请勿退出", recorder.saved, recorder.total);
+    break;
+  case 6:
+    ImGui::TextUnformatted(recorder.packageReady ? "原始包已保存，可退出；完整性待离线分析" : "图片已保存，正在整理日志，请勿退出");
+    break;
+  case 7:
+    ImGui::TextColored(ImVec4(1, .3f, .3f, 1), "采集失败：%s", recorder.error);
+    break;
+  default:
+    ImGui::TextUnformatted("采集会话正在清理");
+    break;
+  }
+  if (recorder.selfContained)
+    ImGui::TextUnformatted("DLL 独立采集，无需后台连接；每进程保留一份事件");
+  else if (recorder.state == 2 && !recorder.watcherAlive)
+    ImGui::TextColored(ImVec4(1, .4f, .2f, 1), "外部控制已断开；该模式需要 watcher");
+  if (recorder.notice == 2)
+    ImGui::TextUnformatted("已收到快捷键，但当前未处于采集状态");
+}
+
 void War3Imgui::drawDebugWindow() {
   ImGuiIO &io = ImGui::GetIO();
 
   // Allow resizing (removed ImGuiWindowFlags_AlwaysAutoResize)
-  if (ImGui::Begin("War3VK 调试器", nullptr, ImGuiWindowFlags_None)) {
+  if (ImGui::Begin("War3VK 调试器", &m_visible, ImGuiWindowFlags_None)) {
     ImGui::Text("帧率 (FPS): %.1f (%.3f ms)", io.Framerate,
                 1000.0f / io.Framerate);
 
@@ -210,6 +269,8 @@ void War3Imgui::drawDebugWindow() {
     }
 
     ImGui::Separator();
+
+    drawFrameRecorderPanel();
 
     if (ImGui::CollapsingHeader("着色器系统 (Shader System)")) {
       if (ImGui::Button("重载配置 (Reload Configs)")) {
@@ -421,7 +482,7 @@ void War3Imgui::drawDebugWindow() {
         ImGui::Checkbox("后处理总开关", &settings.postFx.enabled);
 
         if (ImGui::TreeNode("光照")) {
-          ImGui::Checkbox("太阳光覆盖", &settings.sun.enabled);
+          ImGui::Checkbox("太阳直射光", &settings.sun.enabled);
           ImGui::SliderFloat("太阳强度", &settings.sun.intensity, 0.0f, 3.0f,
                              "%.2f");
           ImGui::TreePop();
@@ -1152,11 +1213,119 @@ void War3Imgui::drawDebugWindow() {
     }
 
     if (ImGui::CollapsingHeader("渲染统计 (Render Stats)")) {
-      // Query Draw Calls
-      ImGui::Text("渲染队列: 激活");
+      drawRenderStatsPanel();
     }
   }
   ImGui::End();
+}
+
+void War3Imgui::drawRenderStatsPanel() {
+  // Singleton UI; POD copies retain no game objects or GPU resources. The
+  // shutdown reset forces a fresh read even if a device address is reused.
+  struct Samples {
+    render::ShadowProducerRuntimeDiagnostics producer;
+    memory::ShadowArenaMemoryStats arena;
+    ShadowReplayDiagnostics replay;
+    render::ShadowDisplayStats receiver;
+    CsmResolutionDiagnostics csm;
+    MEMORYSTATUSEX processMemory{};
+    bool processMemoryValid = false;
+    uint64_t snapshotCap = 0;
+  };
+  static Samples samples;
+  if (m_renderStatsRefresh.due(GetTickCount64())) {
+    samples.producer = render::QueryShadowProducerRuntimeDiagnostics();
+    samples.arena = memory::ShadowArena_QueryMemoryStats();
+    samples.replay = QueryShadowReplayDiagnostics();
+    samples.receiver = render::QueryShadowDisplayStats();
+    samples.csm = QueryCsmResolutionDiagnostics();
+    samples.snapshotCap = render::War3Stage11SnapshotResidentCapBytes();
+    samples.processMemory = {};
+    samples.processMemory.dwLength = sizeof(MEMORYSTATUSEX);
+    samples.processMemoryValid = GlobalMemoryStatusEx(&samples.processMemory) != FALSE;
+  }
+  const auto& p = samples.producer;
+  const auto& a = samples.arena;
+  const auto& r = samples.replay;
+  const auto mib = [](uint64_t value) { return ui::BytesToMiB(value); };
+  const auto u64 = [](uint64_t value) { return static_cast<unsigned long long>(value); };
+  ImGui::TextDisabled("4 Hz 刷新；不需要开启性能录制或帧取证");
+  ImGui::TextWrapped("各来源独立采样，可能相差数帧；数值用于诊断，不代表像素验收。单位 MiB。");
+
+  if (!p.producerSealFrameSerial) {
+    ImGui::TextDisabled("尚无已封口场景数据（主菜单/加载中/阴影未运行）。");
+  } else {
+    ImGui::Text("生产帧 %llu / 地图 %llu / 设备 %llu",
+        u64(p.producerSealFrameSerial), u64(p.producerSealMapEpoch), u64(p.producerSealDeviceEpoch));
+    ImGui::Text("生产封口 %s / 必需 caster 缺失 %llu / 原因 0x%llX",
+        p.producerCompletenessSealed ? "是" : "否",
+        u64(p.producerRequiredCasterOmissionCount), u64(p.producerCompletenessReasonMask));
+    if (p.producerRequiredCasterOmissionCount || p.producerCompletenessReasonMask ||
+        p.producerCompletenessCounterOverflow)
+      ImGui::TextColored(ImVec4(1.f, .4f, .2f, 1.f), "生产不完整：可导致本帧阴影拒绝更新。");
+  }
+
+  ImGui::Separator();
+  ImGui::Text("快照页池 Stage11：常驻 %.1f / 上限 %.1f MiB",
+      mib(p.drawTimeSnapshotPageResidentBytes), mib(samples.snapshotCap));
+  ImGui::ProgressBar(ui::BudgetFraction(p.drawTimeSnapshotPageResidentBytes, samples.snapshotCap),
+      ImVec2(-1, 0), "快照页池常驻 / 预算");
+  ImGui::Text("页内已占用 %.1f MiB；回收页 %llu",
+      mib(p.drawTimeSnapshotPageUsedBytes), u64(p.drawTimeSnapshotPageReclaimedCount));
+  ImGui::Text("发布帧计数：容量拒绝 %llu / 分配失败 %llu / 新页 %llu",
+      u64(p.drawTimeSnapshotPageCapacityRejectCount),
+      u64(p.drawTimeSnapshotPageAllocationFailureCount), u64(p.drawTimeSnapshotPageCreateCount));
+  ImGui::Text("静态缓存逻辑引用 %.1f MiB（受保护 %.1f）",
+      mib(p.drawTimeVBCacheStaticLiveBytes), mib(p.drawTimeVBCacheStaticProtectedBytes));
+  ImGui::TextWrapped("页内占用包含未单独回收的旧切片，并非当前镜头的几何净量。缓存引用与页常驻有重叠，不可相加；池上限也不是总显存上限。");
+
+  ImGui::Separator();
+  ImGui::Text("Arena：当前代使用 %.1f MiB / 多代常驻 %.1f MiB",
+      mib(a.usedBytes), mib(a.residentBytes));
+  {
+    ImGui::Text("Arena 常驻上限 %.1f MiB / 活跃代 %u / 代号 %llu",
+        mib(a.residentLimitBytes), a.activeGenerationCount, u64(a.generation));
+    ImGui::ProgressBar(ui::BudgetFraction(a.residentBytes, a.residentLimitBytes),
+        ImVec2(-1, 0), "Arena 常驻 / 预算");
+  }
+  ImGui::Text("提交 serial %llu / 完成 serial %llu / 当前不完整 %s",
+      u64(a.submittedSerial), u64(a.completedSerial), a.frameIncomplete ? "是" : "否");
+  ImGui::Text("Arena 累计：溢出 %llu / 准入拒绝 %llu / 忙拒绝 %llu / 隔离 %llu",
+      u64(a.overflowCount), u64(a.admissionRejectedCount), u64(a.busyReuseRejectCount), u64(a.quarantineCount));
+  ImGui::TextDisabled("Arena 为独立临时上传池；原子字段非同一事务快照，不能据此授权回收。");
+  if (a.budgetSupported && a.budgetTrusted && a.budgetFrameSerial) {
+    ImGui::Text("Vulkan 主堆：预算 %.1f / 本分配器已分配 %.1f / 可用估计 %.1f MiB",
+        mib(a.budgetBytes), mib(a.allocatedBytes), mib(a.availableBytes));
+    ImGui::TextDisabled("堆预算采样帧 %llu；不是整张显卡的实时占用。", u64(a.budgetFrameSerial));
+  } else {
+    ImGui::TextDisabled("Vulkan 主堆预算：暂无可信采样（不以 0 当作空闲）。");
+  }
+  if (samples.processMemoryValid) {
+    ImGui::Text("本 32 位进程 VA 可用 %.1f / 总量 %.1f MiB",
+        mib(samples.processMemory.ullAvailVirtual), mib(samples.processMemory.ullTotalVirtual));
+    ImGui::TextDisabled("VA 是虚拟地址空间，不是物理 RAM 或显存。");
+  } else {
+    ImGui::TextDisabled("进程 VA：查询失败。");
+  }
+
+  ImGui::Separator();
+  const auto& receiver = samples.receiver;
+  ImGui::Text("已发布阴影状态（生产帧 %llu）：图 serial %llu",
+      u64(receiver.producerFrame), u64(receiver.mapRenderSerial));
+  ImGui::Text("完整图 %u / 本帧更新 %u / 接收端绘制 %u / 早退码 %u",
+      receiver.hasCompleteMap, receiver.mapExecuted, receiver.receiverExecuted, receiver.earlyReturnReason);
+  ImGui::Text("准备 caster %u（地形装饰 %u）/ 级联 draws %u | %u | %u | %u",
+      receiver.prepared, receiver.terrainDoodadPrepared, receiver.cascadeDrawn[0],
+      receiver.cascadeDrawn[1], receiver.cascadeDrawn[2], receiver.cascadeDrawn[3]);
+  ImGui::Text("阴影回放采样帧 %llu / 地图 %llu / 设备 %llu",
+      u64(r.candidateFrameSerial), u64(r.mapEpoch), u64(r.deviceEpoch));
+  ImGui::Text("计划 %u / 回放 %u / 验证 %u / drawn %u",
+      r.plannedCasterCount, r.replayCasterCount, r.validatedCasterCount, r.drawnCasterCount);
+  ImGui::Text("回放累计：验证拒绝 %llu / 阻止不完整 %llu / 旧代拒绝 %llu",
+      u64(r.validationRejectCount), u64(r.partialPreventedCount), u64(r.staleEpochConsumerRejectCount));
+  ImGui::Text("最近回放拒绝原因码 %u / CSM 请求 %u → 实际 %u",
+      r.lastRejectReason, samples.csm.requestedResolution, samples.csm.effectiveResolution);
+  ImGui::TextDisabled("CSM 降级原因码 %u；drawn 是提交统计，不是屏幕可见对象数。", samples.csm.fallbackReason);
 }
 
 void War3Imgui::setCursorBitmap(int width, int height, const void *bgraData,

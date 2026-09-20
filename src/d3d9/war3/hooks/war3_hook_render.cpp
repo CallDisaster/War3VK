@@ -1,4 +1,5 @@
 #include "war3_hook_render.h"
+#include "../tools/war3_data_collection_tree.h"
 #include "war3_hook_address_book.h"
 #include "war3_hook_lifecycle.h"
 #include "war3_hook_perf.h"
@@ -13,6 +14,7 @@
 #include "../../d3d9_device.h"
 #include "../../jass/war3_game.h"
 #include "../war3.h"
+#include "../model/war3_native_light_bridge.h"
 
 #include "../core/war3_internal_test_config.h"
 #include "../core/war3_game_structs.h"
@@ -1905,6 +1907,7 @@ static void PublishVisibleRenderableFromDispatch(
     void* renderablePart,
     uint32_t layerIndex,
     void* layerState) {
+  WARVK_DATA_SCOPE(VisiblePublish);
   // 默认路径只付一次进程期静态 bool 分支；不读取 TLS、不推进 ordinal、
   // 不查 section，也不触发 QPC。显式诊断时以整次调用统一抽样，保证八个
   // 子阶段来自同一批调用且能与根节点闭合。
@@ -2615,6 +2618,7 @@ int __fastcall Hook_WorldRenderScene(void *thisPtr, void *edx) {
   }
 
   War3RenderState::OnWorldRenderSceneEnter();
+  native_light::BeginWorld();
   int result = 0;
   if (g_trampolineWorldRenderScene) {
     auto origScope =
@@ -2631,6 +2635,7 @@ int __fastcall Hook_WorldRenderScene(void *thisPtr, void *edx) {
     auto afterScope =
         MakeRenderHookFrameScope("Hook_WorldRenderScene/WarVKPostHook");
     War3RenderState::OnWorldRenderSceneExit();
+    native_light::EndWorld();
   }
   return result;
 }

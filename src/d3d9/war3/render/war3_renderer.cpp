@@ -1,8 +1,10 @@
 // war3_renderer.cpp - War3 渲染逻辑入口实现
 
 #include <windows.h>
+#include "../tools/war3_data_collection_tree.h"
 
 #include "war3_renderer.h"
+#include "../model/war3_native_light_bridge.h"
 #include "../model/war3_model_resource_cache.h"
 #include "../model/war3_model_registry.h"
 #include "../core/war3_events.h"
@@ -142,6 +144,8 @@ War3Renderer& War3Renderer::instance() {
 }
 
 void War3Renderer::ResetMapSession() {
+    WARVK_DATA_SCOPE(RegistryMaintenance);
+    native_light::ResetMap();
     ResetRenderObjectMapSessionCaches();
     hooks::ResetWidgetIdentityMapSession();
 
@@ -176,6 +180,7 @@ void War3Renderer::ResetMapSession() {
 }
 
 void War3Renderer::BeginFrame() {
+    WARVK_DATA_SCOPE(RegistryMaintenance);
     ++m_rendererFrameSerial;
     m_semanticEndFrameBuildAttemptsThisFrame = 0;
     m_semanticEndFrameSawSkinnedThisFrame = false;
@@ -202,6 +207,7 @@ void War3Renderer::BeginFrame() {
 }
 
 void War3Renderer::PublishSemanticRegistriesForScene() {
+    WARVK_DATA_SCOPE(SnapshotPublish);
     const bool semanticData = AreSemanticFrameRegistriesEnabled();
     SemanticPerfScope semanticPerf(
         SemanticDataPerfTag::FrameRegistryPublish, semanticData);

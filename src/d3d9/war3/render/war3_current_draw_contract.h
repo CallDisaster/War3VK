@@ -1,4 +1,5 @@
 #pragma once
+#include "war3_skin_palette_selection.h"
 
 #include "../../util/util_matrix.h"
 #include "war3_render_objects.h"
@@ -136,6 +137,7 @@ struct CurrentDrawAuthoritativeSample {
   CurrentDrawResolveStatus status = CurrentDrawResolveStatus::MissingContract;
   // Phase 1：palette bytes 的来源标记。
   PaletteProvenance paletteProvenance = PaletteProvenance::Unknown;
+  skin::Selection paletteSelection = {};
 
   bool contractKnown() const {
     return contract.known;

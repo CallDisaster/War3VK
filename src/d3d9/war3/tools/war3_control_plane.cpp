@@ -2,7 +2,9 @@
 
 #include "../../d3d9_war3_debug.h"
 #include "war3_frame_capture.h"
+#include "war3_frame_evidence_control.h"
 #include "war3_internal_test_api.h"
+#include "../../../util/thread.h"
 
 #include "../render/war3_render_objects.h"
 #include "../render/war3_current_draw_contract.h"
@@ -15,6 +17,7 @@
 #include <atomic>
 #include <chrono>
 #include <mutex>
+#include <memory>
 #include <string>
 #include <thread>
 
@@ -26,7 +29,21 @@ using json = nlohmann::json;
 
 std::atomic<bool> g_running = false;
 std::atomic<bool> g_stopRequested = false;
-std::thread g_serverThread;
+struct ControlThreadDeleter {
+  void operator()(std::thread* thread) const noexcept {
+    // ExitProcess already terminates other threads before DLL detach. A
+    // joinable std::thread destructor would call terminate here; joining or
+    // pthread-detaching under the loader lock can deadlock. Abandon only this
+    // terminated process-owned handle/object; the OS reclaims it. Explicit
+    // shutdown during normal operation below still wakes and joins the worker.
+    if (this_thread::isInModuleDetachment()) {
+      ::OutputDebugStringA("WarVK Exit: control thread owner abandoned at process detach\n");
+      return;
+    }
+    delete thread; // Preserve the ordinary join-before-destroy contract.
+  }
+};
+std::unique_ptr<std::thread, ControlThreadDeleter> g_serverThread(new std::thread);
 std::atomic<uint32_t> g_activeClientCount = 0u;
 std::mutex g_semanticBuildRequestMutex;
 uint64_t g_lastSemanticBuildRequestMs = 0u;
@@ -217,7 +234,11 @@ json ToJson(const War3RuntimeStatusSnapshot& snapshot) {
         {"state", snapshot.module.state}}},
       {"perf",
        {{"enabled", snapshot.perf.enabled},
-        {"recording", snapshot.perf.recording}}},
+        {"recording", snapshot.perf.recording},
+        {"frameAnchorValid", snapshot.perf.frameAnchorValid},
+        {"businessFrameSerial", snapshot.perf.businessFrameSerial},
+        {"perfFrameEpoch", snapshot.perf.perfFrameEpoch},
+        {"producerAccumulationEpoch", snapshot.perf.producerAccumulationEpoch}}},
       {"profile",
        {{"name", snapshot.profile.name},
         {"disabledModules", snapshot.profile.disabledModules},
@@ -1499,6 +1520,27 @@ json ToJson(const render::ShadowRuntimeBridgeSummary& summary) {
        summary.dispatchToShapeFromShadowSetupCount},
       {"dispatchToShapeFromOtherCallerCount",
        summary.dispatchToShapeFromOtherCallerCount},
+      // P2 批次 0：RegisterImage / StaticStampPath producer 治理。
+      {"registerImageEnterCount", summary.registerImageEnterCount},
+      {"registerImageBlockedCount", summary.registerImageBlockedCount},
+      {"registerImageStaticStampCount",
+       summary.registerImageStaticStampCount},
+      {"registerImageEmitterStampCount",
+       summary.registerImageEmitterStampCount},
+      {"registerImageSelectionCount", summary.registerImageSelectionCount},
+      {"registerImageOcclusionCount", summary.registerImageOcclusionCount},
+      {"registerImageWithParamsCount",
+       summary.registerImageWithParamsCount},
+      {"registerImageObjectBridgeCount",
+       summary.registerImageObjectBridgeCount},
+      {"registerImageFromPointCount", summary.registerImageFromPointCount},
+      {"registerImageFromTwoPointsCount",
+       summary.registerImageFromTwoPointsCount},
+      {"registerImageUnknownSourceCount",
+       summary.registerImageUnknownSourceCount},
+      {"staticStampPathEnterCount", summary.staticStampPathEnterCount},
+      {"staticStampPathBlockedCount", summary.staticStampPathBlockedCount},
+      {"staticStampPathCleanupCount", summary.staticStampPathCleanupCount},
       // Phase 7.108：ShadowProjector 永久统计。
       {"projectorAddFromObjectEnterCount",
        summary.projectorAddFromObjectEnterCount},
@@ -2276,12 +2318,56 @@ json ToJson(const render::ShadowRuntimeBridgeSummary& summary) {
       {"semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeCModelFallbackCount",
        summary
            .semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeCModelFallbackCount},
+      {"semanticSceneSubmittedSkinnedPaletteSourceOwnedPartSnapshotCount", summary.semanticSceneSubmittedSkinnedPaletteSourceOwnedPartSnapshotCount},
       {"semanticSceneSubmittedSkinnedPaletteStablePartSampleCount",
        summary.semanticSceneSubmittedSkinnedPaletteStablePartSampleCount},
       {"semanticSceneSubmittedSkinnedPaletteHashChurnCount",
        summary.semanticSceneSubmittedSkinnedPaletteHashChurnCount},
       {"semanticSceneSubmittedSkinnedPaletteSourceChurnCount",
        summary.semanticSceneSubmittedSkinnedPaletteSourceChurnCount},
+      {"semanticSceneAppendEntrySkinnedCount",
+       summary.semanticSceneAppendEntrySkinnedCount},
+      {"semanticSceneCanonicalGateRejectSkinnedCount",
+       summary.semanticSceneCanonicalGateRejectSkinnedCount},
+      {"semanticSceneDrawTimeProducerSubmittedSkinnedCount",
+       summary.semanticSceneDrawTimeProducerSubmittedSkinnedCount},
+      {"semanticSceneDirectCurrentDrawSubmittedSkinnedCount",
+       summary.semanticSceneDirectCurrentDrawSubmittedSkinnedCount},
+      {"semanticSceneSkinnedPaletteSlotCacheDeviceServedAfterConfirmCount",
+       summary
+           .semanticSceneSkinnedPaletteSlotCacheDeviceServedAfterConfirmCount},
+      {"semanticSceneSkinnedPaletteSlotCacheDeviceRejectedStaleCount",
+       summary.semanticSceneSkinnedPaletteSlotCacheDeviceRejectedStaleCount},
+      {"semanticBuildOffThreadRefusedCount",
+       summary.semanticBuildOffThreadRefusedCount},
+      {"semanticBuildOwnerUnestablishedRefusedCount",
+       summary.semanticBuildOwnerUnestablishedRefusedCount},
+      {"semanticBuildDirectAdvanceRefusedCount",
+       summary.semanticBuildDirectAdvanceRefusedCount},
+      {"semanticSceneSkinnedPaletteSlotCacheShadowCoreServedAfterConfirmCount",
+       summary
+           .semanticSceneSkinnedPaletteSlotCacheShadowCoreServedAfterConfirmCount},
+      {"semanticSceneSkinnedPaletteSlotCacheShadowCoreRejectedStaleCount",
+       summary
+           .semanticSceneSkinnedPaletteSlotCacheShadowCoreRejectedStaleCount},
+      {"semanticSceneSkinnedPaletteSlotCacheShadowCoreProducerSnapshotFallbackCount",
+       summary
+           .semanticSceneSkinnedPaletteSlotCacheShadowCoreProducerSnapshotFallbackCount},
+      {"semanticSceneSkinnedPaletteSlotCacheShadowCoreFrameProofServedCount",
+       summary
+           .semanticSceneSkinnedPaletteSlotCacheShadowCoreFrameProofServedCount},
+      {"semanticSceneSkinnedPaletteSlotCacheShadowCoreGroupShortRejectedCount",
+       summary
+           .semanticSceneSkinnedPaletteSlotCacheShadowCoreGroupShortRejectedCount},
+      {"semanticSceneSkinnedPaletteSlotCacheShadowCoreBindingFrameStaleRejectedCount",
+       summary
+           .semanticSceneSkinnedPaletteSlotCacheShadowCoreBindingFrameStaleRejectedCount},
+      {"semanticSceneSkinnedPaletteSlotCacheShadowCoreSlotRangeStaleRejectedCount",
+       summary
+           .semanticSceneSkinnedPaletteSlotCacheShadowCoreSlotRangeStaleRejectedCount},
+      {"semanticSceneSkinnedPaletteSlotCacheShadowCoreSnapshotFrameStaleRejectedCount",
+       summary
+           .semanticSceneSkinnedPaletteSlotCacheShadowCoreSnapshotFrameStaleRejectedCount},
       {"semanticSceneSubmittedSkinnedPaletteSlotIndexChurnCount",
        summary.semanticSceneSubmittedSkinnedPaletteSlotIndexChurnCount},
       {"semanticSceneSubmittedSkinnedPaletteHashUniqueInWindowMax",
@@ -3214,6 +3300,10 @@ json ToJson(const render::ShadowRuntimeBridgeSummary& summary) {
        summary.nativeD3D9BackendCanonicalPublishRejectNotReadyCount},
       {"nativeD3D9BackendCanonicalPublishRejectNoPositionsCount",
        summary.nativeD3D9BackendCanonicalPublishRejectNoPositionsCount},
+      {"nativeD3D9BackendCanonicalSkippedPathBlockerCount",
+       summary.nativeD3D9BackendCanonicalSkippedPathBlockerCount},
+      {"nativeD3D9BackendCanonicalSkippedPathBlockerGeometryMarkerCount",
+       summary.nativeD3D9BackendCanonicalSkippedPathBlockerGeometryMarkerCount},
       {"nativeD3D9BackendGeometryRejectCount",
        summary.nativeD3D9BackendGeometryRejectCount},
       {"nativeD3D9BackendPaletteRejectCount",
@@ -4116,6 +4206,10 @@ json ToJson(const render::ShadowRuntimeBridgeSummary& summary) {
        summary.semanticCoreSkippedNoPoseLookupMiss},
       {"semanticCoreSkippedNoRuntimeGroupPalette",
        summary.semanticCoreSkippedNoRuntimeGroupPalette},
+      {"semanticCoreSkippedPathBlocker",
+       summary.semanticCoreSkippedPathBlocker},
+      {"semanticCoreSkippedPathBlockerGeometryMarker",
+       summary.semanticCoreSkippedPathBlockerGeometryMarker},
       {"semanticCoreBuildDurationUs", summary.semanticCoreBuildDurationUs},
       {"semanticCoreBuildInProgress", summary.semanticCoreBuildInProgress},
       {"semanticCoreBuildRequestPending",
@@ -4486,6 +4580,30 @@ json HandleCommand(const json& request) {
     response["result"] =
         ToJson(QueryRuntimeStatusSnapshot("control-plane",
                                           payload.value("frameIndex", uint64_t(0))));
+    return response;
+  }
+
+  if (command == "frame_evidence") {
+    // CPU control-plane work only: no callback into render/JASS and no GPU wait.
+    // An opt-in gate and strict session/state checks live in the provider.
+    try {
+      response["result"] = evidence::Control(payload);
+      response["ok"] = response["result"].value("ok", false);
+      response["error"] = response["result"].value("error", std::string());
+    } catch (const std::exception& e) {
+      response["error"] = std::string("frame evidence control failure: ") + e.what();
+    } catch (...) {
+      response["error"] = "frame evidence control failure";
+    }
+    return response;
+  }
+
+  if(command=="frame_history") {
+    try {response["result"]=FrameHistoryControl(payload);
+      response["ok"]=response["result"].value("ok",false);
+      response["error"]=response["result"].value("error",std::string());
+    }catch(const std::exception& e){response["error"]=e.what();}
+    catch(...){response["error"]="history control failure";}
     return response;
   }
 
@@ -5043,11 +5161,11 @@ void ServerLoop() {
 } // namespace
 
 void InitializeWar3ControlPlane() {
-  if (g_running.load(std::memory_order_relaxed) || g_serverThread.joinable())
+  if (g_running.load(std::memory_order_relaxed) || g_serverThread->joinable())
     return;
 
   g_stopRequested.store(false, std::memory_order_relaxed);
-  g_serverThread = std::thread(ServerLoop);
+  *g_serverThread = std::thread(ServerLoop);
 }
 
 void ShutdownWar3ControlPlane() {
@@ -5059,8 +5177,8 @@ void ShutdownWar3ControlPlane() {
   if (wake != INVALID_HANDLE_VALUE)
     CloseHandle(wake);
 
-  if (g_serverThread.joinable())
-    g_serverThread.join();
+  if (g_serverThread->joinable())
+    g_serverThread->join();
 }
 
 void ResetWar3ControlPlaneState() {

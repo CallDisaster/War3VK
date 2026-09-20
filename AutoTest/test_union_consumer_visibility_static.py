@@ -40,8 +40,19 @@ class UnionConsumerVisibilityContracts(unittest.TestCase):
             "boundsFrameGeneration",
             "cameraFrameGeneration",
             "consumerStateFrameGeneration",
+            "currentMapGeneration",
+            "candidateMapGeneration",
+            "consumerMapGeneration",
+            "currentDeviceGeneration",
+            "candidateDeviceGeneration",
+            "consumerDeviceGeneration",
             "resourceGeneration",
             "expectedResourceGeneration",
+            "NonOrthographicProjection",
+            "MapGenerationUnknown",
+            "MapGenerationMismatch",
+            "DeviceGenerationUnknown",
+            "DeviceGenerationMismatch",
         ):
             self.assertIn(token, self.header)
 
@@ -81,6 +92,32 @@ class UnionConsumerVisibilityContracts(unittest.TestCase):
         self.assertLess(self.source.index("query.cascadeIndex < 2u"), outside)
         self.assertLess(self.source.index("query.dynamic || query.skinned"), outside)
 
+    def test_orthographic_w_row_and_map_device_proofs_are_explicit(self) -> None:
+        self.assertIn("IsExactOrthographicWRow", self.source)
+        self.assertIn("matrix.columns[0][3] == 0.0f", self.source)
+        self.assertIn("matrix.columns[1][3] == 0.0f", self.source)
+        self.assertIn("matrix.columns[2][3] == 0.0f", self.source)
+        self.assertIn("matrix.columns[3][3] == 1.0f", self.source)
+        self.assertIn("NonOrthographicProjection", self.source)
+        self.assertIn("MapGenerationUnknown", self.source)
+        self.assertIn("MapGenerationMismatch", self.source)
+        self.assertIn("DeviceGenerationUnknown", self.source)
+        self.assertIn("DeviceGenerationMismatch", self.source)
+        finite = self.source.index("War3UnionIsFiniteMatrix")
+        wrow = self.source.index("IsExactOrthographicWRow", finite)
+        outside = self.source.index("const bool outside =")
+        self.assertLess(finite, wrow)
+        self.assertLess(wrow, outside)
+        for token in (
+            "generation.currentMapGeneration == 0u",
+            "generation.candidateMapGeneration == 0u",
+            "generation.consumerMapGeneration == 0u",
+            "generation.currentDeviceGeneration == 0u",
+            "generation.candidateDeviceGeneration == 0u",
+            "generation.consumerDeviceGeneration == 0u",
+        ):
+            self.assertIn(token, self.source)
+
     def test_non_finite_or_degenerate_math_never_rejects_a_consumer(self) -> None:
         for token in (
             "War3UnionIsFiniteBounds",
@@ -89,6 +126,7 @@ class UnionConsumerVisibilityContracts(unittest.TestCase):
             "kMinimumClipW",
             "NonFiniteProjection",
             "InvalidGuardBand",
+            "NonOrthographicProjection",
         ):
             self.assertIn(token, self.source)
         proof = self.source.index("result.proofBits |= War3UnionProofOutside")
@@ -104,6 +142,24 @@ class UnionConsumerVisibilityContracts(unittest.TestCase):
         self.assertIn("war3_union_consumer_visibility_test", self.meson)
         self.assertIn("War3EvaluateConservativeCsmSphere", self.unit)
         self.assertIn("int main()", self.unit)
+
+    def test_runtime_epoch_sources_are_independent(self) -> None:
+        shadow = SHADOW.read_text(encoding="utf-8")
+        query = shadow.split("war3::render::War3UnionCsmSphereQuery query = {};", 1)[1]
+        query = query.split("const auto decision =", 1)[0]
+        sources = {
+            "currentMapGeneration": "input.mapEpoch",
+            "candidateMapGeneration": "draw.mapEpoch",
+            "consumerMapGeneration": "m_shadowMapEpoch",
+            "currentDeviceGeneration": "input.deviceEpoch",
+            "candidateDeviceGeneration": "draw.deviceEpoch",
+            "consumerDeviceGeneration": "m_shadowDeviceEpoch",
+        }
+        for field, source in sources.items():
+            assignment = f"query.generations.{field} = {source};"
+            self.assertEqual(query.count(assignment), 1, field)
+            self.assertEqual(query.count(f"query.generations.{field} ="), 1, field)
+        self.assertIn("query.consumeAdmissionGranted = false;", query)
 
     def test_runtime_integration_remains_observe_only(self) -> None:
         include = '#include "war3/render/war3_union_consumer_visibility.h"'

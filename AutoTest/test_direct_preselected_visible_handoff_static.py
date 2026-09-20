@@ -9,23 +9,32 @@ ROOT = Path(__file__).resolve().parents[1]
 DEVICE = (ROOT / "src/d3d9/d3d9_device.cpp").read_text(encoding="utf-8")
 
 
-def function_body(signature: str) -> str:
-    start = DEVICE.index(signature)
-    brace = DEVICE.index("{", start)
+# M1 迁移：记录级 selector 已迁到语义模块；默认仍按 device.cpp 解析，
+# 需要时显式把 source 传成 SEMANTIC。
+SEMANTIC = (
+    ROOT / "src/d3d9/war3/semantic/war3_device_semantic_predicates.cpp"
+).read_text(encoding="utf-8")
+
+
+def function_body(signature: str, source: str = DEVICE) -> str:
+    start = source.index(signature)
+    brace = source.index("{", start)
     depth = 0
-    for pos in range(brace, len(DEVICE)):
-        if DEVICE[pos] == "{":
+    for pos in range(brace, len(source)):
+        if source[pos] == "{":
             depth += 1
-        elif DEVICE[pos] == "}":
+        elif source[pos] == "}":
             depth -= 1
             if depth == 0:
-                return DEVICE[start : pos + 1]
+                return source[start : pos + 1]
     raise AssertionError(f"unterminated function: {signature}")
 
 
 class DirectPreselectedVisibleHandoffStaticTests(unittest.TestCase):
     def test_selection_lookup_returns_a_value_copy_only_on_hit(self) -> None:
-        selector = function_body("uint64_t War3SemanticDirectRecordSelectionKey(")
+        selector = function_body(
+            "uint64_t War3SemanticDirectRecordSelectionKey(", SEMANTIC
+        )
         self.assertIn("VisibleRenderableRecord** outVisibleHint", selector)
         self.assertIn("*outVisibleHint = nullptr;", selector)
         query = selector.index("visibleQueryCache->queryPtr(")

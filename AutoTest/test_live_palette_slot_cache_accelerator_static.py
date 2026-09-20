@@ -2,11 +2,16 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEVICE = (ROOT / "src/d3d9/d3d9_device.cpp").read_text(encoding="utf-8")
+# M2-2：resolvePaletteSlotIndex lambda 已迁往
+# src/d3d9/war3/semantic/war3_live_palette_selection.cpp（逐字节）；
+# 本门禁的函数体断言跟随符号改锚到模块，断言内容一个字未改。
+MODULE = (ROOT / "src/d3d9/war3/semantic/war3_live_palette_selection.cpp").read_text(
+    encoding="utf-8"
+)
 
-start = DEVICE.index("auto resolvePaletteSlotIndex =")
-end = DEVICE.index("// 首选：从 Hook_RuntimeMatrixWrite", start)
-body = DEVICE[start:end]
+start = MODULE.index("auto resolvePaletteSlotIndex =")
+end = MODULE.index("// 首选：从 Hook_RuntimeMatrixWrite", start)
+body = MODULE[start:end]
 
 assert "kMaxPaletteSlotCacheEntries = 4096u" in body
 assert "kPaletteSlotCacheLookupEntries = 8192u" in body
@@ -25,7 +30,7 @@ assert "entry.renderablePart != partPtr || entry.mapEpoch != mapEpoch" in body[f
 # binding; the accelerator never supplies an unchecked palette slot value.
 use = body[body.index("auto useCachedEntry ="):fast]
 assert "currentSlotIndex != 0xFFFFFFFFu" in use
-assert "queryProducerBindingSlot()" in use
+assert "queryProducerBindingSlot(" in use
 assert "return entry.paletteSlotIndex" in use
 
 print("live palette slot cache accelerator static checks passed")

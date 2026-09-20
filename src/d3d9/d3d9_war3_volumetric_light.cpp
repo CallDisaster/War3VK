@@ -11,6 +11,7 @@
 #include "../dxvk/dxvk_device.h"
 #include "../dxvk/dxvk_util.h"
 #include "../util/util_matrix.h"
+#include "../util/util_env.h"
 
 #include <war3_fullscreen_vert.h>
 #include <war3_volumetric_composite.h>
@@ -92,6 +93,21 @@ constexpr uint32_t kVolumetricDirectionalGuideMinTraversalSteps = 64u;
 constexpr uint32_t kVolumetricDirectionalGuideMaxTraversalSteps = 1024u;
 
 std::mutex g_volumetricShaderWorkDiagnosticsMutex;
+War3VolumetricExecutionDiagnostics g_volumetricExecutionDiagnostics;
+
+class VolumetricExecutionWitness {
+public:
+  War3VolumetricExecutionDiagnostics value;
+  ~VolumetricExecutionWitness() {
+    static const bool enabled =
+        env::getEnvVar("DXVK_WAR3_VISUAL_API_DIAGNOSTICS") == "1";
+    if (!enabled)
+      return;
+    std::lock_guard<std::mutex> lock(g_volumetricShaderWorkDiagnosticsMutex);
+    value.observedFrames = g_volumetricExecutionDiagnostics.observedFrames + 1u;
+    g_volumetricExecutionDiagnostics = value;
+  }
+};
 War3VolumetricShaderWorkRuntimeDiagnostics
     g_volumetricShaderWorkRuntimeDiagnostics = {};
 
@@ -530,6 +546,11 @@ War3FogVolumeFrameSnapshot SelectVolumetricFogVolumes(
   return selected;
 }
 } // namespace
+
+War3VolumetricExecutionDiagnostics QueryWar3VolumetricExecutionDiagnostics() {
+  std::lock_guard<std::mutex> lock(g_volumetricShaderWorkDiagnosticsMutex);
+  return g_volumetricExecutionDiagnostics;
+}
 
 War3VolumetricShaderWorkRuntimeDiagnostics
 QueryWar3VolumetricShaderWorkRuntimeDiagnostics() noexcept {
@@ -1440,8 +1461,9 @@ bool War3VolumetricLightPass::drawVolumetricLight(
     uint32_t selectedPointCount, const Vector4& cameraPos,
     float farClearRaw, float rawDepthQuantum, bool farIsOne,
     const VkRect2D& effectScissor, int effectiveSamples,
-    uint32_t& outPointShadowedLightCount) {
+    uint32_t& outPointShadowedLightCount, int32_t& outEffectiveBackend) {
   outPointShadowedLightCount = 0u;
+  outEffectiveBackend = -1;
   m_directionalGuideReadyThisFrame = false;
   m_directionalGuideResolvedView = nullptr;
   m_directionalGuideReadabilityScale = 0.0f;
@@ -2459,6 +2481,7 @@ bool War3VolumetricLightPass::drawVolumetricLight(
           baseShadowTraversalSteps, lightUbo.count,
           lightUbo.pointShadowedLightCount, fogVolumeUbo.count);
     }
+    outEffectiveBackend = static_cast<int32_t>(settings.quality);
     return true;
   }
 
@@ -2516,6 +2539,7 @@ bool War3VolumetricLightPass::drawVolumetricLight(
         static_cast<double>(pc.params0.z),
         static_cast<double>(pc.viewportZ.z));
   }
+  outEffectiveBackend = 0;
   return true;
 }
 
@@ -2631,13 +2655,24 @@ bool War3VolumetricLightPass::compositeVolumetricLight(
 
 void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
                                   const War3PipelineInput& input) {
+  VolumetricExecutionWitness witness;
+  auto& execution = witness.value;
+  execution.frameSerial = input.frameSerial;
+  execution.mapEpoch = input.mapEpoch;
+  execution.deviceEpoch = input.deviceEpoch;
+  execution.stage = "missing-settings";
   // 关闭路径必须极早返回：不分配资源、不 copy color/depth、不影响 CSM。
   if (!input.settings)
     return;
+  execution.requestedBackend = static_cast<uint32_t>(
+      input.settings->postFx.volumetricLight.quality);
+  execution.stage = "disabled";
   if (!input.settings->postFx.volumetricLight.enabled)
     return;
+  execution.stage = "missing-color-or-depth";
   if (!input.colorView || !input.depthView)
     return;
+  execution.stage = "invalid-camera";
   if (!input.scene.worldCamera.valid)
     return;
 
@@ -2647,7 +2682,7 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
   if (s_lastLoggedBackend != static_cast<int32_t>(activeBackend)) {
     s_lastLoggedBackend = static_cast<int32_t>(activeBackend);
     WAR3_RENDER_LOG(
-        "DXVK War3Volumetric: active backend=%u (%s)\n",
+        "DXVK War3Volumetric: requested backend=%u (%s)\n",
         activeBackend,
         settings.quality == War3VolumetricQuality::FroxelHigh
             ? "froxel-high"
@@ -2662,6 +2697,7 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
       settings.globalMediumEnabled && safeDensity > 1e-6f;
   const bool localMediumRequested =
       War3FogVolumeManager::Instance().HasActiveVolumes();
+  execution.stage = "no-medium-or-zero-intensity";
   // Global density zero now means clear air outside authored volumes, not an
   // unconditional pass kill. Keep the atomic manager probe before any image
   // allocation or snapshot lock.
@@ -2673,6 +2709,9 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
   const auto& colorInfo = input.colorView->image()->info();
   const auto& depthInfo = input.depthView->image()->info();
   const VkExtent3D extent = colorInfo.extent;
+  execution.width = extent.width;
+  execution.height = extent.height;
+  execution.stage = "unsupported-extent-or-samples";
   if (extent.width == 0u || extent.height == 0u ||
       depthInfo.extent.width == 0u || depthInfo.extent.height == 0u)
     return;
@@ -2704,6 +2743,7 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
       War3LightManager::Instance().HasActiveLights();
   const bool hasSunVolume = sunIntensity >= minSunIntensity &&
                             sunIntensity * sunColorPeak > 1e-6f;
+  execution.stage = "no-effective-light";
   // Keep the no-lock atomic gate before depth algebra. A true value is only a
   // request to inspect the canonical snapshot; it is not proof that any
   // finite, energetic or view-relevant point light exists.
@@ -2711,6 +2751,7 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
     return;
 
   // Reuse the same projection-derived depth contract as the Hi-Z contact-ray
+  execution.stage = "invalid-depth-or-camera-transform";
   // and shadow-receiver paths. Viewport MinZ/MaxZ may be reversed, so keeping
   // their signed delta is required for a valid world-position reconstruction.
   const float minZ = input.scene.worldCamera.viewport.MinZ;
@@ -2746,6 +2787,8 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
         input.scene.worldCamera, extent);
   }
   const bool hasLocalMedium = fogVolumes.hasAny && fogVolumes.count > 0u;
+  execution.fogVolumes = fogVolumes.count;
+  execution.stage = "no-visible-medium";
   if (!hasConfiguredGlobalMedium && !hasLocalMedium)
     return;
 
@@ -2758,6 +2801,7 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
         pointLights, cameraPos, input.scene.worldCamera, extent, settings);
   }
   const bool hasPointVolume = pointSelection.count > 0u;
+  execution.stage = "no-visible-effective-light";
   // This is the exact pre-copy source gate. Zero-energy/invalid lights are
   // filtered by the canonical snapshot, while unreachable or provably
   // offscreen spheres are filtered locally without mutating shared order.
@@ -2765,6 +2809,7 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
     return;
 
   // CSM 只约束太阳散射；缺失时 sun fail-soft，而独立点光体积仍可继续。
+  execution.stage = "waiting-for-csm";
   if (settings.requireCsmSnapshot && hasSunVolume) {
     auto* shadowPass =
         m_parent ? m_parent->GetWar3ShadowReceiverPass() : nullptr;
@@ -2803,6 +2848,7 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
   const bool froxelRequested =
       settings.quality == War3VolumetricQuality::FroxelMedium ||
       settings.quality == War3VolumetricQuality::FroxelHigh;
+  execution.stage = "resource-or-work-admission";
   constexpr VkFormatFeatureFlags2 requiredFroxelFormatFeatures =
       VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
       VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
@@ -3066,6 +3112,7 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
 
   const auto workEstimate =
       war3::render::EvaluateWar3VolumetricShaderWork(workRequest);
+  execution.stage = "shader-work-rejected";
   PublishVolumetricShaderWorkDiagnostics(input.frameSerial, workEstimate);
   if (!workEstimate.accepted) {
     static uint32_t s_workRejectLogs = 0u;
@@ -3112,6 +3159,7 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
             : resolutionDivisor;
   }
 
+  execution.stage = "resources-or-draw-failed";
   ensureResources(extent, colorInfo.format, depthInfo.format,
                   resolutionDivisor, froxelAdmitted,
                   directionalGuideDivisor);
@@ -3123,9 +3171,13 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
       ctx, input, pointLights, fogVolumes, pointSelection.sourceIndices,
       pointSelection.count, cameraPos, farClearRaw, rawDepthQuantum,
       farIsOne, effectScissor, effectiveSamples,
-      pointShadowedLightCount);
+      pointShadowedLightCount, execution.effectiveBackend);
+  if (effectSubmitted)
+    execution.stage = "composite-failed";
   if (effectSubmitted &&
       compositeVolumetricLight(ctx, input, compositeScissor)) {
+    execution.compositeSubmitted = true;
+    execution.stage = "composite-submitted";
     // Exact execution evidence: this is emitted only after both the low-res
     // scattering draw and the full-res composite were recorded successfully.
     // Keep it periodic so a long DBWIN capture cannot evict the only marker.

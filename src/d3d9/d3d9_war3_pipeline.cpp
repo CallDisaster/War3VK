@@ -14,6 +14,7 @@
 #include "d3d9_war3_debug.h"
 #include "war3/tools/war3_perf_monitor.h"
 #include "war3/tools/war3_diagnostics_hub.h"
+#include "war3/tools/war3_frame_evidence.h"
 
 #include "../util/util_env.h"
 #include "../util/util_error.h"
@@ -23,6 +24,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cmath>
+#include <cstring>
 #include <exception>
 
 namespace dxvk {
@@ -1311,12 +1313,91 @@ namespace dxvk {
 void War3RenderPipeline::Execute(War3InsertionPoint point,
                                      const Rc<DxvkCommandList>& ctx,
                                      const War3PipelineInput& input) {
+        namespace ev = war3::tools::evidence;
+        const ev::Key evidenceKey{uint64_t(reinterpret_cast<uintptr_t>(m_device.ptr())),
+          input.frameSerial,input.mapEpoch,input.deviceEpoch};
+        ev::Scope evidencePipeline(ev::Kind::PipelineBegin,evidenceKey,"PipelineExecute");
         if (unlikely(m_device == nullptr ||
                      m_device->getDeviceStatus() == VK_ERROR_DEVICE_LOST)) {
             // Device loss is irreversible. In particular, do not let optional
             // pass exception handling turn it into a per-pass disable while
             // later passes continue recording against the same lost device.
             return;
+        }
+
+        if (evidencePipeline.id()) {
+            ev::Event event{};
+            event.kind=ev::Kind::Camera; event.key=evidenceKey; event.parent=evidencePipeline.id();
+            event.data[0]=input.scene.worldCamera.valid?1:0;
+            event.data[1]=input.settingsRevision;
+            event.data[2]=input.scene.shadowCasters.size();
+            event.data[3]=input.scene.shadowFallbacks.size();
+            event.data[4]=uint32_t(point);
+            event.data[5]=input.frameIndex; // ring slot, never a frame number
+            if (input.settings) {
+                event.data[6]=uint32_t(input.settings->shadows.debugMode);
+                event.data[7]=uint32_t(input.settings->shadows.shadowTaaMode);
+                event.data[8]=input.settings->postFx.volumetricLight.enabled?1:0;
+            }
+            const Matrix4* matrices[]={&input.scene.worldCamera.view,&input.scene.worldCamera.proj,
+                                      &input.scene.worldCamera.viewProj};
+            for (uint32_t matrix=0;matrix<3;++matrix) for (uint32_t row=0;row<4;++row) {
+                const float v[]={(*matrices[matrix])[row].x,(*matrices[matrix])[row].y,
+                                 (*matrices[matrix])[row].z,(*matrices[matrix])[row].w};
+                for (uint32_t col=0;col<4;++col)
+                    std::memcpy(&event.bits[matrix*16+row*4+col],&v[col],sizeof(float));
+            }
+            ev::Record(evidencePipeline.session(),event);
+            // Finalized caster inputs are copied as bounded metadata while the
+            // frame owner is still valid. This is not a replay authorization.
+            static const bool recordCasters = env::getEnvVar("DXVK_WAR3_FRAME_EVIDENCE_CASTERS") == "1";
+            const size_t casterLimit = recordCasters
+                ? (std::min)(input.scene.shadowCasters.size(), size_t(512)) : 0;
+            for (size_t i=0; i<casterLimit; ++i) {
+                const auto& draw=input.scene.shadowCasters[i];
+                ev::Event caster{}; caster.kind=ev::Kind::CasterInput; caster.key=evidenceKey;
+                caster.parent=evidencePipeline.id();
+                const char* label="ShadowCasterInput";
+                for (size_t n=0;n+1<caster.label.size() && label[n];++n) caster.label[n]=label[n];
+                caster.data[0]=i; caster.data[1]=draw.rawcode; caster.data[2]=draw.jHandle;
+                caster.data[3]=uint64_t(reinterpret_cast<uintptr_t>(draw.shadowRenderablePart));
+                caster.data[4]=draw.shadowLayerIndex; caster.data[5]=draw.shadowMetadataKeyHash;
+                caster.data[6]=draw.shadowExactGeometryKeyHash; caster.data[7]=draw.boundsSourceGeneration;
+                caster.data[8]=draw.alphaMetadataFrameSerial; caster.data[9]=draw.alphaPayloadComplete?1:0;
+                caster.data[10]=draw.mapEpoch; caster.data[11]=draw.deviceEpoch;
+                caster.bits[0]=draw.indexCount; caster.bits[1]=draw.firstIndex;
+                caster.bits[2]=uint32_t(draw.vertexOffset); // exact two's-complement int32 bits
+                caster.bits[3]=draw.vertexCount; caster.bits[4]=draw.firstVertex; caster.bits[5]=draw.numVertices;
+                caster.bits[6]=uint32_t(draw.alphaTestEnabled); caster.bits[7]=uint32_t(draw.alphaBlendEnabled);
+                caster.bits[8]=draw.objectKind; caster.bits[9]=uint32_t(draw.stage<0?0xFFFFFFFFu:uint32_t(draw.stage));
+                caster.bits[10]=draw.shadowActualIndexMin; caster.bits[11]=draw.shadowActualIndexMax;
+                std::memcpy(&caster.bits[12],&draw.alphaRef,sizeof(float));
+                std::memcpy(&caster.bits[13],&draw.boundsRadius,sizeof(float));
+                for (uint32_t row=0;row<4;++row) for (uint32_t col=0;col<4;++col) {
+                    const float v[]={draw.worldMatrix[row].x,draw.worldMatrix[row].y,
+                                     draw.worldMatrix[row].z,draw.worldMatrix[row].w};
+                    std::memcpy(&caster.bits[16+row*4+col],&v[col],sizeof(float));
+                }
+                auto casterId=ev::Record(evidencePipeline.session(),caster);
+                ev::Event backing{}; backing.kind=ev::Kind::CasterBinding; backing.key=evidenceKey;
+                backing.parent=casterId; backing.data={i,uint64_t(draw.positionInfo.buffer),
+                  draw.positionInfo.offset,draw.positionInfo.size,uint64_t(draw.indexInfo.buffer),
+                  draw.indexInfo.offset,draw.indexInfo.size,uint64_t(draw.uvInfo.buffer),
+                  draw.uvInfo.offset,draw.uvInfo.size,uint64_t(draw.blendInfo.buffer),draw.blendInfo.offset};
+                backing.bits[0]=draw.positionStride;backing.bits[1]=draw.positionOffset;
+                backing.bits[2]=uint32_t(draw.positionFormat);backing.bits[3]=uint32_t(draw.indexType);
+                backing.bits[4]=draw.uvStride;backing.bits[5]=draw.uvOffset;backing.bits[6]=uint32_t(draw.uvFormat);
+                backing.bits[7]=draw.uvBinding;backing.bits[8]=draw.diffuseSamplerIndex;
+                backing.bits[9]=draw.vertexBlendEnabled?1:0;backing.bits[10]=draw.paletteIndex;
+                backing.bits[11]=draw.replayBindingsResolved?1:0;
+                ev::Record(evidencePipeline.session(),backing);
+            }
+            if (input.scene.shadowCasters.size()>casterLimit) {
+                ev::Event omitted{}; omitted.kind=ev::Kind::CasterOmitted; omitted.key=evidenceKey;
+                omitted.parent=evidencePipeline.id(); omitted.data[0]=input.scene.shadowCasters.size()-casterLimit;
+                omitted.data[1]=recordCasters?1:0; // 0=provider disabled, 1=bounded truncation
+                ev::Record(evidencePipeline.session(),omitted);
+            }
         }
 
         if (point == War3InsertionPoint::BeforeUi) {
@@ -1333,6 +1414,9 @@ void War3RenderPipeline::Execute(War3InsertionPoint point,
                 reinterpret_cast<void*>(ctx->getExecCommandBuffer()));
         }
         const bool hasListeners = war3shader::internal::HasAnyRenderListeners();
+        if (input.nativeLightBaselines[0] && input.lighting)
+            input.lighting->nativeColorExternalWriteHazard =
+                war3shader::internal::HasNativeColorWriteListeners();
         const auto& frameGraphPlan = dxvk::war3::render::War3FrameGraphPlan::Default();
         if (hasListeners) {
             UpdateShaderApiFrameBuffers(input);
@@ -1358,6 +1442,7 @@ void War3RenderPipeline::Execute(War3InsertionPoint point,
             if (!IsRuntimePipelinePassEnabled(entry.name))
                 continue;
             if (entry.pass->Point() == point) {
+                ev::Scope evidencePass(ev::Kind::PassBegin,evidenceKey,entry.name.c_str(),evidencePipeline.id());
                 try {
                     if (entry.name == "ShadowReceiver") {
                         dxvk::war3::tools::SetGpuFlightBreadcrumb(
@@ -1374,6 +1459,7 @@ void War3RenderPipeline::Execute(War3InsertionPoint point,
                     }
                     auto passScope = perf.cpuScope(entry.name.c_str());
                     entry.pass->Run(ctx, input);
+                    evidencePass.outcome(1); // CPU command recording returned
                 } catch (const dxvk::DxvkError& e) {
                     entry.enabled = false;
                     Logger::err(dxvk::str::format(
@@ -1405,11 +1491,13 @@ void War3RenderPipeline::Execute(War3InsertionPoint point,
             if (!s_disableShaderPack &&
                 dxvk::war3::runtime::IsWar3RuntimeModuleEnabled(
                     dxvk::war3::runtime::War3RuntimeModule::PostFx)) {
+                ev::Scope evidencePack(ev::Kind::PassBegin,evidenceKey,"ShaderPack",evidencePipeline.id());
                 try {
                     dxvk::war3::tools::SetGpuFlightBreadcrumb(
                         dxvk::war3::tools::GpuFlightBreadcrumb::ShaderPack);
                     auto packScope = perf.cpuScope("ShaderPack");
                     war3shader::internal::RunShaderPackPasses(ctx, input);
+                    evidencePack.outcome(1);
                 } catch (const dxvk::DxvkError& e) {
                     war3shader::EnableShaderPack(false);
                     Logger::err(dxvk::str::format("ShaderPack: 异常中止，已禁用: ", e.message()));
@@ -1461,6 +1549,7 @@ void War3RenderPipeline::Execute(War3InsertionPoint point,
 
         // 低频运行时健康日志（默认每 1200 帧）。
         dxvk::war3::tools::LogRuntimeHealthPeriodic(input.frameSerial);
+        evidencePipeline.outcome(1);
     }
 
     void War3RenderPipeline::RegisterPass(const char* name, std::unique_ptr<War3RenderPass> pass, bool enabled) {

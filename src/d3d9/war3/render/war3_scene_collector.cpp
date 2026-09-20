@@ -1,4 +1,5 @@
 #include "war3_scene_collector.h"
+#include "../tools/war3_data_collection_tree.h"
 #include "../../d3d9_war3_debug.h"
 #include "../core/war3_game_structs.h"
 #include "../core/war3_internal_test_config.h"
@@ -211,6 +212,7 @@ extern bool FindHandleByUnitPtr_NoLock(void *unitPtr, uint32_t *outHandleId,
 // 或者在 CollectWorldObjects 内部处理
 
 void SceneCollector::CollectWorldObjects(void *gameWorldPtr, int groupIdx) {
+  WARVK_DATA_SCOPE(SceneCollect);
   constexpr int kMinWorldGroupIdx = 0;
   constexpr int kMaxWorldGroupIdx = 3;
   constexpr uint32_t kMaxWorldGroupEntries = 200000u;

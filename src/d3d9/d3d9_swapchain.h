@@ -14,8 +14,11 @@
 #include "../wsi/wsi_monitor.h"
 
 #include <vector>
+#include <memory>
 
 namespace dxvk {
+  namespace war3::tools { class AsyncScreenshot; }
+  namespace war3::tools { class FrameHistory; }
 
   class D3D9Surface;
   class D3D9SwapChainEx;
@@ -166,6 +169,9 @@ namespace dxvk {
     D3D9WindowContext*        m_wctx = nullptr;
 
     std::vector<Com<D3D9Surface, false>> m_backBuffers;
+    std::unique_ptr<war3::tools::AsyncScreenshot> m_asyncScreenshot;
+    std::shared_ptr<war3::tools::FrameHistory> m_frameHistory;
+    void CaptureNativeAsyncScreenshot(bool afterUi=false);
     
     RECT                      m_srcRect;
     RECT                      m_dstRect;

@@ -46,6 +46,26 @@ category = "TC_WarVK"
 script = "WarVKIsRuntimeReady"
 returns = boolean
 
+[WarVKGetModelPointLightCount]
+title = "查询模型已绑定点光数量"
+description = "模型路径 ${modelPath} 的已注册原生实例点光数量。"
+comment = "0可表示模型尚未加载、没有受支持的Light节点或尚未注册；不是当帧可见灯/阴影数。路径错误可查询最后错误。"
+category = "TC_WarVKPointLight"
+script = "WarVKGetModelPointLightCount"
+returns = integer
+[[.args]]
+type = string
+
+[WarVKIsModelPointLightRegistered]
+title = "查询模型点光注册规则"
+description = "模型路径 ${modelPath} 是否有启用的自动点光规则。"
+comment = "true表示规则已启用，不表示模型已经加载或视觉效果已产生。"
+category = "TC_WarVKPointLight"
+script = "WarVKIsModelPointLightRegistered"
+returns = boolean
+[[.args]]
+type = string
+
 [WarVKCreatePointLight]
 title = "创建点光源"
 description = "以位置 ${x}、${y}、${z}、半径 ${radius}、颜色 ${red}、${green}、${blue}、强度 ${intensity} 创建点光并返回 WarVK id。"

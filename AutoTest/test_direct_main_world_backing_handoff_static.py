@@ -9,24 +9,31 @@ ROOT = Path(__file__).resolve().parents[1]
 DEVICE = (ROOT / "src/d3d9/d3d9_device.cpp").read_text(encoding="utf-8")
 
 
-def function_body(signature: str) -> str:
-    start = DEVICE.index(signature)
-    brace = DEVICE.index("{", start)
+# M1 迁移：记录级 selector 已迁到语义模块；默认仍按 device.cpp 解析，
+# 需要时显式把 source 传成 SEMANTIC。
+SEMANTIC = (
+    ROOT / "src/d3d9/war3/semantic/war3_device_semantic_predicates.cpp"
+).read_text(encoding="utf-8")
+
+
+def function_body(signature: str, source: str = DEVICE) -> str:
+    start = source.index(signature)
+    brace = source.index("{", start)
     depth = 0
-    for pos in range(brace, len(DEVICE)):
-        if DEVICE[pos] == "{":
+    for pos in range(brace, len(source)):
+        if source[pos] == "{":
             depth += 1
-        elif DEVICE[pos] == "}":
+        elif source[pos] == "}":
             depth -= 1
             if depth == 0:
-                return DEVICE[start : pos + 1]
+                return source[start : pos + 1]
     raise AssertionError(f"unterminated function: {signature}")
 
 
 class DirectMainWorldBackingHandoffStaticTests(unittest.TestCase):
     def test_value_validator_retains_all_canonical_checks(self) -> None:
         validator = function_body(
-            "bool War3SemanticDirectPacketMatchesMainWorldVisibleRecord("
+            "bool War3SemanticDirectPacketMatchesMainWorldVisibleRecord(", SEMANTIC
         )
         for token in (
             "VisibleRenderableQueueKind::MainQueue",
@@ -43,7 +50,7 @@ class DirectMainWorldBackingHandoffStaticTests(unittest.TestCase):
 
     def test_canonical_fallback_still_queries_current_snapshot(self) -> None:
         fallback = function_body(
-            "bool War3SemanticDirectPacketHasMainWorldVisibleBacking("
+            "bool War3SemanticDirectPacketHasMainWorldVisibleBacking(", SEMANTIC
         )
         self.assertIn("queryByRenderablePartAndLayer(", fallback)
         self.assertIn(

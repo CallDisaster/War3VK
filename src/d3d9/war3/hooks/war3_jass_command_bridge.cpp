@@ -994,9 +994,11 @@ const char *ExpectedCarrierSignature(CarrierKind kind) {
   case CarrierKind::TypedSaveReal:
     return "(Hhashtable;IIR)V";
   case CarrierKind::TypedLoadInteger:
-    return "(Hhashtable;II)I";
+    // 1.27a native metadata includes this terminal semicolon (unlike the
+    // localized-query carriers). Keep exact NUL-inclusive matching below.
+    return "(Hhashtable;II)I;";
   case CarrierKind::TypedLoadReal:
-    return "(Hhashtable;II)R";
+    return "(Hhashtable;II)R;";
   }
   return "";
 }
@@ -1723,6 +1725,55 @@ bool IsJassTypedTransportInstalled() {
   return s_typedInstalled.load(std::memory_order_acquire);
 }
 
+JassPublicApiTestResult InvokeJassPublicApiForTest(
+    const std::string& carrier, const std::string& payload) {
+  JassPublicApiTestResult result;
+  // Only the bounded public protocol can reach a native here. In particular,
+  // never forward a filename to Preloader or accept embedded string terminators.
+  if (payload.size() > 2048u || payload.compare(0u, 9u, "warvk:v1;") != 0 ||
+      payload.find('\0') != std::string::npos ||
+      (carrier != "Preloader" && carrier != "GetLocalizedHotkey" &&
+       carrier != "GetLocalizedString")) {
+    result.error = "invalid public API test request";
+    return result;
+  }
+  TryInstallJassCommandBridge("public-api-test");
+  if (!IsJassCommandBridgeInstalled()) {
+    result.error = "public bridge not installed";
+    return result;
+  }
+  const auto pre = reinterpret_cast<NativeVoidStringFn>(ReadCurrentNativeFunc(
+      reinterpret_cast<void*>(s_preloader.entry.load(std::memory_order_relaxed))));
+  const auto hot = reinterpret_cast<NativeIntStringFn>(ReadCurrentNativeFunc(
+      reinterpret_cast<void*>(s_hotkey.entry.load(std::memory_order_relaxed))));
+  const auto str = reinterpret_cast<NativeStringStringFn>(ReadCurrentNativeFunc(
+      reinterpret_cast<void*>(s_string.entry.load(std::memory_order_relaxed))));
+  // Fail if another plugin replaced our carrier; do not call a foreign native
+  // with a synthetic argument or mistake its result for WarVK acceptance.
+  if (pre != &Bridge_Preloader || hot != &Bridge_GetLocalizedHotkey ||
+      str != &Bridge_GetLocalizedString) {
+    result.error = "public carrier ownership changed";
+    return result;
+  }
+  // Last-error queries must see the previous call, not clear their own evidence.
+  const bool errorQuery = payload == "warvk:v1;system.lastErrorCode" ||
+      payload == "warvk:v1;system.lastError";
+  if (!errorQuery)
+    pre(MakeSyntheticNativeStringArg("warvk:v1;system.clearError"));
+  if (carrier == "Preloader") {
+    pre(MakeSyntheticNativeStringArg(payload.c_str()));
+  } else if (carrier == "GetLocalizedHotkey") {
+    result.integer = hot(MakeSyntheticNativeStringArg(payload.c_str()));
+  } else {
+    const uint32_t value = str(MakeSyntheticNativeStringArg(payload.c_str()));
+    const char* text = value ? jass::convert::to_CString(value) : nullptr;
+    result.text = text ? text : "";
+  }
+  result.invoked = true;
+  result.errorCode = hot(MakeSyntheticNativeStringArg("warvk:v1;system.lastErrorCode"));
+  return result;
+}
+
 JassCommandBridgeSelfTestResult RunJassCommandBridgeSelfTest(bool displayText) {
   JassCommandBridgeSelfTestResult result = {};
 
@@ -1888,6 +1939,17 @@ JassPauseGameTestResult SetJassGamePausedForTest(bool paused) {
   SetInternalTestGamePauseBypassForCurrentThread(previousBypass);
   result.invoked = true;
   return result;
+}
+
+bool EndJassGameForExitTest(std::string& error) {
+  void* function = nullptr;
+  std::string signature;
+  if (!ResolveNativeStrict("EndGame", "(B)V", 1u, function, signature, error))
+    return false;
+  // Registration + 1.27a 1E0100 independently confirm one cdecl boolean.
+  // No key/input simulation, process termination or native-table patch.
+  reinterpret_cast<NativeVoidBooleanFn>(function)(0u);
+  return true;
 }
 
 JassCameraFieldTestResult SetJassCameraAngleOfAttackForTest(

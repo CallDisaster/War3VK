@@ -114,6 +114,8 @@ function WarVKIsRuntimeReady takes nothing returns boolean
     return GetLocalizedHotkey(payload) != 0
 endfunction
 
+// false 关闭太阳直射光及正常太阳阴影，不关闭环境光、点光或自发光。
+// 写入在下一渲染帧安全点生效；方向/颜色的手动控制还需关闭对应昼夜控制器。
 function WarVKSetSunEnabled takes boolean enabled returns nothing
     local string payload = "warvk:v1;sun.setEnabled" + ";b:" + WarVKBoolToken(enabled)
     call Preloader(payload)
@@ -142,6 +144,25 @@ endfunction
 function WarVKSetCsmTuning takes real depthBias, real blendWidth returns nothing
     local string payload = "warvk:v1;csm.setTuning" + ";r:" + R2S(depthBias) + ";r:" + R2S(blendWidth)
     call Preloader(payload)
+endfunction
+
+// modelPath 是地图导入路径/MPQ资源名，不是磁盘路径。支持MDX800全向点光。
+// 注册只建立当前地图规则；自动跟踪现有与以后加载的实例，不凭路径生成悬空灯。
+// enabled=false 退出WarVK接管，保留游戏本身光照；shadows=false保留光照但不投点阴影。
+function WarVKSetModelPointLightsEnabled takes string modelPath, boolean enabled, boolean shadows returns nothing
+    local string payload = "warvk:v1;modelPointLights.setEnabled" + ";s:" + modelPath + ";b:" + WarVKBoolToken(enabled) + ";b:" + WarVKBoolToken(shadows)
+    call Preloader(payload)
+endfunction
+
+// 返回已经加载且完成原生实例绑定的注册灯数，不是可见灯数/当帧阴影数。
+function WarVKGetModelPointLightCount takes string modelPath returns integer
+    local string payload = "warvk:v1;modelPointLights.count" + ";s:" + modelPath
+    return GetLocalizedHotkey(payload)
+endfunction
+
+function WarVKIsModelPointLightRegistered takes string modelPath returns boolean
+    local string payload = "warvk:v1;modelPointLights.registered" + ";s:" + modelPath
+    return GetLocalizedHotkey(payload) != 0
 endfunction
 
 function WarVKCreatePointLight takes real x, real y, real z, real radius, real red, real green, real blue, real intensity returns integer

@@ -26,6 +26,18 @@ struct JassCommandBridgeSelfTestResult {
   std::string error;
 };
 
+// Internal-test-only native-carrier witness, not JASS bytecode execution.
+struct JassPublicApiTestResult {
+  bool invoked = false;
+  int32_t errorCode = 0;
+  int32_t integer = 0;
+  std::string text;
+  std::string error;
+};
+
+JassPublicApiTestResult InvokeJassPublicApiForTest(
+    const std::string& carrier, const std::string& payload);
+
 struct JassPauseGameTestResult {
   bool resolved = false;
   bool signatureValidated = false;
@@ -193,6 +205,9 @@ JassCommandBridgeSelfTestResult RunJassCommandBridgeSelfTest(
  * does not install a hook or alter normal gameplay behavior.
  */
 JassPauseGameTestResult SetJassGamePausedForTest(bool paused);
+
+/** Internal owner-thread test only: leave the map through stock EndGame(false). */
+bool EndJassGameForExitTest(std::string& error);
 
 /**
  * Resolve ConvertCameraField/SetCameraField and force only the local camera's

@@ -1,4 +1,5 @@
 #include "war3_hook_lifecycle.h"
+#include "war3_native_capture.h"
 #include "war3_hook_address_book.h"
 #include "war3_hook_install_util.h"
 #include "war3_hook_perf.h"
@@ -14,6 +15,7 @@
 #include "../render/war3_renderer.h"
 #include "../state/war3_render_state.h"
 #include "../tools/war3_perf_monitor.h"
+#include "../tools/war3_frame_timeline.h"
 #include "../tools/war3_internal_test_api.h"
 
 #include <algorithm>
@@ -2006,6 +2008,7 @@ int __cdecl Hook_EventMainCallback() {
 }
 
 int __fastcall Hook_EventMessagePump(int a1, int a2) {
+  ::dxvk::war3::timeline::Scope wallTimeline("Hook_EventMessagePump");
   // 主消息泵稳定入口（PeekMessage + Dispatch 循环）：
   // 相比 case5/case14 回调，该入口命中率更高，用于覆盖 MainLoop CPU 时间。
   MarkMainLoopThread();
@@ -2057,6 +2060,7 @@ int __fastcall Hook_EventMessagePump(int a1, int a2) {
 }
 
 void __fastcall Hook_EventDispatch(int a1, int a2, void *a3, void *a4) {
+  ::dxvk::war3::timeline::Scope wallTimeline("Hook_EventDispatch");
   // 事件分发点：细分 MainLoop 消耗来源（系统/输入/游戏/回调）。
   MarkMainLoopThread();
   War3HotHookCallTiming hookTiming(War3HotHookId::EventDispatch, 4u);
@@ -2089,6 +2093,7 @@ void __fastcall Hook_EventDispatch(int a1, int a2, void *a3, void *a4) {
 }
 
 int __fastcall Hook_EngineTlsPump(int a1, int a2) {
+  ::dxvk::war3::timeline::Scope wallTimeline("Hook_EngineTlsPump");
   // 引擎线程 TLS 消息泵包装：用于定位 EventPump 之外的主循环时间。
   // 固定 ID 树是 PERF_LEVEL=2 的 Hook/Native/observer 分账；下面既有的
   // MainLoop/Engine 聚合仍供 stageSeries 使用。两者是同一区间的不同视图，
@@ -2121,6 +2126,7 @@ int __fastcall Hook_EngineTlsPump(int a1, int a2) {
 }
 
 int __fastcall Hook_EngineSelectWorker(int a1, int a2) {
+  ::dxvk::war3::timeline::Scope wallTimeline("Hook_EngineSelectWorker");
   // 从调度队列选择当前 worker/context。
   MarkMainLoopThread();
   const auto targetFn =
@@ -2150,6 +2156,7 @@ int __fastcall Hook_EngineSelectWorker(int a1, int a2) {
 }
 
 int __fastcall Hook_EngineRunCallbacks(int thisPtr, void *edx) {
+  ::dxvk::war3::timeline::Scope wallTimeline("Hook_EngineRunCallbacks");
   // 处理到期回调（逻辑/系统任务），通常是主循环 CPU 大头候选。
   MarkMainLoopThread();
   const auto targetFn =
@@ -2187,6 +2194,7 @@ int __fastcall Hook_EngineRunCallbacks(int thisPtr, void *edx) {
 }
 
 int __fastcall Hook_EngineQueueFlush(int thisPtr, void *edx) {
+  ::dxvk::war3::timeline::Scope wallTimeline("Hook_EngineQueueFlush");
   // 清空并执行 deferred 队列块（LoadResourceBlock stage 触发点）。
   MarkMainLoopThread();
   const auto targetFn =
@@ -2216,6 +2224,7 @@ int __fastcall Hook_EngineQueueFlush(int thisPtr, void *edx) {
 }
 
 int __fastcall Hook_EngineFinalizeTick(int thisPtr, void *edx) {
+  ::dxvk::war3::timeline::Scope wallTimeline("Hook_EngineFinalizeTick");
   // Tick 结束收口（状态机阶段 3/4 + 虚函数提交）。
   MarkMainLoopThread();
   const auto targetFn =
@@ -2246,6 +2255,7 @@ int __fastcall Hook_EngineFinalizeTick(int thisPtr, void *edx) {
 
 int __fastcall Hook_EngineReschedule(uint32_t engineIndex, uint32_t *ctx, int lane,
                                      uint32_t wakeAt) {
+  ::dxvk::war3::timeline::Scope wallTimeline("Hook_EngineReschedule");
   // 任务重排/迁移：决定下一次 wake 时间与 lane 分配。
   MarkMainLoopThread();
   const auto targetFn =
@@ -2275,6 +2285,7 @@ int __fastcall Hook_EngineReschedule(uint32_t engineIndex, uint32_t *ctx, int la
 }
 
 int __fastcall Hook_EnginePrepareWait(int laneIndex, int workerCtx) {
+  ::dxvk::war3::timeline::Scope wallTimeline("Hook_EnginePrepareWait");
   // 进入 WaitGate 前的句柄准备（sub_6F05DEE0）。
   MarkMainLoopThread();
   if (!ShouldCollectMainLoopPerfSamples()) {
@@ -2305,6 +2316,7 @@ int __fastcall Hook_EnginePrepareWait(int laneIndex, int workerCtx) {
 }
 
 int __fastcall Hook_EnginePrepareDispatch(int thisPtr, void *edx) {
+  ::dxvk::war3::timeline::Scope wallTimeline("Hook_EnginePrepareDispatch");
   // 超时分支前置阶段（sub_6F05FCA0）。
   MarkMainLoopThread();
   const auto targetFn =
@@ -2333,6 +2345,7 @@ int __fastcall Hook_EnginePrepareDispatch(int thisPtr, void *edx) {
 }
 
 int __fastcall Hook_EngineFinalizeDispatch(int thisPtr, void *edx) {
+  ::dxvk::war3::timeline::Scope wallTimeline("Hook_EngineFinalizeDispatch");
   // Dispatch 后收口（sub_6F05FD10）。
   MarkMainLoopThread();
   const auto targetFn =
@@ -2362,6 +2375,7 @@ int __fastcall Hook_EngineFinalizeDispatch(int thisPtr, void *edx) {
 }
 
 int __fastcall Hook_EngineTickUpdate(int thisPtr, void *edx) {
+  ::dxvk::war3::timeline::Scope wallTimeline("Hook_EngineTickUpdate");
   // Tick 时间推进与阶段5写入（sub_6F05FC10）。
   MarkMainLoopThread();
   const auto targetFn = g_trampolineEngineTickUpdate ? g_trampolineEngineTickUpdate
@@ -2517,6 +2531,7 @@ int __fastcall Hook_EngineTickUpdate(int thisPtr, void *edx) {
 }
 
 int __fastcall Hook_EngineFinalizeWorker(int laneIndex, int workerCtx) {
+  ::dxvk::war3::timeline::Scope wallTimeline("Hook_EngineFinalizeWorker");
   // Worker 完结/回收路径（sub_6F05DCE0）。
   MarkMainLoopThread();
   const auto targetFn =
@@ -2546,6 +2561,7 @@ int __fastcall Hook_EngineFinalizeWorker(int laneIndex, int workerCtx) {
 }
 
 int __fastcall Hook_EngineComputeWakeDelta(int thisPtr, int tickNow) {
+  ::dxvk::war3::timeline::Scope wallTimeline("Hook_EngineComputeWakeDelta");
   // 计算下一次 wake delta（sub_6F060500）。
   MarkMainLoopThread();
   const auto targetFn =
@@ -2576,6 +2592,7 @@ int __fastcall Hook_EngineComputeWakeDelta(int thisPtr, int tickNow) {
 
 DWORD __fastcall Hook_EngineWaitGate(HANDLE *thisPtr, void *edx,
                                      DWORD dwMilliseconds) {
+  ::dxvk::war3::timeline::Scope wallTimeline("Hook_EngineWaitGate");
   // 内部等待门（sub_6F158940）：主循环中高频出现，优先用于定位未捕获时间。
   MarkMainLoopThread();
   if (!ShouldCollectMainLoopPerfSamples()) {
@@ -2627,6 +2644,7 @@ DWORD __fastcall Hook_EngineWaitGate(HANDLE *thisPtr, void *edx,
 
 void __fastcall Hook_EngineSleepGate(uint32_t *thisPtr, void *edx,
                                      DWORD dwMilliseconds) {
+  ::dxvk::war3::timeline::Scope wallTimeline("Hook_EngineSleepGate");
   // 内部 Sleep 门（sub_6F1648A0）：会走 Sleep 或高精度等待分支。
   MarkMainLoopThread();
   if (!ShouldCollectMainLoopPerfSamples()) {
@@ -2657,6 +2675,7 @@ void __fastcall Hook_EngineSleepGate(uint32_t *thisPtr, void *edx,
 
 void __fastcall Hook_EngineSleepGateInner(uint32_t *thisPtr, void *edx,
                                           DWORD dwMilliseconds) {
+  ::dxvk::war3::timeline::Scope wallTimeline("Hook_EngineSleepGateInner");
   // SleepGate 内部分支（sub_6F164B00）：区分真正 Sleep 与自旋等待路径。
   MarkMainLoopThread();
   if (!ShouldCollectMainLoopPerfSamples()) {
@@ -2798,6 +2817,7 @@ int __cdecl Hook_FlushAndReset() {
 }
 
 void War3HookLifecycle::Install(uintptr_t gameBase) {
+  InstallNativeCapture(gameBase);
   const auto &book = GetWar3HookAddressBook127a();
   // 统一地址解析函数，减少重复指针转换样板代码。
   auto resolveCode = [&](uintptr_t rva) -> LPVOID {

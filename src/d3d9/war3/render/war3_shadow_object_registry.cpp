@@ -1,6 +1,7 @@
 ﻿// war3_shadow_object_registry.cpp - 闃村奖瀵硅薄杩愯鏃堕鏋跺疄鐜?
 
 #include "war3_shadow_object_registry.h"
+#include "../tools/war3_data_collection_tree.h"
 
 #include "../core/war3_memory.h"
 #include "../game/war3_unit.h"
@@ -392,6 +393,7 @@ bool ShadowObjectRegistry::trySkipExactSameFrameRenderObjectLocked(
 }
 
 void ShadowObjectRegistry::noteRenderObject(const RenderObjectInfo &info) {
+  WARVK_DATA_SCOPE(ShadowObjectWrite);
   if (!info.worldObjectEntry && !info.sceneNode && !info.unitPtr &&
       !info.hasValidHandle())
     return;
@@ -410,6 +412,7 @@ void ShadowObjectRegistry::noteRenderObject(const RenderObjectInfo &info) {
 
 void ShadowObjectRegistry::noteRenderObjectsBatch(
     const std::vector<const RenderObjectInfo *> &infos) {
+  WARVK_DATA_SCOPE(ShadowObjectWrite);
   if (infos.empty())
     return;
 
@@ -434,6 +437,7 @@ void ShadowObjectRegistry::noteInstanceIdentity(void *worldObjectEntry,
                                                 uint32_t jHandle,
                                                 uint32_t rawcode,
                                                 ObjectKind kind) {
+  WARVK_DATA_SCOPE(ShadowObjectWrite);
   std::unique_lock<std::shared_mutex> lock(m_mutex);
   noteInstanceIdentityLocked(worldObjectEntry, sceneNode, unitPtr, spritePtr,
                              jHandle, rawcode, kind, false);
@@ -536,6 +540,7 @@ void ShadowObjectRegistry::noteModelBinding(void *spritePtr,
                                             uint32_t modelType,
                                             uint32_t modelFlags,
                                             uint64_t modelKey) {
+  WARVK_DATA_SCOPE(ShadowObjectWrite);
   if (!spritePtr || (!runtimeModelPtr && modelKey == 0 && modelPath.empty()))
     return;
 
@@ -586,6 +591,7 @@ void ShadowObjectRegistry::notePose(void *runtimeModelPtr, void *sceneNode,
                                     bool hasWorldTransform,
                                     const Matrix4 *worldTransform,
                                     uint32_t matrixCount, uint64_t matrixHash) {
+  WARVK_DATA_SCOPE(ShadowObjectWrite);
   if (!runtimeModelPtr && !sceneNode && !unitPtr)
     return;
 
@@ -640,6 +646,7 @@ void ShadowObjectRegistry::noteSpriteFramePose(
     float dt, uint32_t sequenceId, float sequenceTime, float scale, float yaw,
     float pitch, float roll, float height, bool hasWorldTransform,
     const Matrix4 *worldTransform, uint32_t matrixCount, uint64_t matrixHash) {
+  WARVK_DATA_SCOPE(ShadowObjectWrite);
   if (!runtimeModelPtr && !spritePtr && !sceneNode && !unitPtr)
     return;
 
@@ -689,6 +696,7 @@ void ShadowObjectRegistry::noteSpriteFramePose(
 
 bool ShadowObjectRegistry::findByWorldObjectEntry(void *worldObjectEntry,
                                                   ShadowObjectRecord &out) const {
+  WARVK_DATA_SCOPE(ShadowObjectQuery);
   if (!worldObjectEntry)
     return false;
   std::shared_lock<std::shared_mutex> lock(m_mutex);
@@ -701,6 +709,7 @@ bool ShadowObjectRegistry::findByWorldObjectEntry(void *worldObjectEntry,
 
 bool ShadowObjectRegistry::findBySceneNode(void *sceneNode,
                                            ShadowObjectRecord &out) const {
+  WARVK_DATA_SCOPE(ShadowObjectQuery);
   if (!sceneNode)
     return false;
   std::shared_lock<std::shared_mutex> lock(m_mutex);
@@ -713,6 +722,7 @@ bool ShadowObjectRegistry::findBySceneNode(void *sceneNode,
 
 bool ShadowObjectRegistry::findByUnitPtr(void *unitPtr,
                                          ShadowObjectRecord &out) const {
+  WARVK_DATA_SCOPE(ShadowObjectQuery);
   if (!unitPtr)
     return false;
   std::shared_lock<std::shared_mutex> lock(m_mutex);
@@ -725,6 +735,7 @@ bool ShadowObjectRegistry::findByUnitPtr(void *unitPtr,
 
 bool ShadowObjectRegistry::findByHandle(uint32_t jHandle,
                                         ShadowObjectRecord &out) const {
+  WARVK_DATA_SCOPE(ShadowObjectQuery);
   if (jHandle == 0)
     return false;
   std::shared_lock<std::shared_mutex> lock(m_mutex);
@@ -737,6 +748,7 @@ bool ShadowObjectRegistry::findByHandle(uint32_t jHandle,
 
 bool ShadowObjectRegistry::findBySpritePtr(void *spritePtr,
                                            ShadowObjectRecord &out) const {
+  WARVK_DATA_SCOPE(ShadowObjectQuery);
   if (!spritePtr)
     return false;
   std::shared_lock<std::shared_mutex> lock(m_mutex);
@@ -749,6 +761,7 @@ bool ShadowObjectRegistry::findBySpritePtr(void *spritePtr,
 
 bool ShadowObjectRegistry::findByRuntimeModel(void *runtimeModelPtr,
                                                ShadowObjectRecord &out) const {
+  WARVK_DATA_SCOPE(ShadowObjectQuery);
   if (!runtimeModelPtr)
     return false;
   std::shared_lock<std::shared_mutex> lock(m_mutex);
@@ -839,6 +852,7 @@ bool ShadowObjectRegistry::findFirstForAugment(
     void* worldObjectEntry, void* sceneNode, void* primaryUnitPtr,
     void* secondaryUnitPtr, uint32_t jHandle, void* runtimeModelPtr,
     ShadowObjectRecord& out) const {
+  WARVK_DATA_SCOPE(ShadowObjectQuery);
   std::shared_lock<std::shared_mutex> lock(m_mutex);
 
   auto findPointer = [&](const auto& map, void* key) -> bool {
@@ -876,6 +890,7 @@ bool ShadowObjectRegistry::findFirstForAugmentView(
     ShadowObjectAugmentView& out,
     uint64_t* mutationGenerationOut,
     uint64_t* frameNumberOut) const {
+  WARVK_DATA_SCOPE(ShadowObjectQuery);
   std::shared_lock<std::shared_mutex> lock(m_mutex);
   if (mutationGenerationOut != nullptr) {
     *mutationGenerationOut =

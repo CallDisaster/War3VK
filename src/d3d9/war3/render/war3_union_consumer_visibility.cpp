@@ -21,6 +21,15 @@ float RowLength3(const War3UnionMatrix4& matrix, uint32_t row) {
   return std::sqrt(x * x + y * y + z * z);
 }
 
+bool IsExactOrthographicWRow(const War3UnionMatrix4& matrix) {
+  // Column-major layout: row 3 is the homogeneous w row.  A perspective or
+  // near-perspective matrix must fail closed; exact comparison is deliberate.
+  return matrix.columns[0][3] == 0.0f &&
+      matrix.columns[1][3] == 0.0f &&
+      matrix.columns[2][3] == 0.0f &&
+      matrix.columns[3][3] == 1.0f;
+}
+
 void TransformPoint(const War3UnionMatrix4& matrix,
                     const War3UnionBoundsSphere& bounds,
                     float (&clip)[4]) {
@@ -174,6 +183,36 @@ War3UnionVisibilityDecision War3EvaluateConservativeCsmSphere(
   }
   result.proofBits |= War3UnionProofConsumerStateCurrent;
 
+  if (generation.currentMapGeneration == 0u ||
+      generation.candidateMapGeneration == 0u ||
+      generation.consumerMapGeneration == 0u) {
+    result.rejectReason =
+        War3UnionVisibilityRejectReason::MapGenerationUnknown;
+    return result;
+  }
+  if (generation.candidateMapGeneration != generation.currentMapGeneration ||
+      generation.consumerMapGeneration != generation.currentMapGeneration) {
+    result.rejectReason =
+        War3UnionVisibilityRejectReason::MapGenerationMismatch;
+    return result;
+  }
+
+  if (generation.currentDeviceGeneration == 0u ||
+      generation.candidateDeviceGeneration == 0u ||
+      generation.consumerDeviceGeneration == 0u) {
+    result.rejectReason =
+        War3UnionVisibilityRejectReason::DeviceGenerationUnknown;
+    return result;
+  }
+  if (generation.candidateDeviceGeneration !=
+          generation.currentDeviceGeneration ||
+      generation.consumerDeviceGeneration !=
+          generation.currentDeviceGeneration) {
+    result.rejectReason =
+        War3UnionVisibilityRejectReason::DeviceGenerationMismatch;
+    return result;
+  }
+
   if (generation.resourceGeneration == 0u ||
       generation.expectedResourceGeneration == 0u) {
     result.rejectReason =
@@ -205,6 +244,11 @@ War3UnionVisibilityDecision War3EvaluateConservativeCsmSphere(
 
   if (!War3UnionIsFiniteMatrix(query.lightViewProjection)) {
     result.rejectReason = War3UnionVisibilityRejectReason::NonFiniteMatrix;
+    return result;
+  }
+  if (!IsExactOrthographicWRow(query.lightViewProjection)) {
+    result.rejectReason =
+        War3UnionVisibilityRejectReason::NonOrthographicProjection;
     return result;
   }
   result.proofBits |= War3UnionProofFiniteMatrix;

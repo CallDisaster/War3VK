@@ -1,6 +1,7 @@
 ﻿// war3_model_registry.cpp - War3 濡€崇€风挧鍕爱/鐎圭偘绶?婵寧鈧浇绻嶇悰灞炬妤犮劍鐏︾€圭偟骞?
 
 #include "war3_model_registry.h"
+#include "../tools/war3_data_collection_tree.h"
 
 #include "../core/war3_internal_test_config.h"
 #include "../game/war3_unit.h"
@@ -520,6 +521,7 @@ void ModelRegistry::resetMapSession() {
 
 void ModelRegistry::recordSpriteModelPath(void *spritePtr, const char *modelPath,
                                           uint32_t modelType, uint32_t flags) {
+  WARVK_DATA_SCOPE(ModelBind);
   if (!spritePtr || !modelPath || !modelPath[0])
     return;
 
@@ -551,6 +553,7 @@ void ModelRegistry::recordRuntimeModelBinding(void *spritePtr,
                                               void *modelResourcePtr,
                                               uint32_t modelType,
                                               uint32_t flags) {
+  WARVK_DATA_SCOPE(ModelBind);
   if (!spritePtr || !runtimeModelPtr)
     return;
 
@@ -585,6 +588,7 @@ void ModelRegistry::recordRuntimeModelBinding(void *spritePtr,
 }
 
 bool ModelRegistry::findBySprite(void *spritePtr, ModelResourceRecord &out) const {
+  WARVK_DATA_SCOPE(ModelQuery);
   if (!spritePtr)
     return false;
 
@@ -598,6 +602,7 @@ bool ModelRegistry::findBySprite(void *spritePtr, ModelResourceRecord &out) cons
 
 bool ModelRegistry::findByRuntimeModel(void *runtimeModelPtr,
                                        ModelResourceRecord &out) const {
+  WARVK_DATA_SCOPE(ModelQuery);
   if (!runtimeModelPtr)
     return false;
 
@@ -611,6 +616,7 @@ bool ModelRegistry::findByRuntimeModel(void *runtimeModelPtr,
 
 bool ModelRegistry::findByPath(const std::string &modelPath,
                                ModelResourceRecord &out) const {
+  WARVK_DATA_SCOPE(ModelQuery);
   if (modelPath.empty())
     return false;
 
@@ -999,6 +1005,7 @@ bool ModelInstanceRegistry::trySkipExactSameFrameRenderObjectLocked(
 }
 
 void ModelInstanceRegistry::noteRenderObject(const render::RenderObjectInfo &info) {
+  WARVK_DATA_SCOPE(InstanceWrite);
   if (!info.worldObjectEntry && !info.sceneNode && !info.unitPtr &&
       !info.hasValidHandle())
     return;
@@ -1016,6 +1023,7 @@ void ModelInstanceRegistry::noteRenderObject(const render::RenderObjectInfo &inf
 
 void ModelInstanceRegistry::noteRenderObjectsBatch(
     const std::vector<const render::RenderObjectInfo *> &infos) {
+  WARVK_DATA_SCOPE(InstanceWrite);
   if (infos.empty())
     return;
 
@@ -1039,6 +1047,7 @@ void ModelInstanceRegistry::noteInstanceIdentity(void *worldObjectEntry,
                                                  void *spritePtr,
                                                  uint32_t jHandle,
                                                  uint32_t rawcode) {
+  WARVK_DATA_SCOPE(InstanceWrite);
   std::unique_lock<std::shared_mutex> lock(m_mutex);
   noteInstanceIdentityLocked(worldObjectEntry, sceneNode, unitPtr, spritePtr,
                              jHandle, rawcode, false);
@@ -1133,6 +1142,7 @@ void ModelInstanceRegistry::noteInstanceIdentityLocked(void *worldObjectEntry,
 }
 
 void ModelInstanceRegistry::bindSpriteToInstance(void *unitPtr, void *spritePtr) {
+  WARVK_DATA_SCOPE(InstanceWrite);
   if (!unitPtr || !spritePtr)
     return;
 
@@ -1175,6 +1185,7 @@ void ModelInstanceRegistry::bindRuntimeModelToSprite(void *spritePtr,
                                                      uint64_t modelKey,
                                                      void *modelResourcePtr,
                                                      bool propagateOwnerIdentity) {
+  WARVK_DATA_SCOPE(InstanceWrite);
   if (!spritePtr || !runtimeModelPtr)
     return;
 
@@ -1204,6 +1215,7 @@ void ModelInstanceRegistry::bindRuntimeModelToSprite(void *spritePtr,
 void ModelInstanceRegistry::noteRuntimeCreationProvenance(void *runtimeModelPtr,
                                                           void *modelDataPtr,
                                                           uint32_t callerRva) {
+  WARVK_DATA_SCOPE(InstanceWrite);
   if (!runtimeModelPtr)
     return;
   if (modelDataPtr == nullptr && callerRva == 0u)
@@ -1255,6 +1267,7 @@ void ModelInstanceRegistry::noteRuntimeSourceObject(void *runtimeModelPtr,
                                                     void *sourceObjectPtr,
                                                     void *sourceSpriteObjectPtr,
                                                     void *spritePtr) {
+  WARVK_DATA_SCOPE(InstanceWrite);
   if (!runtimeModelPtr)
     return;
   if (!sourceObjectPtr && !sourceSpriteObjectPtr)
@@ -1295,6 +1308,7 @@ void ModelInstanceRegistry::noteRuntimeOwnerIdentity(void *runtimeModelPtr,
                                                      void *spritePtr,
                                                      uint32_t jHandle,
                                                      uint32_t rawcode) {
+  WARVK_DATA_SCOPE(InstanceWrite);
   if (!runtimeModelPtr)
     return;
   if (!worldObjectEntry && !sceneNode && !unitPtr && !spritePtr &&
@@ -1378,6 +1392,7 @@ void ModelInstanceRegistry::bindModelToInstance(void *sceneNode,
 
 bool ModelInstanceRegistry::findByWorldObjectEntry(void *worldObjectEntry,
                                                    ModelInstanceRecord &out) const {
+  WARVK_DATA_SCOPE(InstanceQuery);
   if (!worldObjectEntry)
     return false;
 
@@ -1391,6 +1406,7 @@ bool ModelInstanceRegistry::findByWorldObjectEntry(void *worldObjectEntry,
 
 bool ModelInstanceRegistry::findBySceneNode(void *sceneNode,
                                             ModelInstanceRecord &out) const {
+  WARVK_DATA_SCOPE(InstanceQuery);
   if (!sceneNode)
     return false;
 
@@ -1404,6 +1420,7 @@ bool ModelInstanceRegistry::findBySceneNode(void *sceneNode,
 
 bool ModelInstanceRegistry::findByUnitPtr(void *unitPtr,
                                           ModelInstanceRecord &out) const {
+  WARVK_DATA_SCOPE(InstanceQuery);
   if (!unitPtr)
     return false;
 
@@ -1417,6 +1434,7 @@ bool ModelInstanceRegistry::findByUnitPtr(void *unitPtr,
 
 bool ModelInstanceRegistry::findBySpritePtr(void *spritePtr,
                                             ModelInstanceRecord &out) const {
+  WARVK_DATA_SCOPE(InstanceQuery);
   if (!spritePtr)
     return false;
 
@@ -1430,6 +1448,7 @@ bool ModelInstanceRegistry::findBySpritePtr(void *spritePtr,
 
 bool ModelInstanceRegistry::findByRuntimeModel(void *runtimeModelPtr,
                                                ModelInstanceRecord &out) const {
+  WARVK_DATA_SCOPE(InstanceQuery);
   if (!runtimeModelPtr)
     return false;
 
@@ -1538,6 +1557,7 @@ bool ModelInstanceRegistry::findBySourceSpriteObject(
 
 bool ModelInstanceRegistry::findOwnerByRuntimeModel(void *runtimeModelPtr,
                                                     ModelInstanceRecord &out) const {
+  WARVK_DATA_SCOPE(InstanceQuery);
   out = {};
   if (!runtimeModelPtr)
     return false;
@@ -1552,6 +1572,7 @@ bool ModelInstanceRegistry::findOwnerByRuntimeModel(void *runtimeModelPtr,
 
 bool ModelInstanceRegistry::findByHandle(uint32_t jHandle,
                                           ModelInstanceRecord &out) const {
+  WARVK_DATA_SCOPE(InstanceQuery);
   if (jHandle == 0)
     return false;
 
@@ -1567,6 +1588,7 @@ bool ModelInstanceRegistry::findFirstForAugment(
     void* worldObjectEntry, void* sceneNode, void* primaryUnitPtr,
     void* secondaryUnitPtr, uint32_t jHandle,
     ModelInstanceRecord& out) const {
+  WARVK_DATA_SCOPE(InstanceQuery);
   std::shared_lock<std::shared_mutex> lock(m_mutex);
 
   auto findPointer = [&](const auto& map, void* key) -> bool {
@@ -1601,6 +1623,7 @@ bool ModelInstanceRegistry::findFirstForAugmentView(
     void* secondaryUnitPtr, uint32_t jHandle,
     ModelInstanceAugmentView& out,
     uint64_t* mutationGenerationOut) const {
+  WARVK_DATA_SCOPE(InstanceQuery);
   std::shared_lock<std::shared_mutex> lock(m_mutex);
   if (mutationGenerationOut != nullptr) {
     *mutationGenerationOut =
@@ -1883,6 +1906,7 @@ void PoseRegistry::recordPose(void *runtimeModelPtr, void *sceneNode,
                               float pitch, float roll, float height,
                               bool hasWorldTransform,
                               const Matrix4 *worldTransform) {
+  WARVK_DATA_SCOPE(PoseWrite);
   if (!runtimeModelPtr && !sceneNode && !unitPtr)
     return;
 
@@ -1918,6 +1942,7 @@ void PoseRegistry::recordSpriteFramePose(void *runtimeModelPtr, void *spritePtr,
                                          float height,
                                          bool hasWorldTransform,
                                          const Matrix4 *worldTransform) {
+  WARVK_DATA_SCOPE(PoseWrite);
   if (!runtimeModelPtr && !spritePtr && !sceneNode && !unitPtr)
     return;
 
@@ -1951,6 +1976,7 @@ void PoseRegistry::recordSpriteFramePose(void *runtimeModelPtr, void *spritePtr,
 void PoseRegistry::recordMatrixPalette(void* runtimeModelPtr, void* sceneNode,
                                        void* unitPtr, const Matrix4* matrices,
                                        uint32_t matrixCount) {
+  WARVK_DATA_SCOPE(PoseWrite);
   if ((!runtimeModelPtr && !sceneNode && !unitPtr) || matrices == nullptr ||
       matrixCount == 0)
     return;
@@ -1974,6 +2000,7 @@ void PoseRegistry::recordMatrixPalette(void* runtimeModelPtr, void* sceneNode,
 
 bool PoseRegistry::findByRuntimeModel(void *runtimeModelPtr,
                                       PoseRecord &out) const {
+  WARVK_DATA_SCOPE(PoseQuery);
   if (!runtimeModelPtr)
     return false;
 
@@ -1986,6 +2013,7 @@ bool PoseRegistry::findByRuntimeModel(void *runtimeModelPtr,
 }
 
 bool PoseRegistry::findBySceneNode(void *sceneNode, PoseRecord &out) const {
+  WARVK_DATA_SCOPE(PoseQuery);
   if (!sceneNode)
     return false;
 
@@ -1998,6 +2026,7 @@ bool PoseRegistry::findBySceneNode(void *sceneNode, PoseRecord &out) const {
 }
 
 bool PoseRegistry::findByUnitPtr(void *unitPtr, PoseRecord &out) const {
+  WARVK_DATA_SCOPE(PoseQuery);
   if (!unitPtr)
     return false;
 
@@ -2051,6 +2080,7 @@ static inline void ProjectPoseAugment(const PoseRecord &rec,
 
 bool PoseRegistry::findByRuntimeModelAugment(void *runtimeModelPtr,
                                              PoseAugmentView &out) const {
+  WARVK_DATA_SCOPE(PoseQuery);
   if (!runtimeModelPtr)
     return false;
 
@@ -2064,6 +2094,7 @@ bool PoseRegistry::findByRuntimeModelAugment(void *runtimeModelPtr,
 
 bool PoseRegistry::findBySceneNodeAugment(void *sceneNode,
                                           PoseAugmentView &out) const {
+  WARVK_DATA_SCOPE(PoseQuery);
   if (!sceneNode)
     return false;
 
@@ -2077,6 +2108,7 @@ bool PoseRegistry::findBySceneNodeAugment(void *sceneNode,
 
 bool PoseRegistry::findByUnitPtrAugment(void *unitPtr,
                                         PoseAugmentView &out) const {
+  WARVK_DATA_SCOPE(PoseQuery);
   if (!unitPtr)
     return false;
 

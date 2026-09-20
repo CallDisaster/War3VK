@@ -2,11 +2,16 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEVICE = (ROOT / "src/d3d9/d3d9_device.cpp").read_text(encoding="utf-8")
+# M2-2：选择链本体（含 slot frameTag 懒回退段）已迁往
+# src/d3d9/war3/semantic/war3_live_palette_selection.cpp（逐字节）；
+# 本门禁的函数体断言跟随符号改锚到模块，断言内容一个字未改。
+MODULE = (ROOT / "src/d3d9/war3/semantic/war3_live_palette_selection.cpp").read_text(
+    encoding="utf-8"
+)
 
-start = DEVICE.index("// 首选：从 Hook_RuntimeMatrixWrite")
-end = DEVICE.index("buildTiming.enter(War3LivePaletteBuildPhase::PoseFallback)", start)
-body = DEVICE[start:end]
+start = MODULE.index("// 首选：从 Hook_RuntimeMatrixWrite")
+end = MODULE.index("buildTiming.enter(War3LivePaletteBuildPhase::PoseFallback)", start)
+body = MODULE[start:end]
 
 assert "bool slotFrameTagQueried = false" in body
 assert "auto ensureSlotFrameTags = [&]()" in body

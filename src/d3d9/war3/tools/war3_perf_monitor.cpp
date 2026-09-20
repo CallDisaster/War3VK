@@ -2,6 +2,7 @@
 
 #include "war3_perf_monitor.h"
 #include "war3_perf_report_template.h"
+#include "../../../util/thread.h"
 
 #include <algorithm>
 #include <cmath>
@@ -711,6 +712,7 @@ War3PerfMonitor::ScopedCpuScope::ScopedCpuScope(War3PerfMonitor *monitor,
     : m_monitor(monitor), m_sampleWeight(sampleWeight),
       m_detailSample(detailSample) {
   if (m_monitor) {
+    m_timelineToken = timeline::Enter(name);
     m_monitor->pushScope(name, m_sampleWeight, m_detailSample);
   }
 }
@@ -719,12 +721,14 @@ War3PerfMonitor::ScopedCpuScope::~ScopedCpuScope() {
   if (m_monitor) {
     m_monitor->popScope(m_sampleWeight);
   }
+  timeline::Leave(m_timelineToken);
 }
 
 War3PerfMonitor::ScopedCpuScope::ScopedCpuScope(ScopedCpuScope &&other) noexcept
     : m_monitor(other.m_monitor), m_sampleWeight(other.m_sampleWeight),
-      m_detailSample(other.m_detailSample) {
+      m_detailSample(other.m_detailSample), m_timelineToken(other.m_timelineToken) {
   other.m_monitor = nullptr;
+  other.m_timelineToken = 0;
 }
 
 War3PerfMonitor::ScopedCpuScope &
@@ -736,10 +740,13 @@ War3PerfMonitor::ScopedCpuScope::operator=(ScopedCpuScope &&other) noexcept {
     // pushScope entry and eventually corrupts the per-thread scope stack.
     if (m_monitor)
       m_monitor->popScope(m_sampleWeight);
+    timeline::Leave(m_timelineToken);
     m_monitor = other.m_monitor;
     m_sampleWeight = other.m_sampleWeight;
     m_detailSample = other.m_detailSample;
+    m_timelineToken = other.m_timelineToken;
     other.m_monitor = nullptr;
+    other.m_timelineToken = 0;
   }
   return *this;
 }
@@ -907,6 +914,31 @@ std::string BuildPerfEnvJson() {
       "DXVK_WAR3_GPU_SKIN_MODE",
       "DXVK_WAR3_GPU_SKIN_EXECUTION_ROUTE",
       "DXVK_WAR3_PERF_MONITOR",
+      "DXVK_WAR3_INTERNAL_TEST_API",
+      "DXVK_WAR3_INTERNAL_EXIT_TEST",
+      "DXVK_WAR3_AUTOTEST_DISABLE_BACKGROUND_THROTTLE",
+      "DXVK_WAR3_AUTOTEST_DISABLE_GAME_PAUSE",
+      "DXVK_WAR3_ASYNC_SCREENSHOT",
+      "DXVK_WAR3_PERF_HISTORY_FRAMES",
+      "DXVK_WAR3_PERF_AUTO_EXPORT_SEC",
+      "DXVK_WAR3_SNAPSHOT_RESIDENT_CAP_MB",
+      "DXVK_WAR3_SCENARIO",
+      "DISABLE_VULKAN_OBS_CAPTURE",
+      "DXVK_WAR3_FRAME_EVIDENCE",
+      "DXVK_WAR3_FRAME_EVIDENCE_INPUTS",
+      "DXVK_WAR3_FRAME_EVIDENCE_DRAWS",
+      "DXVK_WAR3_FRAME_EVIDENCE_CASTERS",
+      "DXVK_WAR3_FRAME_EVIDENCE_PALETTE_OBJECT",
+      "DXVK_WAR3_FRAME_HISTORY_SELF_CONTAINED",
+      "DXVK_WAR3_NATIVE_MODEL_LIGHTS",
+      "DXVK_WAR3_NATIVE_MODEL_LIGHT_CONSUMER",
+      "DXVK_WAR3_DEBUG_CONSOLE",
+      "DXVK_WAR3_RENDER_LOG",
+      "DXVK_WAR3_STAGE11_BUDGET_CENSUS",
+      "DXVK_WAR3_STAGE11_UPLOAD_INDEX_RANGE",
+      "DXVK_WAR3_DATA_COLLECTION_TREE",
+      "DXVK_WAR3_DATA_COLLECTION_SAMPLE_PERIOD",
+      "DXVK_WAR3_FRAME_TIMELINE",
       "DXVK_WAR3_PERF_LEVEL",
       "DXVK_WAR3_PERF_TRACE",
       "DXVK_WAR3_PERF_SPRITE_FRAME_HOOKS",
@@ -1028,8 +1060,19 @@ std::string BuildPerfEnvJson() {
 } // namespace
 
 War3PerfMonitor &War3PerfMonitor::instance() {
-  static War3PerfMonitor s_instance;
-  return s_instance;
+  const auto destroy = [](War3PerfMonitor* monitor) {
+    // The native ExitProcess path has already torn down TLS/other threads.
+    // shutdown()->flushCurrentThreadCpuDeltas() must not read dead emutls,
+    // acquire abandoned locks or join the terminated export worker here.
+    // Abandon the process-owned object only at process detach. Ordinary device
+    // destruction still explicitly drains/shuts down the live monitor.
+    if (this_thread::isInModuleDetachment())
+      return;
+    delete monitor;
+  };
+  static std::unique_ptr<War3PerfMonitor, decltype(destroy)> s_instance(
+      new War3PerfMonitor, destroy);
+  return *s_instance;
 }
 
 War3PerfMonitor::War3PerfMonitor()
@@ -1091,6 +1134,31 @@ War3PerfMonitor::War3PerfMonitor()
 
 void War3PerfMonitor::noteBusinessFrameSerial(uint64_t serial) {
   m_lastBusinessFrameSerial.store(serial, std::memory_order_relaxed);
+}
+
+War3PerfMonitor::PublishedPerfState
+War3PerfMonitor::queryPublishedPerfState() {
+  std::lock_guard lock(m_mutex);
+  PublishedPerfState state;
+  state.enabled = m_enabled.load(std::memory_order_relaxed);
+  state.recording = m_recording.load(std::memory_order_relaxed);
+  state.producerAccumulationEpoch = m_producerAccumulationEpoch;
+  if (state.enabled && state.recording && m_producerAccumulationEpoch != 0u &&
+      !m_frameHistory.empty()) {
+    const auto& completed = m_frameHistory.back();
+    state.businessFrameSerial = completed.workload.businessFrameSerial;
+    state.frameEpoch = completed.frameEpoch;
+    state.valid = state.businessFrameSerial != 0u && state.frameEpoch != 0u;
+  }
+  return state;
+}
+
+void War3PerfMonitor::resetShadowBudgetAggregateLocked() {
+  m_shadowBudgetAggregate = {};
+  if (m_producerAccumulationEpoch != 0u)
+    ++m_producerAccumulationEpoch;
+  // UINT64_MAX -> 0 is an exhausted, permanently unprovable domain. Do not
+  // restart at 1: old report/phase identities must never become valid again.
 }
 
 void War3PerfMonitor::noteShadowMetadataFrame(uint64_t captureUs,
@@ -1885,12 +1953,22 @@ void War3PerfMonitor::noteShadowBudgetFrame(
   agg.semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeCModelFallbackCount +=
       stats
           .semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeCModelFallbackCount;
+  agg.semanticSceneSubmittedSkinnedPaletteSourceOwnedPartSnapshotCount += stats.semanticSceneSubmittedSkinnedPaletteSourceOwnedPartSnapshotCount;
   agg.semanticSceneSubmittedSkinnedPaletteStablePartSampleCount +=
       stats.semanticSceneSubmittedSkinnedPaletteStablePartSampleCount;
   agg.semanticSceneSubmittedSkinnedPaletteHashChurnCount +=
       stats.semanticSceneSubmittedSkinnedPaletteHashChurnCount;
   agg.semanticSceneSubmittedSkinnedPaletteSourceChurnCount +=
       stats.semanticSceneSubmittedSkinnedPaletteSourceChurnCount;
+  // 2026-09-17 活跃路径纯计数（累加；当帧值 -> 区间累计）。
+  agg.semanticSceneAppendEntrySkinnedCount +=
+      stats.semanticSceneAppendEntrySkinnedCount;
+  agg.semanticSceneCanonicalGateRejectSkinnedCount +=
+      stats.semanticSceneCanonicalGateRejectSkinnedCount;
+  agg.semanticSceneDrawTimeProducerSubmittedSkinnedCount +=
+      stats.semanticSceneDrawTimeProducerSubmittedSkinnedCount;
+  agg.semanticSceneDirectCurrentDrawSubmittedSkinnedCount +=
+      stats.semanticSceneDirectCurrentDrawSubmittedSkinnedCount;
   agg.semanticSceneSubmittedSkinnedPaletteSlotIndexChurnCount +=
       stats.semanticSceneSubmittedSkinnedPaletteSlotIndexChurnCount;
   agg.semanticSceneSubmittedSkinnedPaletteHashUniqueInWindowMax = std::max(
@@ -2383,6 +2461,18 @@ void War3PerfMonitor::noteShadowBudgetFrame(
   agg.instancedGeometryDrawsSaved += stats.instancedGeometryDrawsSaved;
 }
 
+void War3PerfMonitor::noteStage11BudgetSample(const stage11_census::Sample& sample) {
+  if (!stage11_census::Enabled() || sample.stage >= stage11_census::SampleCount)
+    return;
+  std::lock_guard lock(m_mutex);
+  const auto& first = m_stage11BudgetCensus.samples[0];
+  if (first.deviceIdentity != sample.deviceIdentity || first.mapEpoch != sample.mapEpoch ||
+      first.deviceEpoch != sample.deviceEpoch)
+    m_stage11BudgetCensus = {};
+  m_stage11BudgetCensus.enabled = true;
+  m_stage11BudgetCensus.samples[sample.stage] = sample;
+}
+
 void War3PerfMonitor::notePersistentGeometryFrame(
     const PersistentGeometryFrameStats& stats) {
   if (!m_enabled.load(std::memory_order_relaxed) ||
@@ -2405,6 +2495,14 @@ void War3PerfMonitor::notePersistentGeometryFrame(
       stats.rejectUvBufferCreate;
   m_currentFrameWorkload.rejectRegistryInsert = stats.rejectRegistryInsert;
   m_currentFrameWorkload.rejectOther = stats.rejectOther;
+  m_currentFrameWorkload.rejectDomainConflict = stats.rejectDomainConflict;
+  m_currentFrameWorkload.domainLookupRejects = stats.domainLookupRejects;
+  m_currentFrameWorkload.domainPublishRejects = stats.domainPublishRejects;
+  m_currentFrameWorkload.domainGcEraseRejects = stats.domainGcEraseRejects;
+  m_currentFrameWorkload.domainResetPurgeRejects =
+      stats.domainResetPurgeRejects;
+  m_currentFrameWorkload.domainResetOwnerRejects =
+      stats.domainResetOwnerRejects;
   m_currentFrameWorkload.createAttempts = stats.createAttempts;
   m_currentFrameWorkload.bytesNeededTotal = stats.bytesNeededTotal;
   m_currentFrameWorkload.bytesNeededMax = stats.bytesNeededMax;
@@ -2468,6 +2566,12 @@ void War3PerfMonitor::notePersistentGeometryFrame(
   agg.persistentRejectUvBufferCreate += stats.rejectUvBufferCreate;
   agg.persistentRejectRegistryInsert += stats.rejectRegistryInsert;
   agg.persistentRejectOther += stats.rejectOther;
+  agg.persistentRejectDomainConflict += stats.rejectDomainConflict;
+  agg.persistentDomainLookupRejects += stats.domainLookupRejects;
+  agg.persistentDomainPublishRejects += stats.domainPublishRejects;
+  agg.persistentDomainGcEraseRejects += stats.domainGcEraseRejects;
+  agg.persistentDomainResetPurgeRejects += stats.domainResetPurgeRejects;
+  agg.persistentDomainResetOwnerRejects += stats.domainResetOwnerRejects;
 
   agg.persistentCreateAttempts += stats.createAttempts;
   agg.persistentPoolBytesNeededTotal += stats.bytesNeededTotal;
@@ -2886,13 +2990,14 @@ void War3PerfMonitor::shutdown() {
     std::lock_guard lock(m_mutex);
     m_enabled.store(false, std::memory_order_relaxed);
     m_recording.store(false, std::memory_order_relaxed);
+    collection::SetRecording(false);
     m_device = nullptr;
     m_timestampPeriodNs = 0.0;
     m_pending.clear();
     m_sections.clear();
     m_sectionIds.clear();
     m_frameHistory.clear();
-    m_shadowBudgetAggregate = {};
+    resetShadowBudgetAggregateLocked();
     m_lastReport = Clock::now();
     m_frameCpuProbeStart = {};
     m_currentFrameWorkload = {};
@@ -2902,6 +3007,8 @@ void War3PerfMonitor::shutdown() {
 }
 
 void War3PerfMonitor::beginFrame() {
+  collection::SetRecording(m_enabled.load(std::memory_order_relaxed) &&
+                           m_recording.load(std::memory_order_relaxed));
   if (!m_enabled.load(std::memory_order_relaxed) ||
       !m_recording.load(std::memory_order_relaxed))
     return;
@@ -2910,6 +3017,8 @@ void War3PerfMonitor::beginFrame() {
 
   std::lock_guard lock(m_mutex);
   m_frameStart = Clock::now();
+  timeline::LegacyWindow(true);
+  collection::NoteFrame();
   m_frameCpuProbeStart = captureCpuProbeLocked(false);
   m_currentFrameWorkload = {};
   m_currentGpuTimestampIntervals.clear();
@@ -3613,6 +3722,7 @@ void War3PerfMonitor::archiveFrame() {
   snapshot.frameIndex = m_frameIndex++;
   snapshot.frameEpoch = frameEpoch;
   snapshot.timestamp = Clock::now();
+  timeline::LegacyWindow(false);
   snapshot.workload = m_currentFrameWorkload;
   snapshot.totalCpuMs = toMs(snapshot.timestamp - m_frameStart);
   CpuProbeSnapshot endProbe = captureCpuProbeLocked(true);
@@ -3686,11 +3796,12 @@ void War3PerfMonitor::archiveFrame() {
 }
 
 void War3PerfMonitor::resetHistory() {
+  collection::ResetSession();
   flushCurrentThreadCpuDeltas();
   std::lock_guard lock(m_mutex);
   m_frameHistory.clear();
   m_pending.clear();
-  m_shadowBudgetAggregate = {};
+  resetShadowBudgetAggregateLocked();
   m_frameIndex = 0;
   m_inFrame = false;
   m_frameCpuProbeStart = {};
@@ -3749,12 +3860,18 @@ void War3PerfMonitor::report(std::chrono::steady_clock::time_point now) {
 
 War3PerfMonitor::ExportSnapshot
 War3PerfMonitor::captureExportSnapshotLocked() const {
+  collection::Pause excludeProfilerQueries;
   ExportSnapshot snapshot;
   snapshot.frameHistory = m_frameHistory;
   snapshot.sections = m_sections;
   snapshot.shadowBudgetAggregate = m_shadowBudgetAggregate;
+  snapshot.producerAccumulationEpoch = m_producerAccumulationEpoch;
   snapshot.processId = static_cast<uint32_t>(GetCurrentProcessId());
   snapshot.mainThreadId = m_mainThreadHandleTid;
+  snapshot.dataCollectionJson = collection::CaptureJson(snapshot.mainThreadId);
+  snapshot.frameTimelineJson = timeline::CaptureJson();
+  snapshot.stage11BudgetCensus = m_stage11BudgetCensus;
+  snapshot.stage11BudgetCensus.enabled = stage11_census::Enabled();
   FILETIME processCreate = {};
   FILETIME processExit = {};
   FILETIME processKernel = {};
@@ -4020,6 +4137,15 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
   json << std::fixed << std::setprecision(3);
   json << "{\n";
   json << "  \"frameCount\": " << frames.size() << ",\n";
+  json << "  \"stage11BudgetCensus\": ";
+  stage11_census::WriteJson(json, snapshot.stage11BudgetCensus);
+  json << ",\n";
+  json << "  \"mainThreadTimeline\": "
+       << (snapshot.frameTimelineJson.empty() ? "{\"enabled\":false}" : snapshot.frameTimelineJson)
+       << ",\n";
+  json << "  \"dataCollectionTree\": "
+       << (snapshot.dataCollectionJson.empty() ? "{\"enabled\":false,\"coverageComplete\":false}" : snapshot.dataCollectionJson)
+       << ",\n";
   if (!frames.empty()) {
     const double windowUsed =
         std::chrono::duration<double>(now - frames.front()->timestamp).count();
@@ -6021,6 +6147,8 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
   const double shadowFrames =
       static_cast<double>(std::max<uint64_t>(shadowAgg.framesObserved, 1u));
   json << "  \"shadowBudgetSummary\": {\n";
+  json << "    \"producerAccumulationEpoch\": "
+       << snapshot.producerAccumulationEpoch << ",\n";
   json << "    \"framesObserved\": " << shadowAgg.framesObserved << ",\n";
   json << "    \"framesIncomplete\": " << shadowAgg.framesIncomplete << ",\n";
   json << "    \"framesProducerIncomplete\": "
@@ -6459,10 +6587,6 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg.semanticSceneCanonicalReadyCutoutCount << ",\n";
   json << "    \"semanticSceneCanonicalReadyAlphaBlendCount\": "
        << shadowAgg.semanticSceneCanonicalReadyAlphaBlendCount << ",\n";
-  json << "    \"semanticSceneCanonicalReadyCutoutCount\": "
-       << shadowAgg.semanticSceneCanonicalReadyCutoutCount << ",\n";
-  json << "    \"semanticSceneCanonicalReadyAlphaBlendCount\": "
-       << shadowAgg.semanticSceneCanonicalReadyAlphaBlendCount << ",\n";
   json << "    \"semanticSceneCanonicalRejectNoStableIdentity\": "
        << shadowAgg.semanticSceneCanonicalRejectNoStableIdentity << ",\n";
   json << "    \"semanticSceneCanonicalRejectNoMesh\": "
@@ -6867,6 +6991,8 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg
               .semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeCModelFallbackCount
        << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteSourceOwnedPartSnapshotCount\": "
+       << shadowAgg.semanticSceneSubmittedSkinnedPaletteSourceOwnedPartSnapshotCount << ",\n";
   json << "    \"semanticSceneSubmittedSkinnedPaletteStablePartSampleCount\": "
        << shadowAgg
               .semanticSceneSubmittedSkinnedPaletteStablePartSampleCount
@@ -6878,6 +7004,14 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg
               .semanticSceneSubmittedSkinnedPaletteSourceChurnCount
        << ",\n";
+  json << "    \"semanticSceneAppendEntrySkinnedCount\": "
+       << shadowAgg.semanticSceneAppendEntrySkinnedCount << ",\n";
+  json << "    \"semanticSceneCanonicalGateRejectSkinnedCount\": "
+       << shadowAgg.semanticSceneCanonicalGateRejectSkinnedCount << ",\n";
+  json << "    \"semanticSceneDrawTimeProducerSubmittedSkinnedCount\": "
+       << shadowAgg.semanticSceneDrawTimeProducerSubmittedSkinnedCount << ",\n";
+  json << "    \"semanticSceneDirectCurrentDrawSubmittedSkinnedCount\": "
+       << shadowAgg.semanticSceneDirectCurrentDrawSubmittedSkinnedCount << ",\n";
   json << "    \"semanticSceneSubmittedSkinnedPaletteSlotIndexChurnCount\": "
        << shadowAgg
               .semanticSceneSubmittedSkinnedPaletteSlotIndexChurnCount
@@ -7451,6 +7585,20 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg.persistentRejectRegistryInsert << ",\n";
   json << "    \"persistentRejectOther\": "
        << shadowAgg.persistentRejectOther << ",\n";
+  json << "    \"persistentDomainCounterContract\": "
+          "\"per-Present registry domain owner-check rejects; steady state is 0; rejectDomainConflict is the ShadowCapture bucket of the DomainConflict create failure, domainPublishRejects covers every caller, and domainLookupRejects is lookup-only\",\n";
+  json << "    \"persistentRejectDomainConflict\": "
+       << shadowAgg.persistentRejectDomainConflict << ",\n";
+  json << "    \"persistentDomainLookupRejects\": "
+       << shadowAgg.persistentDomainLookupRejects << ",\n";
+  json << "    \"persistentDomainPublishRejects\": "
+       << shadowAgg.persistentDomainPublishRejects << ",\n";
+  json << "    \"persistentDomainGcEraseRejects\": "
+       << shadowAgg.persistentDomainGcEraseRejects << ",\n";
+  json << "    \"persistentDomainResetPurgeRejects\": "
+       << shadowAgg.persistentDomainResetPurgeRejects << ",\n";
+  json << "    \"persistentDomainResetOwnerRejects\": "
+       << shadowAgg.persistentDomainResetOwnerRejects << ",\n";
   json << "    \"persistentRejectCreateOrBudgetDetailedTotal\": "
        << (shadowAgg.persistentRejectCapacity +
            shadowAgg.persistentRejectPositionBufferCreate +
@@ -7458,7 +7606,8 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
            shadowAgg.persistentRejectBlendBufferCreate +
            shadowAgg.persistentRejectUvBufferCreate +
            shadowAgg.persistentRejectRegistryInsert +
-           shadowAgg.persistentRejectOther)
+           shadowAgg.persistentRejectOther +
+           shadowAgg.persistentRejectDomainConflict)
        << ",\n";
   json << "    \"persistentDiagnosticsFramesObserved\": "
        << shadowAgg.persistentDiagnosticsFramesObserved << ",\n";
@@ -7647,6 +7796,55 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
   json << "  \"shadowRuntimeV2Summary\": {\n";
   const auto runtimeSummary =
       dxvk::war3::render::QueryShadowRuntimeBridgeSummary();
+  // 2026-09-16 P0 palette 缝隙修复度量（进程累计值，直接取最新 summary）。
+  json << "    \"semanticSceneSkinnedPaletteSlotCacheDeviceServedAfterConfirmCount\": "
+       << runtimeSummary
+              .semanticSceneSkinnedPaletteSlotCacheDeviceServedAfterConfirmCount
+       << ",\n";
+  json << "    \"semanticSceneSkinnedPaletteSlotCacheDeviceRejectedStaleCount\": "
+       << runtimeSummary
+              .semanticSceneSkinnedPaletteSlotCacheDeviceRejectedStaleCount
+       << ",\n";
+  // 2026-09-17 上级裁定（线程修复方案 B 第一部分）：构建推进边界线程见证
+  // （进程累计值，直接取最新 summary；与 A5 拒绝计数不同分母）。
+  json << "    \"semanticBuildOffThreadRefusedCount\": "
+       << runtimeSummary.semanticBuildOffThreadRefusedCount << ",\n";
+  json << "    \"semanticBuildOwnerUnestablishedRefusedCount\": "
+       << runtimeSummary.semanticBuildOwnerUnestablishedRefusedCount << ",\n";
+  json << "    \"semanticBuildDirectAdvanceRefusedCount\": "
+       << runtimeSummary.semanticBuildDirectAdvanceRefusedCount << ",\n";
+  json << "    \"semanticSceneSkinnedPaletteSlotCacheShadowCoreServedAfterConfirmCount\": "
+       << runtimeSummary
+              .semanticSceneSkinnedPaletteSlotCacheShadowCoreServedAfterConfirmCount
+       << ",\n";
+  json << "    \"semanticSceneSkinnedPaletteSlotCacheShadowCoreRejectedStaleCount\": "
+       << runtimeSummary
+              .semanticSceneSkinnedPaletteSlotCacheShadowCoreRejectedStaleCount
+       << ",\n";
+  json << "    \"semanticSceneSkinnedPaletteSlotCacheShadowCoreProducerSnapshotFallbackCount\": "
+       << runtimeSummary
+              .semanticSceneSkinnedPaletteSlotCacheShadowCoreProducerSnapshotFallbackCount
+       << ",\n";
+  json << "    \"semanticSceneSkinnedPaletteSlotCacheShadowCoreFrameProofServedCount\": "
+       << runtimeSummary
+              .semanticSceneSkinnedPaletteSlotCacheShadowCoreFrameProofServedCount
+       << ",\n";
+  json << "    \"semanticSceneSkinnedPaletteSlotCacheShadowCoreGroupShortRejectedCount\": "
+       << runtimeSummary
+              .semanticSceneSkinnedPaletteSlotCacheShadowCoreGroupShortRejectedCount
+       << ",\n";
+  json << "    \"semanticSceneSkinnedPaletteSlotCacheShadowCoreBindingFrameStaleRejectedCount\": "
+       << runtimeSummary
+              .semanticSceneSkinnedPaletteSlotCacheShadowCoreBindingFrameStaleRejectedCount
+       << ",\n";
+  json << "    \"semanticSceneSkinnedPaletteSlotCacheShadowCoreSlotRangeStaleRejectedCount\": "
+       << runtimeSummary
+              .semanticSceneSkinnedPaletteSlotCacheShadowCoreSlotRangeStaleRejectedCount
+       << ",\n";
+  json << "    \"semanticSceneSkinnedPaletteSlotCacheShadowCoreSnapshotFrameStaleRejectedCount\": "
+       << runtimeSummary
+              .semanticSceneSkinnedPaletteSlotCacheShadowCoreSnapshotFrameStaleRejectedCount
+       << ",\n";
   const auto semanticAugmentCache =
       dxvk::war3::render::QuerySemanticAugmentTlsCacheStats();
   json << "    \"staticPersistentCount\": "
@@ -7741,6 +7939,34 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg.drawTimeVBCacheRejectNoLayerContext << ",\n";
   json << "    \"drawTimeVBCacheSameFrameDedupMiss\": "
        << shadowAgg.drawTimeVBCacheSameFrameDedupMiss << ",\n";
+  json << "    \"registerImageEnterCount\": "
+       << runtimeSummary.registerImageEnterCount << ",\n";
+  json << "    \"registerImageBlockedCount\": "
+       << runtimeSummary.registerImageBlockedCount << ",\n";
+  json << "    \"registerImageStaticStampCount\": "
+       << runtimeSummary.registerImageStaticStampCount << ",\n";
+  json << "    \"registerImageEmitterStampCount\": "
+       << runtimeSummary.registerImageEmitterStampCount << ",\n";
+  json << "    \"registerImageSelectionCount\": "
+       << runtimeSummary.registerImageSelectionCount << ",\n";
+  json << "    \"registerImageOcclusionCount\": "
+       << runtimeSummary.registerImageOcclusionCount << ",\n";
+  json << "    \"registerImageWithParamsCount\": "
+       << runtimeSummary.registerImageWithParamsCount << ",\n";
+  json << "    \"registerImageObjectBridgeCount\": "
+       << runtimeSummary.registerImageObjectBridgeCount << ",\n";
+  json << "    \"registerImageFromPointCount\": "
+       << runtimeSummary.registerImageFromPointCount << ",\n";
+  json << "    \"registerImageFromTwoPointsCount\": "
+       << runtimeSummary.registerImageFromTwoPointsCount << ",\n";
+  json << "    \"registerImageUnknownSourceCount\": "
+       << runtimeSummary.registerImageUnknownSourceCount << ",\n";
+  json << "    \"staticStampPathEnterCount\": "
+       << runtimeSummary.staticStampPathEnterCount << ",\n";
+  json << "    \"staticStampPathBlockedCount\": "
+       << runtimeSummary.staticStampPathBlockedCount << ",\n";
+  json << "    \"staticStampPathCleanupCount\": "
+       << runtimeSummary.staticStampPathCleanupCount << ",\n";
   json << "    \"drawTimeGenerationBackedPositionReuseCount\": "
        << shadowAgg.drawTimeGenerationBackedPositionReuseCount << ",\n";
   json << "    \"drawTimeGenerationBackedUvReuseCount\": "
@@ -8352,6 +8578,8 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg
               .semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeCModelFallbackCount
        << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteSourceOwnedPartSnapshotCount\": "
+       << shadowAgg.semanticSceneSubmittedSkinnedPaletteSourceOwnedPartSnapshotCount << ",\n";
   json << "    \"semanticSceneSubmittedSkinnedPaletteStablePartSampleCount\": "
        << shadowAgg
               .semanticSceneSubmittedSkinnedPaletteStablePartSampleCount
@@ -8363,6 +8591,14 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg
               .semanticSceneSubmittedSkinnedPaletteSourceChurnCount
        << ",\n";
+  json << "    \"semanticSceneAppendEntrySkinnedCount\": "
+       << shadowAgg.semanticSceneAppendEntrySkinnedCount << ",\n";
+  json << "    \"semanticSceneCanonicalGateRejectSkinnedCount\": "
+       << shadowAgg.semanticSceneCanonicalGateRejectSkinnedCount << ",\n";
+  json << "    \"semanticSceneDrawTimeProducerSubmittedSkinnedCount\": "
+       << shadowAgg.semanticSceneDrawTimeProducerSubmittedSkinnedCount << ",\n";
+  json << "    \"semanticSceneDirectCurrentDrawSubmittedSkinnedCount\": "
+       << shadowAgg.semanticSceneDirectCurrentDrawSubmittedSkinnedCount << ",\n";
   json << "    \"semanticSceneSubmittedSkinnedPaletteSlotIndexChurnCount\": "
        << shadowAgg
               .semanticSceneSubmittedSkinnedPaletteSlotIndexChurnCount
@@ -8882,6 +9118,20 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg.persistentRejectRegistryInsert << ",\n";
   json << "    \"persistentRejectOther\": "
        << shadowAgg.persistentRejectOther << ",\n";
+  json << "    \"persistentDomainCounterContract\": "
+          "\"per-Present registry domain owner-check rejects; steady state is 0; rejectDomainConflict is the ShadowCapture bucket of the DomainConflict create failure, domainPublishRejects covers every caller, and domainLookupRejects is lookup-only\",\n";
+  json << "    \"persistentRejectDomainConflict\": "
+       << shadowAgg.persistentRejectDomainConflict << ",\n";
+  json << "    \"persistentDomainLookupRejects\": "
+       << shadowAgg.persistentDomainLookupRejects << ",\n";
+  json << "    \"persistentDomainPublishRejects\": "
+       << shadowAgg.persistentDomainPublishRejects << ",\n";
+  json << "    \"persistentDomainGcEraseRejects\": "
+       << shadowAgg.persistentDomainGcEraseRejects << ",\n";
+  json << "    \"persistentDomainResetPurgeRejects\": "
+       << shadowAgg.persistentDomainResetPurgeRejects << ",\n";
+  json << "    \"persistentDomainResetOwnerRejects\": "
+       << shadowAgg.persistentDomainResetOwnerRejects << ",\n";
   json << "    \"persistentRejectCreateOrBudgetDetailedTotal\": "
        << (shadowAgg.persistentRejectCapacity +
            shadowAgg.persistentRejectPositionBufferCreate +
@@ -8889,7 +9139,8 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
            shadowAgg.persistentRejectBlendBufferCreate +
            shadowAgg.persistentRejectUvBufferCreate +
            shadowAgg.persistentRejectRegistryInsert +
-           shadowAgg.persistentRejectOther)
+           shadowAgg.persistentRejectOther +
+           shadowAgg.persistentRejectDomainConflict)
        << ",\n";
   json << "    \"persistentDiagnosticsFramesObserved\": "
        << shadowAgg.persistentDiagnosticsFramesObserved << ",\n";
@@ -9245,6 +9496,10 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << runtimeSummary.semanticCoreSkippedNoPoseLookupMiss << ",\n";
   json << "    \"semanticCoreSkippedNoRuntimeGroupPalette\": "
        << runtimeSummary.semanticCoreSkippedNoRuntimeGroupPalette << ",\n";
+  json << "    \"semanticCoreSkippedPathBlocker\": "
+       << runtimeSummary.semanticCoreSkippedPathBlocker << ",\n";
+  json << "    \"semanticCoreSkippedPathBlockerGeometryMarker\": "
+       << runtimeSummary.semanticCoreSkippedPathBlockerGeometryMarker << ",\n";
   json << "    \"semanticCoreRuntimeGroupPaletteRescueByMeshPoseContext\": "
        << runtimeSummary.semanticCoreRuntimeGroupPaletteRescueByMeshPoseContext
        << ",\n";
@@ -9624,7 +9879,10 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
           "\"hasPersistentGeometry\", \"rejectCapacity\", "
           "\"rejectPositionBufferCreate\", \"rejectIndexBufferCreate\", "
           "\"rejectBlendBufferCreate\", \"rejectUvBufferCreate\", "
-          "\"rejectRegistryInsert\", \"rejectOther\", \"createAttempts\", "
+          "\"rejectRegistryInsert\", \"rejectOther\", \"rejectDomainConflict\", "
+          "\"domainLookupRejects\", \"domainPublishRejects\", "
+          "\"domainGcEraseRejects\", \"domainResetPurgeRejects\", "
+          "\"domainResetOwnerRejects\", \"createAttempts\", "
           "\"bytesNeededTotal\", \"bytesNeededMax\", \"bytesNeededLast\", "
           "\"forceGcRequests\", \"forceGcNoBytesFreed\", "
           "\"forceGcStillInsufficient\", \"forceGcBytesFreed\", "
@@ -9743,6 +10001,9 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
          << w.rejectIndexBufferCreate << ", "
          << w.rejectBlendBufferCreate << ", " << w.rejectUvBufferCreate
          << ", " << w.rejectRegistryInsert << ", " << w.rejectOther << ", "
+         << w.rejectDomainConflict << ", " << w.domainLookupRejects
+         << ", " << w.domainPublishRejects << ", " << w.domainGcEraseRejects
+         << ", " << w.domainResetPurgeRejects << ", " << w.domainResetOwnerRejects << ", "
          << w.createAttempts << ", " << w.bytesNeededTotal << ", "
          << w.bytesNeededMax << ", " << w.bytesNeededLast << ", "
          << w.forceGcRequests << ", " << w.forceGcNoBytesFreed << ", "

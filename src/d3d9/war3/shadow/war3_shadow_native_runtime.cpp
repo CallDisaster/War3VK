@@ -1,6 +1,13 @@
 #include "war3_shadow_native_runtime.h"
 
+#include "../core/war3_game_structs.h"
 #include "../core/war3_internal_test_config.h"
+#include "../core/war3_memory.h"
+#include "../render/war3_render_objects.h"
+#include "../war3_path_blocker_evidence.h"
+
+#include <algorithm>
+#include <cmath>
 
 namespace dxvk::war3::shadow {
 
@@ -45,6 +52,39 @@ void FillNativeBackendExecutionSummary(NativeD3D9BackendSummary& summary,
   summary.submitRejectCount = backend.submitRejectCount();
 }
 
+[[maybe_unused]] bool CanonicalHasDynamicUnitEvidence(
+    const ShadowDrawPacket& packet) {
+  return dxvk::war3::PathBlockerHasDynamicUnitEvidence(packet);
+}
+
+[[maybe_unused]] bool CanonicalTryReadWidgetPathBlockerRawcode(
+    void* widgetPtr, uint32_t& outRawcode) {
+  return dxvk::war3::PathBlockerTryReadWidgetRawcode(widgetPtr, outRawcode);
+}
+
+[[maybe_unused]] bool CanonicalTryResolvePathBlockerRawcode(
+    ShadowRenderableRecord& renderable) {
+  return dxvk::war3::PathBlockerTryResolveRawcode(renderable);
+}
+
+[[maybe_unused]] bool CanonicalPacketCanUseBelowGroundFlatMarkerFallback(
+    const ShadowDrawPacket& packet) {
+  return dxvk::war3::PathBlockerPacketCanUseBelowGroundFlatMarkerFallback(
+      packet);
+}
+
+[[maybe_unused]] bool CanonicalPacketIsBelowGroundFlatMarkerGeometry(
+    const ShadowDrawPacket& packet) {
+  return dxvk::war3::PathBlockerPacketIsBelowGroundFlatMarkerGeometry(packet);
+}
+
+bool CanonicalShouldSubmitPacket(ShadowDrawPacket& packet,
+                                 bool& outPathBlocker,
+                                 bool& outGeometryMarker) {
+  return dxvk::war3::PathBlockerShouldSubmitPacket(
+      packet, outPathBlocker, outGeometryMarker);
+}
+
 } // namespace
 
 void NativeD3D9BackendRuntime::setDevice(IDirect3DDevice9* device) {
@@ -61,6 +101,8 @@ void NativeD3D9BackendRuntime::setDevice(IDirect3DDevice9* device) {
   m_canonicalFramePublishCount = 0u;
   m_canonicalPublishRejectNotReadyCount.store(0u, std::memory_order_relaxed);
   m_canonicalPublishRejectNoPositionsCount.store(0u, std::memory_order_relaxed);
+  m_canonicalSkippedPathBlockerCount = 0u;
+  m_canonicalSkippedPathBlockerGeometryMarkerCount = 0u;
 }
 
 void NativeD3D9BackendRuntime::reset() {
@@ -77,6 +119,8 @@ void NativeD3D9BackendRuntime::reset() {
   m_canonicalFramePublishCount = 0u;
   m_canonicalPublishRejectNotReadyCount.store(0u, std::memory_order_relaxed);
   m_canonicalPublishRejectNoPositionsCount.store(0u, std::memory_order_relaxed);
+  m_canonicalSkippedPathBlockerCount = 0u;
+  m_canonicalSkippedPathBlockerGeometryMarkerCount = 0u;
 }
 
 void NativeD3D9BackendRuntime::beginCanonicalFrame(uint64_t frameSerial) {
@@ -267,6 +311,18 @@ bool NativeD3D9BackendRuntime::buildCanonicalFrame(
       packet.pose.worldTransform = world.matrix;
     }
 
+    bool skippedPathBlocker = false;
+    bool skippedGeometryMarker = false;
+    if (!CanonicalShouldSubmitPacket(packet,
+                                     skippedPathBlocker,
+                                     skippedGeometryMarker)) {
+      if (skippedPathBlocker)
+        ++m_canonicalSkippedPathBlockerCount;
+      if (skippedGeometryMarker)
+        ++m_canonicalSkippedPathBlockerGeometryMarkerCount;
+      continue;
+    }
+
     outFrame.draws.emplace_back(std::move(packet));
     auto& outPacket = outFrame.draws.back();
     outPacket.resource.positions = &outPacket.resource.ownedPositions;
@@ -347,6 +403,10 @@ bool NativeD3D9BackendRuntime::buildLatestFrame() {
       hasCanonicalFrame ? canonicalFrame.draws.size() : 0u;
   m_lastSummary.canonicalFrameSerial =
       hasCanonicalFrame ? canonicalFrame.frameSerial : 0u;
+  m_lastSummary.canonicalSkippedPathBlockerCount =
+      m_canonicalSkippedPathBlockerCount;
+  m_lastSummary.canonicalSkippedPathBlockerGeometryMarkerCount =
+      m_canonicalSkippedPathBlockerGeometryMarkerCount;
   FillNativeBackendExecutionSummary(m_lastSummary, m_backend);
   m_lastSummary.hasDevice = true;
   return m_lastSummary.submittedDrawCount != 0u;
@@ -380,6 +440,10 @@ NativeD3D9BackendSummary NativeD3D9BackendRuntime::snapshot() const {
       m_canonicalPublishRejectNotReadyCount.load(std::memory_order_relaxed);
   summary.canonicalPublishRejectNoPositionsCount =
       m_canonicalPublishRejectNoPositionsCount.load(std::memory_order_relaxed);
+  summary.canonicalSkippedPathBlockerCount =
+      m_canonicalSkippedPathBlockerCount;
+  summary.canonicalSkippedPathBlockerGeometryMarkerCount =
+      m_canonicalSkippedPathBlockerGeometryMarkerCount;
   if (summary.hasDevice) {
     FillNativeBackendExecutionSummary(summary, m_backend);
   }

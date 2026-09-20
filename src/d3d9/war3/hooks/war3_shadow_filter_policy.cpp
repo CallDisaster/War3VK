@@ -116,7 +116,8 @@ bool IsLikelyNativeShadowTextureKey(const char* key) {
   if (!key || !key[0])
     return false;
 
-  if (ContainsIgnoreCaseAscii(key, "replaceabletextures\\shadows\\"))
+  if (ContainsIgnoreCaseAscii(key, "replaceabletextures\\shadows\\") ||
+      ContainsIgnoreCaseAscii(key, "replaceabletextures/shadows/"))
     return true;
 
   if (EqualsIgnoreCaseAscii(key, "Shadow") ||
@@ -136,7 +137,8 @@ bool IsLikelyNativeShadowTextureKey(const char* key) {
 bool IsLikelySelectionTextureKey(const char* key) {
   if (!key || !key[0])
     return false;
-  return ContainsIgnoreCaseAscii(key, "replaceabletextures\\selection\\");
+  return ContainsIgnoreCaseAscii(key, "replaceabletextures\\selection\\") ||
+         ContainsIgnoreCaseAscii(key, "replaceabletextures/selection/");
 }
 
 uint32_t ByteSwapU32(uint32_t v) {
@@ -207,15 +209,39 @@ ShadowRegisterDecision DecideRegisterImage(const ShadowRegisterContext& ctx) {
   decision.blocked = false;
   decision.reason = "PassThrough";
 
-  if (ctx.mode < 1u)
-    return decision;
-
   if (ctx.mode == 1u &&
       dxvk::war3::internal::kNativeShadowRegisterBlockAllWhenMode1) {
     decision.blocked = true;
     decision.reason = "Mode1_BlockAllRegisterImage";
     return decision;
   }
+
+  if (IsWhitelistedRegisterSource(ctx.source)) {
+    decision.reason = "Default_WhitelistSource";
+    return decision;
+  }
+
+  if (IsLikelySelectionTextureKey(ctx.hasKey ? ctx.key : nullptr)) {
+    decision.reason = "Default_AllowSelectionTextureKey";
+    return decision;
+  }
+
+  if (ctx.source == ShadowRegisterSource::StaticStamp &&
+      dxvk::war3::internal::kNativeShadowRegisterBlockStaticStampByDefault) {
+    decision.blocked = true;
+    decision.reason = "Default_BlockStaticStamp";
+    return decision;
+  }
+
+  if (dxvk::war3::internal::kNativeShadowRegisterBlockShadowTextureKeyByDefault &&
+      IsLikelyNativeShadowTextureKey(ctx.hasKey ? ctx.key : nullptr)) {
+    decision.blocked = true;
+    decision.reason = "Default_BlockShadowTextureKey";
+    return decision;
+  }
+
+  if (ctx.mode < 1u)
+    return decision;
 
   // StrictMode=off 时保留旧配置语义，避免历史调试开关失效。
   if (!dxvk::war3::internal::kNativeShadowRegisterPolicyStrictMode1) {

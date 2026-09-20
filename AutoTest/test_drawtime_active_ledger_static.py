@@ -36,7 +36,7 @@ class DrawTimeActiveLedgerStaticTest(unittest.TestCase):
         self.assertIn("War3DrawTimeActiveLedger::EntryStamp", DEVICE_H)
         self.assertIn("War3DrawTimeActiveLedger m_war3DrawTimeActiveLedger", DEVICE_H)
 
-    def test_both_current_frame_writes_activate_the_full_key(self) -> None:
+    def test_successful_reuse_and_capture_activate_the_full_key(self) -> None:
         writes = list(
             re.finditer(
                 r"(?:cached|entry)\.frameSerial\s*=\s*"
@@ -44,7 +44,10 @@ class DrawTimeActiveLedgerStaticTest(unittest.TestCase):
                 DEVICE_CPP,
             )
         )
-        self.assertEqual(len(writes), 2)
+        # Reuse still refreshes directly. New capture refreshes only in the
+        # shared transaction's successful commit, after final settlement.
+        self.assertEqual(len(writes), 1)
+        self.assertTrue(writes[0].group().startswith("cached.frameSerial"))
         for write in writes:
             tail = DEVICE_CPP[write.end() : write.end() + 180]
             self.assertRegex(
@@ -52,6 +55,28 @@ class DrawTimeActiveLedgerStaticTest(unittest.TestCase):
                 r"War3ActivateDrawTimeCacheEntry\(vbCacheKey,\s*"
                 r"(?:cached|entry)\);",
             )
+        start = DEVICE_CPP.index("War3DrawTimeSnapshotCaptureAttempt captureAttempt(")
+        end = DEVICE_CPP.index("} while (false);", start)
+        capture = DEVICE_CPP[start:end]
+        self.assertNotRegex(capture, r"entry\.(?:frameSerial|lastAccessFrameSerial)\s*=")
+        self.assertEqual(capture.count("War3ActivateDrawTimeCacheEntry(vbCacheKey, entry)"), 1)
+        # Only successful captures may release obsolete UV wrappers and then
+        # activate the exact full key. Keep this block/order guard strict:
+        # allowing activation outside commit would refresh an incomplete entry.
+        self.assertRegex(capture, r"if \(captureAttempt\.commit\(\)\)\s*\{\s*"
+                         r"if \(!currentUvBackingUsable\)\s*"
+                         r"war3::render::War3ReleaseDrawTimeUvBacking\(entry\);\s*"
+                         r"War3ActivateDrawTimeCacheEntry\(vbCacheKey, entry\);\s*\}")
+        self.assertLess(capture.index("gpuSkinShadowSettlement.commit()"),
+                        capture.index("captureAttempt.commit()"))
+        lifetime = (ROOT / "src/d3d9/war3/render/war3_draw_time_snapshot_lifetime.h").read_text(
+            encoding="utf-8")
+        commit = lifetime.split("bool commit() noexcept {", 1)[1].split("private:", 1)[0]
+        self.assertLess(commit.index("if (!m_entry.HasCompleteBacking())"),
+                        commit.index("m_entry.frameSerial = m_frame;"))
+        self.assertIn("m_entry.lastAccessFrameSerial = m_frame;", commit)
+        self.assertIn("m_committed = true;", commit)
+        self.assertIn("return true;", commit)
 
     def test_frame_and_session_boundaries_reset_logical_records(self) -> None:
         serial = DEVICE_CPP.index("m_war3ShadowPersistentFrameSerial++;")

@@ -9,6 +9,7 @@
 #include "../../war3_shader_api.h"
 #include "../math/war3_curve_runtime.h"
 #include "../render/war3_lightning_runtime.h"
+#include "../model/war3_native_light_bridge.h"
 #include "../state/war3_render_state.h"
 #include "../war3.h"
 #endif
@@ -84,6 +85,9 @@ enum class CommandId : uint16_t {
   PointLightSetShadowEnabled,
   PointLightSetShadowConfig,
   PointLightIsAlive,
+  ModelPointLightsSetEnabled,
+  ModelPointLightsCount,
+  ModelPointLightsRegistered,
   VolumetricSetEnabled,
   VolumetricSetGlobalMediumEnabled,
   VolumetricSetDensity,
@@ -179,7 +183,7 @@ struct CommandSpec {
   bool backendRequired;
 };
 
-constexpr std::array<CommandSpec, 106> kCommands = {{
+constexpr std::array<CommandSpec, 109> kCommands = {{
     {CommandId::SystemVersion, "system.version", Carrier::LocalizedString, "", 0u, false},
     {CommandId::SystemProtocolVersion, "system.protocolVersion", Carrier::Hotkey, "", 0u, false},
     {CommandId::SystemLastErrorCode, "system.lastErrorCode", Carrier::Hotkey, "", 0u, false},
@@ -202,6 +206,9 @@ constexpr std::array<CommandSpec, 106> kCommands = {{
     {CommandId::PointLightSetShadowEnabled, "pointLight.setShadowEnabled", Carrier::Preloader, "db", kFeaturePointLight, true},
     {CommandId::PointLightSetShadowConfig, "pointLight.setShadowConfig", Carrier::Preloader, "dir", kFeaturePointLight, true},
     {CommandId::PointLightIsAlive, "pointLight.isAlive", Carrier::Hotkey, "d", kFeaturePointLight, true},
+    {CommandId::ModelPointLightsSetEnabled, "modelPointLights.setEnabled", Carrier::Preloader, "sbb", kFeaturePointLight, false},
+    {CommandId::ModelPointLightsCount, "modelPointLights.count", Carrier::Hotkey, "s", kFeaturePointLight, false},
+    {CommandId::ModelPointLightsRegistered, "modelPointLights.registered", Carrier::Hotkey, "s", kFeaturePointLight, false},
     {CommandId::VolumetricSetEnabled, "volumetric.setEnabled", Carrier::Preloader, "b", kFeatureVolumetric, true},
     {CommandId::VolumetricSetGlobalMediumEnabled, "volumetric.setGlobalMediumEnabled", Carrier::Preloader, "b", kFeatureVolumetric, true},
     {CommandId::VolumetricSetDensity, "volumetric.setDensity", Carrier::Preloader, "r", kFeatureVolumetric, true},
@@ -1068,6 +1075,14 @@ Reply DispatchBackend(const ParsedRequest& request) {
   }
 
   switch (request.spec->id) {
+    case CommandId::ModelPointLightsSetEnabled:
+      return native_light::SetModelPath(a[0].text,a[1].boolean,a[2].boolean) ? SuccessVoid() : BackendRejected();
+    case CommandId::ModelPointLightsCount: {
+      const int32_t count=native_light::ModelPathCount(a[0].text);
+      return count>=0 ? SuccessInteger(count) : BackendRejected();
+    }
+    case CommandId::ModelPointLightsRegistered:
+      return SuccessInteger(native_light::ModelPathRegistered(a[0].text) ? 1 : 0);
     case CommandId::SunSetEnabled:
       settings->sun.enabled = a[0].boolean;
       return SuccessVoid();

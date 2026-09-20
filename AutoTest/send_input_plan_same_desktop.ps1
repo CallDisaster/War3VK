@@ -1,4 +1,4 @@
-param(
+﻿param(
   [Parameter(Mandatory=$true)][int]$TargetPid,
   [Parameter(Mandatory=$true)][string]$ActionsPath,
   [string]$StatusPath = ""

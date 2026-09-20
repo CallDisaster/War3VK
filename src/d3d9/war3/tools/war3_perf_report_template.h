@@ -293,6 +293,7 @@ tr.danger-row .namecell{color:var(--red)}
       <button type="button" class="chip" id="treeGt5">仅 &gt;5% 分支</button>
       <select id="treeThreadSel"></select>
       <span id="treeCount" class="dim"></span>
+      <span id="dataTreeNote" class="split-note"></span>
     </div>
     <div id="treeScroll" class="tree-scroll">
       <div id="treeSpacer"></div>
@@ -1265,6 +1266,31 @@ function buildTree(list) {
   return root;
 }
 function rebuildTree() {
+  var note = $('dataTreeNote');
+  if (treeThread.indexOf('data:') === 0) {
+    var dc = data.dataCollectionTree || {};
+    var dt = (dc.threads || []).filter(function(t) { return 'data:' + t.threadId === treeThread; })[0];
+    if (!dt) {
+      treeRoot = null;
+      note.textContent = 'DataCollection 未采集：需要专用构建开关与运行时开关。不是 0 ms。';
+      return;
+    }
+    var paths = {}, rows = [];
+    (dt.nodes || []).forEach(function(n) {
+      var path = n.id === 0 ? 'DataCollection' : paths[n.parent] + '/' + n.name;
+      paths[n.id] = path;
+      rows.push({path:path, parentPath:n.id === 0 ? '' : paths[n.parent], name:n.name,
+        avgCpuMs:n.inclusiveMs, avgSelfCpuMs:n.unclassifiedMs, callsPerFrame:n.sampledCalls});
+    });
+    var built = buildTree(rows);
+    treeRoot = built.children[0] || null;
+    if (treeRoot) { treeRoot.parent = null; treeRoot.name = 'DataCollection — sampled total ms'; }
+    note.textContent = '本次录制会话累计；非当前报告滑窗/非线程CPU。采样1/' + dc.samplePeriod +
+      '，两列为inclusive/Self，calls为采样次数；Self=未细分时间。整数闭合=' + dt.closed + ', inFlight=' + dt.inFlight +
+      '。根外入口覆盖尚未证明完整，不能与Hook树相加。';
+    return;
+  }
+  note.textContent = '';
   var list = sections;
   if (treeThread !== 'all') {
     list = threadSections.filter(function (ts) { return String(ts.threadId) === treeThread; });
@@ -1274,7 +1300,7 @@ function rebuildTree() {
 function flattenTree() {
   flatRows = [];
   if (!treeRoot) return;
-  var fm = frameMs || 1;
+  var fm = treeThread.indexOf('data:') === 0 ? (treeRoot.incl || 1) : (frameMs || 1);
   (function walk(n, depth) {
     if (depth > 0 && treeOnly5 && (n.incl / fm) < 0.05) return;
     flatRows.push({ n: n, depth: depth });
@@ -2035,6 +2061,11 @@ function renderThreadSel() {
   threadOrder.forEach(function (t) {
     var lane = laneOfThread(t);
     html += '<option value="' + esc(t) + '">' + LANE_LABEL[lane] + ' (tid ' + esc(t) + ')</option>';
+  });
+  var collectionThreads = (data.dataCollectionTree || {}).threads || [];
+  if (!collectionThreads.length) html += '<option value="data:none">DataCollection (未采集)</option>';
+  collectionThreads.forEach(function(t) {
+    html += '<option value="data:' + esc(t.threadId) + '">DataCollection (tid ' + esc(t.threadId) + ')</option>';
   });
   sel.innerHTML = html;
 }

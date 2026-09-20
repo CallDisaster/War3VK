@@ -1,17 +1,32 @@
 #include "war3_shadow_renderer_core.h"
 
+#include "../war3_path_blocker_evidence.h"
 #include "war3_shadow_backend_dxvk.h"
 #include "../render/war3_render_identity_bridge.h"
 #include "../render/war3_upper_layer_shadow.h"
 #include "../render/war3_shadow_object_registry.h"
 #include "../render/war3_shadow_runtime_bridge.h"
+// 2026-09-17 S2（收窄版）：分组调色板重映射 / group 表校验 / 等权平均的共享纯计算内核。
+#include "../render/war3_runtime_group_palette_kernel.h"
 #include "../game/war3_unit.h"
 #include "../model/war3_model_resource_cache.h"
 #include "../model/war3_model_registry.h"
+// 2026-09-16 P0：按 renderablePart 查询 producer 侧调色板绑定与快照。
+// 同目录 war3_shadow_runtime_contract.cpp 已有相同 include 先例。
+#include "../model/war3_model_hook.h"
+// 2026-09-17 上级裁定（Step 1③，R 点）：对象级 palette 证据的采集支持 + 子门判定 +
+// 当前渲染帧域（renderFrame）。子门关闭时这些调用一个都不执行（见 FindOrUpdatePaletteSlotCache
+// 的出参与其调用点：关闭时传 nullptr，不构造键、不查表、不发事件）。
+#include "../tools/war3_frame_evidence.h"
+#include "../tools/war3_palette_object_capture.h"
+#include "../tools/war3_palette_object_evidence_sink.h"
+#include "../state/war3_render_state.h"
 #include "../core/war3_internal_test_config.h"
 #include "../core/war3_semantic_shadow_gate.h"
 #include "../core/war3_game_structs.h"
 #include "../core/war3_memory.h"
+// 2026-09-17 上级裁定（线程修复方案 B 第一部分）：构建推进边界需要主循环线程身份。
+#include "../hooks/war3_hook_lifecycle.h"
 #include "../../d3d9_war3_debug.h"
 #include "../../util/util_env.h"
 #include "../../../util/util_small_vector.h"
@@ -30,6 +45,12 @@
 namespace dxvk::war3::shadow {
 
 namespace {
+
+// 2026-09-17 上级裁定（Step 1③，R 点）：对象级 palette 证据的既有类型。
+using dxvk::war3::tools::evidence::PaletteObjectFrames;
+using dxvk::war3::tools::evidence::PaletteObjectKey;
+using dxvk::war3::tools::evidence::PaletteObjectRejectReason;
+using dxvk::war3::tools::evidence::PaletteSlotRecheckEvidence;
 
 bool SemanticCoreTraceEnabled() {
   static const bool enabled =
@@ -91,6 +112,47 @@ bool IsCanonicalDirectGeosetWholeSlice(
 bool ShouldSkipLegacyMeshDataDecode(
     const ShadowRenderableRecord& renderable) {
   return RenderableUsesDirectGeosetData(renderable);
+}
+
+[[maybe_unused]] bool SemanticCoreHasDynamicUnitEvidence(
+    const ShadowDrawPacket& packet) {
+  return dxvk::war3::PathBlockerHasDynamicUnitEvidence(packet);
+}
+
+[[maybe_unused]] bool SemanticCoreTryReadWidgetPathBlockerRawcode(
+    void* widgetPtr, uint32_t& outRawcode) {
+  return dxvk::war3::PathBlockerTryReadWidgetRawcode(widgetPtr, outRawcode);
+}
+
+[[maybe_unused]] bool SemanticCoreTryResolvePathBlockerRawcode(
+    ShadowRenderableRecord& renderable) {
+  return dxvk::war3::PathBlockerTryResolveRawcode(renderable);
+}
+
+[[maybe_unused]] bool SemanticCorePacketCanUseBelowGroundFlatMarkerFallback(
+    const ShadowDrawPacket& packet) {
+  return dxvk::war3::PathBlockerPacketCanUseBelowGroundFlatMarkerFallback(
+      packet);
+}
+
+[[maybe_unused]] bool SemanticCorePacketIsBelowGroundFlatMarkerGeometry(
+    const ShadowDrawPacket& packet) {
+  return dxvk::war3::PathBlockerPacketIsBelowGroundFlatMarkerGeometry(packet);
+}
+
+bool SemanticCoreShouldSubmitResolvedPacket(ShadowDrawPacket& packet,
+                                            ShadowResolveStats& ioStats) {
+  bool skippedPathBlocker = false;
+  bool skippedGeometryMarker = false;
+  if (dxvk::war3::PathBlockerShouldSubmitPacket(
+          packet, skippedPathBlocker, skippedGeometryMarker)) {
+    return true;
+  }
+  if (skippedPathBlocker)
+    ioStats.skippedPathBlocker++;
+  if (skippedGeometryMarker)
+    ioStats.skippedPathBlockerGeometryMarker++;
+  return false;
 }
 
 ShadowRenderableRecord ConvertVisibleRecord(
@@ -712,10 +774,50 @@ static thread_local PaletteSlotCacheEntry s_paletteSlotCache[kMaxPaletteSlotCach
 static thread_local size_t s_paletteSlotCacheIndex = 0;
 static std::atomic<uint64_t> g_paletteSlotCacheHitCount{0};
 static std::atomic<uint64_t> g_paletteSlotCacheMissCount{0};
+// 2026-09-16 P0：区分"经 producer 确认后仍命中快路径"与"因槽位陈旧被拒"。
+// 前者证明修复未误杀合法对象，后者必须伴随替代来源（producer 快照 / CPU pose 构建）
+// 增长，而不是 SourceNone/遗漏增长。
+static std::atomic<uint64_t> g_paletteSlotCacheServedAfterConfirmCount{0};
+static std::atomic<uint64_t> g_paletteSlotCacheRejectedStaleCount{0};
+static std::atomic<uint64_t> g_paletteSlotCacheProducerSnapshotFallbackCount{0};
+// 2026-09-17 Gap B 补强（上级裁定确认的缺口 B-1..B-6）：
+// 绑定 groupCount 必须参与判定；绑定帧与"槽位字节帧"必须分别见证；
+// 细分拒绝原因以便实机对账（sum(细分) == 聚合 RejectedStale）。
+// 容差默认 0（严格同帧），对齐 device 侧最强先例 d3d9_device.cpp:22564-22572；
+// 放宽必须由实机反例门证据驱动，且不得超过 2，不得按对象/按帧动态取值。
+static constexpr uint32_t kPaletteSlotCacheMaxFrameTagDelta = 0u;
+static std::atomic<uint64_t> g_paletteSlotCacheFrameProofServedCount{0};
+static std::atomic<uint64_t> g_paletteSlotCacheBindingMissRejectCount{0};
+static std::atomic<uint64_t> g_paletteSlotCacheGroupShortRejectCount{0};
+static std::atomic<uint64_t> g_paletteSlotCacheBindingFrameStaleRejectCount{0};
+static std::atomic<uint64_t> g_paletteSlotCacheSlotRangeStaleRejectCount{0};
+static std::atomic<uint64_t> g_paletteSlotCacheSnapshotFrameStaleRejectCount{0};
+// 2026-09-17 上级裁定（线程修复方案 B 第一部分）：构建推进边界的线程见证计数。
+// 与 A5（palette 槽位缓存）拒绝计数属于不同分母，不得混算。
+static std::atomic<uint64_t> g_semanticBuildOffThreadRefusedCount{0};
+// 2026-09-17 上级裁定：所有者未建立（GetMainLoopThreadId()==0）时**拒绝推进**的次数。
+// 上级明确该情形不得消费构建（只能安全排队或明确拒绝），因此不再放行、只拒绝。
+static std::atomic<uint64_t> g_semanticBuildOwnerUnestablishedRefusedCount{0};
+// 底层推进入口 ensureFrameBuiltForContract 被所有者门拒绝的次数：
+// 用于证明「直接调用底层方法也无法绕过」，与 ensureLatestFrameBuilt 的拒绝分开计数。
+static std::atomic<uint64_t> g_semanticBuildDirectAdvanceRefusedCount{0};
 static std::atomic<uint64_t> g_paletteSlotCacheSessionGeneration{1u};
 
 // 查找或更新调色板槽位索引缓存
-static uint32_t FindOrUpdatePaletteSlotCache(void* renderablePart, uint32_t currentSlotIndex) {
+// 2026-09-17 上级裁定（Step 1③，R 点）：新增**一个**小型 POD 出参
+// （不是一堆独立参数），只用于对象级具名拒绝原因。
+//  * 出参默认 nullptr：子门关闭时调用方传 nullptr，本函数不写任何字段、不构造 POD
+//    （零填充开销）。
+//  * **原返回值、判断顺序、准入、回退、缓存更新行为一律不变**：判定表达式与聚合细分
+//    计数分支逐条保留，只把"拒绝分支选择"与"POD 里的原因"合并到同一个分类函数
+//    （dxvk::war3::tools::evidence::ClassifyPaletteSlotRecheckReject），
+//    因此两者不可能漂移（穷举等价测试见 war3_palette_slot_recheck_evidence_test.cpp）。
+//  * 字段全部来自**当场已经算出的局部值**，不做任何补充查询。
+static uint32_t FindOrUpdatePaletteSlotCache(
+    void* renderablePart, uint32_t currentSlotIndex,
+    uint32_t requiredPaletteCount,
+    dxvk::war3::tools::evidence::PaletteSlotRecheckEvidence*
+        outRecheckEvidence = nullptr) {
   if (renderablePart == nullptr)
     return 0xFFFFFFFF;
 
@@ -740,9 +842,132 @@ static uint32_t FindOrUpdatePaletteSlotCache(void* renderablePart, uint32_t curr
         g_paletteSlotCacheHitCount.fetch_add(1u, std::memory_order_relaxed);
         return currentSlotIndex;
       } else {
-        // 使用缓存的值
-        g_paletteSlotCacheHitCount.fetch_add(1u, std::memory_order_relaxed);
-        return s_paletteSlotCache[i].paletteSlotIndex;
+        // 2026-09-16 P0：RenderablePart + 0x08 本帧未被更新时，绝不把"记忆槽位"
+        // 直接当作今天 arena 字节的所有权。必须由 producer 侧按 renderablePart
+        // 记录的绑定确认同一槽位当前仍属于该 part，才允许继续走 slot 读取。
+        // 未确认则返回 0xFFFFFFFF，由调用方落到 producer 快照 / CPU pose 构建，
+        // 而不是读入可能属于其它对象的字节。
+        // A0-A5（见 docs/plan/2026-09-17-gapb-confirmation-strengthening-design.md §4.1）：
+        // 只有 producer 绑定命中、槽位域合法、与记忆槽位一致、groupCount 覆盖所需矩阵数、
+        // 绑定帧与逐槽位字节帧都不旧，才允许把记忆槽位当成本帧 arena 字节的所有权。
+        uint32_t boundSlotIndex = 0xFFFFFFFFu;
+        uint32_t boundGroupCount = 0u;
+        uint32_t boundFrameTag = 0u;
+        const bool bindingHit =
+            dxvk::war3::model::QueryRenderablePartPaletteSlot(
+                renderablePart, boundSlotIndex, &boundGroupCount, &boundFrameTag);
+        // 溢出安全写法：不得用 boundSlotIndex + requiredPaletteCount 相加后再比较
+        // （requiredPaletteCount 极大时 uint32 回绕会绕过上界）。改为减法并显式约束
+        // requiredPaletteCount 的上界，任何不满足即拒绝（fail-closed）。
+        const bool slotDomainValid =
+            boundSlotIndex != 0xFFFFFFFFu && boundSlotIndex < 0x3A98u &&
+            requiredPaletteCount != 0u && requiredPaletteCount <= 0x3A98u &&
+            boundSlotIndex <= 0x3A98u - requiredPaletteCount;
+        const bool boundSlotIndexMatchesRemembered =
+            boundSlotIndex == s_paletteSlotCache[i].paletteSlotIndex;
+        // A3 先于 A4/A5 判定：数量不足的绑定做帧查询是无谓开销。
+        const bool groupCountSuffices =
+            requiredPaletteCount != 0u &&
+            boundGroupCount >= requiredPaletteCount;
+        uint32_t currentPaletteFrameTag = 0u;
+        const bool currentFrameTagReadable =
+            dxvk::war3::model::QueryCurrentPaletteFrameTag(
+                currentPaletteFrameTag) &&
+            currentPaletteFrameTag != 0u;
+        const bool bindingFrameFresh =
+            currentFrameTagReadable && boundFrameTag != 0u &&
+            boundFrameTag <= currentPaletteFrameTag &&
+            currentPaletteFrameTag - boundFrameTag <=
+                kPaletteSlotCacheMaxFrameTagDelta;
+        uint32_t slotRangeMinFrameTag = 0u;
+        uint32_t slotRangeMaxFrameTag = 0u;
+        uint32_t slotRangeMissingCount = 0u;
+        const bool slotRangeFrameFresh =
+            bindingHit && slotDomainValid && groupCountSuffices &&
+            dxvk::war3::model::QueryBlendedPaletteFrameTagRange(
+                boundSlotIndex, requiredPaletteCount, slotRangeMinFrameTag,
+                slotRangeMaxFrameTag, slotRangeMissingCount) &&
+            slotRangeMissingCount == 0u &&
+            slotRangeMinFrameTag == slotRangeMaxFrameTag &&
+            slotRangeMaxFrameTag == boundFrameTag &&
+            currentFrameTagReadable &&
+            currentPaletteFrameTag - slotRangeMaxFrameTag <=
+                kPaletteSlotCacheMaxFrameTagDelta;
+        const bool producerConfirmed =
+            bindingHit && slotDomainValid && boundSlotIndexMatchesRemembered &&
+            groupCountSuffices && bindingFrameFresh && slotRangeFrameFresh;
+        // 2026-09-17 上级裁定（Step 1③，R 点）：只把**当场已经算出的局部值**复制进 POD
+        // （不重新查询补证）。outRecheckEvidence == nullptr（子门关闭）时整段不执行：
+        // 不构造 POD、不写字段。producerConfirmed 为真时原因保持 NotChecked（本次没有拒绝）。
+        if (outRecheckEvidence != nullptr) {
+          PaletteSlotRecheckEvidence evidence{};
+          evidence.recheckPerformed = true;
+          evidence.producerConfirmed = producerConfirmed;
+          evidence.bindingHit = bindingHit;
+          evidence.slotDomainValid = slotDomainValid;
+          evidence.boundSlotIndexMatchesRemembered =
+              boundSlotIndexMatchesRemembered;
+          evidence.groupCountSuffices = groupCountSuffices;
+          evidence.bindingFrameFresh = bindingFrameFresh;
+          evidence.slotRangeFrameFresh = slotRangeFrameFresh;
+          evidence.requiredPaletteCount = requiredPaletteCount;
+          evidence.currentSlotIndexRaw = currentSlotIndex;
+          evidence.rememberedSlotIndex = s_paletteSlotCache[i].paletteSlotIndex;
+          evidence.boundSlotIndex = boundSlotIndex;
+          evidence.boundGroupCount = boundGroupCount;
+          evidence.boundFrameTag = boundFrameTag;
+          evidence.currentPaletteFrameTag = currentPaletteFrameTag;
+          evidence.slotRangeMinFrameTag = slotRangeMinFrameTag;
+          evidence.slotRangeMaxFrameTag = slotRangeMaxFrameTag;
+          evidence.slotRangeMissingCount = slotRangeMissingCount;
+          evidence.rejectReason =
+              producerConfirmed
+                  ? PaletteObjectRejectReason::NotChecked
+                  : dxvk::war3::tools::evidence::
+                        ClassifyPaletteSlotRecheckReject(
+                            bindingHit, slotDomainValid,
+                            boundSlotIndexMatchesRemembered, groupCountSuffices,
+                            bindingFrameFresh);
+          dxvk::war3::tools::evidence::PublishPaletteSlotRecheckEvidence(
+              outRecheckEvidence, evidence);
+        }
+        if (producerConfirmed) {
+          g_paletteSlotCacheHitCount.fetch_add(1u, std::memory_order_relaxed);
+          g_paletteSlotCacheServedAfterConfirmCount.fetch_add(
+              1u, std::memory_order_relaxed);
+          g_paletteSlotCacheFrameProofServedCount.fetch_add(
+              1u, std::memory_order_relaxed);
+          return s_paletteSlotCache[i].paletteSlotIndex;
+        }
+        g_paletteSlotCacheMissCount.fetch_add(1u, std::memory_order_relaxed);
+        g_paletteSlotCacheRejectedStaleCount.fetch_add(
+            1u, std::memory_order_relaxed);
+        // 具名原因分类：与既有 if/else 分支**逐条等价**（R0 = 绑定 miss / 槽位域非法 /
+        // 与记忆槽位不一致；R1 = groupCount 不足；R2 = 绑定帧陈旧；其余 = R3 槽位区间陈旧）。
+        // 用同一个函数的返回值选择聚合细分计数，保证 POD 里的原因就是**实际计数的分支**。
+        const PaletteObjectRejectReason recheckRejectReason =
+            dxvk::war3::tools::evidence::ClassifyPaletteSlotRecheckReject(
+                bindingHit, slotDomainValid, boundSlotIndexMatchesRemembered,
+                groupCountSuffices, bindingFrameFresh);
+        switch (recheckRejectReason) {
+        case PaletteObjectRejectReason::R0:
+          g_paletteSlotCacheBindingMissRejectCount.fetch_add(
+              1u, std::memory_order_relaxed);
+          break;
+        case PaletteObjectRejectReason::R1:
+          g_paletteSlotCacheGroupShortRejectCount.fetch_add(
+              1u, std::memory_order_relaxed);
+          break;
+        case PaletteObjectRejectReason::R2:
+          g_paletteSlotCacheBindingFrameStaleRejectCount.fetch_add(
+              1u, std::memory_order_relaxed);
+          break;
+        default:
+          g_paletteSlotCacheSlotRangeStaleRejectCount.fetch_add(
+              1u, std::memory_order_relaxed);
+          break;
+        }
+        return 0xFFFFFFFFu;
       }
     }
   }
@@ -6436,6 +6661,31 @@ bool TryConvertUpperLayerResolvedItem(
   return true;
 }
 
+// 2026-09-17 S2：内核 miss reason 与 shadow-core 的 RuntimeGroupPaletteMissReason
+// 一一对应（设计 §3.2）。显式 switch 映射，不用下标转换，避免两侧枚举漂移。
+RuntimeGroupPaletteMissReason ToRuntimeGroupPaletteMissReason(
+    render::RuntimeGroupPaletteKernelMiss reason) {
+  switch (reason) {
+  case render::RuntimeGroupPaletteKernelMiss::None:
+    return RuntimeGroupPaletteMissReason::None;
+  case render::RuntimeGroupPaletteKernelMiss::NoSkinningData:
+    return RuntimeGroupPaletteMissReason::NoSkinningData;
+  case render::RuntimeGroupPaletteKernelMiss::NoPosePalette:
+    return RuntimeGroupPaletteMissReason::NoPosePalette;
+  case render::RuntimeGroupPaletteKernelMiss::NoVertexGroups:
+    return RuntimeGroupPaletteMissReason::NoVertexGroups;
+  case render::RuntimeGroupPaletteKernelMiss::InvalidGroupTable:
+    return RuntimeGroupPaletteMissReason::InvalidGroupTable;
+  case render::RuntimeGroupPaletteKernelMiss::MatrixIndexOutOfRange:
+    return RuntimeGroupPaletteMissReason::MatrixIndexOutOfRange;
+  case render::RuntimeGroupPaletteKernelMiss::VertexGroupOutOfRange:
+    return RuntimeGroupPaletteMissReason::VertexGroupOutOfRange;
+  case render::RuntimeGroupPaletteKernelMiss::FallbacksFailed:
+    return RuntimeGroupPaletteMissReason::FallbacksFailed;
+  }
+  return RuntimeGroupPaletteMissReason::None;
+}
+
 bool TryBuildRuntimeGroupPalette(const ShadowModelResourceRecord& resource,
                                  const ShadowRenderableRecord& renderable,
                                  const ShadowPoseRecord& pose,
@@ -6471,15 +6721,58 @@ bool TryBuildRuntimeGroupPalette(const ShadowModelResourceRecord& resource,
                 uint32_t(resource.matrixIndices.size())),
             false);
 
-  for (size_t i = 0u; i < vertexGroupSlotCount; ++i) {
-    const uint8_t groupSlot = resource.vertexGroupIndices[i];
-    outMaxVertexGroupSlot =
-        (std::max)(outMaxVertexGroupSlot, uint32_t(groupSlot));
-  }
+  outMaxVertexGroupSlot = render::FindRuntimeGroupPaletteMaxSlot(
+      resource.vertexGroupIndices.data(), vertexGroupSlotCount);
 
   // 尝试从引擎的全局调色板缓冲区读取完整骨架
   // 这解决了 CModel + 0x60 只有 2-3 个根骨骼矩阵的问题
   auto tryEngineDirectPosePalette = [&]() -> bool {
+    const uint32_t requiredCount = outMaxVertexGroupSlot + 1u;
+    if (requiredCount == 0u || requiredCount > 256u)
+      return false;
+
+    // 2026-09-16 P0：优先消费 producer 按 renderablePart 记录的完整调色板快照。
+    // 与按 slot 读 Game.dll 全局 arena 相比，这条路径与 writer 绑定更紧，
+    // 能规避 slot 复用/相位差造成的 stale bytes（与 device 侧同源策略）。
+    // 2026-09-17 Gap B 补强 S0-S3：
+    // S0 producer 快照上限（war3_model_hook.cpp:338 kRenderablePartPaletteSnapshotMaxCount=64）；
+    // S1 必须精确等于所需矩阵数（原为 >=，不足以排除"多带了别人的槽位"）；
+    // S2/S3 快照 frameTag 必须可读且是当前帧。
+    // 注意边界：只做 S0-S3 时，快照字节仍可能来自 FROZEN 携带的旧槽位
+    // （见设计文档 §4.2 S4）；本候选不做 S4，报告不得宣称"快照路径已排除陈旧字节"。
+    static constexpr uint32_t kProducerSnapshotMaxCount = 64u;
+    if (renderable.renderablePart != nullptr &&
+        requiredCount <= kProducerSnapshotMaxCount) {
+      uint32_t snapshotFrameTag = 0u;
+      if (dxvk::war3::model::QueryRenderablePartPaletteSnapshot(
+              renderable.renderablePart, requiredCount, &outPalette, nullptr,
+              &snapshotFrameTag) &&
+          outPalette.size() == size_t(requiredCount)) {
+        uint32_t currentFrameTag = 0u;
+        const bool currentReadable =
+            dxvk::war3::model::QueryCurrentPaletteFrameTag(currentFrameTag) &&
+            currentFrameTag != 0u;
+        const bool snapshotFrameFresh =
+            currentReadable && snapshotFrameTag != 0u &&
+            snapshotFrameTag <= currentFrameTag &&
+            currentFrameTag - snapshotFrameTag <=
+                kPaletteSlotCacheMaxFrameTagDelta;
+        if (snapshotFrameFresh) {
+          outUsesAveraging = false;
+          g_paletteSlotCacheProducerSnapshotFallbackCount.fetch_add(
+              1u, std::memory_order_relaxed);
+          return true;
+        }
+        // 2026-09-17 对抗性复核修正：该计数只表示"快照确认存在但帧号确实超差"，
+        // 不得把"当前帧不可读 / snapshotFrameTag == 0"混进来。后者是"不可证明"，
+        // 同样拒绝但不计入陈旧，避免污染"是否放宽 kDelta"的判据。
+        if (currentReadable && snapshotFrameTag != 0u) {
+          g_paletteSlotCacheSnapshotFrameStaleRejectCount.fetch_add(
+              1u, std::memory_order_relaxed);
+        }
+      }
+    }
+
     // 尝试从 RenderablePart + 0x08 读取调色板槽位索引
     // 注意：RenderablePartFieldOffsets 中该字段名为 StagePresetSpanBaseIndex
     // 但在 CModel_AllocAndFillGroupPalette 中实际用作 palette slot index
@@ -6491,11 +6784,57 @@ bool TryBuildRuntimeGroupPalette(const ShadowModelResourceRecord& resource,
           paletteSlotIndex);
     }
 
-    // 使用缓存机制：如果当前帧没有更新槽位索引，使用上一帧的值
+    // 使用缓存机制：如果当前帧没有更新槽位索引，使用上一帧的值。
+    // 2026-09-17 Gap B 补强：必须把所需矩阵数交给复核链（groupCount 覆盖判定）。
+    //
+    // 2026-09-17 上级裁定（Step 1③，R 点）采集点：**子门判定是本块的第一条语句**。
+    // 关闭时传 nullptr（本函数不写任何字段，零填充开销），且下面整段不执行：
+    // 不取值、不构造键、不查表、不发事件。
+    const bool paletteObjectEvidenceOn =
+        dxvk::war3::tools::evidence::PaletteObjectEvidenceEnabled();
+    PaletteSlotRecheckEvidence recheckEvidence{};
     paletteSlotIndex = FindOrUpdatePaletteSlotCache(
-        renderable.renderablePart, paletteSlotIndex);
-    
-    if (paletteSlotIndex == 0xFFFFFFFF || paletteSlotIndex >= 0x3A98)
+        renderable.renderablePart, paletteSlotIndex, requiredCount,
+        paletteObjectEvidenceOn ? &recheckEvidence : nullptr);
+    if (paletteObjectEvidenceOn) {
+      // 只有"复核链执行过 + 确实被拒绝 + 原因具名"才发；未执行的检查是 NotChecked，
+      // 这里直接不发事件（不得用 R0 冒充）。
+      PaletteObjectRejectReason namedRejectReason =
+          PaletteObjectRejectReason::NotChecked;
+      if (dxvk::war3::tools::evidence::ShouldNotifyPaletteSlotReject(
+              recheckEvidence, namedRejectReason)) {
+        // 会话代际沿用既有采集会话（不新造"原生对象代际"）；未 arm 时 0 ⇒ 不发事件，
+        // 避免在未激活时污染观察表。
+        const uint64_t evidenceSession =
+            dxvk::war3::tools::evidence::ActiveSession();
+        if (evidenceSession != 0u) {
+          // 取值全部来自**当场局部值**：record 四元组 + 资源 map 代际；
+          // 帧域四项分列（manifest 帧与 native 帧在 shadow-core 当场不可得 ⇒ 置 unknown）。
+          const PaletteObjectKey key =
+              dxvk::war3::tools::evidence::MakePaletteObjectKey(
+                  renderable.renderablePart, renderable.runtimeModelPtr,
+                  renderable.jHandle, renderable.rawcode, evidenceSession,
+                  resource.mapEpoch);
+          const PaletteObjectFrames frames =
+              dxvk::war3::tools::evidence::MakePaletteObjectFrames(
+                  uint64_t(
+                      dxvk::war3::state::RenderState::instance().getFrameIndex()),
+                  renderable.frameSerial,
+                  uint64_t(recheckEvidence.currentPaletteFrameTag),
+                  recheckEvidence.currentPaletteFrameTag != 0u,
+                  // K3：拒绝点用**当场清单记录**自己的序号 —— 与 Served 点同族
+                  // （packet.renderable.frameSerial），故同一次尝试在两点得到同一个号。
+                  renderable.frameSerial);
+          dxvk::war3::tools::evidence::PaletteObjectRecorder().NoteReject(
+              key, namedRejectReason, frames);
+        }
+      }
+    }
+
+    // 2026-09-17 Gap B 补强：除上界外，还必须保证 [slot, slot+requiredCount)
+    // 整段落在合法槽位域内，避免把"尾部槽位 + 完整骨架长度"读成越段数据。
+    if (paletteSlotIndex == 0xFFFFFFFF || paletteSlotIndex >= 0x3A98 ||
+        paletteSlotIndex + requiredCount > 0x3A98u)
       return false;
 
     uintptr_t gameDllBase = reinterpret_cast<uintptr_t>(::GetModuleHandleA("Game.dll"));
@@ -6511,8 +6850,7 @@ bool TryBuildRuntimeGroupPalette(const ShadowModelResourceRecord& resource,
     }
     const uintptr_t globalPaletteBufferBase = reinterpret_cast<uintptr_t>(globalPaletteBufferPtr);
     
-    const uint32_t requiredCount = outMaxVertexGroupSlot + 1u;
-    if (requiredCount == 0 || requiredCount > 256) return false;
+    // requiredCount 已在 lambda 顶部声明并校验。
     
     // 引擎使用 3x4 矩阵（48字节），使用 DecodeRuntimePoseMatrix48 解析
     const uint8_t* enginePalette = reinterpret_cast<const uint8_t*>(globalPaletteBufferBase + 48u * paletteSlotIndex);
@@ -6549,17 +6887,6 @@ bool TryBuildRuntimeGroupPalette(const ShadowModelResourceRecord& resource,
   if (!resource.hasSkinningData())
     return false;
 
-  std::vector<uint32_t> uniqueGroupSlots;
-  uniqueGroupSlots.reserve(outMaxVertexGroupSlot + 1u);
-  std::array<bool, 256> seenGroupSlots = {};
-  for (size_t i = 0u; i < vertexGroupSlotCount; ++i) {
-    const uint8_t groupSlot = resource.vertexGroupIndices[i];
-    if (!seenGroupSlots[groupSlot]) {
-      seenGroupSlots[groupSlot] = true;
-      uniqueGroupSlots.push_back(uint32_t(groupSlot));
-    }
-  }
-
   auto logFailure = [&]() {
     if constexpr (dxvk::war3::internal::kShadowSemanticCoreSceneSubmissionEnabled) {
       return;
@@ -6571,6 +6898,19 @@ bool TryBuildRuntimeGroupPalette(const ShadowModelResourceRecord& resource,
         1, std::memory_order_relaxed);
     if (!(logIndex < 32u || (logIndex % 2048u) == 0u))
       return;
+
+    // 仅在确实要打印失败诊断时重建 unique 槽位；生产 5 步 fallback 在三条
+    // 前置校验通过后不会走到 FallbacksFailed，所以这趟不进入热路径。
+    std::vector<uint32_t> uniqueGroupSlots;
+    uniqueGroupSlots.reserve(outMaxVertexGroupSlot + 1u);
+    std::array<bool, 256> seenGroupSlots = {};
+    for (size_t i = 0u; i < vertexGroupSlotCount; ++i) {
+      const uint8_t groupSlot = resource.vertexGroupIndices[i];
+      if (!seenGroupSlots[groupSlot]) {
+        seenGroupSlots[groupSlot] = true;
+        uniqueGroupSlots.push_back(uint32_t(groupSlot));
+      }
+    }
 
     bool directMatrixOk = !resource.matrixIndices.empty() &&
                           outMaxVertexGroupSlot < resource.matrixIndices.size();
@@ -6825,161 +7165,46 @@ bool TryBuildRuntimeGroupPalette(const ShadowModelResourceRecord& resource,
         l1cHead10, l1cHead14, l1cHead18, l1cHead1C);
   };
 
-  auto buildDirectMatrixRemap = [&]() -> bool {
-    if (resource.matrixIndices.empty() ||
-        outMaxVertexGroupSlot >= resource.matrixIndices.size()) {
-      return false;
-    }
+  // 2026-09-20 b02 成本/安全收口：计算仍由共享纯计算内核唯一完成；适配层保留来源
+  // 选择链（tryEngineDirectPosePalette）、失败诊断（logFailure）与计数派生
+  //（RuntimeVertexGroupSlotCount / matrixGroupSizes.size()，D4/D5）。
+  //
+  // 成本/安全口径：来源链前只做 1 趟 maxSlot 扫描，仅用于
+  // tryEngineDirectPosePalette；内核随后用固定 256 项 seen/输出数组单趟同时求
+  // maxSlot + unique，不接受 caller-provided trusted max。core 总扫描 2 趟，
+  // upper 内核单趟。输出直接写入调用方的 outPalette，复用其容量；失败残留仍由
+  // 内核直接写回同一 outPalette。
+  render::RuntimeGroupPaletteInput kernelInput = {};
+  kernelInput.vertexGroupIndices   = resource.vertexGroupIndices.data();
+  kernelInput.vertexGroupSlotCount = vertexGroupSlotCount;
+  kernelInput.matrixGroupSizes     = resource.matrixGroupSizes.data();
+  kernelInput.groupCount           = uint32_t(resource.matrixGroupSizes.size());
+  kernelInput.matrixIndices        = resource.matrixIndices.data();
+  kernelInput.matrixIndexCount     = resource.matrixIndices.size();
+  kernelInput.posePalette          = pose.matrixPalette.data();
+  kernelInput.posePaletteSize      = pose.matrixPalette.size();
+  kernelInput.poseMatrixCount      = pose.matrixCount;
 
-    outPalette.resize(outMaxVertexGroupSlot + 1u);
-    for (uint32_t group = 0u; group <= outMaxVertexGroupSlot; ++group) {
-      const uint32_t matrixIndex = resource.matrixIndices[group];
-      if (matrixIndex >= pose.matrixCount ||
-          matrixIndex >= pose.matrixPalette.size()) {
-        return false;
-      }
-      outPalette[group] = pose.matrixPalette[matrixIndex];
-    }
-    return true;
-  };
+  render::RuntimeGroupPaletteKernelDetail kernelDetail = {};
+  const bool kernelSucceeded = render::TryBuildRuntimeGroupPaletteKernel(
+      kernelInput,
+      render::RuntimeGroupPaletteFallbackSet::MatrixPoseAndUniformRoot,
+      outPalette, outMaxVertexGroupSlot, outUsesAveraging, &kernelDetail);
 
-  auto buildSparseMatrixRemap = [&]() -> bool {
-    if (resource.matrixIndices.empty() || uniqueGroupSlots.empty() ||
-        uniqueGroupSlots.size() > resource.matrixIndices.size()) {
-      return false;
-    }
+  // miss 明细仍按抽取前的写回语义整体搬运（成功失败一致）。
+  NoteRuntimeGroupPaletteMiss(
+      outMissDetail, ToRuntimeGroupPaletteMissReason(kernelDetail.reason),
+      kernelDetail.poseCount, kernelDetail.groupCount,
+      kernelDetail.maxVertexGroupSlot, kernelDetail.matrixIndexCount,
+      kernelDetail.group, kernelDetail.matrixIndex);
 
-    outPalette.assign(outMaxVertexGroupSlot + 1u, Matrix4(0.0f));
-    for (size_t i = 0; i < uniqueGroupSlots.size(); ++i) {
-      const uint32_t matrixIndex = resource.matrixIndices[i];
-      if (matrixIndex >= pose.matrixCount ||
-          matrixIndex >= pose.matrixPalette.size()) {
-        return false;
-      }
-      outPalette[uniqueGroupSlots[i]] = pose.matrixPalette[matrixIndex];
-    }
-    return true;
-  };
-
-  auto buildDirectPosePalette = [&]() -> bool {
-    if (outMaxVertexGroupSlot >= pose.matrixCount ||
-        outMaxVertexGroupSlot >= pose.matrixPalette.size()) {
-      return false;
-    }
-
-    outPalette.resize(outMaxVertexGroupSlot + 1u);
-    for (uint32_t group = 0u; group <= outMaxVertexGroupSlot; ++group)
-      outPalette[group] = pose.matrixPalette[group];
-    return true;
-  };
-
-  auto buildSparsePosePalette = [&]() -> bool {
-    if (uniqueGroupSlots.empty() || uniqueGroupSlots.size() > pose.matrixCount ||
-        uniqueGroupSlots.size() > pose.matrixPalette.size()) {
-      return false;
-    }
-
-    outPalette.assign(outMaxVertexGroupSlot + 1u, Matrix4(0.0f));
-    for (size_t i = 0; i < uniqueGroupSlots.size(); ++i)
-      outPalette[uniqueGroupSlots[i]] = pose.matrixPalette[i];
-    return true;
-  };
-
-  auto buildUniformPosePalette = [&]() -> bool {
-    if (pose.matrixCount == 0u || pose.matrixPalette.empty())
-      return false;
-
-    const uint32_t paletteCount =
-        (std::max)(outMaxVertexGroupSlot + 1u,
-                   uint32_t(resource.matrixGroupSizes.size()));
-    if (paletteCount == 0u)
-      return false;
-
-    // Some runtime models publish only the final root matrix even though the
-    // static geoset still carries vertex-group metadata. Broadcasting that root
-    // matrix gives us a semantic rigid-palette packet instead of dropping back
-    // to the old draw-time capture path.
-    outPalette.assign(paletteCount, pose.matrixPalette.front());
-    return true;
-  };
-
-  auto tryFallbacks = [&]() -> bool {
-    const bool ok = buildDirectMatrixRemap() || buildSparseMatrixRemap() ||
-                    buildDirectPosePalette() || buildSparsePosePalette() ||
-                    buildUniformPosePalette();
-    if (!ok) {
-      NoteRuntimeGroupPaletteMiss(
-          outMissDetail, RuntimeGroupPaletteMissReason::FallbacksFailed,
-          pose.matrixCount, uint32_t(resource.matrixGroupSizes.size()),
-          outMaxVertexGroupSlot, uint32_t(resource.matrixIndices.size()));
+  if (!kernelSucceeded) {
+    if (kernelDetail.reason ==
+        render::RuntimeGroupPaletteKernelMiss::FallbacksFailed) {
       logFailure();
     }
-    return ok;
-  };
-
-  const uint32_t groupCount = uint32_t(resource.matrixGroupSizes.size());
-  if (groupCount == 0u) {
-    return tryFallbacks();
+    return false;
   }
-
-  std::vector<uint32_t> prefix(groupCount, 0u);
-  uint32_t running = 0u;
-  for (uint32_t i = 0u; i < groupCount; ++i) {
-    prefix[i] = running;
-    running += resource.matrixGroupSizes[i];
-  }
-  if (running > resource.matrixIndices.size()) {
-    NoteRuntimeGroupPaletteMiss(
-        outMissDetail, RuntimeGroupPaletteMissReason::InvalidGroupTable,
-        pose.matrixCount, groupCount, outMaxVertexGroupSlot,
-        uint32_t(resource.matrixIndices.size()));
-    return tryFallbacks();
-  }
-
-  outPalette.resize(groupCount);
-  for (uint32_t group = 0u; group < groupCount; ++group) {
-    const uint32_t groupSize = resource.matrixGroupSizes[group];
-    const uint32_t groupBase = prefix[group];
-    if (groupSize == 0u || (groupBase + groupSize) > resource.matrixIndices.size()) {
-      NoteRuntimeGroupPaletteMiss(
-          outMissDetail, RuntimeGroupPaletteMissReason::InvalidGroupTable,
-          pose.matrixCount, groupCount, outMaxVertexGroupSlot,
-          uint32_t(resource.matrixIndices.size()), group);
-      return tryFallbacks();
-    }
-
-    Matrix4 accum(0.0f);
-    for (uint32_t i = 0u; i < groupSize; ++i) {
-      const uint32_t matrixIndex = resource.matrixIndices[groupBase + i];
-      if (matrixIndex >= pose.matrixCount ||
-          matrixIndex >= pose.matrixPalette.size()) {
-        NoteRuntimeGroupPaletteMiss(
-            outMissDetail,
-            RuntimeGroupPaletteMissReason::MatrixIndexOutOfRange,
-            pose.matrixCount, groupCount, outMaxVertexGroupSlot,
-            uint32_t(resource.matrixIndices.size()), group, matrixIndex);
-        return tryFallbacks();
-      }
-      accum += pose.matrixPalette[matrixIndex];
-    }
-
-    if (groupSize > 1u)
-      outUsesAveraging = true;
-    outPalette[group] =
-        groupSize == 1u ? accum : (accum / float(groupSize));
-  }
-
-  for (size_t i = 0u; i < vertexGroupSlotCount; ++i) {
-    const uint8_t groupSlot = resource.vertexGroupIndices[i];
-    if (uint32_t(groupSlot) >= groupCount) {
-      NoteRuntimeGroupPaletteMiss(
-          outMissDetail, RuntimeGroupPaletteMissReason::VertexGroupOutOfRange,
-          pose.matrixCount, groupCount, outMaxVertexGroupSlot,
-          uint32_t(resource.matrixIndices.size()), uint32_t(groupSlot));
-      return tryFallbacks();
-    }
-  }
-
   return true;
 }
 
@@ -7000,6 +7225,60 @@ bool ShouldBuildAttachmentSupplementalForChunk(uint64_t maxDurationUs) {
 }
 
 } // namespace
+
+// 2026-09-16 P0 Gap B：导出 palette 槽位缓存复核计数，供 runtime bridge
+// summary / diagnostics hub / control plane / perf monitor 报告
+// "经 producer 确认仍命中快路径"（未误杀）、"陈旧槽位被拒"、
+// "producer 快照替代路径命中"三项实机度量。
+uint64_t QueryPaletteSlotCacheServedAfterConfirmCount() {
+  return g_paletteSlotCacheServedAfterConfirmCount.load(
+      std::memory_order_relaxed);
+}
+uint64_t QueryPaletteSlotCacheRejectedStaleCount() {
+  return g_paletteSlotCacheRejectedStaleCount.load(
+      std::memory_order_relaxed);
+}
+uint64_t QueryPaletteSlotCacheProducerSnapshotFallbackCount() {
+  return g_paletteSlotCacheProducerSnapshotFallbackCount.load(
+      std::memory_order_relaxed);
+}
+// 2026-09-17 Gap B 补强：细分拒绝原因与"全链帧证明通过"计数。
+// 不导出 BindingMissRejectCount（其口径已在 RejectedStale 聚合内，避免扩大报告面）。
+uint64_t QueryPaletteSlotCacheFrameProofServedCount() {
+  return g_paletteSlotCacheFrameProofServedCount.load(
+      std::memory_order_relaxed);
+}
+uint64_t QueryPaletteSlotCacheGroupShortRejectCount() {
+  return g_paletteSlotCacheGroupShortRejectCount.load(
+      std::memory_order_relaxed);
+}
+uint64_t QueryPaletteSlotCacheBindingFrameStaleRejectCount() {
+  return g_paletteSlotCacheBindingFrameStaleRejectCount.load(
+      std::memory_order_relaxed);
+}
+uint64_t QueryPaletteSlotCacheSlotRangeStaleRejectCount() {
+  return g_paletteSlotCacheSlotRangeStaleRejectCount.load(
+      std::memory_order_relaxed);
+}
+uint64_t QueryPaletteSlotCacheSnapshotFrameStaleRejectCount() {
+  return g_paletteSlotCacheSnapshotFrameStaleRejectCount.load(
+      std::memory_order_relaxed);
+}
+// 2026-09-17 上级裁定（线程修复方案 B 第一部分）：构建推进边界线程见证。
+// 所有者判定 DecideShadowBuildAdvance 是 inline 纯函数，定义见
+// war3_shadow_build_thread_gate.h（生产推进边界与宿主机边界测试共用同一份实现）。
+// 本 TU 不再提供 out-of-line 定义，避免出现第二份判定。
+uint64_t QuerySemanticBuildOffThreadRefusedCount() {
+  return g_semanticBuildOffThreadRefusedCount.load(std::memory_order_relaxed);
+}
+uint64_t QuerySemanticBuildOwnerUnestablishedRefusedCount() {
+  return g_semanticBuildOwnerUnestablishedRefusedCount.load(
+      std::memory_order_relaxed);
+}
+uint64_t QuerySemanticBuildDirectAdvanceRefusedCount() {
+  return g_semanticBuildDirectAdvanceRefusedCount.load(
+      std::memory_order_relaxed);
+}
 
 bool TryResolveExplicitBlendSkinningForRenderable(
     const ShadowRenderableRecord& renderable,
@@ -7099,7 +7378,8 @@ size_t ShadowRendererCore::buildFrameChunk(
         ? std::chrono::steady_clock::now()
         : std::chrono::steady_clock::time_point();
     const auto& record = manifest.records[index];
-    if (resolveRecord(record, resources, poses, attachments, packet, ioStats))
+    if (resolveRecord(record, resources, poses, attachments, packet, ioStats) &&
+        SemanticCoreShouldSubmitResolvedPacket(packet, ioStats))
       ioFrame.draws.emplace_back(std::move(packet));
     if (recordTimingProbe) {
       const uint64_t recordElapsedUs = static_cast<uint64_t>(
@@ -7220,7 +7500,8 @@ size_t ShadowRendererCore::buildFrameChunk(
         ShadowDrawPacket packet = {};
         ioStats.considered++;
         if (!resolveRecord(supplemental, resources, poses, attachments, packet,
-                           ioStats)) {
+                           ioStats) ||
+            !SemanticCoreShouldSubmitResolvedPacket(packet, ioStats)) {
           return;
         }
 
@@ -9241,8 +9522,55 @@ void ShadowValidationRuntime::requestFrameBuildForContract(
   }
 }
 
+// 2026-09-17 上级裁定：**唯一一份**消费权限检查。规则只此一处，两处推进入口共用，
+// 避免复制两套容易分叉的守卫。所有者未建立/非所有者一律拒绝消费（只保留安全请求）。
+bool ShadowValidationRuntime::consumePermissionGranted(bool directEntry) {
+  ShadowBuildAdvanceCounters counters;
+  counters.offThreadRefused = &g_semanticBuildOffThreadRefusedCount;
+  counters.ownerUnestablishedRefused =
+      &g_semanticBuildOwnerUnestablishedRefusedCount;
+  counters.directAdvanceRefused = &g_semanticBuildDirectAdvanceRefusedCount;
+  return m_buildLifecycle.consumeAllowed(
+      directEntry,
+      static_cast<uint32_t>(dxvk::war3::hooks::GetMainLoopThreadId()),
+      static_cast<uint32_t>(::GetCurrentThreadId()), counters);
+}
+
+void ShadowValidationRuntime::publishBuildProgressLocked(
+    const ShadowValidationBuildWork& work, uint64_t generation) {
+  // 调用者必须已持有 m_mutex（唯一写者：构建推进线程）。
+  // 上级要求：**按值**发布、无可变别名、**不新增每块堆分配**；帧号/发布 revision/工作代际
+  // 与统计来自同一次发布；旧代际发布被 ShadowBuildProgressState::Publish 拒绝。
+  ShadowBuildProgressValues values;
+  values.workGeneration = generation;
+  values.frameSerial =
+      work.manifest != nullptr ? work.manifest->frameSerial : 0u;
+  values.publishRevision =
+      work.manifest != nullptr ? work.manifest->publishRevision : 0u;
+  values.nextRecordIndex = static_cast<uint64_t>(work.nextRecordIndex);
+  values.recordCount = work.manifest != nullptr
+                           ? static_cast<uint64_t>(work.manifest->records.size())
+                           : 0u;
+  values.chunkCount = work.chunkCount;
+  values.totalBuildDurationUs = work.totalBuildDurationUs;
+  values.drawCount = static_cast<uint64_t>(work.frame.draws.size());
+  // 上级裁定：仅当 (work, generation) 仍是当前工作时才发布；旧工作不得回写。
+  if (m_buildLifecycle.publishIfCurrent(&work, generation, values))
+    m_publishedBuildStats = work.stats;
+}
+
 void ShadowValidationRuntime::ensureLatestFrameBuilt() {
   requestLatestFrameBuild();
+
+  // 2026-09-17 上级裁定（线程修复方案 B 第一部分）：构建推进只允许发生在所有者线程。
+  // 控制面 drain（DrainSemanticBuildFromControlPlaneIfAllowed ->
+  // drainPendingBuildForControlPlane）在命名管道的分离线程上调用本函数；而 palette 槽位缓存
+  // 是非原子读、构建进度字段也在锁外更新 ⇒ 非所有者/所有者未建立一律只保留
+  // requestLatestFrameBuild() 的请求语义，不推进任何分块。该检查位于**推进边界**，
+  // 因此同时覆盖 allowControlPlaneSemanticDrain 与 IsHotSemanticBuildWaitPayload 两条门控。
+  // 所有者身份取自 hook 生命周期观测到的主循环线程，**不是第一个请求线程**。
+  if (!consumePermissionGranted(false))
+    return;
 
   std::shared_ptr<const ShadowFrameManifest> manifest;
   std::shared_ptr<const ShadowModelResourceStore> resources;
@@ -9257,6 +9585,9 @@ void ShadowValidationRuntime::ensureLatestFrameBuilt() {
           IsSemanticContractNewer(m_pendingManifest, m_buildWork->manifest);
       if (hasNewerPending && IsMissOnlyPreviewBuild(m_buildWork.get())) {
         ++m_stalePendingBuildClearedCount;
+        m_buildLifecycle.cancelIfCurrent(m_buildWork.get(),
+                                         m_buildWorkGeneration);
+        m_publishedBuildStats = {};
         m_buildWork.reset();
         m_buildInProgress = false;
         m_buildFrameSerial = 0;
@@ -9345,10 +9676,17 @@ void ShadowValidationRuntime::ensureFrameBuiltForContract(
     std::shared_ptr<const ShadowModelResourceStore> resources,
     std::shared_ptr<const ShadowPoseStore> poses,
     std::shared_ptr<const ShadowAttachmentRigidStore> attachments) {
+  // 2026-09-17 上级裁定：所有者门必须在**真正的推进入口**也成立——直接调用本底层方法
+  // （绕过 ensureLatestFrameBuilt）同样不得消费构建；拒绝单独计数以便与入口门区分。
+  if (!consumePermissionGranted(true))
+    return;
   if (!manifest || !resources || !poses || !attachments)
     return;
   manifest = MaybeCapPreviewManifest(std::move(manifest), *resources, *poses);
   std::shared_ptr<ShadowValidationBuildWork> buildWork;
+  // 2026-09-17 上级裁定：**工作对象与其代际必须在锁内成对取得**并在后续始终成对携带；
+  // 不得在发布时读取「当时的成员代际」（否则旧工作可能被配上新 token）。
+  uint64_t buildWorkGeneration = 0u;
   {
     std::unique_lock<std::shared_mutex> lock(m_mutex);
     const uint64_t supplementalCandidateCount =
@@ -9368,6 +9706,7 @@ void ShadowValidationRuntime::ensureFrameBuiltForContract(
 
     if (m_buildInProgress) {
       buildWork = m_buildWork;
+      buildWorkGeneration = m_buildWorkGeneration;
       if ((attachmentSupplementalNeedsRebuild ||
            IsSemanticContractStrictlyNewerThanBuild(
                manifest, m_buildPublishRevision, m_buildFrameSerial)) &&
@@ -9386,6 +9725,12 @@ void ShadowValidationRuntime::ensureFrameBuiltForContract(
                                                     std::move(resources),
                                                     std::move(poses),
                                                     std::move(attachments));
+      // 上级要求：开始/替换构建都要更新摘要，并分配新的工作代际。
+      m_buildWorkGeneration = m_buildLifecycle.beginBuild(
+          m_buildWork.get(), m_buildWork->manifest->frameSerial,
+          m_buildWork->manifest->publishRevision);
+      buildWorkGeneration = m_buildWorkGeneration;
+      publishBuildProgressLocked(*m_buildWork, buildWorkGeneration);
       buildWork = m_buildWork;
     }
   }
@@ -9412,12 +9757,22 @@ void ShadowValidationRuntime::ensureFrameBuiltForContract(
           std::chrono::steady_clock::now() - chunkStart)
           .count());
 
+  // 2026-09-17 上级裁定（线程修复方案 B 第二部分）：进度在**短临界区**内以不可变摘要发布；
+  // reader 只读该摘要，构建本身仍不持锁（不把锁持进 buildFrameChunk）。
+  {
+    std::unique_lock<std::shared_mutex> lock(m_mutex);
+    // 上级要求：修改任何对外结果前核验「工作对象 + 固定代际」仍是当前工作。
+    // 该核验在组件内完成（publishIfCurrent），此处不再复制第二套规则。
+    publishBuildProgressLocked(*buildWork, buildWorkGeneration);
+  }
+
   if (buildWork->nextRecordIndex < buildWork->manifest->records.size()) {
     if (buildWork->frame.frameSerial != 0u && !buildWork->frame.draws.empty()) {
       auto partialFrame =
           std::make_shared<ShadowSubmissionFrame>(buildWork->frame);
       std::unique_lock<std::shared_mutex> lock(m_mutex);
-      if (ShouldPreferRenderableSubmissionFrame(partialFrame.get(),
+      if (m_buildLifecycle.isCurrent(buildWork.get(), buildWorkGeneration) &&
+          ShouldPreferRenderableSubmissionFrame(partialFrame.get(),
                                                 m_lastRenderableFrame.get())) {
         m_lastRenderableFrame = std::move(partialFrame);
       }
@@ -9467,6 +9822,11 @@ void ShadowValidationRuntime::ensureFrameBuiltForContract(
       if (!dedupKeys.insert(MakeDrawDedupKey(packet)).second)
         continue;
 
+      if (!SemanticCoreShouldSubmitResolvedPacket(packet,
+                                                  buildWork->stats.resolve)) {
+        continue;
+      }
+
       buildWork->frame.draws.emplace_back(std::move(packet));
       buildWork->stats.supplementalUpperLayerDrawPacketCount++;
     }
@@ -9485,6 +9845,14 @@ void ShadowValidationRuntime::ensureFrameBuiltForContract(
 
   {
     std::unique_lock<std::shared_mutex> lock(m_mutex);
+    // 2026-09-17 上级裁定：**在修改任何对外结果之前**核验它仍是当前工作；
+    // 若不是（已被 Reset 或已被替换为 B），不更新摘要/部分帧/最终帧，也不清除后来的新工作。
+    if (!m_buildLifecycle.isCurrent(buildWork.get(), buildWorkGeneration))
+      return;
+    // 完成时也要更新摘要（先发终值，再结束该代际）；发布必须先于 frame 被 move。
+    publishBuildProgressLocked(*buildWork, buildWorkGeneration);
+    m_buildLifecycle.completeIfCurrent(buildWork.get(), buildWorkGeneration);
+    m_publishedBuildStats = {};
     m_lastBuildDurationUs = buildWork->stats.buildDurationUs;
     m_lastStats = buildWork->stats;
     auto completedFrame =
@@ -9547,6 +9915,9 @@ void ShadowValidationRuntime::reset() {
     m_pendingResources.reset();
     m_pendingPoses.reset();
     m_pendingAttachments.reset();
+    m_buildLifecycle.reset();
+    m_publishedBuildStats = {};
+    m_buildWorkGeneration = 0u;
     m_buildWork.reset();
     m_stalePendingBuildClearedCount = 0;
     m_lastStats = {};
@@ -9572,11 +9943,13 @@ void ShadowValidationRuntime::reset() {
 
 ShadowValidationFrameStats ShadowValidationRuntime::snapshot() const {
   std::shared_lock<std::shared_mutex> lock(m_mutex);
-  if (m_buildInProgress && m_buildWork != nullptr) {
-    ShadowValidationFrameStats stats = m_buildWork->stats;
-    stats.coreDrawPacketCount = m_buildWork->frame.draws.size();
-    stats.drawPacketCount = m_buildWork->frame.draws.size();
-    stats.buildDurationUs = m_buildWork->totalBuildDurationUs;
+  // 2026-09-17 上级裁定：只读锁内发布的不可变进度摘要，**不再读 m_buildWork 的 live 字段**
+  // （构建推进不持锁，读者加锁保护不了它）。
+  if (m_buildInProgress && m_buildLifecycle.hasValues()) {
+    ShadowValidationFrameStats stats = m_publishedBuildStats;
+    stats.coreDrawPacketCount = m_buildLifecycle.values().drawCount;
+    stats.drawPacketCount = m_buildLifecycle.values().drawCount;
+    stats.buildDurationUs = m_buildLifecycle.values().totalBuildDurationUs;
     return stats;
   }
   return m_lastStats;
@@ -9596,11 +9969,13 @@ ShadowValidationBuildState ShadowValidationRuntime::buildStateSnapshot() const {
   state.pendingPublishRevision =
       m_pendingManifest != nullptr ? m_pendingManifest->publishRevision : 0u;
   state.lastBuildDurationUs = m_lastBuildDurationUs;
-  if (m_buildWork != nullptr && m_buildWork->manifest != nullptr) {
-    state.buildCurrentRecordIndex = m_buildWork->nextRecordIndex;
-    state.buildRecordCount = m_buildWork->manifest->records.size();
-    state.buildChunkCount = m_buildWork->chunkCount;
-    state.lastBuildDurationUs = m_buildWork->totalBuildDurationUs;
+  // 2026-09-17 上级裁定：同上，只读已发布的进度摘要。
+  if (m_buildLifecycle.hasValues()) {
+    state.buildCurrentRecordIndex = m_buildLifecycle.values().nextRecordIndex;
+    state.buildRecordCount = m_buildLifecycle.values().recordCount;
+    state.buildChunkCount = m_buildLifecycle.values().chunkCount;
+    state.lastBuildDurationUs =
+        m_buildLifecycle.values().totalBuildDurationUs;
   }
   state.stalePendingBuildClearedCount = m_stalePendingBuildClearedCount;
   return state;

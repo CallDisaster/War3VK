@@ -1,6 +1,10 @@
 #pragma once
+#include "../render/war3_skin_palette_selection.h"
 
 #include "war3_shadow_backend.h"
+#include "war3_shadow_build_lifecycle.h"
+#include "war3_shadow_build_progress.h"
+#include "war3_shadow_build_thread_gate.h"
 #include "war3_shadow_runtime_contract.h"
 
 #include <cstdint>
@@ -114,6 +118,7 @@ struct ShadowDrawPacket {
   ShadowDrawPath path = ShadowDrawPath::Rigid;
   bool usesDynamicMeshPositions = false;
   bool hasRuntimeGroupPalette = false;
+  render::skin::Selection paletteSelection = {};
   bool matrixGroupsUseAveraging = false;
   uint32_t maxVertexGroupSlot = 0;
   uint64_t runtimeGroupPaletteHash = 0;
@@ -210,6 +215,8 @@ struct ShadowResolveStats {
   uint64_t skippedNoPoseAnonymousSubpart = 0;
   uint64_t skippedNoPoseLookupMiss = 0;
   uint64_t skippedNoRuntimeGroupPalette = 0;
+  uint64_t skippedPathBlocker = 0;
+  uint64_t skippedPathBlockerGeometryMarker = 0;
   uint64_t slowestRecordResolveUs = 0;
   uint64_t slowestRecordIndex = 0;
   uint64_t slowestRecordRuntimeModelPtr = 0;
@@ -379,6 +386,18 @@ struct ShadowValidationBuildWork {
   uint64_t chunkCount = 0;
 };
 
+// 2026-09-17 上级裁定（线程修复方案 B 第二部分）：构建进度的安全发布摘要。
+// 构建推进在锁外写 nextRecordIndex/chunkCount/totalBuildDurationUs/stats/frame，
+// 而 snapshot()/buildStateSnapshot() 原先在锁内读同一份 live 字段；只给读者加锁
+// 不能保护不持同一把锁的写者。
+// 上级追加要求：摘要必须**按值发布、无可变别名**、**不新增每块堆分配**，且帧号/发布 revision/
+// 工作代际/统计来自同一次发布，开始/完成/取消/Reset/替换都要更新，旧块不得在 Reset 后发布。
+// 状态机与按值载体见轻量头 war3_shadow_build_progress.h（生产与宿主机测试共用）。
+
+// 2026-09-17 上级裁定（线程修复方案 B 第一部分）：构建推进的所有者判定
+// （enum ShadowBuildAdvanceDecision + DecideShadowBuildAdvance）已抽到轻量头
+// war3_shadow_build_thread_gate.h，语义见该头注释；本头 include 它，对包含者保持可见。
+
 class ShadowValidationRuntime {
 public:
   static ShadowValidationRuntime& instance();
@@ -413,6 +432,13 @@ private:
 
   void clearPendingBuildLocked();
 
+  // 2026-09-17 上级裁定：必须在**持锁**状态下调用；只接受当前代际（旧块不得回写）。
+  void publishBuildProgressLocked(const ShadowValidationBuildWork& work,
+                                  uint64_t generation);
+  // 2026-09-17 上级裁定：**唯一一份**消费权限检查（规则只此一处，避免两套守卫分叉）；
+  // 供 ensureLatestFrameBuilt（入口）与 ensureFrameBuiltForContract（真正的推进入口）共用。
+  bool consumePermissionGranted(bool directEntry);
+
   // Phase 7.87：reader 路径（snapshot*/buildState*/snapshotFrame*）每帧多次。
   mutable std::shared_mutex m_mutex;
   bool m_buildInProgress = false;
@@ -423,6 +449,14 @@ private:
   std::shared_ptr<const ShadowPoseStore> m_pendingPoses;
   std::shared_ptr<const ShadowAttachmentRigidStore> m_pendingAttachments;
   std::shared_ptr<ShadowValidationBuildWork> m_buildWork;
+  // 2026-09-17 上级裁定：reader 只读按值发布的摘要；构建推进不把锁持进构建过程，
+  // 且每块**不新增堆分配**（无 shared_ptr/make_shared）。
+  // 生产共用组件：所有者门 + 按值进度发布 + 工作代际守卫（与宿主机测试同一份实现）。
+  ShadowBuildLifecycle m_buildLifecycle;
+  // 与摘要同一次发布（同一临界区）的统计值。
+  ShadowValidationFrameStats m_publishedBuildStats = {};
+  // 当前构建工作对象的代际（由 m_buildProgress.BeginBuild 分配；旧代际发布被拒）。
+  uint64_t m_buildWorkGeneration = 0u;
   uint64_t m_lastBuildDurationUs = 0;
   uint64_t m_stalePendingBuildClearedCount = 0;
   ShadowValidationFrameStats m_lastStats = {};
@@ -432,5 +466,24 @@ private:
       std::make_shared<ShadowSubmissionFrame>();
   ShadowRendererCore m_core = {};
 };
+
+// 2026-09-16 P0 Gap B：palette 槽位缓存复核计数访问器（实现见 core.cpp）。
+uint64_t QueryPaletteSlotCacheServedAfterConfirmCount();
+uint64_t QueryPaletteSlotCacheRejectedStaleCount();
+uint64_t QueryPaletteSlotCacheProducerSnapshotFallbackCount();
+// 2026-09-17 Gap B 补强访问器（实现见 core.cpp）。
+uint64_t QueryPaletteSlotCacheFrameProofServedCount();
+uint64_t QueryPaletteSlotCacheGroupShortRejectCount();
+uint64_t QueryPaletteSlotCacheBindingFrameStaleRejectCount();
+uint64_t QueryPaletteSlotCacheSlotRangeStaleRejectCount();
+uint64_t QueryPaletteSlotCacheSnapshotFrameStaleRejectCount();
+// 2026-09-17 上级裁定（线程修复方案 B 第一部分）：构建推进边界线程见证访问器。
+// 两个访问器都在本 TU 实现；pre-main-loop 计数不进导出链（仅 off-thread 拒绝数导出）。
+uint64_t QuerySemanticBuildOffThreadRefusedCount();
+// 2026-09-17 上级裁定：所有者未建立（GetMainLoopThreadId()==0）时拒绝推进的计数。
+uint64_t QuerySemanticBuildOwnerUnestablishedRefusedCount();
+// 底层直接推进入口（ensureFrameBuiltForContract）被拒绝的次数：用于证明"直接调用
+// 底层方法也无法绕过所有者门"，与 ensureLatestFrameBuilt 的拒绝分开计数。
+uint64_t QuerySemanticBuildDirectAdvanceRefusedCount();
 
 } // namespace dxvk::war3::shadow
