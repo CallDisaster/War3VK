@@ -42,5 +42,50 @@
 
 ## 状态
 
-本条写入时尚未执行 Git mutation。实际提交、切换、验证与未覆盖门在收尾回执中追加；
-不得把此方案当作已合并证明。v1.22正式配置、独立构建、组合视觉/GPU与发布包仍待完成。
+**本地主树源码整合已完成；不是稳定版本接受或发布。**
+
+## 实际执行回执
+
+- B在新checkpoint分支提交`17ecf66cb97368bf3ff033c5f0061d2f94c33da3`：801个文件、
+  +150268/-3601行，包含此前累积的实现/测试/文档，不是本轮新增的研发量。
+- 创建整合分支指向该commit，并在A执行非强制、不递归子模块、禁止覆盖ignored的switch。
+  当前权威主目录为`E:/Mycode/Source/Repos/War3MapReforge/Core/Base/Graphics/dxvk`；
+  B保留在checkpoint分支，后续不再双树并行写产品源码。
+- 旧A分支仍为`88089cdf90f728e85b91bf45d75002348574b665`；旧B release-integration分支
+  仍为`ae890542d766470d1703f5bea7f5b73636039733`。保留型stash为
+  `7b1a52a8535fcd300f7af51773edc9a2ef1a3616`，未apply/drop；50个实际changed tracked文件
+  与120个untracked文件均核验可恢复（9个untracked仅Git换行规范化，外部ZIP保留原字节）。
+- 切换后2870个index条目与冻结B完全一致；2866个普通文件逐字节核对，995个只存在CRLF/LF
+  规范化差异，其余原字节一致。接着的本回执/入口/发布文档更新单独提交，不改产品代码。
+- A的11542个ignored文件与StormBreaker的2404个文件逐size/SHA不变；子仓HEAD、status、
+  `.git/HEAD/index/index.lock/config`不变。superproject切换后唯一原有dirty为StormBreaker，
+  它是受保护的既有内容，不是未解决的合并冲突；不得据此使用该旧子仓做产品构建。
+- A旧DLL、B内部676 DLL、玩家FAC DLL均不变；玩家FAC为36412825B /
+  `FAC75C10D640F011BA07482B1706E77223756095BCFFCA448046B2FA0289E529`。
+
+### 过程中遇到的真实问题（不隐藏失败）
+
+1. 首次A stash因superproject `.git/index.lock`存在而失败，无A源码变动。确认没有Git进程、
+   该锁为9月16日留下的0字节文件后，仅改名保存为`index.lock.parked-v122-20260920`，未删除。
+   StormBreaker内自己的index.lock完全未触碰。随后stash成功。
+2. 首次stash原字节断言发现Git自动规范化文本换行；用外部ZIP原字节与stash内容逐项比较后，
+   仅允许CRLF→LF这一差异，其它内容仍要求完全一致，未忽略真实内容变化。
+3. 首次完整cached diff空白检查exit2，发现历史未跟踪文档/源码注释/冻结参考夹具中的尾空白和
+   EOF空行。保留其历史字节（参考夹具有SHA合同），不伪报该检查通过；本次新收尾diff另行检查。
+   这是源码checkpoint的已知整理项，不等于C++/测试失败，也不授予发布资格。
+
+### 验证、证据与后续
+
+- A新主目录独立复跑：树整合25、配置20、包审计25、native-light bridge6/transaction18、
+  Stage13 retention4、Render Stats7，合计105项通过。均为定向纯Python/static，不是全量回归。
+- 完整CreateNew回执：`D:/WarVK-Backups/20260920-formal-integration-transaction/`中的
+  `preflight.json`、`staged-index.json`、`stash.json`、`switch-verified.json`；外部A/B备份及旧子仓备份保留。
+- 无新编译、部署、游戏/GPU、push/tag/release。版本资源仍未晋升1.22.00。
+  下一阶段从本地主线commit建立独立clean构建与正确依赖，执行正式配置、组合视觉/GPU、包验收。
+  旧A build32不能因源码已切换就冒充新DLL，旧B内部DLL亦不是正式配置产物。
+
+### 回退入口
+
+保留上述原分支、stash和ZIP。若需恢复旧A工作：先停止当前主树写者、备份之后的新修改，
+再非强制切回`codex/native-shadow-stable-baseline-20260830`并apply指定stash，不能把stash
+apply到v1.22分支。不drop、不prune，不将本说明当作自动回退指令。

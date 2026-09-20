@@ -1,5 +1,9 @@
 # v1.22 主树整合方案（integration-release-r1，只读设计）
 
+> 2026-09-20执行状态：主线程已完成B-primary源码checkpoint及原主目录切换，见
+> [正式执行回执](2026-09-20-formal-main-tree-integration.md)。下文保留r1/r2历史分析，
+> 其中外移StormBreaker再update方案未执行；以回执的原位保护和实际验证为准。
+
 ## 0. 本 batch 边界
 
 - taskId: `integration-release-r1`

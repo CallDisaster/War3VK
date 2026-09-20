@@ -3,6 +3,15 @@
 本账本记录集成候选、验证和未通过项。根 CHANGELOG 的已发布历史保持不变；
 待发布功能原理见 `docs/RELEASE_NOTES_1.22.00_DRAFT.md`，只有最终通过的组合才转为正式日志。
 
+## 2026-09-20 本地主树源码整合完成（非发布）
+
+- 源码checkpoint为17ecf66cb97368bf3ff033c5f0061d2f94c33da3，801文件/+150268/-3601行属于此前累计工作。本次按B-primary审查结果整合，原主目录dxvk已切换到codex/v1.22-main-tree-20260920；不是把旧A全部merge覆盖B，不再在两树继续产品开发。
+- A/B原分支未移动；A stash 7b1a52a8535fcd300f7af51773edc9a2ef1a3616保留、未apply/drop；独立ZIP/HEAD bundle保留。50个changed tracked/120个untracked可恢复，原字节以外部ZIP为准。旧A的Stage13历史测试、image guard及研究资产未丢失，也未混入产品。
+- 2870个index条目相同、2866普通文件验证（995仅CRLF/LF差异）；A11542个ignored与StormBreaker2404个文件逐SHA不变，子仓元数据/HEAD/status不变。唯一既有dirty为StormBreaker，禁止拿其旧dirty或A旧build32编译发布；后续须独立clean依赖/配置。
+- A主目录重跑树25/配置20/包25/native bridge6/native transaction18/Stage13 retention4/Render Stats7，共105项定向Python/static通过，不是全量或实机。DLL/玩家FAC未变，无构建/游戏/部署/push/tag/release。
+- 如实保留两个检查失败：历史0字节superproject index.lock使首次stash失败，核零Git进程后改名保存再成功（嵌套index.lock未动）；cached全量空白exit2暴露旧untracked尾空白/EOF空行，冻结夹具与历史原文未为凑全绿改写。另stash换行差异已用ZIP复核为仅CRLF/LF，不忽略内容差异。
+- 本次收尾只更新入口/文档，稳定根CHANGELOG仍不改。事务与原字节证据见docs/plan/2026-09-20-formal-main-tree-integration.md和D:/WarVK-Backups/20260920-formal-integration-transaction；正式配置/组合视觉GPU/发布包待完成。
+
 ## 2026-09-20 正式本地主树整合开始（主线程独占Git事务）
 
 - 用户明确授权正式合并；按B-primary reviewed checkpoint + A主目录切换执行，保留A/B原分支、A未提交内容与StormBreaker。DSH写者已完成并冻结，额外复核仅只读。
