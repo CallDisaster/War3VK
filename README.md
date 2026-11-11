@@ -4,13 +4,15 @@
 
 WarVK enhances **Warcraft III 1.27a (32-bit)** using a DXVK-derived D3D9-to-Vulkan backend. It adds directional/point shadows, volumetric lighting, local fog, post-processing, diagnostics and a bounded JASS API, without changing map gameplay.
 
-## Changes in 1.22.02 (release candidate)
+## Changes in 1.22.02
 
-- A rebuilt JASS native table now requests a shadow-session reset before new-map producers run; GPU retirement remains on the Present owner. The isolated same-process `ChangeLevel` A→B→A path passed, but menu transitions, D3D9 Reset and prolonged pressure remain release gates.
-- Map authors gain a unit Walk-loop switch and movement-animation Override helpers. The isolated `Hamg` test confirmed requests reached the DLL and automatic Walk reselection was suppressed; other units and full visual behavior remain under review.
-- Persistent shadow geometry publication, live/retired accounting, frame-evidence attribution and screenshot shutdown ownership are hardened. These correctness changes do not imply an FPS gain.
-- **32-bit entry and low-address maintenance candidate.** Large per-thread CurrentDraw/material tables are cold-started, allocation failure is fail-visible and retryable, and the native event hook is installed only after its JASS prerequisites. A restricted isolated Lost Temple run reached a real screenshot and natural exit; this is not x64 renderer migration or player-DLL release approval. See [the 2026-10-24 evidence](docs/research/2026-10-24-mdldata-low-address-repair.md).
-- The unit-model attachment-point world-coordinate API is deferred. Shader API 1.2.0 and JASS wire `warvk:v1` are unchanged.
+- **Startup failures now explain themselves.** Previously a Vulkan start-up failure (or a missing `vulkan-1.dll`) made the game quit silently. WarVK now shows a dialog (Chinese) with the reason, every GPU's model/VRAM/current driver version, the vendor's minimum driver and download page, whether the GPU itself is supported, and "delete d3d9.dll to return to stock". The same text is saved to `WarVK\Log\startup-error.txt`. Warcraft III then shows its own DirectX error and exits; that part is the game's behavior.
+- **Documented GPU floor.** NVIDIA driver **551.61+** (Maxwell/GTX 750 and newer; Kepler unsupported), AMD Adrenalin **24.2.1+** (RX 5000/RDNA and newer, Ryzen 6000+ iGPUs; Polaris/Vega unsupported), Intel **32.0.101.6557+** (Arc, Core Ultra; Iris Xe listed but unverified). Floors come from published extension lists; only one NVIDIA GPU was tested. See `WarVK_GPU_REQUIREMENTS.md` in the player ZIP.
+- **Automatic VRAM preset.** ≤2.5 GB or integrated → low (sun cascade shadow resolution capped at 2048, ~80 MiB instead of ~320 MiB); ≤5.5 GB → medium; otherwise high (unchanged). Override with `VramPreset=low|medium|high` under `[Graphics]` in `WarVK\warvk.ini`. The choice is logged to `WarVK\Log\gpu.txt`.
+- **`WarVK_LockD3D9.cmd` / `WarVK_UnlockD3D9.cmd`** stop game platforms or cleaners from deleting/renaming/replacing `d3d9.dll` (NTFS permissions; loading is unaffected). Unlock before updating.
+- **Memory/stability.** Low-address domain for Storm `MDLDATAHash` arenas (an old out-of-address error); if that optional part fails to install, the base Storm hooks still install. Per-thread CurrentDraw/material tables are allocated on first use (~12.9 → 3.2 MiB per thread). NetEvent installs only after its JASS prerequisites. Same-process map change requests a shadow-session reset (isolated `ChangeLevel` A→B→A only; still restart per map). Persistent shadow geometry publication is transactional. 32-bit fixes found during x64 work (descriptor sync, condition-variable deadline, Vulkan dispatch, ImGui ownership) are included.
+- **Authors.** Unit Walk-loop switch and movement-animation Override helpers. **Weather preview** (12 calls: snowflakes, snow fog, drifting snow), off unless a map calls it; art and per-GPU performance are not accepted yet. Real results via the LocalizedString carrier no longer use exponent notation, which stock `S2R` misread. The experimental map-module loader is **deny-by-default** (requires a local `WarVK\modules\allowed.txt` with name + SHA-256).
+- Not included: the 64-bit render host and its dev options (source stays in the repo), unfinished Water, automatic native-model point lights, unapproved culling experiments. Shader API 1.2.0 and JASS wire `warvk:v1` are unchanged.
 
 ### Earlier 1.22.01 maintenance update
 
@@ -40,7 +42,7 @@ A historical same-DLL, matched isolated 2560×1440 A-B-B-A experiment measured m
 ## Requirements / installation
 
 - Windows 10/11; Warcraft III **1.27a / 32-bit**.
-- A GPU and current official driver supporting **Vulkan 1.3**. Vulkan 1.2 alone is insufficient.
+- A GPU and official driver supporting **Vulkan 1.3** plus the extensions this fork uses: NVIDIA 551.61+, AMD Adrenalin 24.2.1+, Intel 32.0.101.6557+ (see `WarVK_GPU_REQUIREMENTS.md`). If start-up fails, WarVK tells you why and which driver to install.
 - Only verified executable/Game.dll signatures are supported; unknown layouts are not guessed.
 
 1. Fully exit Warcraft III and the editor; back up any existing `d3d9.dll` separately.
@@ -65,13 +67,14 @@ The separate **author-kit** ZIP contains JASS/YDWE integration, not a runtime DL
 - **Restart the game for every map.** Same-process map changes remain outside release validation ([#6](https://github.com/CallDisaster/War3VK/issues/6)).
 - Finite budgets can still reject genuinely excessive active working sets. Incomplete candidates must not replace complete shadow maps.
 - Issue #8 fixes have code/input and stage-specific player evidence, not proof that all intermittent shadows or historical crashes are solved.
+- Launching with `-opengl` (some map tools/launchers force it) means Warcraft III never loads `d3d9.dll`, so WarVK is inactive.
 - Worst-case 1440p/4K Froxel requests may safely fall back to Legacy. Fine foliage and point-shadow surfaces can still need map-specific assessment.
 - Not every JASS wrapper is implemented or exhaustively runtime-tested. Check capability/error results and [author notes](WarVK/README.md).
 - **Excluded:** unfinished Water-branch changes, automatic native-model point-light takeover, the 64-bit renderer and unapproved culling/Consume experiments. Existing explicit author-created point lights remain supported.
 
 ## Reports and rollback
 
-Include map name, fresh-process/map-change sequence, settings, screenshots and performance HTML when available. Logs, runtime status and GPU/crash reports help; remove private data before publishing. Heavy evidence is not required for normal play.
+If the game does not start, attach `WarVK\Log\startup-error.txt`. Otherwise include map name, fresh-process/map-change sequence, settings, screenshots and performance HTML when available. Logs, runtime status and GPU/crash reports help; remove private data before publishing. Heavy evidence is not required for normal play.
 
 Fully exit before restoring the backed-up DLL. To uninstall, remove WarVK's DLL; logs can be managed separately.
 
