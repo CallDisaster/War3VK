@@ -1052,9 +1052,17 @@ bool StormHook_Install() {
   bindings[3].original = reinterpret_cast<LPVOID *>(&g_origReAlloc);
 
   StormNativeSmallRepairHookDesc repair = {}, lowDomain = {};
-  if (!StormLowDomain_Prepare(hStorm, &lowDomain) ||
-      !StormNativeSmallRepair_Prepare(hStorm, &repair))
+  if (!StormNativeSmallRepair_Prepare(hStorm, &repair))
     return false;
+  // MDLDATA 低地址域是 1.22.02 新增的附加修复。它准备不了（例如 Game.dll
+  // 不在低地址、页大小不符）时只放弃它自己，仍然安装 1.22.01 起就有的
+  // TLSF 大块 Hook，不能因为附加项失败把基础保护一起丢掉。
+  const bool lowDomainReady = StormLowDomain_Prepare(hStorm, &lowDomain);
+  if (!lowDomainReady) {
+    lowDomain = {};
+    StormLowDomain_Disable();
+    war3dbg::Print("DXVK Storm MDLDATA: low-address domain unavailable; base Storm hooks continue\n");
+  }
 
   // 只在全部只读身份/前导字节检查通过后发布兼容信号，避免 standalone
   // 因一次尚未具备安装条件的 DXVK 尝试而提前退出。
@@ -1064,7 +1072,7 @@ bool StormHook_Install() {
   // event 只能通知尚未越过 OpenEvent 检查的旧 standalone。发布后再做一次
   // 精确前导字节核验，把检查窗口内已经修改目标的并发安装拒绝掉。
   if (!VerifyStorm127a(hStorm, bindings) ||
-      !StormLowDomain_Prepare(hStorm, &lowDomain) ||
+      (lowDomainReady && !StormLowDomain_Prepare(hStorm, &lowDomain)) ||
       !StormNativeSmallRepair_Prepare(hStorm, &repair)) {
     war3dbg::Print(
         "DXVK War3[StormHook]: 兼容信号发布后目标前导字节发生漂移，拒绝双重 Hook\n");
@@ -1089,15 +1097,22 @@ bool StormHook_Install() {
   }
 
   if (!StormLowDomain_PublishImport()) {
-    if (StormLowDomain_RollbackImport()) {
-      ReleaseIntegrationSignal();
-    } else {
+    if (!StormLowDomain_RollbackImport()) {
       g_redirectEnabled.store(false, std::memory_order_release);
       g_installHealthy.store(false, std::memory_order_release);
       g_installed.store(true, std::memory_order_release);
       war3dbg::Print("DXVK Storm MDLDATA: import rollback unproven; resident pass-through, reinstall refused\n");
+      return false;
     }
-    return false;
+    // 导入槽已证明恢复原值（例如 Storm 尚未初始化、目标锁正忙、已有高地址
+    // arena）：只放弃低地址域及其 Create Hook，继续安装基础 Hook。
+    StormLowDomain_Disable();
+    if (lowDomain.target) {
+      --bindingCount;  // 低地址域的 binding 总是最后追加的一项
+      bindings[bindingCount] = {};
+      lowDomain = {};
+    }
+    war3dbg::Print("DXVK Storm MDLDATA: import publication refused; low-address domain off, base Storm hooks continue\n");
   }
 
   g_redirectEnabled.store(false, std::memory_order_release);

@@ -127,7 +127,8 @@ module.load
   → 解析字节：warvk_modules\<name>.dll（MPQ，地图导入）→ WarVK\modules\<name>.dll → <name>.dll
   → PE 校验：MZ / PE\0\0 / Machine=0x14C / IMAGE_FILE_DLL / ≤ 64 MiB
   → 策略：WarVK\modules\allowed.txt 逐行 "<name> <sha256>"
-          文件不存在 = 开发模式（放行 + 告警）；存在则必须命中
+          文件不存在 = 拒绝（v1.22.02 起；只有进程环境变量
+          DXVK_WAR3_MODULE_DEV_MODE=1 时才放行 + 告警）；存在则必须命中
   → 写 %TEMP%\wvkmod_<name>_<pid>_<tick>.dll
   → LoadLibraryExW(绝对路径, LOAD_WITH_ALTERED_SEARCH_PATH)
   → GetProcAddress("WarVKModuleInit") → 调用 → 校验描述

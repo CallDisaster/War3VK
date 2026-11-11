@@ -16,6 +16,10 @@ bool StormLowDomain_PublishImport();
 void StormLowDomain_ActivateAfterBatch();
 bool StormLowDomain_RollbackImport();
 bool StormLowDomain_IsRequested();
+// Give up only the optional low-address domain (prepare or import publication
+// failed and the import slot is proven restored). The base Storm hooks still
+// install; ActivateAfterBatch then leaves the domain disabled.
+void StormLowDomain_Disable();
 // Preserve the native arena as owner even for target allocations large enough
 // for TLSF. Otherwise a later realloc with a different source could lose the
 // domain when downgrading/falling back from a source-less managed header.

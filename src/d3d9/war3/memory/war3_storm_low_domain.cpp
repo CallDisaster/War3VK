@@ -214,6 +214,11 @@ bool StormLowDomain_RollbackImport() {
   return restored && (old==reinterpret_cast<void*>(LowVirtualAlloc) || old==reinterpret_cast<void*>(g_alloc));
 }
 bool StormLowDomain_IsRequested() { return g_requested; }
+void StormLowDomain_Disable() {
+  g_enabled.store(false,std::memory_order_release);
+  g_requested = false;
+  ReleaseInstallLock();
+}
 bool StormLowDomain_RequiresNativeAllocation(const char* source, int32_t line) noexcept {
   return g_enabled.load(std::memory_order_relaxed) && Selected(source, line, kHeap);
 }

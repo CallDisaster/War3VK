@@ -310,17 +310,31 @@ std::wstring GameDirectory() {
 }
 
 // 允许清单：<游戏目录>\WarVK\modules\allowed.txt
-// 每行 "<模块名> <sha256>"；文件不存在表示开发模式（放行并告警）。
+// 每行 "<模块名> <sha256>"。
+//
+// 地图可以从任何地方下载，所以没有允许清单时默认拒绝；否则任何地图都能
+// 让 WarVK 加载并执行它自带的 DLL。本地开发可设置环境变量
+// DXVK_WAR3_MODULE_DEV_MODE=1 放行（地图脚本改不了进程环境变量）。
+bool ModuleDevModeRequested() {
+  char value[4] = {};
+  const DWORD n = ::GetEnvironmentVariableA("DXVK_WAR3_MODULE_DEV_MODE", value, sizeof(value));
+  return n == 1 && value[0] == '1';
+}
+
 bool PassesPolicy(const std::string& name, const std::vector<uint8_t>& data) {
   const std::wstring path = GameDirectory() + L"\\WarVK\\modules\\allowed.txt";
   std::ifstream in(path.c_str());
   if (!in.is_open()) {
-    if (!g_policyWarned) {
-      g_policyWarned = true;
-      HostLog(nullptr, 1,
-              "未找到 WarVK\\modules\\allowed.txt，模块加载处于开发模式（不做完整性校验）");
+    if (ModuleDevModeRequested()) {
+      if (!g_policyWarned) {
+        g_policyWarned = true;
+        HostLog(nullptr, 1,
+                "DXVK_WAR3_MODULE_DEV_MODE=1 且未找到 allowed.txt：模块加载处于开发模式（不做完整性校验）");
+      }
+      return true;
     }
-    return true;
+    SetError("模块加载默认关闭：需要在 WarVK\\modules\\allowed.txt 中写入模块名和 SHA-256: " + name);
+    return false;
   }
 
   std::string digest;
