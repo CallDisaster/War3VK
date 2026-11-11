@@ -126,7 +126,7 @@ struct CurrentDrawGeometryLedgerEntry {
 // Keep the exact per-thread ownership/capacity and slot mapping. Large static
 // PE TLS arrays were copied for every game/driver worker, even workers that
 // never enter CurrentDraw. Only a thread using a table now owns its backing.
-thread_local memory::LazyThreadArray<CurrentDrawContractRecord, kContractCacheSize>
+thread_local memory::ThreadLocalLazyArray<CurrentDrawContractRecord, kContractCacheSize>
     g_currentDrawContractCache = {};
 // Direct-mapped cache slots are sparse in normal scenes. Snapshot used to walk
 // all 4096 large records every frame; retain an exact TLS occupancy bitmap so
@@ -134,7 +134,7 @@ thread_local memory::LazyThreadArray<CurrentDrawContractRecord, kContractCacheSi
 // order (and therefore the historical dedupe/tie order).
 thread_local std::array<uint64_t, kContractCacheOccupancyWordCount>
     g_currentDrawContractCacheOccupancy = {};
-thread_local memory::LazyThreadArray<PaletteSnapshotEntry, kPaletteSnapshotCacheSize>
+thread_local memory::ThreadLocalLazyArray<PaletteSnapshotEntry, kPaletteSnapshotCacheSize>
     g_paletteSnapshotCache = {};
 thread_local std::array<CurrentDrawPreparedSliceRecord,
                         kPreparedSliceCacheSize>
@@ -149,7 +149,7 @@ thread_local std::array<CurrentDrawPreparedSliceRecord,
 thread_local std::array<CurrentDrawPreparedSliceInterest,
                         kPreparedSliceInterestCacheSize>
     g_preparedSliceInterestCache = {};
-thread_local memory::LazyThreadArray<CurrentDrawGeometryLedgerEntry,
+thread_local memory::ThreadLocalLazyArray<CurrentDrawGeometryLedgerEntry,
                         kGeometryContractLedgerSize>
     g_currentDrawGeometryLedger = {};
 thread_local CurrentDrawContractRecord g_globalFallbackRecord = {};

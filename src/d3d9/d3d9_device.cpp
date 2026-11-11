@@ -4607,7 +4607,7 @@ War3BuildShadowMaterialSignatureCached(
 
   // Preserve this thread's 16384 entries and epoch/key rules, without making
   // Windows copy a 1.75 MiB material table into every unrelated worker's TLS.
-  static thread_local war3::memory::LazyThreadArray<CacheEntry, 16384> s_cache;
+  static thread_local war3::memory::ThreadLocalLazyArray<CacheEntry, 16384> s_cache;
   auto* storage = s_cache.try_get();
   if (!storage) {
     // This cache is optional. Failed first backing allocation must neither

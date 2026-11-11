@@ -27,7 +27,7 @@ assert "ShadowModelResourceCache::instance().mapEpoch()" in cache
 
 # The canonical resolver does not consume the draw-local layerState view.
 # A fallback signature does consume it, so it must retain exact matching.
-hash_end = cache.index("static thread_local war3::memory::LazyThreadArray<CacheEntry, 16384>")
+hash_end = cache.index("static thread_local war3::memory::ThreadLocalLazyArray<CacheEntry, 16384>")
 hash_setup = cache[:hash_end]
 assert "fnv1a_iter(hash, reinterpret_cast<uintptr_t>(renderable.layerState))" not in hash_setup
 assert "entry.signature.layerContractResolved ||" in cache

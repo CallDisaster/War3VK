@@ -483,7 +483,7 @@ def fixture() -> tuple[str, dict]:
     ):
         extracted[name] = block(text, prefix, semicolon=True)
     for name in OWNERS:
-        extracted[name] = statement(cpp, rf"^thread_local\s+memory::LazyThreadArray<[^;]+?\s+{name}\s*=\s*\{{\}};")
+        extracted[name] = statement(cpp, rf"^thread_local\s+memory::ThreadLocalLazyArray<[^;]+?\s+{name}\s*=\s*\{{\}};")
     for prefix in FUNCTIONS:
         extracted[prefix] = block(cpp, prefix)
     record = mask_noncode(extracted["CurrentDrawContractRecord"])

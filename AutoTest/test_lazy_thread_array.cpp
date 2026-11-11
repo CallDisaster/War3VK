@@ -2,6 +2,7 @@
 // C++17, standard library only; caller supplies the existing process timeout.
 #include "../src/d3d9/war3/memory/war3_lazy_thread_array.h"
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -19,10 +20,11 @@ static thread_local unsigned allocations = 0;
 static thread_local unsigned deallocations = 0;
 static thread_local bool failNextAllocation = false;
 static thread_local unsigned failAllocationOrdinal = 0;
-// The watched pointer is trivially destructible TLS. It remains available when
-// the thread_local owning array's destructor returns its backing allocation.
-// Count that exact pointer, not unrelated std::thread/CRT housekeeping.
-static thread_local void* watchedDelete = nullptr;
+// Watched backing pointers live in ordinary (non-TLS) storage: under GCC's
+// emulated TLS a std::thread's TLS blocks are already freed when its backing is
+// returned at thread exit. Count those exact pointers, not unrelated
+// std::thread/CRT housekeeping.
+static std::array<std::atomic<void*>, 8> watchedDelete{};
 static std::atomic<unsigned> watchedDeletions{0};
 
 void* operator new(std::size_t bytes) {
@@ -39,9 +41,12 @@ void* operator new(std::size_t bytes) {
 void operator delete(void* pointer) noexcept {
   if (pointer) {
     ++deallocations;
-    if (pointer == watchedDelete) {
-      watchedDelete = nullptr;
-      watchedDeletions.fetch_add(1, std::memory_order_relaxed);
+    for (auto& watched : watchedDelete) {
+      void* expected = pointer;
+      if (watched.compare_exchange_strong(expected, nullptr)) {
+        watchedDeletions.fetch_add(1, std::memory_order_relaxed);
+        break;
+      }
     }
   }
   std::free(pointer);
@@ -68,6 +73,12 @@ static_assert(!std::is_move_constructible<Values>::value, "owner must not move")
 static_assert(!std::is_move_assignable<Values>::value, "owner must not move assign");
 static_assert(std::is_nothrow_default_constructible<Values>::value, "cold construction cannot throw");
 static_assert(std::is_nothrow_destructible<Values>::value, "owner destruction cannot throw");
+using TlsValues = memory::ThreadLocalLazyArray<uint32_t, 1024>;
+static_assert(std::is_trivially_destructible<TlsValues>::value,
+              "thread_local owner must not depend on TLS destructor order");
+static_assert(!std::is_copy_constructible<TlsValues>::value, "TLS owner must not copy");
+static_assert(!std::is_move_constructible<TlsValues>::value, "TLS owner must not move");
+static_assert(std::is_nothrow_default_constructible<TlsValues>::value, "TLS cold construction cannot throw");
 static_assert(Values::size() == 1024 && Values::capacity() == 1024, "capacity unchanged");
 static_assert(sizeof(Values) == sizeof(void*), "cold TLS is one owning pointer");
 static_assert(noexcept(std::declval<Values&>().peek()), "mutable inspection cannot throw");
@@ -364,6 +375,10 @@ static void DestructionAndEmptyCapacity() {
 }
 
 static void ThreadOwnershipAndExit() {
+  // thread_local owners use ThreadLocalLazyArray. GCC/mingw emulated TLS frees
+  // a thread's TLS blocks before __cxa_thread_atexit destructors run, so the
+  // backing is released by the per-thread FLS callback instead. FLS callbacks
+  // run before DLL_THREAD_DETACH, while this file's emutls counters are valid.
   Tracked::live = Tracked::constructed = Tracked::destroyed = 0;
   constexpr unsigned count = 4;
   const unsigned deletedBefore = watchedDeletions.load();
@@ -374,14 +389,15 @@ static void ThreadOwnershipAndExit() {
   for (unsigned i = 0; i < count; ++i) {
     threads[i] = std::thread([&, i] {
       const unsigned cold = allocations;
-      thread_local memory::LazyThreadArray<Tracked, 16> cache;
+      thread_local memory::ThreadLocalLazyArray<Tracked, 16> cache;
       CHECK(!cache.peek());
       if (auto* array = cache.peek()) (*array)[0].value = 123;
       CHECK(allocations == cold);
       auto& array = cache.get();
+      // The FLS registry is a process-heap block, not a C++ allocation.
       CHECK(allocations == cold + 1);
-      CHECK(watchedDelete == nullptr);
-      watchedDelete = &array;
+      CHECK(watchedDelete[i].load() == nullptr);
+      watchedDelete[i].store(&array);
       array[0].value = i + 1;
       addresses[i] = &array;
       const unsigned warm = allocations;
@@ -402,6 +418,34 @@ static void ThreadOwnershipAndExit() {
   CHECK(watchedDeletions.load() == deletedBefore + count);
 }
 
+static void ThreadLocalFailureAndSeveralTables() {
+  Tracked::live = Tracked::constructed = Tracked::destroyed = 0;
+  std::thread([] {
+    thread_local memory::ThreadLocalLazyArray<Tracked, 8> first;
+    thread_local memory::ThreadLocalLazyArray<Tracked, 4> second;
+    thread_local memory::ThreadLocalLazyArray<Tracked, 4> third;
+    // Backing allocation refused twice: no partial publication, no registry
+    // entry consumed, and retry succeeds with exactly one allocation.
+    failNextAllocation = true;
+    CHECK(first.try_get() == nullptr && !first.peek());
+    CHECK(Tracked::live == 0);
+    failNextAllocation = true;
+    CHECK(first.try_get() == nullptr && !first.peek());
+    CHECK(Tracked::live == 0);
+    const unsigned beforeRetry = allocations;
+    auto* a = first.try_get();
+    CHECK(allocations == beforeRetry + 1);
+    CHECK(a != nullptr && first.peek() == a && Tracked::live == 8);
+    CHECK(second.try_get() != nullptr && Tracked::live == 12);
+    CHECK(memory::TryPrepareThreadArrays(first, second, third));
+    CHECK(Tracked::live == 16);
+    const unsigned warm = allocations;
+    CHECK(first.try_get() == a && allocations == warm);
+  }).join();
+  // All three backings were returned by the single FLS callback.
+  CHECK(Tracked::live == 0 && Tracked::destroyed == 16);
+}
+
 int main() {
   ColdWarmAndReset();
   EveryAccessInitializes();
@@ -411,6 +455,7 @@ int main() {
   ThreeTableStoragePreflight();
   DestructionAndEmptyCapacity();
   ThreadOwnershipAndExit();
+  ThreadLocalFailureAndSeveralTables();
   std::printf("RESULT {\"checks\":%u,\"failures\":%u,\"ok\":%s}\n",
       checks.load(), failures.load(), failures.load() ? "false" : "true");
   return failures.load() ? 1 : 0;
