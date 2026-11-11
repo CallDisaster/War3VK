@@ -56,6 +56,7 @@ constexpr uint64_t kRawcode = 0x6831ull;      // 'h1' 形状的 rawcode 占位�
 constexpr uint64_t kMapEpoch = 0x0Bull;       // 生产侧来自 draw.mapEpoch / resource.mapEpoch
 constexpr uint64_t kDeviceEpoch = 0x5A5Aull;  // 仅 A/B/C 的强身份场景显式给出（epochUnknown=false）
 constexpr uint64_t kRecordFrameSerialBase = 0x100000000ull;  // 刻意跨 32 位，检验 lo/hi 拆分
+constexpr uint64_t kTestAttemptSerial = 0xFEDCBA9876543210ull; // v5 全宽 u64，不能经有符号/浮点截断
 // 2026-09-17 上级裁定 ⑦：**已认证**路径必须保持可执行。三个生产采集点一律
 // lifecycleIdentity=0 + identityWeak=true + epochUnknown=true（生产**不可达**认证），
 // 因此认证只能在**合成键**上覆盖：A/F 场景显式给出非零实例生命周期身份 + 两个强标记为假。
@@ -68,10 +69,11 @@ constexpr uint64_t kServedFrame = 503ull;
 constexpr uint64_t kEnqueuedFrame = 504ull;
 constexpr uint64_t kDrawnFrame = 505ull;
 
-PaletteObjectFrames FramesAt(uint64_t renderFrame) {
+PaletteObjectFrames FramesAt(uint64_t renderFrame, uint64_t attemptSerial = kTestAttemptSerial) {
   // 生产真实口径：manifest 帧号 / 发布 revision 当场不可得 ⇒ 0 + manifestUnknown=true；
   // native 帧号当场不可得 ⇒ 0 + nativeUnknown=true；record 帧号是当场已读到的局部值。
-  return MakePaletteObjectFrames(renderFrame, kRecordFrameSerialBase + renderFrame, 0u, false);
+  return MakePaletteObjectFrames(renderFrame, kRecordFrameSerialBase + renderFrame,
+                                 0u, false, attemptSerial);
 }
 
 PaletteObjectKey MakeKey(uint64_t session, bool identityWeak, uint64_t lifecycleIdentity) {
@@ -187,9 +189,9 @@ void RecordCertifiedShape(uint64_t session, bool identityWeak, uint64_t lifecycl
   recorder.NoteReject(key, PaletteObjectRejectReason::R1, FramesAt(kRejectFrame));
   // 来源必须是**生产可达**值（审计卫生点）：S 点 switch 只可能给出
   // DrawTimeCaptured / ArenaSlot / OwnedPartSnapshot / PoseKernel / Unknown（override 时 None）。
-  recorder.NoteServed(key, PaletteObjectSource::ArenaSlot, 0xA1ull,
+  recorder.NoteServed(key, PaletteObjectSource::DrawTimeCaptured, 0xC3ull,
                       FramesAt(kServedFrame));
-  recorder.NoteEnqueued(key, PaletteObjectSource::ArenaSlot, 0xB2ull,
+  recorder.NoteEnqueued(key, PaletteObjectSource::DrawTimeCaptured, 0xC3ull,
                         FramesAt(kEnqueuedFrame), false);
   recorder.NoteDrawn(key, PaletteObjectSource::DrawTimeCaptured, 0xC3ull,
                      FramesAt(kDrawnFrame), false);
@@ -238,6 +240,106 @@ void ScenarioG(const ScenarioIO& io) {
   recorder.NoteFirstSight(key, FramesAt(kRejectFrame));
   recorder.NoteEnqueued(key, PaletteObjectSource::ArenaSlot, 0xB2ull,
                         FramesAt(kEnqueuedFrame), false);
+}
+
+// v5 反例全部通过真实记录器/导出，不修改 JSON 或伪造 Recovered 终态。
+void ScenarioH(const ScenarioIO& io) { // S 属于 A，E/D 属于 B：不得拼链
+  const PaletteObjectKey key = MakeKey(io.session, false, kCertifiedLifecycleIdentity);
+  auto& recorder = PaletteObjectRecorder();
+  recorder.NoteReject(key, PaletteObjectRejectReason::R1, FramesAt(kRejectFrame));
+  recorder.NoteServed(key, PaletteObjectSource::DrawTimeCaptured, 0xC3ull, FramesAt(kServedFrame));
+  recorder.NoteEnqueued(key, PaletteObjectSource::DrawTimeCaptured, 0xC3ull,
+                        FramesAt(kEnqueuedFrame, kTestAttemptSerial + 1u), false);
+  recorder.NoteDrawn(key, PaletteObjectSource::DrawTimeCaptured, 0xC3ull,
+                     FramesAt(kDrawnFrame, kTestAttemptSerial + 1u), false);
+}
+
+void ScenarioI(const ScenarioIO& io) { // D 的 attempt 未知：不能沿用先前 S/E
+  const PaletteObjectKey key = MakeKey(io.session, false, kCertifiedLifecycleIdentity);
+  auto& recorder = PaletteObjectRecorder();
+  recorder.NoteReject(key, PaletteObjectRejectReason::R1, FramesAt(kRejectFrame));
+  recorder.NoteServed(key, PaletteObjectSource::DrawTimeCaptured, 0xC3ull, FramesAt(kServedFrame));
+  recorder.NoteEnqueued(key, PaletteObjectSource::DrawTimeCaptured, 0xC3ull,
+                        FramesAt(kEnqueuedFrame), false);
+  recorder.NoteDrawn(key, PaletteObjectSource::DrawTimeCaptured, 0xC3ull,
+                     FramesAt(kDrawnFrame, ~0ull), false);
+}
+
+void ScenarioJ(const ScenarioIO& io) { // 同 attempt 同 hit，但 D 换来源
+  const PaletteObjectKey key = MakeKey(io.session, false, kCertifiedLifecycleIdentity);
+  auto& recorder = PaletteObjectRecorder();
+  recorder.NoteReject(key, PaletteObjectRejectReason::R1, FramesAt(kRejectFrame));
+  recorder.NoteServed(key, PaletteObjectSource::DrawTimeCaptured, 0xC3ull, FramesAt(kServedFrame));
+  recorder.NoteEnqueued(key, PaletteObjectSource::DrawTimeCaptured, 0xC3ull,
+                        FramesAt(kEnqueuedFrame), false);
+  recorder.NoteDrawn(key, PaletteObjectSource::OwnedPartSnapshot, 0xC3ull,
+                     FramesAt(kDrawnFrame), false);
+}
+
+void ScenarioK(const ScenarioIO& io) { // 两轮完整且明确区分的尝试仍合法
+  RecordCertifiedShape(io.session, false, kCertifiedLifecycleIdentity, false);
+  const PaletteObjectKey key = MakeKey(io.session, false, kCertifiedLifecycleIdentity);
+  auto& recorder = PaletteObjectRecorder();
+  const uint64_t retry = kTestAttemptSerial + 1u;
+  recorder.NoteReject(key, PaletteObjectRejectReason::R1, FramesAt(510u, retry));
+  recorder.NoteServed(key, PaletteObjectSource::DrawTimeCaptured, 0xC3ull, FramesAt(511u, retry));
+  recorder.NoteEnqueued(key, PaletteObjectSource::DrawTimeCaptured, 0xC3ull,
+                        FramesAt(512u, retry), false);
+  recorder.NoteDrawn(key, PaletteObjectSource::DrawTimeCaptured, 0xC3ull,
+                     FramesAt(513u, retry), false);
+}
+
+void ScenarioL(const ScenarioIO& io) { // attempt 0 是已知值，不是 unknown
+  const PaletteObjectKey key = MakeKey(io.session, false, kCertifiedLifecycleIdentity);
+  auto& recorder = PaletteObjectRecorder();
+  recorder.NoteReject(key, PaletteObjectRejectReason::R1, FramesAt(kRejectFrame, 0u));
+  recorder.NoteServed(key, PaletteObjectSource::DrawTimeCaptured, 0xC3ull,
+                      FramesAt(kServedFrame, 0u));
+  recorder.NoteEnqueued(key, PaletteObjectSource::DrawTimeCaptured, 0xC3ull,
+                        FramesAt(kEnqueuedFrame, 0u), false);
+  recorder.NoteDrawn(key, PaletteObjectSource::DrawTimeCaptured, 0xC3ull,
+                     FramesAt(kDrawnFrame, 0u), false);
+}
+
+void RecordCompleteSecondAttempt(const PaletteObjectKey& key) {
+  auto& recorder = PaletteObjectRecorder();
+  const uint64_t retry = kTestAttemptSerial + 1u;
+  recorder.NoteReject(key, PaletteObjectRejectReason::R1, FramesAt(510u, retry));
+  recorder.NoteServed(key, PaletteObjectSource::DrawTimeCaptured, 0xC3ull, FramesAt(511u, retry));
+  recorder.NoteEnqueued(key, PaletteObjectSource::DrawTimeCaptured, 0xC3ull,
+                        FramesAt(512u, retry), false);
+  recorder.NoteDrawn(key, PaletteObjectSource::DrawTimeCaptured, 0xC3ull,
+                     FramesAt(513u, retry), false);
+}
+
+void ScenarioM(const ScenarioIO& io) { // 旧 A 缺 S，但完整 B 必须可独立认证
+  const PaletteObjectKey key = MakeKey(io.session, false, kCertifiedLifecycleIdentity);
+  auto& recorder = PaletteObjectRecorder();
+  recorder.NoteReject(key, PaletteObjectRejectReason::R1, FramesAt(kRejectFrame));
+  recorder.NoteEnqueued(key, PaletteObjectSource::DrawTimeCaptured, 0xC3ull,
+                        FramesAt(kEnqueuedFrame), false);
+  RecordCompleteSecondAttempt(key);
+}
+
+void ScenarioN(const ScenarioIO& io) { // 旧 A 缺 E，旧 D 无 submit 见证不能污染完整 B
+  const PaletteObjectKey key = MakeKey(io.session, false, kCertifiedLifecycleIdentity);
+  auto& recorder = PaletteObjectRecorder();
+  recorder.NoteReject(key, PaletteObjectRejectReason::R1, FramesAt(kRejectFrame));
+  recorder.NoteServed(key, PaletteObjectSource::DrawTimeCaptured, 0xC3ull, FramesAt(kServedFrame));
+  recorder.NoteDrawn(key, PaletteObjectSource::DrawTimeCaptured, 0xC3ull,
+                     FramesAt(kDrawnFrame), false);
+  RecordCompleteSecondAttempt(key);
+}
+
+void ScenarioO(const ScenarioIO& io) { // 同 A 真正 E→S 降秩：完整 B 不能洗掉历史违规
+  const PaletteObjectKey key = MakeKey(io.session, false, kCertifiedLifecycleIdentity);
+  auto& recorder = PaletteObjectRecorder();
+  recorder.NoteReject(key, PaletteObjectRejectReason::R1, FramesAt(500u));
+  recorder.NoteServed(key, PaletteObjectSource::DrawTimeCaptured, 0xC3ull, FramesAt(501u));
+  recorder.NoteEnqueued(key, PaletteObjectSource::DrawTimeCaptured, 0xC3ull,
+                        FramesAt(502u), false);
+  recorder.NoteServed(key, PaletteObjectSource::DrawTimeCaptured, 0xC3ull, FramesAt(503u));
+  RecordCompleteSecondAttempt(key);
 }
 
 // ---------------------------------------------------------------------------
@@ -322,8 +424,8 @@ void ConcurrencyWriter(const ScenarioIO* io, ConcurrencyPlan* plan, unsigned thr
     const uint64_t base = kConcurrencyFrameBase + uint64_t(threadIndex) * 100000ull +
                           uint64_t(k) * 4ull;
     recorder.NoteReject(key, PaletteObjectRejectReason::R1, FramesAt(base));
-    recorder.NoteServed(key, PaletteObjectSource::ArenaSlot, 0xA1ull + k, FramesAt(base + 1ull));
-    recorder.NoteEnqueued(key, PaletteObjectSource::ArenaSlot, 0xB2ull + k,
+    recorder.NoteServed(key, PaletteObjectSource::DrawTimeCaptured, 0xC3ull + k, FramesAt(base + 1ull));
+    recorder.NoteEnqueued(key, PaletteObjectSource::DrawTimeCaptured, 0xC3ull + k,
                           FramesAt(base + 2ull), false);
     recorder.NoteDrawn(key, PaletteObjectSource::DrawTimeCaptured, 0xC3ull + k,
                        FramesAt(base + 3ull), false);
@@ -508,6 +610,8 @@ void RunEncoderUnitChecks() {
   record.frames.manifestPublishRevision = 0x40000000Bull;  // 跨 32 位：bits[26]/[27]
   record.frames.recordFrameSerial = 0x300000009ull;        // 跨 32 位：bits[24]/[25]
   record.frames.nativeFrameTag = 0x200000007ull;           // 跨 32 位：bits[21]/[32]
+  record.frames.attemptSerial = kTestAttemptSerial;
+  record.chainType = PaletteObjectChainType::Observation; // 非零载荷验证既有 v4 槽
   record.frames.manifestUnknown = true;
   record.frames.nativeUnknown = true;
   record.hitKey = 0xAAAAull;
@@ -542,8 +646,10 @@ void RunEncoderUnitChecks() {
   // 2026-09-17 D2（版本 2 声明的语义，取代旧的"data[3] 必须为 0"保留位断言）：
   expect(out.data[3] == record.windowSegment,
          "data[3] windowSegment (declared v2 carrier, full u64)");
-  for (unsigned i = 4u; i <= 8u; ++i)
-    expect(out.data[i] == 0u, "data[4..8] reserved must stay zero");
+  expect(out.data[4] == uint64_t(record.chainType), "data[4] chainType (declared v4 carrier)");
+  expect(out.data[5] == record.frames.attemptSerial, "data[5] attemptSerial (declared v5 carrier, full u64)");
+  for (unsigned i = 6u; i <= 8u; ++i)
+    expect(out.data[i] == 0u, "data[6..8] reserved must stay zero");
   expect(out.data[9] == record.frames.manifestFrameSerial, "data[9] manifestFrameSerial");
   expect(out.data[10] == uint64_t(record.source), "data[10] source");
   expect(out.data[11] == record.hitKey, "data[11] hitKey");
@@ -646,8 +752,16 @@ int main() {
     RunScenario("D", &ScenarioD, 256u);  // 空样本（子门开启）
     RunScenario("E", &ScenarioE, kConcurrencyCapacity, true);  // 并发所有者协议（环由控制线程冻结）
     RunAutoFreezeScenario("F", &ScenarioF, 256u);  // post-window 自动冻结（无 Control(freeze)）
-  // G 必须排在最后：A..F 的序号被外部驱动的钉死值（session 世代等）依赖，插入中间会移动它们。
-  RunScenario("G", &ScenarioG, 256u);  // 正常观察链（生产入口 NoteFirstSight）=> 必须导出为 version 3
+    // 新场景追加在 G 后，保留 A..G 的既有 session 世代。
+    RunScenario("G", &ScenarioG, 256u);  // 正常观察链同样使用当前 v5 导出
+    RunScenario("H", &ScenarioH, 256u);  // 跨 attempt 假恢复
+    RunScenario("I", &ScenarioI, 256u);  // unknown D
+    RunScenario("J", &ScenarioJ, 256u);  // 来源不匹配
+    RunScenario("K", &ScenarioK, 256u);  // 完整重试正例
+    RunScenario("L", &ScenarioL, 256u);  // 已知零 attempt 正例
+    RunScenario("M", &ScenarioM, 256u);  // 旧 attempt 缺 S 后完整重试
+    RunScenario("N", &ScenarioN, 256u);  // 旧 attempt 缺 E 后完整重试
+    RunScenario("O", &ScenarioO, 256u);  // 历史真正降秩不能由新 attempt 洗白
 
 
     // 2026-09-18 阶段 D（批次 2，B1 **运行期半边**）：armed 的发布是**单一同步域**的发布点。

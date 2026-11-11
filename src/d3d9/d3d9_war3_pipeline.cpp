@@ -15,10 +15,12 @@
 #include "war3/tools/war3_perf_monitor.h"
 #include "war3/tools/war3_diagnostics_hub.h"
 #include "war3/tools/war3_frame_evidence.h"
+#include "war3/platform/war3_vram_preset.h"
 
 #include "../util/util_env.h"
 #include "../util/util_error.h"
 #include "../util/log/log.h"
+#include "../util/util_string.h"
 
 #include <algorithm>
 #include <chrono>
@@ -257,6 +259,16 @@ namespace dxvk {
 
     War3RenderPipeline::War3RenderPipeline(const Rc<DxvkDevice>& device)
         : m_device(device) {
+        // 显存档位只改默认值；下面的环境变量覆盖仍然优先。
+        if (const auto* preset = dxvk::war3::platform::CurrentVramPreset()) {
+            const uint32_t before = m_settings.shadows.csm.shadowResolution;
+            m_settings.shadows.csm.shadowResolution =
+                (std::min)(before, preset->csmResolutionCap);
+            Logger::info(str::format("WarVK VRAM preset: tier=",
+                dxvk::war3::gpureq::VramTierName(preset->tier), " source=", preset->source,
+                " csmResolution ", before, " -> ",
+                m_settings.shadows.csm.shadowResolution));
+        }
 // Note: War3RenderPipeline needs to be updated to accept/store D3D9DeviceEx*
     // For now, commenting out shadow pass registration - will fix in pipeline refactor
     // RegisterPass(std::make_unique<War3ShadowReceiverPass>(m_device));
@@ -832,6 +844,21 @@ namespace dxvk {
 
     War3RenderPipeline::~War3RenderPipeline() = default;
 
+    void War3RenderPipeline::CaptureWeatherSnapshot(War3PipelineInput& input) {
+        if (m_weatherSnapshot.frameSerial != input.frameSerial ||
+            m_weatherSnapshot.mapEpoch != input.mapEpoch ||
+            m_weatherSnapshot.deviceEpoch != input.deviceEpoch) {
+            auto& runtime = war3::render::WeatherRuntime::instance();
+            m_weatherSnapshot = runtime.hasEnabled()
+                ? runtime.snapshot(input.frameSerial, input.mapEpoch, input.deviceEpoch)
+                : war3::render::WeatherFrameSnapshot{};
+            m_weatherSnapshot.frameSerial = input.frameSerial;
+            m_weatherSnapshot.mapEpoch = input.mapEpoch;
+            m_weatherSnapshot.deviceEpoch = input.deviceEpoch;
+        }
+        input.weather = m_weatherSnapshot;
+    }
+
     void War3RenderPipeline::CaptureSettingsSnapshot(
             War3PipelineInput& input) const {
         const auto mailbox = m_settingsMailbox;
@@ -1018,7 +1045,13 @@ namespace dxvk {
                 semanticShadowForcesBeforeUi;
             m_wantsBeforeUiInsertion =
                 shaderPackEnabled || wantsShadowReceiver || wantsPostFx ||
-                semanticShadowForcesBeforeUi;
+                semanticShadowForcesBeforeUi ||
+                war3::render::WeatherRuntime::instance().hasEnabled() ||
+                // Preserve one real world-frame drain after authored weather
+                // is disabled/destroyed, even when no other post-FX needs us.
+                // CaptureWeatherSnapshot replaces this cached enabled value
+                // with the new off snapshot; queued prior frames keep theirs.
+                m_weatherSnapshot.enabled;
         }
 
         // 日夜色调：在帧开始应用到全局设置，保证主线程渲染状态与后处理能读取到

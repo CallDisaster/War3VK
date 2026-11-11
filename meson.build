@@ -1,9 +1,15 @@
-project('warvk', ['c', 'cpp'], version : '1.22.01', meson_version : '>= 0.58', default_options : [ 'cpp_std=c++17', 'b_vscrt=static_from_buildtype', 'warning_level=2' ])
+project('warvk', ['c', 'cpp'], version : '1.22.02', meson_version : '>= 0.58', default_options : [ 'cpp_std=c++17', 'b_vscrt=static_from_buildtype', 'warning_level=2' ])
 
 pkg = import('pkgconfig')
 cpu_family = target_machine.cpu_family()
 platform   = target_machine.system()
 fs = import('fs')
+
+if get_option('warvk_render_host_core_dev')
+  if platform != 'windows' or cpu_family != 'x86_64' or get_option('enable_d3d9')
+    error('The render-host core lab requires Windows x86_64 and enable_d3d9=false; game hooks must not be linked into it')
+  endif
+endif
 
 cpp = meson.get_compiler('cpp')
 cc = meson.get_compiler('c')
@@ -87,9 +93,13 @@ if platform == 'windows'
         '-Wl,--kill-at',
       ]
       # Fix stack alignment issues with mingw on 32-bit
-      compiler_args += [
-        '-mpreferred-stack-boundary=2'
-      ]
+      # GCC uses log2(bytes); Clang uses bytes. Keep the same Win32
+      # compatibility contract when configuring an independent LLVM build.
+      if cpp.has_argument('-mpreferred-stack-boundary=2')
+        compiler_args += ['-mpreferred-stack-boundary=2']
+      elif cpp.has_argument('-mstack-alignment=4')
+        compiler_args += ['-mstack-alignment=4']
+      endif
     endif
   else
     # setup file alignment + enable PDB output for MSVC builds
@@ -229,3 +239,7 @@ if platform != 'windows'
 endif
 
 subdir('src')
+
+if get_option('warvk_render_host_core_dev')
+  subdir('tools/render_host/dxvk_core')
+endif

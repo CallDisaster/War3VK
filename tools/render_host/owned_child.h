@@ -9,7 +9,7 @@ namespace warvk::host::lab {
 class OwnedChild {
 public:
   OwnedChild(const std::wstring& executable,const std::wstring& arguments,
-             const std::wstring& createNewLog);
+             const std::wstring& createNewLog,const std::wstring& desktop=L"");
   ~OwnedChild();
   OwnedChild(const OwnedChild&)=delete;
   OwnedChild& operator=(const OwnedChild&)=delete;

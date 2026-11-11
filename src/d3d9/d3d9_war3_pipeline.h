@@ -4,6 +4,7 @@
 #include "d3d9_war3_settings.h"
 #include "d3d9_war3_light.h"
 #include "war3/render/war3_render_state.h"
+#include "war3/render/war3_weather_runtime.h"
 
 #include "../dxvk/dxvk_device.h"
 #include "../dxvk/dxvk_cmdlist.h"
@@ -84,6 +85,7 @@ namespace dxvk {
         uint64_t frameSerial = 0;
         uint64_t mapEpoch = 0;
         uint64_t deviceEpoch = 0;
+        war3::render::WeatherFrameSnapshot weather;
         // Immutable ownership is carried with the queued CS command. A raw
         // pointer into War3RenderPipeline would race the next JASS/UI update
         // and could observe a torn multi-field configuration.
@@ -176,6 +178,7 @@ namespace dxvk {
         // exposed by war3::GetMutableSettings().
         const War3RenderSettings& GetSettings() const { return m_settings; }
         void CaptureSettingsSnapshot(War3PipelineInput& input) const;
+        void CaptureWeatherSnapshot(War3PipelineInput& input);
         std::shared_ptr<War3RenderSettingsMailbox> GetSettingsMailbox() const {
             return m_settingsMailbox;
         }
@@ -223,6 +226,7 @@ namespace dxvk {
 
         // 旁路开关（每帧 OnFrameStart 刷新）
         bool m_wantsBeforeUiInsertion = true;
+        war3::render::WeatherFrameSnapshot m_weatherSnapshot;
         bool m_wantsShadowCapture = true;
         // Direction/color consumption remains in War3ShadowReceiverPass; the
         // render-only authored clock advances here even when shadows are off.

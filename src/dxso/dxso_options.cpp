@@ -1,13 +1,11 @@
 #include "dxso_options.h"
 
-#include "../d3d9/d3d9_device.h"
-
 namespace dxvk {
 
   DxsoOptions::DxsoOptions() {}
 
-  DxsoOptions::DxsoOptions(D3D9DeviceEx* pDevice, const D3D9Options& options) {
-    const Rc<DxvkDevice> device = pDevice->GetDXVKDevice();
+  DxsoOptions::DxsoOptions(const Rc<DxvkDevice>& device, const D3D9Options& options,
+                           uint32_t vertexFloatConstantBytes) {
 
     const Rc<DxvkAdapter> adapter = device->adapter();
 
@@ -25,7 +23,7 @@ namespace dxvk {
     forceSamplerTypeSpecConstants = options.forceSamplerTypeSpecConstants;
     forceSampleRateShading = options.forceSampleRateShading;
 
-    vertexFloatConstantBufferAsSSBO = pDevice->GetVertexConstantLayout().floatSize() > devInfo.core.properties.limits.maxUniformBufferRange;
+    vertexFloatConstantBufferAsSSBO = vertexFloatConstantBytes > devInfo.core.properties.limits.maxUniformBufferRange;
 
     robustness2Supported = devFeatures.extRobustness2.robustBufferAccess2;
 

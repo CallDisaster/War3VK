@@ -2,6 +2,8 @@
 
 #extension GL_EXT_nonuniform_qualifier : require
 #extension GL_EXT_scalar_block_layout : require
+#extension GL_GOOGLE_include_directive : require
+#include "war3_weather_density.glsl"
 
 layout(set = 0, binding = 0) uniform sampler s_samplers[];
 layout(set = 1, binding = 0) uniform texture2DArray s_color;
@@ -65,6 +67,10 @@ uniform FogVolumeBlock {
   uint u_pad1;
   uint u_pad2;
   FogVolume u_volumes[8];
+  vec4 u_weatherMin;
+  vec4 u_weatherMax;
+  vec4 u_weatherControls;
+  vec4 u_weatherMotion;
 } fogVolumes;
 
 layout(push_constant, scalar, row_major)
@@ -632,8 +638,9 @@ void main() {
   // bound identical so the per-pixel ray intervals have a fixed small budget.
   uint pointLightCount = min(lights.u_count, 2u);
   bool hasPointVolume = pointLightCount > 0u;
+  bool hasWeatherMedium = fogVolumes.u_weatherControls.w > 0.5;
   if (!finiteFloat(intensity) || !finiteFloat(sunIntensity) ||
-      intensity <= 1e-6 || (!hasSunVolume && !hasPointVolume)) {
+      intensity <= 1e-6 || (!hasSunVolume && !hasPointVolume && !hasWeatherMedium)) {
     emitNoEffect();
     return;
   }
@@ -683,6 +690,33 @@ void main() {
   // GPU-side backstop: stale callers cannot restore the old unbounded
   // full-screen ray-march that could exceed the Windows TDR budget.
   int sampleCount = int(clamp(pc.p_params2.x, 4.0, 16.0));
+  if (hasWeatherMedium) {
+    vec3 weatherRay = rayVec / rayLen;
+    vec2 weatherInterval = vec2(0.0, min(rayLen, 10000.0));
+    if (!war3WeatherRayInterval(cameraPos, weatherRay,
+            fogVolumes.u_weatherMin.xyz, fogVolumes.u_weatherMax.xyz,
+            weatherInterval)) {
+      emitNoEffect();
+      return;
+    }
+    float stepLength = (weatherInterval.y - weatherInterval.x) / float(sampleCount);
+    float weatherOpticalDepth = 0.0;
+    for (int sampleIndex = 0; sampleIndex < 16; ++sampleIndex) {
+      if (sampleIndex >= sampleCount)
+        break;
+      float t = weatherInterval.x + (float(sampleIndex) + 0.5) * stepLength;
+      float sigma = war3WeatherSigma(cameraPos + weatherRay * t,
+          fogVolumes.u_weatherMin, fogVolumes.u_weatherMax,
+          fogVolumes.u_weatherControls, fogVolumes.u_weatherMotion);
+      weatherOpticalDepth += max(sigma, 0.0) * stepLength;
+    }
+    float weatherTransmittance = exp(-clamp(weatherOpticalDepth, 0.0, 2.0));
+    // Independent bounded ambient. No sun, point light, author fog intensity
+    // or author extinction gate is required by this compatibility fallback.
+    o_color = vec4(vec3(0.30, 0.34, 0.40) * (1.0 - weatherTransmittance),
+                   weatherTransmittance);
+    return;
+  }
   float maxDistScale = clamp(pc.p_params1.w, 0.05, 2.0);
   float maxWorldDistance = max(pc.p_params2.y * maxDistScale, 25.0);
   // 积分区间（相机到表面沿 ray 的弧长）：

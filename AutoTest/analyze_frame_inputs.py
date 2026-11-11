@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 import copy
 from analyze_frame_evidence import load, require, u64, uint
+from native_render_input_contract import validate_render_input_evidence
 
 WORDS=('stage handle rawcode layer positionStride positionOffset positionFormat indexType indexCount firstIndex '
        'vertexOffset vertexCount firstVertex minVertexIndex numVertices blendEnabled blendIndexed blendCount paletteIndex '
@@ -109,7 +110,7 @@ def reconstruct(draw, spans, event):
 
 def analyze_inputs(manifest,binary,cpu):
     d=manifest
-    require(type(d.get('schema')) is int and d['schema'] in (1,2) and d.get('rootCauseReady') is False,'input schema or completeness')
+    require(type(d.get('schema')) is int and d['schema'] in (1,2,3) and d.get('rootCauseReady') is False,'input schema or completeness')
     require(d['session']==cpu['session'] and d['processNonce']==cpu['processNonce'],'input session/nonce')
     slots=uint(d['slots'],576)
     require(slots in (224,576) and (d['bytesPerSlot'],d['drawsPerSlot'])==(262144,128),'capacity contract')
@@ -135,6 +136,12 @@ def analyze_inputs(manifest,binary,cpu):
             require(len(draw['words'])==40 and len(draw['provenance'])==16 and len(draw['worldMatrixBits'])==16,'record layout')
             for v in draw['words']+draw['worldMatrixBits']:uint(v,2**32-1)
             for v in draw['provenance']:u64(v)
+            render_input_evidence=None
+            if d['schema']>=3:
+                require('renderInputEvidence' in draw,'schema3 draw missing renderInputEvidence')
+                render_input_evidence=validate_render_input_evidence(
+                    draw['renderInputEvidence'],part=draw['part'],layer=draw['words'][3],
+                    map_epoch=batch['mapEpoch'],device_epoch=batch['deviceEpoch'])
             require(len(draw['spans'])==7,'span layout');spans=[];missing=[];hashes={}
             for name,s in zip(SPAN_NAMES,draw['spans']):
                 status=uint(s['status'],7);all_status[STATUSES[status]]=all_status.get(STATUSES[status],0)+1
@@ -151,6 +158,7 @@ def analyze_inputs(manifest,binary,cpu):
                  'stride':draw['words'][4],'indices':draw['words'][8],'vertices':draw['words'][14],
                  'producer':draw['provenance'][0],'cacheOutcome':draw['provenance'][2],
                  'focus':bool(draw['words'][37]),'hashes':hashes,'missing':missing,'actualDraws':len(match),'reconstructed':False}
+            if render_input_evidence is not None:row['renderInputEvidence']=render_input_evidence
             try:
                 require(batch['gpuComplete'],'GPU input copy incomplete');require(match,'no actual draw event in retained CPU window')
                 e=match[0];pc=e['words32']
@@ -170,13 +178,14 @@ def analyze_inputs(manifest,binary,cpu):
             rows.append(row)
     require(file_end==len(binary),'trailing binary bytes')
     focus=[r for r in rows if r['focus'] and r['actualDraws']]
-    return {'schema':1,'manifestValid':True,'rootCauseReady':False,'binarySha256':sha(binary),
+    return {'schema':1,'manifestValid':True,'rootCauseReady':False,'sharedRendererReady':False,'binarySha256':sha(binary),
             'captureDrops':u64(d['captureDrops']),'batchCount':len(d['batches']),'spanStatuses':all_status,
             'omittedDraws':sum(b['omitted'] for b in d['batches']),
             'reconstructedDraws':sum(r['reconstructed'] for r in rows),'focusDraws':len(focus),
             'focusReconstructed':sum(r['reconstructed'] for r in focus),'draws':rows,
             'limitations':['No pixel draw-ID, alpha texture pixels or intermediate GPU attachments.',
                            'CPU reconstruction is numeric diagnostic, not bit-identical shader execution.',
+                           'Native material observations do not certify final shader color, GEOA, object ownership or GPU execution.',
                            'A matching signature is not proof of model identity; pointers require epoch/frame.']}
 
 def main():

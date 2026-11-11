@@ -71,7 +71,8 @@ namespace dxvk::war3 {
         ~War3Material();
 
         bool compile(D3D9DeviceEx* device, bool force = false);
-        void apply(D3D9DeviceEx* device);
+        // 绑定只需公开的 D3D9 接口（S2 切口）；编译仍要 DXVK 设备与选项。
+        void apply(IDirect3DDevice9* device);
 
         // 配置
         void setVertexShaderPath(const std::string& path, const std::string& entry = "main_vs");
@@ -123,7 +124,7 @@ namespace dxvk::war3 {
         ShaderConstantStore m_psConstants;
         std::unordered_set<std::string> m_missingUniforms;
 
-        void applyConstantStore(D3D9DeviceEx* device, const ShaderConstantStore& store, bool isVertex) const;
+        void applyConstantStore(IDirect3DDevice9* device, const ShaderConstantStore& store, bool isVertex) const;
 
         // 编译单个着色器
         template <typename T>

@@ -112,6 +112,10 @@ Reply Dispatch(Carrier carrier, std::string_view payload) noexcept;
 // texture resources; the renderer owner performs that work at Present.
 void ResetAuthorState() noexcept;
 
+// CPU-only weather retirement for the coalesced MainRunner fallback when no
+// JASS native-table rebuild was observed. Called before new map code executes.
+void ResetWeatherAuthorState() noexcept;
+
 // Compatibility alias for the CPU-only reset above.
 void Reset() noexcept;
 

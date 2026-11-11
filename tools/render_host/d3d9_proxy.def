@@ -1,0 +1,7 @@
+EXPORTS
+  Direct3DCreate9@4
+  WarVKD3D9ReadPresentedImage@16
+  WarVKD3D9DiagnosticCheckpoint@20
+  WarVKD3D9AnnotateNextDraw@16
+  WarVKD3D9SetFrameScene@16
+  WarVKD3D9MarkStage@8

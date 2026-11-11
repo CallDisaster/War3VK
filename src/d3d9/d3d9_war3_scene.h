@@ -8,6 +8,7 @@
 #include "war3/gpu_skin/war3_gpu_skin_types.h"
 #include "war3/render/war3_palette_object_diagnostics.h"
 #include "war3/render/war3_skin_palette_selection.h"
+#include "war3/render/war3_native_draw_material_facts.h"
 
 #include "../dxvk/dxvk_buffer.h"
 #include "../dxvk/dxvk_image.h"   // 用于 Rc<DxvkImageView> (Alpha测试阴影)
@@ -256,7 +257,7 @@ namespace dxvk {
         }
     };
 
-    struct War3ShadowCasterDraw {
+struct War3ShadowCasterDraw {
         bool indexed = true;
 
         // Unified ownership tuple. Raw pointers, JASS handles and VkBuffer
@@ -324,6 +325,9 @@ namespace dxvk {
         uint32_t blendBinding = 0;
 
         // ===== Alpha测试支持 (用于树叶、栅栏等透明物体的正确阴影) =====
+        // The selected native source's observation keeps its original frame
+        // across retained replay; availability is not current-frame proof.
+        war3::render::native_input::NativeDrawMaterialFacts nativeDrawMaterial;
         bool alphaTestEnabled = false;      // 是否启用Alpha测试
         float alphaRef = 0.5f;              // Alpha阈值 (低于此值的像素不投射阴影)
         bool alphaBlendEnabled = false;     // 是否启用 AlphaBlend

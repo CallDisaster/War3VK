@@ -5,19 +5,21 @@ from pathlib import Path
 import tempfile
 import unittest
 import zipfile
-from package_v122_release import make_archive, verify_archive, verify_win32, members, PLAYER, AUTHOR, TESTED_CANDIDATE_SHA
+from package_v122_release import (make_archive, verify_archive, verify_win32, members, PLAYER, AUTHOR,
+                                  PLAYER_SOURCES, PLAYER_RUNNING_PREDECESSOR_SHA, VERSION)
 
 
 class ReleaseArchiveTests(unittest.TestCase):
     def test_patch_version_and_player_identity(self):
-        self.assertEqual(TESTED_CANDIDATE_SHA,
-            '028565BCB33B6EB646E4915115B60CDA3C14C287A4225DAA50F8F6513F9E9BA3')
+        self.assertEqual(VERSION, '1.22.02')
+        self.assertEqual(PLAYER_RUNNING_PREDECESSOR_SHA,
+            '1FFE0BD14C51C8E1D2A9EB94425A06260CD4B480A7CA735E13E946EA93EE35CF')
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); package = root / 'package'; package.mkdir()
             (package / 'README.md').write_text('payload', encoding='utf-8')
             make_archive(package, root / 'p.zip', ('README.md',), {})
             manifest = json.loads((package / 'manifest.json').read_text())
-            self.assertEqual(manifest['version'], '1.22.01')
+            self.assertEqual(manifest['version'], '1.22.02')
 
     def test_actual_pe_reader_contract(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -41,6 +43,14 @@ class ReleaseArchiveTests(unittest.TestCase):
         self.assertFalse(any(x.endswith(('.dll', '.exe', '.lua', '.ai')) for x in AUTHOR))
         self.assertIn('README_CN.md', PLAYER)
         self.assertIn('WarVK/icons/atom.blp', AUTHOR)
+        self.assertIn('WarVK/WEATHER_API.md', AUTHOR)
+        # Player scripts and docs map to repository files that exist.
+        repo = Path(__file__).resolve().parents[1]
+        for member, source in PLAYER_SOURCES.items():
+            self.assertIn(member, PLAYER)
+            self.assertTrue((repo / source).is_file(), source)
+        for member in AUTHOR:
+            self.assertTrue((repo / member).is_file(), member)
 
     def case(self, mutation):
         with tempfile.TemporaryDirectory() as tmp:

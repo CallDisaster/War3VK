@@ -1,8 +1,11 @@
 # WarVK JAPI
 
-## 1.22.01 作者须知
+天气开发候选：本树已增加可编排雪片、雪雾与低空吹雪的 12 个作者接口，详见
+[天气 API](WEATHER_API.md)。该链接不代表现有发布包已经包含本轮候选或画面已验收。
 
-产品/JAPI显示1.22.01，Shader API1.2.0、JASS wire `warvk:v1`不变。太阳禁用现在停止直射和
+## 1.22.02 作者须知
+
+产品/JAPI显示1.22.02，Shader API1.2.0、JASS wire `warvk:v1`不变。太阳禁用现在停止直射和
 相应太阳阴影，环境/自发光保留；1.27a typed Hashtable carrier签名已修正，失败仍回退字符串通道。
 请查询功能位与错误结果：目录包装存在不等于功能实现或全部效果已验收。当前仍有明确返回
 UnsupportedFeature的outline/bloom/postfx/aa包装；历史限定测试不是全部109命令验收。
@@ -55,9 +58,15 @@ Carrier 保持可用。
 `d3d9.dll` 安装到 `war3.exe` 同级目录，再启动游戏。地图与作者包不携带 DLL、不导入
 AI/Lua Loader，也不会在游戏运行期间尝试加载 DLL；bridge 不可用时 API 会安全返回失败值。
 
-YDWE 菜单按功能拆分为 WarVK 系统/诊断、太阳与阴影、光照时钟与昼夜、点光源、体积光、全局体积雾、
+YDWE 菜单按功能拆分为 WarVK 系统/诊断、单位动画、太阳与阴影、光照时钟与昼夜、点光源、体积光、全局体积雾、
 局部体积雾、闪电、闪电模板、数学公式和曲线。根 `WarVK` 分类只保留版本、协议、功能位与运行时
 状态；没有 C++ dispatch 的预留接口不会出现在作者菜单中。
+
+单位动画分类中，`WarVKSetUnitWalkLoopEnabled(unit, false)` 暂停该单位因移动而自动重选 Walk，
+`true` 恢复。`WarVKPlayUnitMovementAnimationOverride` 和按序号版本先暂停自动 Walk，再调用
+魔兽原版的动画播放接口；返回值只表示播放请求已发出，不证明模型具有该动画或会持续循环。
+动画覆盖结束后使用 `WarVKClearUnitMovementAnimationOverride`。此接口不需要额外环境变量，
+但只在 Game.dll 的已核对指令布局匹配且 Hook 安装成功时可用；正式玩家运行效果仍须实机验证。
 
 ## 点光源、体积光与局部体积雾
 

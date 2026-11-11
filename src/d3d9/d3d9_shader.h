@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../dxso/dxso_module.h"
+#include "../dxso/dxso_shader_module_cache.h"
 
 #include "../dxvk/dxvk_shader.h"
 #include "../dxvk/dxvk_shader_key.h"
@@ -25,11 +26,7 @@ class D3D9CommonShader {
 public:
   D3D9CommonShader();
 
-  D3D9CommonShader(D3D9DeviceEx *pDevice, VkShaderStageFlagBits ShaderStage,
-                   const DxvkShaderKey &Key,
-                   const DxsoModuleInfo *pDxbcModuleInfo,
-                   const void *pShaderBytecode,
-                   const DxsoAnalysisInfo &AnalysisInfo, DxsoModule *pModule);
+  explicit D3D9CommonShader(const DxsoCompiledModule& module);
 
   Rc<DxvkShader> GetShader() const { return m_shader; }
 
@@ -214,8 +211,8 @@ public:
 private:
   dxvk::mutex m_mutex;
 
-  std::unordered_map<DxvkShaderKey, D3D9CommonShader, DxvkHash, DxvkEq>
-      m_modules;
+  // Construct lazily after the D3D9 device has derived its effective options.
+  std::unique_ptr<DxsoShaderModuleCache> m_modules;
 };
 
 template <typename T>

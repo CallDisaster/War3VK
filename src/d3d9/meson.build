@@ -43,6 +43,9 @@ d3d9_src = [
   'd3d9_adapter.cpp',
   'd3d9_monitor.cpp',
   'd3d9_device.cpp',
+  'd3d9_migration_census.cpp',
+  'war3/memory/war3_mdl_trace.cpp',
+  'war3/diagnostics/war3_startup_witness.cpp',
   'd3d9_native_light.cpp',
   'd3d9_state.cpp',
   'd3d9_cursor.cpp',
@@ -85,6 +88,8 @@ d3d9_src = [
   'd3d9_war3_shadow_outline.cpp',
   'd3d9_war3_fog_volume.cpp',
   'd3d9_war3_volumetric_light.cpp',
+  'd3d9_war3_weather.cpp',
+  'war3/render/war3_weather_runtime.cpp',
   'war3/render/war3_hybrid_ray_tracing.cpp',
   'd3d9_war3_ssao.cpp',
   'war3_shader_api.cpp',
@@ -102,6 +107,7 @@ d3d9_src = [
   'war3/war3.cpp',
   'war3/bridge/war3_visual_bridge_v1.cpp',
   'war3/japi/war3_japi_v1.cpp',
+  'war3/japi/war3_module_loader.cpp',
   'war3/core/war3_memory.cpp',
   'war3/core/war3_crash_handler.cpp',
   'war3/core/war3_runtime_profile.cpp',
@@ -109,12 +115,16 @@ d3d9_src = [
   'war3/platform/war3_module_api.cpp',
   'war3/platform/war3_native_device_resolver.cpp',
   'war3/platform/war3_runtime_bootstrap.cpp',
+  'war3/platform/war3_gpu_requirements.cpp',
+  'war3/platform/war3_startup_error.cpp',
+  'war3/platform/war3_vram_preset.cpp',
   'war3/math/war3_math_expression.cpp',
   'war3/math/war3_curve_runtime.cpp',
   'war3/memory/tlsf.c',
   'war3/memory/war3_tlsf_pool.cpp',
   'war3/memory/war3_storm_hook.cpp',
   'war3/memory/war3_storm_native_small_repair.cpp',
+  'war3/memory/war3_storm_low_domain.cpp',
   'war3/memory/war3_shadow_arena.cpp',
   'war3/memory/war3_cpu_readable_buffer_span.cpp',
   'war3/handle/war3_handle_resolver.cpp',
@@ -198,6 +208,7 @@ d3d9_src = [
   'war3/native/war3_native_symbols.cpp',
   'war3/war3_user_example.cpp',
   'war3/game/war3_unit.cpp',
+  'war3/game/war3_unit_animation_api.cpp',
   'war3/game/war3_agent.cpp',
   'war3/shader/war3_shader_manager.cpp',
   'war3/shader/war3_material.cpp',
@@ -351,7 +362,38 @@ adaptive_memory_slice_test = executable('adaptive_memory_slice_test',
   '../../AutoTest/test_adaptive_memory_and_slice.cpp', install : false)
 test('adaptive_memory_slice', adaptive_memory_slice_test, timeout : 30)
 
+# Player-facing GPU floor, driver version decoding and startup advice text.
+gpu_requirements_test = executable('gpu_requirements_test',
+  ['../../AutoTest/test_gpu_requirements.cpp',
+   'war3/platform/war3_gpu_requirements.cpp'],
+  cpp_args : ['-UNDEBUG'], install : false)
+test('gpu_requirements', gpu_requirements_test, timeout : 30)
+
 maintenance_python = import('python').find_installation()
+
+# Native draw observations and the exact production encoder/strict reader.
+# CPU-only: no Game.dll, Vulkan device, new capture owner or shared-core link.
+native_draw_material_facts_test = executable('native_draw_material_facts_test',
+  '../../AutoTest/test_native_draw_material_facts.cpp',
+  cpp_args : ['-UNDEBUG'], install : false)
+test('native_draw_material_facts', native_draw_material_facts_test, timeout : 30)
+native_render_input_export_test = executable('native_render_input_export_test',
+  '../../AutoTest/test_native_render_input_export.cpp',
+  include_directories : [dxvk_include_path],
+  cpp_args : ['-UNDEBUG'], install : false)
+test('native_render_input_export', native_render_input_export_test, timeout : 30)
+test('native_render_input_roundtrip', maintenance_python,
+  args : [files('../../AutoTest/test_native_render_input_roundtrip.py'),
+          native_render_input_export_test], timeout : 30)
+test('native_render_input_contract', maintenance_python,
+  args : [files('../../AutoTest/test_native_render_input_contract.py')], timeout : 30)
+test('native_render_input_manifest', maintenance_python,
+  args : [files('../../AutoTest/test_frame_inputs.py')], timeout : 30)
+native_draw_material_cost_test = executable('native_draw_material_cost_test',
+  '../../AutoTest/test_native_draw_material_cost.cpp',
+  include_directories : [dxvk_include_path],
+  cpp_args : ['-UNDEBUG'], install : false)
+test('native_draw_material_cost', native_draw_material_cost_test, timeout : 30)
 image_probe_source = custom_target('image_allocation_probe',
   input : '../dxvk/dxvk_memory.cpp', output : 'image_allocation_probe.inc',
   command : [maintenance_python, files('../../AutoTest/extract_image_allocation_probe.py'), '@INPUT@', '@OUTPUT@'])
@@ -371,6 +413,13 @@ screenshot_core_test = executable('native_async_screenshot_core_test',
   '../../AutoTest/test_native_async_screenshot_core.cpp',
   cpp_args : ['-UNDEBUG'], dependencies : [dependency('threads')], install : false)
 test('native_async_screenshot_core', screenshot_core_test, timeout : 30)
+if platform == 'windows'
+  screenshot_io_test = executable('screenshot_io_production_test',
+    '../../AutoTest/test_screenshot_io_production.cpp',
+    cpp_args : ['-UNDEBUG'], include_directories : [dxvk_include_path],
+    dependencies : [dependency('threads')], install : false)
+  test('screenshot_io_production', screenshot_io_test, timeout : 30)
+endif
 if platform == 'windows' and cpu_family == 'x86'
   memory_allocator_test = executable('d3d9_memory_allocator_production_test',
     ['../../AutoTest/test_d3d9_memory_allocator_production.cpp', 'd3d9_mem.cpp'],
@@ -498,6 +547,46 @@ lib_dwmapi = cpp.find_library('dwmapi')
 lib_dbghelp = cpp.find_library('dbghelp')
 
 d3d9_cpp_args = []
+d3d9_mdl_trace_dep = []
+if get_option('warvk_startup_witness_dev')
+  d3d9_cpp_args += [ '-DWARVK_STARTUP_WITNESS_DEV=1' ]
+  startup_core_test = executable('warvk-startup-core-test',
+    files('../../AutoTest/test_startup_witness_core.cpp'),
+    dependencies: [dependency('threads')], cpp_args: ['-UNDEBUG'], install: false)
+  test('startup_core', startup_core_test, timeout: 30)
+  startup_runtime_test = executable('warvk-startup-runtime-test',
+    files('../../AutoTest/test_startup_witness_runtime.cpp', 'war3/diagnostics/war3_startup_witness.cpp'),
+    cpp_args: ['-UNDEBUG', '-DWARVK_STARTUP_WITNESS_DEV=1'], install: false)
+  test('startup_reader', maintenance_python,
+    args: ['-B', files('../../AutoTest/test_startup_witness.py')], timeout: 30)
+  storm_low_domain_test = executable('warvk-storm-low-domain-test',
+    files('../../AutoTest/test_storm_low_domain.cpp'),
+    link_with: [minhook_lib], include_directories: [minhook_inc_path],
+    dependencies: [cpp.find_library('bcrypt')],
+    cpp_args: ['-UNDEBUG'], link_args: ['-municode', '-Wl,--large-address-aware'], install: false)
+  test('storm_low_domain_core', storm_low_domain_test, args: ['--core'], timeout: 30)
+endif
+if get_option('warvk_mdl_allocation_trace_dev')
+  d3d9_cpp_args += [ '-DWARVK_MDLDATA_TRACE_DEV=1' ]
+  d3d9_mdl_trace_dep += [ cpp.find_library('bcrypt') ]
+  mdl_trace_core_test = executable('warvk-mdl-trace-core-test',
+    files('../../AutoTest/test_mdl_trace_core.cpp'),
+    dependencies: [dependency('threads')],
+    cpp_args: ['-UNDEBUG'], install: false)
+  test('mdl_trace_core', mdl_trace_core_test, timeout: 30)
+  mdl_trace_hooks_test = executable('warvk-mdl-trace-hooks-test',
+    files('../../AutoTest/test_mdl_trace_hooks.cpp'),
+    link_with: [minhook_lib], include_directories: [minhook_inc_path],
+    cpp_args: ['-UNDEBUG'], install: false)
+  test('mdl_trace_hooks', mdl_trace_hooks_test, timeout: 30)
+  test('mdl_trace_reader', maintenance_python,
+    args: ['-B', files('../../AutoTest/test_mdl_link_trace.py')], timeout: 30)
+  test('mdl_trace_integration', maintenance_python,
+    args: ['-B', files('../../AutoTest/test_mdl_trace_integration.py')], timeout: 30)
+endif
+if get_option('warvk_d3d9_migration_census_dev')
+  d3d9_cpp_args += [ '-DWARVK_D3D9_MIGRATION_CENSUS_DEV=1' ]
+endif
 if get_option('warvk_skin_palette_contract_candidate')
   d3d9_cpp_args += [ '-DWARVK_SKIN_PALETTE_CONTRACT_DEFAULT=1' ]
 endif
@@ -530,11 +619,22 @@ if get_option('warvk_data_collection_tree_dev')
   d3d9_cpp_args += [ '-DWARVK_DATA_COLLECTION_TREE_DEV=1' ]
 endif
 
-d3d9_dll = shared_library(dxvk_name_prefix+'d3d9', d3d9_src,
+warvk_imgui_dx9_backend = custom_target('warvk-imgui-dx9-owned-backend',
+  # Use the subproject's File object, not an illegal cross-subproject path.
+  # The generator's exact source digest also guards the pinned last entry.
+  input : imgui.get_variable('imgui_src')[-1],
+  output : 'war3_imgui_dx9_backend.cpp',
+  command : [maintenance_python, files('../../AutoTest/prepare_warvk_imgui_dx9.py'),
+    '--source', '@INPUT@', '--output', '@OUTPUT@'],
+)
+test('warvk_imgui_dx9_adapter', maintenance_python,
+  args : ['-B', files('../../AutoTest/test_warvk_imgui_dx9_adapter.py')], timeout : 30)
+
+d3d9_dll = shared_library(dxvk_name_prefix+'d3d9', d3d9_src, warvk_imgui_dx9_backend,
   glsl_generator.process(d3d9_shaders), d3d9_war3_gpu_skin_ff_vs, d3d9_res,
-  dependencies        : [ dxso_dep, dxvk_dep, imgui_dep, lib_dwmapi, lib_dbghelp ],
+  dependencies        : [ dxso_dep, dxvk_dep, imgui_dep, lib_dwmapi, lib_dbghelp ] + d3d9_mdl_trace_dep,
   link_with           : [ minhook_lib ],
-  include_directories : [ dxvk_include_path, minhook_inc_path ],
+  include_directories : [ dxvk_include_path, minhook_inc_path, include_directories('.') ],
   install             : true,
   vs_module_defs      : 'd3d9'+def_spec_ext,
   link_args           : d3d9_ld_args,
@@ -547,6 +647,29 @@ d3d9_dep = declare_dependency(
   link_with           : [ d3d9_dll ],
   include_directories : [ dxvk_include_path ],
 )
+
+# The survey is opt-in. Its CPU tool compiles the SAME fixed-function source
+# on x86 and x64, without a Vulkan instance, game, or D3D9 device.
+if get_option('warvk_d3d9_migration_census_dev')
+  d3d9_migration_census_test = executable('warvk-d3d9-migration-census-test',
+    files('../../AutoTest/test_d3d9_migration_census.cpp'),
+    dependencies: [dependency('threads')],
+    install: false)
+  test('d3d9_migration_census', d3d9_migration_census_test, timeout: 30)
+  d3d9_migration_census_roundtrip = executable('warvk-d3d9-migration-census-roundtrip',
+    files('../../AutoTest/d3d9_migration_census_roundtrip.cpp'),
+    install: false)
+  d3d9_ff_key_compile = executable('warvk-ff-key-compile',
+    files('../../tools/render_host/dxvk_core/ff_key_compile_main.cpp',
+          'd3d9_fixed_function.cpp', 'd3d9_options.cpp'),
+    glsl_generator.process(files('shaders/d3d9_fixed_function_vert.vert',
+                                  'shaders/d3d9_fixed_function_frag.frag')),
+    d3d9_war3_gpu_skin_ff_vs,
+    dependencies: [dxso_dep, dxvk_dep, vkcommon_dep, dxbc_spirv_dep,
+                   lib_gdi32, dependency('threads')],
+    link_args: ['-municode'],
+    install: false)
+endif
 
 # Public WarVK v1 parser/dispatcher contract. This compiles the exact
 # production source with the rendering backend replaced by a fail-closed stub,
@@ -574,7 +697,9 @@ war3_japi_v1_protocol_test = executable(
   'war3_japi_v1_protocol_test',
   [
     'war3/japi/war3_japi_v1.cpp',
+    'war3/japi/war3_module_loader.cpp',
     'war3/japi/tests/war3_japi_v1_protocol_test.cpp',
+    'war3/render/war3_weather_runtime.cpp',
   ],
   cpp_args            : [ '-DWARVK_JAPI_PROTOCOL_TEST=1' ],
   include_directories : [ dxvk_include_path ],
@@ -585,6 +710,78 @@ test(
   war3_japi_v1_protocol_test,
   timeout : 30,
 )
+
+war3_module_protocol_test = executable(
+  'war3_module_protocol_test',
+  [
+    'war3/japi/war3_japi_v1.cpp',
+    'war3/japi/war3_module_loader.cpp',
+    'war3/render/war3_weather_runtime.cpp',
+    '../../AutoTest/test_war3_module_protocol.cpp',
+  ],
+  cpp_args            : [ '-DWARVK_JAPI_PROTOCOL_TEST=1' ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_module_protocol',
+  war3_module_protocol_test,
+  timeout : 30,
+)
+
+weather_runtime_test = executable(
+  'war3_weather_runtime_test',
+  ['war3/render/war3_weather_runtime.cpp', '../../AutoTest/test_war3_weather_runtime.cpp'],
+  include_directories : dxvk_include_path,
+  install : false,
+)
+test('war3_weather_runtime', weather_runtime_test, timeout : 30)
+
+weather_protocol_test = executable(
+  'warvk_weather_protocol_test',
+  ['war3/japi/war3_japi_v1.cpp', 'war3/japi/war3_module_loader.cpp',
+   'war3/render/war3_weather_runtime.cpp',
+   '../../AutoTest/test_warvk_weather_protocol.cpp'],
+  include_directories : dxvk_include_path,
+  cpp_args : ['-DWARVK_JAPI_PROTOCOL_TEST=1'],
+  install : false,
+)
+test('warvk_weather_protocol', weather_protocol_test, timeout : 30)
+
+managed_object_reset_test = executable(
+  'war3_managed_object_reset_test',
+  ['war3/japi/war3_japi_v1.cpp', 'war3/japi/war3_module_loader.cpp',
+   'war3/render/war3_weather_runtime.cpp',
+   '../../AutoTest/test_war3_managed_object_reset.cpp'],
+  include_directories : dxvk_include_path,
+  cpp_args : ['-DWARVK_JAPI_PROTOCOL_TEST=1'],
+  install : false,
+)
+test('war3_managed_object_reset', managed_object_reset_test, timeout : 30)
+
+weather_resource_retry_test = executable(
+  'war3_weather_resource_retry_test',
+  '../../AutoTest/test_war3_weather_resource_retry.cpp',
+  install : false,
+)
+test('war3_weather_resource_retry', weather_resource_retry_test, timeout : 30)
+
+war3_unit_walk_policy_test = executable(
+  'war3_unit_walk_policy_test',
+  '../../AutoTest/test_war3_unit_walk_policy.cpp',
+  cpp_args : ['-UNDEBUG'],
+  dependencies : [dependency('threads')],
+  install : false,
+)
+test('war3_unit_walk_policy', war3_unit_walk_policy_test, timeout : 30)
+
+war3_map_transition_gate_test = executable(
+  'war3_map_transition_gate_test',
+  '../../AutoTest/test_war3_map_transition_gate.cpp',
+  cpp_args : ['-UNDEBUG'],
+  install : false,
+)
+test('war3_map_transition_gate', war3_map_transition_gate_test, timeout : 30)
 
 # The old warvk:cmd: bridge is release-disabled.  Build the policy twice so
 # both the default-deny binary and the explicit developer-only capability are
@@ -1613,6 +1810,33 @@ test(
   war3_palette_object_evidence_test,
   timeout : 60,
 )
+
+palette_attempt_production_test = executable('palette_attempt_production_test',
+  '../../AutoTest/test_palette_attempt_production.cpp',
+  include_directories : [dxvk_include_path],
+  dependencies : [dependency('threads')], install : false)
+test('palette_attempt_production', palette_attempt_production_test, timeout : 30)
+
+shadow_geometry_publication_test = executable('shadow_geometry_publication_test',
+  '../../AutoTest/test_shadow_geometry_publication.cpp',
+  cpp_args : ['-UNDEBUG'], install : false)
+test('shadow_geometry_publication', shadow_geometry_publication_test, timeout : 30)
+
+shadow_session_retirement_test = executable('shadow_session_retirement_test',
+  '../../AutoTest/test_shadow_session_retirement.cpp',
+  cpp_args : ['-UNDEBUG'], install : false)
+test('shadow_session_retirement', shadow_session_retirement_test, timeout : 30)
+
+# Production lazy TLS owner: preserve capacity/thread isolation without copying
+# multi-MiB render caches into every unrelated game/driver worker's PE TLS.
+lazy_thread_array_test = executable('warvk-lazy-thread-array-test',
+  '../../AutoTest/test_lazy_thread_array.cpp',
+  dependencies : [dependency('threads')], install : false)
+test('warvk-lazy-thread-array', lazy_thread_array_test, timeout : 30)
+condition_deadline_test = executable('warvk-condition-deadline-test',
+  '../../AutoTest/test_condition_variable_deadline.cpp',
+  dependencies : [ dependency('threads') ], install : false)
+test('warvk-condition-deadline', condition_deadline_test, timeout : 30)
 
 # 2026-09-17 D6 前置：对象级 palette 证据的**离线 CPU 成本测量**（容量/饱和最坏探测长度、
 # 六个 dropped* 触发点、零堆分配（含 32 次 Reset 循环）、满表 CloseWindow 关闭开销、

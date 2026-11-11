@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <functional>
 #include <vector>
 #include <mutex>
@@ -169,9 +170,12 @@ namespace dxvk::war3 {
         War3Events() = default;
         
         std::mutex m_mutex;
-        bool m_jassReady = false;
-        bool m_gameStarted = false;
-        uint32_t m_lastGameTick = 0;
+        // Control-plane snapshots read these outside the callback mutex.
+        // Callback vectors remain mutex-owned; atomics only publish scalar
+        // observations, not an atomic transaction over the whole runtime.
+        std::atomic<bool> m_jassReady{false};
+        std::atomic<bool> m_gameStarted{false};
+        std::atomic<uint32_t> m_lastGameTick{0};
         std::vector<Callback> m_onJassReadyCallbacks;
         std::vector<Callback> m_onGameStartCallbacks;
         std::vector<TickCallback> m_onGameTickCallbacks;

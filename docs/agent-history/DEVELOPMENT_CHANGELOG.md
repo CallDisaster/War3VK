@@ -3,6 +3,977 @@
 本账本记录集成候选、验证和未通过项。根 CHANGELOG 的旧版本历史保持不变；
 1.22正式范围见 `docs/RELEASE_1.22.00.md`；带DRAFT的旧文档仅供追溯，不覆盖后续验收与发布决定。
 
+## 2026-10-31：x64 增强层拆分 S2 第一组：只用 D3D9 API 的子系统改经接口调用（Claude）
+
+`D3D9DeviceEx` 是 `final`，经具体类的 COM 调用会被去虚化成对 `d3d9_device.cpp` 的链接引用。
+本组把四个子系统的函数签名改成接收 `IDirect3DDevice9*`，执行的仍是同一个函数：
+- 队伍色管理器：`Initialize` 和成员；
+- 着色器管理器：`applyGlobalUniforms`；
+- 材质：`apply`、`applyConstantStore`；
+- 帧截图：`ProcessPendingFrameCapture`、`CaptureSurfaceToBmp`。
+
+实例化缓冲（私有引用持有具体顶点缓冲，关系到 Reset 的 losable 计数）和材质编译（要用 DXVK 设备）没有动。
+
+验收：
+- 全新 x86 构建通过。
+- 切口门以 r2 为基线、开 ratchet 通过：正向 113 → 104 个符号、49 → 46 条边，新增 0；反向不变。
+- 两个静态测试共 45 项通过。
+- 用新 DLL 作 fork 参照，GPU 门 r2 通过：主路径哈希仍是 03f7265a，resize 两组哈希与 G7 相同。
+- 保留失败回执 r1：x64 宿主的构建回执覆盖了 `src/`，改源码后报 host source drift；已重建宿主。
+
+未接游戏，未部署、提交、推送或发布。详见 [S2 回执](../research/2026-10-31-x64-s2-forward-cut.md)。
+
+## 2026-10-31：x64 增强层拆分 S1 第七组：G7 窗口自己改尺寸（WM_SIZE）（Claude）
+
+游戏改窗口尺寸时不调 Reset：fork 的窗口过程截获 WM_SIZE，自己调 `ResetSwapChain`。开发代理现在照做：
+- 每种 profile 都挂设备窗口的窗口过程。窗口线程收到 WM_SIZE 只记下客户区尺寸，消息不转给应用。
+- owner 线程在下一次与尺寸有关的调用里接手（场景外；Present 在调用之后接手），发带 `ResetKeepResources` 的 Reset op。
+  宿主只跳过"DEFAULT 池缓冲须已释放"这一项检查。
+- 代理换上新的后台缓冲，视口和剪裁矩形覆盖新目标，其余状态、绑定和缓冲都保留，与 fork 一致。
+- 新增 `D3D9 window-proxy:` 行；`reset-host` 行新增 `windowResets`。
+- 夹具新增 `--resize`（13 项保留/替换检查），门新增 `--resize`：game 组 1280×720 → 1902×963，a8 组 257×129 → 64×64。
+
+897A416E 宿主 fresh BelowNormal/-j2 的结果：
+- CPU 门通过：210,915 项 CPU 检查，wire 1,455,523 项。
+- VVL GPU 门 r2 通过：resize 两组离屏用例与 fork 原版逐像素一致，stream + 固定功能批也一致；主路径 11 个哈希仍是 03f7265a，
+  尺寸、reset、ring 哈希不变，VVL 0 错误。
+- 资源寿命门、M0 内存门通过；旧呈现门仍是计数过期，计数与 G6 相同。
+- 保留失败回执 GPU r1：resize-present-game 的宿主正常返回后超过 5 秒才退出，同一构建重跑通过；同一现象在 §7 出现过一次，原因未明。
+
+War3 分辨率字段的改写（S2，留在 x86）和 fork 窗口过程的其他行为没有搬。
+未接游戏，未部署、提交、推送或发布。详见 [S1 回执 §11](../research/2026-10-30-x64-s1-d3d9-path.md)。
+
+## 2026-10-31：x64 增强层拆分 S1 第六组：G6 有序状态与缓冲内容不等回复（Claude）
+
+异步批次档位下，UploadBuffer、SetEffects、SetSamplerState、SetTextureStages 经新的 `Connection::enqueueOrdered` 直接进有序队列，
+不再等宿主回复；载荷在返回前复制，宿主拒绝是终止性的。NOOVERWRITE 内容按 Lock 约定可以越过暂存的 draw，
+DISCARD、普通 Lock 和状态先刷出暂存 draw。代理的 Unlock 分块与 draw 时的三种状态同步都改走 `Device::ordered`；
+同步档位不变。连接记下正在等回复的 `call` 序号，`call` 发出的有序状态被拒仍可恢复（原有故障用例的约定）。
+新增 `D3D9 ordered-async:` 计数行。
+
+CPU 测试 `asyncOrderedState`（顺序、私有副本、四种终止回复、`call` 的可恢复拒绝）；门的 ring 用例按 fixture 顺序独立算出批的切分。
+CB922267 宿主 fresh BelowNormal/-j2：CPU 门（210,915 项）、VVL GPU 门 r3（主路径 11 个哈希仍是 03f7265a，尺寸、reset、ring 哈希不变，
+5 个原始协议故障用例通过，VVL 0 错误）、资源寿命门、M0 内存门通过；旧呈现门仍是计数过期。
+ring stream + 固定功能批：211 次上传、3 次状态同步都不等回复，批数 64 → 20、最大一批 1 → 6 个 draw。
+保留失败回执：GPU r1（门漏算纹理上传）、r2（第一版把 `call` 发出的状态拒绝也变成终止）。没有测时间（机器负载噪声）。
+未接游戏、未部署、提交、推送、发布。详见 [S1 回执 §10](../research/2026-10-30-x64-s1-d3d9-path.md)。
+
+## 2026-10-31：x64 增强层拆分 S1 第五组：G2b DEPTHBIAS 与按 FVF 缓存声明（Claude）
+
+DEPTHBIAS（渲染状态 195，游戏设置的渲染状态里远端唯一缺的）作为 effects 包的第 16 个键，要求有限 float，默认 0；
+代理存取、按像素状态进状态块、ResetState 清零，Caps 加 `D3DPRASTERCAPS_DEPTHBIAS`。宿主照原版按
+`VK_EXT_depth_bias_control` 选表示方式，系数取 D32_SFLOAT 目标的 R 值，每个 draw 设常数偏移。SLOPESCALEDEPTHBIAS 游戏不用，不携带。
+代理照原版 `m_fvfTable` 按 FVF 保留声明，切 FVF 时直接绑定；开发宿主只有 4 个声明槽位，创建失败时先放掉未绑定的缓存声明再重试一次。
+
+extent fixture 新增 `--depth-bias`（同深度四条竖带：零偏移 LESS 失败、负偏移 LESS 通过、正偏移 LESS 失败而 GREATER 通过），
+ring 模式加"同一 FVF 取回同一声明"检查。C00F4CA7 宿主 fresh BelowNormal/-j2：CPU 门（wire 1,455,520 项）、
+VVL GPU 门 r3（主路径 11 个哈希仍是 03f7265a，尺寸与 reset 哈希不变，4 个 ring 用例 `b491e0cf`，宿主声明 3 个，VVL 0 错误）、
+资源寿命门、M0 内存门通过；旧呈现门仍是计数过期。保留失败回执：GPU r1（缓存占满 4 个声明槽位，主 fixture 的多纹理阶段 SetFVF 失败）、
+r2（代理改动后未重新构建，门按源码漂移拒绝）。未接游戏、未部署、提交、推送、发布。详见 [S1 回执 §9](../research/2026-10-30-x64-s1-d3d9-path.md)。
+
+## 2026-10-30：x64 增强层拆分 S1 第四组：G5 动态 VB/IB 的 Lock 模式（Claude）
+
+新增 x86 缓冲普查 `warvk-d3d9-buffer-census/v1`（只在普查构建里，按返回地址分调用方），游戏 1951 帧的结果：
+Game.dll 只用三个 DEFAULT 池 DYNAMIC|WRITEONLY 环形缓冲，512 KiB VB（FVF 0x112）、576 KiB VB（FVF 0x152）、96 KiB INDEX16 IB，
+NOOVERWRITE 顺序追加，回绕时 DISCARD，VB 的 Lock 全部带 NOSYSLOCK，没有越界、嵌套、跳写和 READONLY。
+由此发现远端路径接游戏的三个问题：代理拒绝 NOSYSLOCK；wire 的 MaxBuffer 256 KiB 装不下两个 VB；宿主每次上传都两次排空 GPU。
+修正：MaxBuffer 1 MiB；CreateBuffer 带 DYNAMIC，UploadBuffer 带 Lock 方式（Ordered/NoOverwrite/Discard，静态缓冲只接受 Ordered）；
+代理接受 NOSYSLOCK，只有第一块上传带 Discard；宿主的动态缓冲用 coherent 内存，NoOverwrite 直接写，
+stream 档位的 Discard 换一块新存储并带过已初始化前缀，其他档位 settle 后原地写。新增 `D3D9 dynamic-buffer-host:` 计数行。
+
+extent fixture 新增 `--ring` 模式重放游戏的缓冲用法，门 `--ring` 4 个用例（参考、同步、stream、stream+固定功能批），
+8 帧 64 个 draw、136 次 Lock、19 次 DISCARD、16 次回绕，四个哈希相同（`8f0918f7`）。42DC1DAC 宿主 fresh BelowNormal/-j2：
+CPU 门、VVL GPU 门（原 11 个哈希仍是 03f7265a，尺寸与 reset 哈希不变，VVL 0 错误）、资源寿命门、M0 内存门通过。
+旧呈现门仍因写死的计数失败，多出的一次是遮挡查询轮询（上传不再提交 GPU，时序变了）。
+未解决：每次 Unlock 仍是同步往返并刷出暂存 draw（固定功能批只剩 1 个 draw）；每次切 FVF 宿主新建声明。
+未接游戏、未部署、提交、推送、发布。详见 [S1 回执 §8](../research/2026-10-30-x64-s1-d3d9-path.md)。
+
+## 2026-10-30：x64 增强层拆分 S1 第三组：G4 设备参数与 Reset（Claude）
+
+代理与 Factory 接受游戏的交换链：X8R8G8B8 后台缓冲、D16 自动深度、INTERVAL_IMMEDIATE，CreateDevice 与 Reset 共用
+`ResolveSwapChain`。wire 的 Initialize 增加 args[7] 格式（22 为不透明目标），间隔允许 IMMEDIATE；新增 `Op::Reset`。
+X8 仍用 BGRA8 存储，DESTALPHA 混合按 1 处理，呈现时 alpha 取 1；D16 与 fork 一样映射到 D32_SFLOAT。
+Reset 按原版 D3D9 的顺序：参数被拒时状态不动；否则清空状态、释放隐式后台缓冲；还有 DEFAULT 池 VB/IB、
+后台缓冲引用或状态块时进入 NotReset（DEVICENOTRESET，Present 返回 DEVICELOST）。清空的范围与参考 DLL 的
+ResetState 相同：着色器、声明、常量、变换、材质、灯光保留，null 流保留 offset/stride。代理的默认 CULLMODE 由 NONE 改为 CCW。
+宿主 `reset()` 按新尺寸和格式重建目标与交换链；窗口改尺寸后、Reset 之前的 Present 跳过这一帧（PresentSkipped），不再是永久故障。
+
+extent fixture 新增 reset 模式与 `--reset` 门 6 个用例：游戏组 1902×963→1280×720，a8 组 257×129→64×64 且尺寸填 0。
+两组参考与远端哈希相同（`da171c90`、`5996d86d`），呈现用例 Reset 后再呈现 3 帧。64CABE43 宿主 fresh BelowNormal/-j2：
+CPU 门、VVL GPU 门 r4（原 11 个哈希仍是 03f7265a，尺寸用例哈希不变，VVL 0 错误）、资源寿命门、M0 内存门通过。
+保留失败回执：GPU r1（fork 收到 WM_SIZE 后自己重置交换链，已让夹具窗口不产生 WM_SIZE）、r2（参考 Reset 后保留
+offset/stride 与 FVF，已按 DXVK 改代理）、r3（一次 host 退出超过 5 秒，重跑未复现）。旧呈现门结果与 G3 时相同。
+发现：游戏改窗口尺寸时不调 Reset，由 fork 的 WM_SIZE hook 处理；远端路径接游戏前 x86 侧需要等价处理。
+未接游戏、未部署、提交、推送、发布。详见 [S1 回执 §7](../research/2026-10-30-x64-s1-d3d9-path.md)。
+
+## 2026-10-30：x64 增强层拆分 S1 第二组：G3 真实分辨率后台缓冲与呈现（Claude）
+
+协议从固定 64×64 改为协商尺寸，每轴 1..4096：Initialize 携带宽高；Readback 按整行分带（每带 ≤ 65,440 B，
+1902 宽每带 8 行）；Present 在整图放不进一次回复时只回帧号，代理再按帧号分带取冻结快照。代理按 D3D9 窗口语义
+取客户区尺寸并写回，默认视口与剪裁覆盖整个后台缓冲。Peer 表面模式的离屏目标与交换链用真实尺寸；
+host-owned 表面仍只支持 64×64。宿主回读缓冲 256 KiB → 65,440 B；x86 侧只有诊断回读档位保留整图。
+
+新 x86 fixture 与 `--extent` 门共 7 个用例：1902×963 原版/远端/零尺寸/呈现、257×129 原版/远端、64×64 呈现。
+同尺寸哈希一致（1902×963 `42d6f4f3`，257×129 `16e2ac0d`），1902×963 呈现 3 帧且与目标图逐字节相同。
+25BAC9EA 宿主 fresh BelowNormal/-j2：CPU 门、VVL GPU 门 r2（原 11 个哈希仍是 03f7265a，远端 0 错误）、
+资源寿命门 r2、M0 内存门通过。保留失败回执：GPU r1（fixture 卸载后才测 Vulkan 模块）、寿命 r1（我传错工具链路径）。
+旧呈现门在 G3 前后结果相同，init/clear-soak 通过，remote-normal 因写死的消息计数过期而失败，待刷新。
+init fixture 修正两处过期（args[6] 改用 4，初始化前 Clear 改为 ClearRegions）。
+未接游戏、未部署、提交、推送、发布。详见 [S1 回执 §6](../research/2026-10-30-x64-s1-d3d9-path.md)。
+
+## 2026-10-30：x64 增强层拆分 S1：调用方普查与拓扑/渲染状态值域（Claude）
+
+新增与冻结 v2 并列的 `warvk-d3d9-caller-census/v1`：公开设备方法入口取返回地址，按 PE 范围分 game/self/other，
+try-cell 记录不阻塞；严格读取器与 42+8 项测试，原普查测试不变。实测 `s1-caller-census-20261030-r1` 通过：
+Game.dll 只用 DrawIndexedPrimitive（三角列表 49,035、三角带 9,372、线带 12，最大 5,896 图元）、FVF 0x112/0x152、
+托管 A8R8G8B8 纹理；RT/DS、StretchRect、着色器、状态块全是 WarVK 自己的调用。缺口清单 G1–G5 见回执。
+
+第一组补 G1/G2：新 `d3d9_topology.h` 代理与宿主共用（线列表/线带/三角列表/带/扇，≤65535 图元，点仍拒绝），
+宿主按图元类型设输入装配；代理接受全部剔除、深度比较、混合因子与混合运算，DITHERENABLE 本地保存进像素状态块，
+caps 与物理 caps 求交。GPU fixture 新增 8 张成员判定图（5000 图元带、BaseVertexIndex、扇、CW/CCW 剔除、
+DESTCOLOR、MAX、GREATER）和 2 张只进哈希的线图；raw 协议新增 4 个可恢复拒绝。
+
+AC88CE77 宿主 fresh BelowNormal/-j2。CPU 门、VVL GPU 门（11 个哈希都是 03f7265a，远端 0 错误，raw 5 档各 24 拒绝/恢复）、
+资源寿命门与 M0 内存门一次通过。未接游戏、未部署、提交、推送、发布。
+详见 [S1 回执](../research/2026-10-30-x64-s1-d3d9-path.md)。
+
+## 2026-10-30：x64 增强层拆分 S0：数据层切口门与标注传输（Claude）
+
+作者同意全面接管渲染层，增强层拆为 x86 数据层 + x64 GPU 执行器，见[拆分计划](../plan/2026-10-30-x64-enhancement-split.md)。
+新增 `run_x86_data_layer_cut_gate.py`：llvm-nm 读真实对象、明确规则分类、未知对象报错，`--ratchet` 时正向切口
+只许减少。基线 r2（r1 因 `version` 未分类失败保留）：数据层 114 个对象，正向切口 113 个符号 / 21 个对象，
+反向面 477 个符号（`d3d9_device.cpp` 388），难点在逐 draw 决定。
+
+D9C2 扩展由 Initialize `args[6]` bit1 协商，未协商一律可恢复拒绝：`FrameScene`（`FrameCamera` 160 B）、
+`StageMarker`（四个阶段）、`AnnotateDraws`（只绑定紧接的下一条 draw 消息，序号/schema 严格递增，
+其他消息到来即拒绝并作废记录）。代理 `WARVK_D3D9_ANNOTATIONS=1`，导出 `WarVKD3D9AnnotateNextDraw`、
+`WarVKD3D9SetFrameScene`、`WarVKD3D9MarkStage`；批次模式记录随暂存批走，非 OK 一律 fail-closed。
+宿主只接 FNV-1a 记录器消费者，冻结 v1 行不变，另出 `annotation-proxy/v1`、`annotation-host/v1`。
+
+94BAA54C 宿主 fresh BelowNormal/-j2。CPU 门（各 210,798 项、wire 各 1,454,928 项）、VVL GPU 门 r2
+（16 个远端用例 0 错误；11 图仍为 0627ed73；fixture、代理、宿主摘要同步与流固定批两档都是 4959d1f6；
+raw 27 个可恢复拒绝、摘要一致）、资源寿命门与 M0 内存门通过。GPU 门 r1 因漏写 raw 固定批账户期望失败，
+保留为失败回执。只有记录器，没有真实执行器；未接游戏、未部署、提交、推送、发布。
+详见[标注传输回执](../research/2026-10-30-x64-annotation-transport.md)。
+
+## 2026-10-30：x64 迁移的 x86 内容副本按预算驻留（内存优先，Claude）
+
+作者要求内存优先于性能：迁移初衷是减轻 32 位进程内存压力。开发代理此前为每个 VB/IB/纹理在 x86 留完整
+副本，接游戏后会抵掉移出 DXVK/驱动的收益。新增默认关闭的 `WARVK_D3D9_X86_BACKING_KIB=<KiB>`：
+Initialize `args[6]` bit0 协商后宿主保留 VB/IB/纹理的 x64 权威副本，新 op `ReadContent` 只读这些 CPU 副本；
+x86 每个缓冲/纹理 level 为一个驻留项，Lock 和索引检查期间钉住，释放后按 LRU 淘汰到预算内，再用时读回，
+读回失败 fail-closed。索引检查逻辑与拒绝结果不变。默认模式 CPU 账户逐字节不变；冻结 v1 行不变，
+另出 `backing-proxy/v1`、`backing-host/v1`。
+
+合成工作量（12 张 1024² 满 mip ARGB，约 64 MiB）同像素下 x86 已用 VA：进程内 DXVK 739.9 MiB，
+代理默认 126.5 MiB，代理预算 0 为 59.5 MiB，预算 8 MiB 为 65.5 MiB；其中约 617 MiB 是进程内
+Vulkan/DXVK/驱动基线。53E76905 宿主 fresh BelowNormal/-j2；CPU 门（各 210,734 项、wire 各 1,454,681 项）、
+VVL GPU 门（14 个远端用例 0 错误；主 fixture 297 图仍为 0627ed73，内存工作量四模式同哈希；保留模式
+4 个正向读、12 个可恢复拒绝）、资源寿命与 M0 内存门全部通过。M0 门自 10-22 后未跑，期望值已过时
+（纹理上传事务每轮多 2 次调用、首个 draw 多 1 次采样器发布、宿主 v1 行新增 `queryWaits`），
+r1–r3 保留为失败回执，按调用结构推导更新期望后通过。未接游戏、未部署、提交、推送、发布。
+详见[内容驻留回执](../research/2026-10-30-x64-x86-content-residency.md)。
+
+## 2026-10-29：x64 固定功能 draw 异步批次（T2 路线 ②，Claude）
+
+新增 `DrawFixedBatch` op 与默认关闭的 `WARVK_D3D9_FIXED_BATCH=1`（需 `BATCH_DRAWS`）：每包 1–20 个完整、
+独立的固定功能 draw（各 3,180 B），代理同一时刻只暂存一种 draw，切换种类、满包及任何远端调用先冲刷，
+远端顺序即调用顺序。延迟拒绝同 `DrawBatch` 为终止性；代理暂存前本地 `ValidFixedFunction`，状态域拒绝仍可恢复。
+宿主整包解码后全条目 prepare 再录制：流模式整包进打开列表，其他模式保持逐条 settle/submit。
+`drawFixed` 即 1 条批次；冻结 v1 行不变，另出 `fixed-batch-proxy/v1`、`fixed-batch-host/v1`。
+
+C32C135C 宿主 fresh BelowNormal/-j2 通过。CPU 门（x86/x64 各 210,734 项 + 新 `bounded-fixed-batch`）、
+FF GPU 默认/强制优化（七端 297 图同为 0627ed73，281 个 FF draw 全部经批次）、raw 12 个原子拒绝/恢复
+（非异步与新增流同步环境，均像素不变）、计时门 VVL（45,293 draw / 2,299 批）、SM3 回归与资源寿命全部通过，
+VVL 0。1,025 固定功能 draw：同步 DrawFixed 45–47 ms → 固定批 **7.8–9.2 ms**，宿主 CPU 约降至 1/3–1/5，
+仍为本地 3.3–3.6 ms 的 2.3–2.8 倍，未过建议门槛。剩余主要在 3,180 B/draw 的传输与解码、FF 常量每条重算。
+本轮机器状态漂移（未改动的本地 SM3 参考 1.65 ms），只做轮内比较。未部署、提交、推送、发布。详见
+[固定功能批次回执](../research/2026-10-29-x64-fixed-function-batch.md)。
+
+## 2026-10-29：x64 准入段拆解（Claude）
+
+新增默认关闭 `WARVK_D3D9_ADMISSION_PROFILE=1`：生产者/工作线程/宿主三方 CPU 墙钟计数，
+每次 EVENT Issue 后切样本，≤128 个，关闭时不读时钟；宿主录制内再分常量/状态绑定/
+8 槽采样器/DXVK draw。严格读方检查样本连续、单调、嵌套与每区间恰为一帧，纯测试 3 例。
+
+06868F71（一级）与 27482FB2（录制细分）宿主 fresh BelowNormal/-j2 通过；1,025 draw
+开/关计时三轮六端像素全一致，计时开销在噪声内。r2 安静流端完成 2.68 ms：工作线程每批
+往返 69 µs 完全串行，宿主 apply 占 65%、管道+唤醒约 29%；生产者 75% 准入时间在等队列。
+宿主 apply 中 DXVK 绑定+draw 约 1.0 µs/draw（≈1.0 ms/帧，70%），8 槽采样器循环仅 54 ns/draw，
+解码/预检/常量合计约 0.33 ms。group 多出的 0.54 ms 全在 flight/批次 UBO 处理。
+下一步：FF draw 异步批次 → 宿主原生式脏跟踪 → 预检后回复让传输与录制重叠 → 共享内存环。
+未部署、提交、推送、发布；改动文件均未被 git 跟踪。详见
+[准入段拆解回执](../research/2026-10-29-x64-admission-breakdown.md)。
+
+## 2026-10-29：x64 宿主流式命令列表与原生常量环（T2 第一批原型，Claude）
+
+新增默认关闭 `WARVK_D3D9_STREAM=1`：draw 批次与固定功能 draw 录进同一打开列表，
+在 FlushDraws/EVENT/任何 settle 操作处提交；常量按原生 `D3D9ConstantBuffer::Alloc`
+取 1 MiB 环切片，用尽经 `invalidateBuffer` 换存储，不再 CPU 等 GPU。单列表 ≤4,096 draw，
+未完成流序号领先 GPU ≤3。与 flights/group/等待计时互斥；冻结 v1 指标不变，另出
+`stream-host/v1` 行。固定功能 draw 在流模式下不再每次排空 GPU；代理 DrawFixed 仍同步。
+
+E7CB8E38 宿主 fresh BelowNormal/-j2 通过。批次门四轮、VVL365、FF GPU 默认/强制优化
+（五端 297 图同为 0627ed73，281 个 FF draw 进流）、流模式 raw 故障/恢复、96 轮资源寿命
+全部通过，VVL 0。安静轮 r3 1,025 draw：stream 2.76/2.90 ms 对 group 3.65/3.81 ms，
+宿主 CPU 少约 42%，仍为本地 0.61–0.82 ms 的 3.4–4.7 倍，未过建议门槛；剩余时间
+几乎全在 EndScene 返回前的准入/传输段。r1 有 Steam 游戏占 6–7 核，绝对值作废。
+未部署、提交、推送、发布；改动文件均未被 git 跟踪，T0 仍待作者确认。详见
+[流式命令列表回执](../research/2026-10-29-x64-stream-constant-ring.md)。
+
+## 2026-10-29：评审后暂停兼容扩展，实测 T1 VA 与 T2 flight 等待
+
+StateBlock既有收口保持；按作者转交评审先做T1/T2，暂停RT/DS/Reset等X3扩展。
+新增保留只读句柄的完整VA区域/映射文件采样和独立memory+正常退出验收；不能凭
+VirtualQuery归属private堆。Lost Temple同DLL OFF/CPU事件环ON/OFF三轮均正常退出：
+Private633–653/732 MiB，ON增量79–99 MiB，OFF自身波动约20 MiB。玩家与沙箱
+war3.exe今天均已LAA，本批未修改；低2GiB最大空闲块分列，不混同完整4GiB。
+仍有约998–1018 MiB已占VA未归属，净迁移量保持unknown，不将Arena DEVICE_LOCAL
+预算、事件池容量和GPU显存相加冒充可迁出量。
+
+x64新增默认关闭、128区间有界的flight复用分段计时，沿用原CPU提交/GPU/use退休。
+813688CC宿主fresh BelowNormal/-j2及no-work通过；1,025 draw实测合并模式8次复用/
+帧，约占完整时间51–55%，逐批模式29次。开启/关闭诊断及VVL365三组门通过，
+像素/原始拒绝恢复/资源归零保持。当前无计时同轮本地约1.74–1.76 ms、远端14.55–
+14.61 ms，尚不可接受；与旧3.6ms或25ms轮不拼接归因。
+
+真实census独立轮取得1606 Present/173378 draw尝试，但现有稀疏累计快照缺少
+逐帧分布、Lock/Unlock/GetData和字节数，不能称T2真实负载门完成。下一步补有界
+逐帧来源/字节见证及T1既有allocator地址区间，再做共享环原型；不新增全局设备锁。
+纯测试6+39+3+9通过；不是新的产品全量回归。T0与建议性能阈值待作者决定；未提交、
+部署、推送、发布。完整事实、口径、T4对比与未覆盖见
+[T1/T2首批测量](../research/2026-10-29-x64-review-t1-t2-baseline.md)。
+
+## 2026-10-29：StateBlock 状态恢复与无纹理 shader 接线
+
+x86 owner 新增 Create/Begin/End StateBlock、Capture/Apply，按原 D3D9 实现选择
+PIXEL/VERTEX/ALL 字段，不复制整个 Device；录制期保留 live getters，按值保存常量/
+变换，资源使用原 COM 私有保活，绘制继续经过现有 x64 DXVK 状态与 GPU 退休。
+未结束录制在 Finish 前销毁。修正 null VB 绑定覆盖 offset/stride 的原代理缺陷；
+Capture 后换短 VB 保留旧 offset 时，Apply 在任何发布前拒绝并传播失败。
+
+实际 shader 恢复测试发现旧有限 profile 在 COM、wire、host resolver、backend 中
+要求 programmable draw 必须有 stage 0 纹理。四处现允许规范空纹理并用原 DXSO
+null sampler 语义；非零身份/代际/上传检查保留，缺失 VB/声明/programmable shader
+继续拒绝。没有增加 StateBlock IPC、wire 布局、全局锁或逐 setter GPU wait。
+
+80287B63 宿主独立构建/no-work 通过；`x64-stateblock-gpu-20261029-r5/r6` 强制优化/
+默认 GPU 门通过：四端各 297 图 / 4,866,048 通道，hash `0627ed73c4fa582e`，远端
+各 302 draws。StateBlock 新增 11 图及 native 246 / remote 247 状态检查；私有引用
+保活、Capture 替换资源、shader/常量恢复、未结束录制析构均覆盖。两宽 wire 各
+1,454,644、token 各 6,560、专门化与 sampler key 各 200,000。raw 门各 97 draws /
+72 rejected / 342 submitted=completed=retired，VVL365 无 warning/error，资源归零，
+正常退出、来源保全和玩家 DLL 不变。随后 `x64-stateblock-lifetime-20261029-r1`
+完成 96 轮 / 576 资源 / 256 Query / 319,488 像素；raw 61 拒绝、48 像素恢复、13 Query
+恢复同样通过，最终资源归零、自然退出及 source/reference/player 保持。
+
+保留语法缺特化、预检宏重复、夹具选用未支持的 managed VB、遗漏 wire 解码器、夹具
+写死 4096 偏移等失败记录；后续绿门不追认旧失败。仍是有限 64×64 开发 profile，
+未完成 Warcraft / RT-DS / Reset / 增强 pass 接入；没有新内存或性能收益测量。
+下一步为 RT/DS 和目标切换。详见
+[实现、失败和验收回执](../research/2026-10-29-x64-stateblock-integration.md)。
+
+## 2026-10-29：八纹理 stage 与独立 sampler 进入 x64 实际绘制
+
+新增 448 B 成组绑定/采样状态事务，完整预检后发布，每次 draw 重新核验纹理代际、
+上传完成和上传所有者。FF 使用原 key 的真实八位纹理掩码，SM3 使用原 DXSO 的 s0..s7；
+每个 stage 独立地址/LOD/sRGB，COM 私有绑定与原 DXVK GPU 退休保持。没有新增逐 setter
+IPC 或 GPU wait。16 个开发纹理槽供八纹理同时存在，不改变 Warcraft Arena/快照预算。
+
+C68506CF 宿主默认/优化 `x64-multitexture-gpu-20261029-r3/r4` 通过：四端各 286 图 /
+4,685,824 通道完全相等，新增 17 图；72 个实际非法事务、部分发布拒绝及新代际恢复
+通过，VVL365 零 warning/error，资源归零及自然退出。两宽 wire 各 1,454,388、token
+各 6,560，专门化/key 各 200,000 检查。最终
+`x64-multitexture-lifetime-20261029-r1` 的 96 轮 / 576 资源 / 256 Query / 319,488
+像素及原 raw 故障恢复通过，source/reference 保持、资源归零并自然退出。
+构造函数、runner 计数门槛、夹具提前释放引用三次红门均保留；修复后重新执行而未追认。
+完整 Warcraft / StateBlock / RT-DS / Reset / 增强 pass 尚未通过；未做新的 Storm、
+客户端内存或游戏性能测量，玩家 DLL 未覆盖。详见
+[接线、红门及完整接入边界](../research/2026-10-29-x64-fixed-function-integration.md)。
+
+## 2026-10-29：Alpha / fog / scissor 进入 x64 实际绘制
+
+76 B 按值 effects 状态通过同一预检入口交给原 DXVK；专门化常量变化采用原 storage
+rename，保留在途旧版本，无新增 setter GPU wait。修复代理 Clear 漏用 scissor 的
+真实语义缺口，并保留首先暴露它的 native 测试初始化错误。5BCCD41A 宿主的默认/
+优化两门 `x64-effects-gpu-20261029-r3/r4` 通过：四端各 269 图 / 4,407,296 通道
+完全一致；60 个实际非法事务和恢复通过，VVL365 零 warning/error，资源归零及自然退出。
+`x64-effects-lifetime-20261029-r1` 的原 96 轮生命周期/故障恢复亦通过。
+完整 Warcraft、增强 pass、真实性能和 Storm/进程内存均未验收；
+遵守用户完整接入后再测内存的顺序。详情及红门见
+[本轮接线回执](../research/2026-10-29-x64-fixed-function-integration.md)。
+
+## 2026-10-29：Factory / Clear / FVF 与固定功能实际执行
+
+原 Factory 协商和局部 Clear 已接入 x64，FVF decoder、FF key 与变换常量准备由
+本地生产设备和远端共用。持续绘制暴露了优化 pipeline 的 FF 专门化常量遗漏，
+已复用原打包算法修复，并以实际有效配置/双宽原实现差分重验。随后 BGRA8 的多 mip、
+NPOT、局部/分块上传、LOD 接通；089A0BAA 宿主默认/强制优化两门通过：
+两宽 wire CPU 各 1,150,226、专门化各 200,000 检查，四个渲染场景各 31 张图 /
+507,904 通道完全相同。30 个真实非法事务及恢复、VVL365 零 warning/error、
+GPU/use 退休、资源归零和自然退出通过。共享产品 fresh ED72F52E DLL 与本次配置
+119/119 回归通过。详见
+[接线回执与保留红门](../research/2026-10-29-x64-fixed-function-integration.md)。
+
+后续 16 格式/表面与 sampler 批次已分别完成实际对照。sampler 共用原 native key，
+SetSamplerState 本地合并；sRGB view 与 managed BC 非对齐锁域接到原资源所有者。
+E7EFBD5E 宿主的默认/强制优化 `x64-sampler-gpu-20261029-r3/r4` 均通过：四端各
+225 图 / 3,686,400 通道实际哈希相同；两宽 wire 各 1,180,900、专门化/key 各 200,000。
+48 个非法事务与恢复、VVL365 零 warning/error、GPU/use 退休及自然退出通过。
+共享 x86 26B411E9 DLL 本次实际 119/119，资源寿命门 96 轮 / 576 资源、256 Query /
+319,488 像素通过，96 轮相同 sampler 仅增加一次有序消息。确切 hash 与红回执见上方报告。
+
+完整 Warcraft 仍未接入：RT/DS/StateBlock、更多 stage、Reset/换图和
+WarVK 增强 pass 尚待。Alpha/fog/scissor 后续候选正在验证，不能继承 sampler 身份。
+FF 当前同步有序事务，未接受游戏性能。按用户顺序，本批不测 Storm/客户端迁移内存；
+没有部署、提交、推送或发布。
+
+## 2026-10-28 后续：GPU 提交合并、非索引覆盖和双进程成本
+
+- 四个 32-draw 消息共享一个原 DXVK command list，仍使用四份常量 backing（测试 GPU
+  总计不超过 1 MiB）。EndScene 显式提交尾部，上传/销毁/Query/读回沿原有序边界；
+  不扩大队列或跳过 CPU/GPU/use 三项退休见证。
+- 实际接通 `DrawPrimitive(TRIANGLELIST)`，空 IB 身份规范化，Draw/DrawBatch 共用
+  宿主解析入口，逐 draw 初始化范围/身份验证和整批预检继续执行。定宽 wire helper
+  与旧字节 codec 做未对齐/全宽/guard 对拍，字节布局不变。
+- 最终同版 1,025 draw，提交合并完成中位数约减少 7–13%、双进程 CPU 周期约减少
+  30%；97 draw 中位数约减少 20–24%，依然没有追平本地。额外的批内重复状态省略没有稳定收益，默认关闭，
+  不把减少 306,744 次状态设置计作性能接受。系统竞争负载与长时尾延迟未闭合。
+- 新 CPU 工作量计数绑定进程身份和保留句柄；短窗口 `GetProcessTimes` 的零增量
+  不当作零 CPU，增加原始周期计数且不作固定频率换算。逐帧 EVENT 计时与包含预热/
+  读回的 44 帧 CPU 工作量分开。
+- r3/r4 状态切换用例先在本地参考失败：沿用了上一 tile viewport，却期待整面 Clear。
+  保留失败，r5 显式设置整面 viewport 后本地/远端通过；未放宽像素容差，也没有声称
+  已实现子视口/矩形 Clear（这是当前开发宿主的新登记缺口）。
+- 最终低 draw r6 reader 拒绝了合法短窗口的系统 CPU 零增量。保留失败回执，新增
+  unavailable/null 和原因字段，禁止当作零系统负载；r7 重跑九场景通过。CPU 周期、
+  QPC 和像素门仍严格，最终高 draw r6 / 低 draw r7 与状态实验 r5 分开记账。
+- 当前宿主 `3ACCB356…C5666C` fresh build/no-work；x86/x64 各 210,608 Connection +
+  116,079 wire/状态判定；97 / 1,025 draw 各 9 场景 GPU；VVL365 三场景零 warning/error；
+  实际管道 EVENT / DrawBatch 各五种故障拒绝通过。完整身份与回执见
+  [专项报告](../research/2026-10-28-x64-submit-groups-and-nonindexed.md)。
+- 未改共享产品源；玩家 DLL `1FFE0BD1…35CF` 未动，未提交/部署/发布，不声称完整游戏迁移。
+
+## 2026-10-28：实际 x64 draw 批次与等待成本收敛，完整游戏迁移仍未验收
+
+- **实现**：开发代理按值打包最多 32 draw（37,248 B），资源身份/代际、viewport、
+  状态、常量和 index 参数一起交给 x64 原 DXSO/DXVK。整批预检后才记录 GPU，
+  更新/销毁/Query/Readback/Present 保留有序屏障；没有增大四槽队列或丢 draw 换性能。
+- **共用边界**：以原 DXVK 提交/finish 通知替代宿主固定 Sleep 轮询；修复 Win32
+  condition variable 的 deadline 符号、虚假唤醒循环和毫秒转换。timeout 不授权
+  取消或复用；原 GPU timeline 与资源使用退休仍分别核验。
+- **已验收范围**：通知候选的 97-draw 实际 COM→x64 离屏 GPU 9 场景、29 组整批拒绝
+  与恢复、三个独立 VVL365 场景通过；x86/x64 实际等待原语各 1,014 检查通过。
+  同轮完成中位数：逐 draw 10.33–10.99 ms、32-draw 批次 0.755–0.877 ms、
+  本地参考 0.127–0.174 ms；这是 64×64 提交微基准，**不是游戏 FPS**。
+- **x86 共用修改回归**：新独立 DLL `F6589D0F5BC9EA7440764104ACAB3D9B1279FA53D4CE8842DE52D07D468F9C4F`，
+  构建/no-work、127/127 配置测试，以及一轮同 35 秒限制内的 Lost Temple 载图、
+  截图、退图、自然 exit 0 通过。此前两次启动/退出总时限失败与旧 DLL 正向对照保留，
+  间歇耗时原因未证实。玩家 DLL `1FFE0BD1…35CF` 未动。
+- **四批在途 / 异步批次**：97 / 1,025 draw 各 16 场景通过，1,025 draw 的三场景
+  VVL365 独立回调零 warning/error；193 draw 补充判据覆盖旧批常量、纹理更新和 in-flight
+  Destroy / 六类 ID 换代。1,459 批实际提交全部按原见证退休。CPU x86/x64 各 190,493
+  检查及真实管道五类故障拒绝通过，完整回执见专项报告。
+  高 draw 数同轮完成中位数为 24.64–26.64 ms，较逐批等待约减少 38–44%，仍远慢于
+  本地 2.06–3.31 ms；不能宣称性能目标已达成。两次配置超时保留，第三次只把构建
+  工具配置 watchdog 改为 600 秒；游戏/GPU/IPC 时限不变。
+- **一次性 EVENT 完成通知**：新 FE6ECB 宿主仅在原 GPU timeline 完成后授权本地 Query
+  成功，资源退休单独核验。97 / 1,025 draw 各 8 场景、三场景 VVL365、五种真实管道故障、
+  x86/x64 各 210,589 Connection + 1,319 wire 检查、59 项严格 reader 通过。
+  12 个错误 WaitEvent / 3 个合法恢复、重复 Issue、多 Query、销毁复用均有真实链路证据。
+  97 draw 同轮 Poll IPC 从 6,261 / 5,723 降至零（各 46 次真实等待）；完成中位数
+  4.995–5.647 → 2.465–4.164 ms，本地 0.419–0.807 ms。高 draw 尾延迟未全面改善，
+  紧密本地 GetData 的 CPU 时间仍缺测量，性能接受门保留。测试后只读快照发现另一游戏
+  占用约 5.28 个逻辑核；不认证这是全部抖动原因，也未干预该进程。
+- **如实保留测试失败**：新 Query 用例最初漏了 D3DGETDATA_FLUSH，使本地参考 Clear
+  保留在 CPU 命令流而超时；修正测试后重新全门通过，未放宽 deadline。原 r1 红回执保留。
+- **未覆盖**：实际游戏仍缺完整 Factory/FF、多子资源纹理、RT/DS/StateBlock 等代理语义；
+  Game.dll 保护保留，不声称全部渲染搬迁、游戏内存节省或发布。详细身份、失败与原始回执见
+  `docs/research/2026-10-28-x64-draw-batching-and-cost.md`。
+
+## 2026-10-24：低地址/TLS 压力、真实入口与管道分片修复完成一轮闭环
+
+- **实现**：CurrentDraw 三张大 TLS 表和 material signature cache 改为冷启动
+  `LazyThreadArray`；首次 backing 失败在 native hook 边界内 fail-visible，发布前
+  三表成组预检，合法 caster 走既有 uncached material resolver，拒绝计数独立且可重试。
+  这收紧的是分配异常安全，不是放宽准入或扩大 Arena。
+- **实现**：NetEvent 初始化移到 `war3_preinit`/JASS instance 已发布之后；事件标量
+  改为原子发布。早期 one-shot 初始化曾导致 `GAME_LEAVE` 永久缺失，本轮生产接线修正后
+  复用既有 War3Events reset 与 Present 安全退役事务。
+- **实现**：调查器对立即 `ERROR_MORE_DATA` 使用 `GetOverlappedResult` 读取实际完成
+  字节数；真实消息管道回归证明旧实现会丢中间 65,536 bytes 并伪造重复 JSON，修复后
+  严格读方仍拒绝真正重复字段，合法跨对象同名字段继续接受。
+- **验证**：CurrentDraw 生产抽取 `6,489,896/0`；lazy runtime `16,308/0`；
+  真实管道 `9/9`、20轮 `180/180`；完整 restricted-Medium Meson `126` tests exit 0；
+  Storm/MDL/低地址专门门全部 exit 0。
+- **真实入口**：候选 `24,469,504 B / AA4CF7F9499A325A5849C2AA463926908F209FE3A800889ACF997EE70830BCCD`
+  在隔离非输入 Desktop 中载入 Lost Temple、取得 1902×963 真实截图，成功退图并以
+  原 retained handle 证明自然 exit code 0；玩家 DLL SHA `1FFE0BD14C51C8E1D2A9EB94425A06260CD4B480A7CA735E13E946EA93EE35CF`
+  保持不变。
+- **边界**：这证明 32 位本地入口和低地址压力修复候选可以工作，不等于 x64 renderer
+  已接产品、不等于全场景/长时/跨地图/GPU 等价，也不是发布授权。完整证据见
+  `docs/research/2026-10-24-mdldata-low-address-repair.md`。
+
+## 2026-10-23：MDLDATA 高地址真实返回/入链已采到，独立OFF再次原指令异常
+
+- 在不重新强制设备多线程锁的基础上，新增默认编译关闭的模型域有界探针：六个精确版本入口，
+  局部POD、一次try-cell、4096目录/16探测、allocationSerial+operationToken抵抗同地址复用；
+  cell内无原生调用/读取/IO，固定81,936B core与2,097,408B映射。分配前不读未构造node。
+  原ABI/参数/返回/LastError透传，不改变Storm/TLSF策略、Game解码、LAA或显存预算。
+- build r1的LLVM intrinsic链接失败已修并保留；r2 build/no-work/输入保全通过，BelowNormal/-j2。
+  候选34,582,528B / `37BB9CDA329B351C502747A9EC50D8C15CF129AA19151426BC4C420376CD0F0B`。
+  实际Core40,293检查、真实MinHook synthetic ABI548检查/0失败，reader62/62（含C++8事件往返）、
+  接线6/6、census14/44、runner31通过。窗口0堆分配；未测游戏p95/p99，不称全库全绿。
+- 主线程发现r1 reader误把node+4当global backlink，修正为node+0x10/w18并加反例；
+  r1语义验收撤销，游戏r1原receipt不改、另存corrected分析，当前以CPU r2为准。
+- 三轮同DLL隔离采集：ON r1为64事件/8低分配；OFF自然0xC0000005；ON r2为112事件/19分配，
+  **其中9次真实高地址返回**。r2 seq74返回80A30090，75/76入链，81低node7FC45820的backlink
+  等于该先前返回值；82 unlink返回、84 free返回不认证链结构正确。预测错误写落点仅是条件复算，
+  未采实际store/页属性，未证明写污染或完整寿命；合法~anchor哨兵单列，绝不把所有高位算高指针。
+- OFF新dump再次在Game+12D96D异常，模型为AltarOfDarkness（旧为UBirth）；本次低arena头有保留，
+  source为MDLDATAHash、两22,404B低块与native header/account吻合。高arena仍无保留，
+  不借用ON事件认证OFF lifetime。缺失管道的初始化分支仍未定位。
+- ON两轮均120秒超时/Job强制结束；OFF是自然AV，不合并成同类终态。三轮均未成功连接控制管道、
+  未执行地图ready谓词、无截图，游戏门仍NOT_COVERED。全部Job空/Desktop关闭、玩家DLL不变。
+- 收口复核1524源码身份变化0；宏关闭的同TU无代码/数据/BSS或探针符号（仅debug节）。
+  后续先补既有OutputDebugString阶段见证，再设计模型分配域低地址兼容及完整free/realloc边界；
+  不扩大Arena、不泛改signed分支、不把探针成功写成x64游戏迁移或崩溃修复。
+  详见 `docs/research/2026-10-23-mdldata-allocation-probe.md` 及其中原始/独立回执索引。
+  未提交、推送、部署玩家目录或发布。
+
+## 2026-10-23：census 改为局部 POD / 有界 try-cell，分配来源继续收窄
+
+- 按作者要求删除诊断强制设备多线程锁，设备仅遵守原 BehaviorFlags；原业务锁不变。
+  Draw 不再额外读设备/上传页状态；未知 shader/FVF/texture state 明确 missing，FF key
+  从当场局部值交接。四 draw/三 texture 的 API 和事实成为同次准入事务，Present 只存一份计数。
+- ConcurrentCensus 每次一次 atomic_flag 尝试，忙则立即拒绝；固定容量、cell 内无分配/日志/
+  游戏/设备调用。按值副本与序号同锁域，格式化在释放后。refusal 是独立 32 位非同刻读数，
+  不与 accepted calls 相加，不用零值认证无丢失；溢出黏性可见。默认诊断编译门仍关闭。
+- v2 严格读方保留 v1 精确兼容，不以 busy 放松 accepted 恒等式；实际缺失直方图全量核对。
+  同一生产 serializer → Python 解析器的往返覆盖两个设备寿命、空样本、截断、Present/Reset/销毁。
+- 两次定向 Python 各134项通过；两次隔离 CPU gate 各569检查零失败、3条往返记录，
+  wrapper6104B/copy6072B、窗口内0堆分配，3写者+1读者60003事务、halfway交错与恢复通过。
+  独立x86目标文件审查确认hot路径无CAS自旋/设备锁；冷ordinal的64位CAS重试明确排除。
+  这些是局部合同证据，不是全库、完整调用图或性能证明。
+- 构建r1虽477步链接成功，但输入两文件漂移/no-work失败，原回执保留；重新冻结的r2
+  regenerate/build/no-work及源身份保全通过，BelowNormal/-j2。候选34,566,144B，SHA-256
+  `346B25D3B6968BA338EF88EFA267318AEDFC04BC5064B83A8BBDB5C448665D80`。
+- 两个全新restricted-Medium非输入Desktop游戏实例分别产出2/4条严格v2记录，日志均
+  forcedDeviceLock=false、BehaviorFlags66；但都未取得ready/截图、120秒超时Job清理，
+  **总门NOT_COVERED，正常退出不成立**。两个最后Present为64/1024，draw为1416/24648；
+  不能把未知场景阶段计为地图覆盖，不能将超时改称旧访问违规，也不证明强制锁是旧故障根因。
+- 高地址只读调查确认失败低节点是UBirth的MDLDATAHash；静态allocator请求0x5784（22404B）
+  经Game+0x128EDD→Storm ordinal401。按当前产品尺寸路由原生透传，不受TLSF大块低地址保护。
+  Game+0x1292D0是旧head backlink写点；三节点数值重建吻合dump四字段及错误取反地址。
+  高节点/arena页未保留，数值重建不是分配史，不认证原生arena返回或live/UAF；protect-memory
+  模式也可能从external VA分配。未修改Game/LAA/分配返回值/阈值，没有扩大Arena。
+- 玩家DLL、源地图及原始坏证据保留，所有本轮Job/Desktop已收口，未提交/推送/发布。
+  后续最小证据是此模型域 allocation lifetime→入链实际写值→free/unlink 的有界关联，
+  不是泛改signed分支或将census成功冒充x64游戏迁移。详情和回执索引：
+  `docs/research/2026-10-23-census-try-cell-checkpoint.md`、
+  `docs/research/2026-10-23-high-address-link-allocation-followup.md`。
+
+## 2026-10-23：真实游戏输入接线与共用 FF，实际进图红门保留
+
+- 按作者要求进入游戏接入阶段：复用原DXSO/DXVK，x86传有类型/顺序/资源身份的数据和操作，
+  x64拥有资源与GPU执行；不另写渲染引擎，不传COM/游戏裸指针，不把CPU ACK当GPU完成。
+- 共用固定功能编译器已接回生产wrapper；保留缓存、注册及GPU-skin不预热行为。
+  新开发census定长6064B，48 API/四draw/三纹理族，32事实及各32唯一key上限；
+  计数为尝试、Unknown来源、缺失/丢失显式，默认编译关闭。当前强制device锁有诊断扰动，
+  不用于性能验收；下一修订改局部POD与独立有界同步，尚未把设计写成完成。
+- fresh诊断x86DLL/x64工具和census-off x86DLL构建/no-work通过；当前定向Python113/113。
+  实际census CPU422检查零失败、测试窗口零分配。真实游戏进程观测3VS+1FS配置，
+  两位宽4份SPIR-V逐字节一致、28个native负例按预期拒绝；不是GPU运行这些shader的证明。
+- 游戏诊断r1未ready而超时；r2模块身份通过但0xC0000005异常退出。
+  独审找到真实WarVK/Crash JSON+dmp，修正工具漏目录并补28/28工具纯测；旧失败receipt不改。
+  稳定/本批前LLVM控制取得ready及1902×963内部BMP，稳定控制做过一次视觉检查。
+  当前census-off两次控制仍无ready/截图、120秒强制收口；不能据此只归因census或FF。
+- 离线dump把故障指令定位到Game+0x12D96D，真实返回边界经过JASS原函数透传。
+  链字段符号/取反解码和LAA高地址是调查线索，尚缺分配/写入来源，不修改Game/LAA。
+  独审未发现FF新增悬空引用，亦不以源码审查盖过实机失败。
+- 全部隔离游戏已按所属Job收口、受保护源/玩家DLL不变。无完整远端游戏画面、内存收益、
+  自然退出、长期/换图或发布验收；Game.dll代理保护保留。后续先闭合真实输入红门，再推进
+  Factory协商、FF状态和多mip/分块纹理。详见
+  `docs/research/2026-10-23-native-game-census-and-shared-ff.md`。未提交、推送或发布。
+
+## 2026-10-23：32 位本地 / 64 位宿主真实像素对比，游戏内存收益仍未量化
+
+- 响应作者的内存与对比图请求：未接 Warcraft/Game.dll 完整负载，故不提供虚构节省 MiB/%。
+  旧 r3 的 x86/x64 内存列是同一跨进程方案的组成部分，不能相减成收益。
+- 只在固定 fixture 的测试副本加可逆、CREATE_NEW 的 BGRA 导出；同一二进制分别走
+  保存的 x86 WarVK/DXVK 参考与当前 x64 开发宿主。正式渲染源码及玩家 DLL 不变。
+- fresh r2 两路径受限 Medium / 非输入 Desktop 正常退出、Job 清空，4,096 像素/
+  16,384 BGRA 字节（含 alpha）完全一致；各 2,548 独立 oracle 检查 0 错。右侧 VVL365 零警告/错误。
+- r1 的汇总器误判“host 只能一条 JSON”保留红；r2 新读方严格验证 desktop+final 两条及实际身份。
+  采集纯测试20/20；独审重验1,169冻结输入及4份raw清单通过。不是全库回归。
+- 真实64×64读回整理为8倍最近邻并排PNG，原始/alpha PNG及来源回执保留，完成一次整图视觉检查。
+  明示是测试场景，不是魔兽画面、双窗口Present或内存收益。详见
+  `docs/research/2026-10-23-x64-visual-comparison-and-memory-scope.md`。未部署/提交/发布。
+
+## 2026-10-23：正式宿主窗口/Presenter 接线，两轮六场景 GPU 门通过
+
+- 已把同一 HostSurfaceTarget 接入正式开发宿主，x64 独立 UI 线程拥有实际 surface HWND；
+  peer 身份不偷换，原 DXVK 资源/帧/队列退休后销毁 Presenter，再复核 device health 后关 HWND。
+  普通 GPU 工作统一校验窗口，Present 保留具名且受原 quiescent 谓词约束的故障清理。
+- 全新独立 x64 build/no-work 通过（BelowNormal/-j2），host 5,541,888B/C58F020D…19623；
+  主线程静态交接 21/21、73 内存变异 KILLED，GPU 读方 22/22。不是全库回归或设备丢失注入。
+- 同源、同 host/VVL365、两轮各 fresh x86 构建和真实非输入 Desktop：top-level/child ×
+  normal八帧、clear-soak256Present、quiescent父窗销毁，**各6/6通过**。
+  每正常例61,152像素检查、每soak例1,048,576检查均0错；GPU提交=完成=退休，VVL零warning/error。
+  原5秒primary exit未改，12例实际93–265ms；无强杀，空Job，Desktop关闭，输入Default不变。
+- child父窗销毁两轮确实preRetirementDestroyed=1；只认证故障清理，不认证正常保活。
+  本轮每例surface callback均1次，未证明真实recreate、GPU在途父窗销毁、完整C2或游戏收益。
+- 回执r1 `CB61662C…389530`、r2 `8862ACFB…40ECD7`，每轮1,163冻结输入/39唯一raw保全。
+  下一批已定位idle窗口fault不能唤醒backend、空队列parent未监听host退出，计划独立通知/取消drain闭环，尚未实施。
+  详见`docs/research/2026-10-23-x64-host-window-lifetime.md`。玩家DLL/游戏/发布未动。
+
+## 2026-10-23：真实宿主窗口八场景 CPU 门通过，接续 Presenter 集成（前置记录）
+
+- 同一 HostSurfaceTarget 在 x86父/x64宿主真实HWND+IPC上完成2模式×4场景；policy54、
+  两架构Desktop probe、纯读方19/19通过。OwnerQuit故障后实际保活102.4432/101.9532ms，
+  均12样本；child父窗关闭确实外部提前销毁，单列fault cleanup，绝不计成正常保活。
+- r1因测试夹具Scenario可能未初始化编译失败且未运行native，原失败保留；r2仅修夹具初始化。
+  回执`host-child-surface-cpu-20261023-r2` SHA `E91A6191…E7B571`，独审重算8/8一致，
+  58输入、39唯一raw文件保全；无强杀、无输入Desktop切换，Job/Desktop完全收口。
+- 同字节adapter已接入开发宿主，补上post-Presenter device-health、quarantine当时窗口报告及
+  普通工作统一owned-window准入；Presenter保留具名quiescent故障清理入口。
+  新全量构建/真实GPU门另行验证，CPU通过不冒充GPU；不部署玩家DLL、不启动Game.dll。
+  详情和未覆盖门见`docs/research/2026-10-23-x64-host-window-lifetime.md`。
+
+## 2026-10-23：X1b事件唤醒与完整六例GPU子集两轮通过
+
+- 实际Connection三处Sleep轮询改成两项匿名不可继承事件；通知只催促queue/done复核，
+  四槽+一私有Batch、5/30秒期限、done-first及原GPU退休不变。失败先锁存再诊断，未动系统计时器。
+- x86/x64各463项实际CPU断言、5项真实IPC故障通过；CPU-only固定2244命令单AB为
+  38550.9463→16.7088ms。跨线程等待不相加，也不把CPU结果冒充游戏/FPS收益。
+- 初次notification GPU r1因旧读方假设“只能一个背压事务”失败保留；新采集逐Full/事务/回包
+  核对。独审另封堵5项读方误通过，56/56纯测与可逆插桩复验后才重新native。
+- r2/r3各自fresh x86构建、同正式源/固定x64 host/VVL365，六例cap5/draw/normal/invalid/com/raw
+  全部通过。96轮COM+256 Query+退出3719/1844ms，2244命令全结算；原45秒未改。
+  两轮每例GPU提交=完成=退休，VVL零warning/error；Job/Desktop清场、输入Default不变。
+- 回执r2 `F440A2D7…4ECE7C`、r3 `18888908…756C80`；各183输入保全。是受限离屏GPU子集，
+  不是完整C2/游戏/产品异步owner/显存或VA收益。下一步验证host-owned窗口寿命，不替换玩家DLL。
+  详见`docs/research/2026-10-23-x64-notification-waits.md`；未提交、推送或发布。
+
+## 2026-10-23：X1a GPU组合四项通过，COM原期限失败保留
+
+- r1在探针schema读方不匹配处失败、GPU cases=0；旧脚本及回执保留。窄修后r2的
+  cap5/Draw屏障/normal/invalid四项通过，实际GPU completed=retired、像素及VVL365零告警。
+- 96轮COM在39.531秒完成80轮，45秒外层watchdog触发；raw未执行，整组明确失败。
+  exact-owned Job清空、隔离Desktop关闭，输入桌面未变；不把清场当正常退出，不延长门或删负载。
+- 回执`x1a-ipc-gpu-20261023-r2` SHA `659B9DA4…62806BB`；独审复核183输入/9 raw清单。
+  当前只能说四项机制通过，不能说组合完成。下一步测量实际Connection等待成本，随后重跑原组合。
+  详见`docs/research/2026-10-23-x64-bounded-clear-async.md`；玩家DLL、游戏、发布未动。
+
+## 2026-10-23：X1a真实IPC故障交接门
+
+- x86实际Connection/worker经认证管道对x64 CPU故障对端，固定五例通过：S_FALSE、多余载荷、
+  错nonce、peer正常退出与半包超时。均在pending Readback握手后触发，32字节活缓冲未被写入、
+  后续Clear拒绝；原5秒transport/30秒call和四槽+一私有批未改。
+- 五例restricted-Medium非输入Desktop、exit0、无外层强杀、Job/Desktop收口；半包实际5047ms，
+  其余31ms。secondary drain15–16ms只作清场，不追认primary正常退出，不伪造GPU DEVICELOST。
+- 读方先堵住“peer退出被timeout冒充”和进程创建身份未绑定等反例，纯测30/30；
+  回执`x1a-fault-ipc-20261023-r1` SHA `BE70F2DD…56C39FD`，49源码/53输入身份与初始raw保全。
+  这是CPU真实IPC故障证明，不是公共COM/GPU故障、产品owner、游戏内存收益或发布验收。
+  详见`docs/research/2026-10-23-x64-bounded-clear-async.md`；接着验真实GPU背压/Draw屏障与资源回归。
+
+## 2026-10-23：X1a异步Clear接入与双架构CPU交接门
+
+- 仅开发代理Clear改为有界入队，Draw/资源/Readback/Present仍同步屏障；实际Initialize回包
+  建立ready，Full不吃序号，失败先锁存再诊断/排空；四槽+一私有批、原5秒/30秒策略保留。
+- 先前未编译草稿现已由主线程集成；r1链接遗漏`protocol.cpp`失败保留。r2补真实实现后，
+  restricted-Medium非输入Desktop上x86/x64各263断言通过、Job/Desktop收口、原始输入保全。
+  是同一覆盖双架构运行，不是526种用例；CPU合成回包不是真实IPC/GPU通过。
+- 回执`x1a-connection-cpu-20261023-r2` SHA `B68BB675…49A66905`；旧Connection/proxy逐字归档。
+  blocking lab析构、真实IPC压力/故障、产品异步owner与游戏迁移收益仍未过门。
+  详见`docs/research/2026-10-23-x64-bounded-clear-async.md`。
+
+## 2026-10-23：新旧host的VVL365隔离对照完成（仅固定两例）
+
+- 新层首轮旧配置暴露弃用设置，失败回执`x64-dispatch-vvl-control-20261023-r1`保留。
+  单独增加1.4.365适配器，不改旧1.4.335读方；精确六类启用横幅、无任何warning/error豁免，
+  18项纯测通过并补上混合旧/新横幅拒绝。启用类别不等于全部配置或过滤行为均已运行时证明。
+- 正确配置下旧host两例仍因真实GPA警告失败；新host两例均通过：256帧clear/Present与8帧shader，
+  独立原始VVL均零warning/error，原5秒transport/primary-exit及45/90秒外层门不变。
+  函数表修正未增加Present锁、未关闭特性；不能用新VVL的wait/destroy检测缺口替代GPU寿命证明。
+- 新诊断host 5,537,792B / `9BCFF0F730A468DCE23F83626A2D2BEFBB4A21A8992F8FB46A0F6EC06BEEF715`；
+  回执`x64-dispatch-vvl365-candidate-20261023-r1/receipt.json` SHA
+  `D1A32369A9BC026E5BC78C4B4C6FD040C36A7D1F9CE994D2F90BDE2CEE25A0CA`。
+  restricted-Medium非输入Desktop、exact child结算、Job/Desktop清理及初始raw/源码保全通过。
+- 这是host-owned独立窗口的两例诊断，不是完整C2、嵌入游戏窗口、全D3D9、游戏内存收益或发布接受。
+  旧peer退出红门与初始化5375ms红门仍保留；接下来落实Clear-only有界异步及真实背压/故障交接。
+
+## 2026-10-23：独立VVL发现与函数分派修正（前置记录）
+
+- host-owned两例真实VVL诊断失败已保留：错误函数表查询是本项目缺陷，Acquire/WaitForPresent2
+  并发告警则对应Khronos已修正的验证层误报，不据此给Present加锁或关闭特性。
+- `vkGetPhysicalDeviceMultisamplePropertiesEXT`从DeviceFn移至InstanceFn，setter保留设备分派。
+  11项当前生产源/registry静态测试通过（含8反例），fresh x64构建和no-work通过；旧header、旧host、
+  全部历史失败及玩家/天气/两份x86候选DLL字节保全，未作发布。
+- 官方修正版VVL仅放在项目artifact下，待以原期限在restricted-Medium非输入Desktop做旧/新host对照；
+  不修改系统安装、不屏蔽原始warning/error，不把验证层已修正等同完整C2验收。
+- 详见`docs/research/2026-10-22-x64-initialization-and-surface-owner.md`新增VVL节。
+
+## 2026-10-22：固定12例surface所有权续验，三处旧退出失败仍保留
+
+- 同`339F8C6B…`执行固定12例，全部restricted-Medium非输入Desktop：host目标六例全部通过；
+  peer的两次256帧及extent故障在原5000ms退出门失败，其余三例通过。整组exit1，不能称全绿。
+- 原peer身份/尺寸/销毁拒绝继续生效；host窗口只改变实际surface目标，仍不是游戏窗口嵌入。
+  三次secondary退出只用于安全清场，不补救原primary失败；全部Job空/Desktop关闭、无强杀。
+- 显式readback profile修正测试reader的26/28阶段差异，38+27纯测通过；旧两文件逐字归档并作
+  窄SHA修订映射，未刷新历史receipt或放宽原native门。fault退出watcher采样仍明确未覆盖。
+- 回执`x64-surface-owner-continuation-20261022-r1/receipt.json`，SHA`83CCAC35…40005CB`；
+  详细逐例结果见`docs/research/2026-10-22-x64-initialization-and-surface-owner.md`。
+  接着做独立VVL诊断与X1a有界异步Clear；产品、玩家DLL、游戏和发布均未动。
+
+## 2026-10-22：同EXE窗口所有权ABBA与真实触发边界
+
+- copy-TU诊断完成固定peer/host/host/peer：每臂256帧/1048576实际swapchain像素零错，
+  自然退出172/172/93/109ms，全部restricted-Medium非输入Desktop、Job0、无强杀。
+- A两臂观测到精确活体PaletteWatcher42548/56724；B两臂在已绑定OpenGL读到认证[0,0]，
+  不是module-absent填零。支持窗口所有权影响watcher触发，尚不证明全寿命无watcher或旧退出红门修复。
+- 15纯测和独审闭合DWORD宽度、最终monitor/proxy创建身份；1379输入记录/26raw及执行副本重验。
+  同EXE SHA `339F8C6B…C8C721`，receipt `B1C63374…AD237`；6条编译warning如实保留。
+- 产品源码/host/玩家DLL未变，B不是peer HWND/compositor视觉验收。继续同身份故障/八帧/长负载，
+  不部署、不发布、不用后来的快退出覆盖旧失败；详情见初始化与surface所有权研究。
+
+## 2026-10-22：初始化分段实测与窗口所有权因果实验准备
+
+- 同源复制TU初始化诊断三轮完成，原5秒门内2597/3105/2306ms；各256帧/1048576像素零错，
+  自然退出94/110/125ms，真实restricted-Medium隔离Desktop及Job收口。原r10超时没有复现亦未修复。
+  独审重新核对每轮raw与实际编译/链接输入；三轮EXE SHA不同，不称同二进制A/B。
+- 冻结系统映像静态证据发现跨进程窗口会走PaletteWatcher分支；普通WM_NCDESTROY与detach清理
+  的TID清零方式不同。与r5历史线程终止但全局未清零相容，尚未测到完整驱动调用链。
+- 新增copy-TU surface-owner ABBA诊断及13项pure测试，产品构建不引用；两臂同EXE同窗口负载，
+  仅选择peer/host surface目标，peer校验保留。native尚未执行，不声称已修复退出。
+- 边界收敛：原peer身份与实际surface目标分账；窗口清理由真正创建线程负责，晚于Presenter退出、
+  早于device卸载，不另建GPU寿命或改系统库。旧失败/玩家DLL保留；VVL与全游戏迁移仍未验收。
+  见`docs/research/2026-10-22-x64-initialization-and-surface-owner.md`。
+
+## 2026-10-22：新DLL全回归与真实watcher退出证据（开发续批）
+
+- 专用新x86 DLL完整配置回归116/116通过、全目标no-work；2099项输入与初始raw字节保全。
+  所有native测试在restricted-Medium非输入Desktop，父进程exit0、Job空、Desktop关闭，未发全局输入。
+  回执`x86-shader-cache-regressions-20261022-r1/receipt.json`，SHA
+  `E585984F353B2F26618938C79F9FC0C88EEABDBD2EF5E9640FD8ABC8A3FC06A2`。
+- watcher仅允许冻结preferred或独立绑定module base的完整表示并锁定；55项纯测通过，
+  读取范围/权限/预算/native输入不变。预定r3/r4/r5诊断中末轮复现5000ms退出失败。
+- r5实际取得TID55712退出前活体、精确OpenGL PaletteWatcher起始地址及保留线程HANDLE；
+  退出后约0.3/1/3秒历史线程均已结束但同一全局TID仍非零。旧栈与新状态证据相符，
+  尚未证明创建调用者/正常清零责任，不改系统/强杀/延长时限。secondary退出0不补救原失败。
+- 三轮均只诊断、acceptancePassed=false；产品异步、完整游戏迁移和显示可靠性仍未验收。
+  详见palette-watcher研究的r5记录；继续用复制TU测初始化各阶段。
+
+## 2026-10-22：当前R1/Q1重验与显示初始化红门（开发续批）
+
+- 当前host `888B801C…` 的R1/Q1 r3实际通过：COM96轮/319488像素、raw169728像素零错，
+  61个精确拒绝后48次像素与13次Query恢复；GPU/资源退休、终态逻辑归零、child自然退出79/312ms。
+  独审重新核对1128源码、9binary、6执行副本、7份初始raw及39+344读方变异，不复用旧host通过结论。
+- 当前完整Presenter r10失败：首次clear-soak的Initialize耗时5375ms超过原5000msreply门。
+  客户端断管后的host self-fail-stop是后果；无该轮坏像素证据，也不是该轮退出期卡顿。
+  不延长时限，不将schema错误标签冒充根因，原raw/源码/隔离收口证据保留。
+- watcher只读r1/r2暴露测量工具的NT ImageBase表示缺口：磁盘preferred与实际module base不同，
+  精确差异仅该字段；两轮尚无TID读取，不能声称已取得watcher线程归属。45项纯测试及真实差异保留，
+  后续仅做绑定实际module base的窄表示校验，不改系统/权限/采样预算或旧失败。
+- 新x86 DLL完整配置回归在restricted-Medium非输入Desktop进行，原玩家/天气/参考DLL不替换；
+  VVL、初始化/退出可靠性、产品异步及游戏迁移收益仍未验收。
+
+## 2026-10-22：共享DXSO实际复用与三方像素等价（开发续批，组合门待验）
+
+- 专用clean-start x86产品构建r1达到原1800秒watchdog，失败保留；确认后代编译器结束后以r2续编，
+  输入清单完全相同，完整DLL链接/no-work通过：34,500,608B / `6805CC0B07DF1D1F3314ACCC5A18CF5342823D705E02FCA367F16ED3D99DF3DE`。
+  不删除失败、不延长时限、不覆盖旧reference/天气候选/玩家DLL，编译warning如实保留。
+- 新M0 r3在restricted-Medium非输入Desktop完整执行96轮/256Query/319488像素，零错且自然退出62ms。
+  实际8个cache观察确认192CREATE只编译/注册2次、190hits、cookie和400B token容量稳定；
+  1487条M0及579条cache读方反例通过。x86 drained private固定2342912B；x64 drained private
+  末值较首值少2248704B，但VA仍增长且无同条件ABBA，不宣称游戏收益或全进程无泄漏。
+- 三个独立Medium Desktop的old-reference/new-reference/remote各72帧、239616选定像素零错；
+  覆盖同token不同COM对象、全部public释放后重建、DEF常量变化与恢复；设备/factory终态引用归零。
+  像素等价与cache命中分别取证，不将相同图像当成缓存复用证明。
+- 补齐验证器实际缺口：M0/equivalence/Presenter/R1/VVL初始raw字节冻结及重验，截断Validation Error拒绝；
+  全回归门拒绝零测试/重复JSON键，采用唯一Meson日志名和历史原始副本，失败路径也核验保全。
+  root独立纯测：M0 39、equivalence37、cache reader52、regression reader22、watcher40均通过。
+- 完整当前Presenter/R1、独立VVL、新DLL全回归仍在继续；此前退出失败不因这几项通过而消失。
+  代理仍拒绝Game.dll，没有部署、游戏迁移或发布结论。详细实据见DXSO cache与M0研究记录。
+
+## 2026-10-22：Medium因果修复、有效退出对照与共享DXSO缓存（开发续批）
+
+- 私有派生token补真实用户默认DACL后，同一冻结x86/x64 kernel-only探针与完整CPU父子探针
+  均实际通过；源token/共享安全配置不变。早期入口前失败保留，不用新的通过追认。
+- 有效Medium层off/on对照出现off仍退出超时的反例；进一步真实全空层来源运行仍失败。
+  新转储经匹配PDB与LLDB实际unwind，仍落在OpenGL palette-watcher的进程detach等待。
+  初始化偶发超时与退出等待分列；未改deadline/系统/外部进程，不能宣称退出已修复。
+- x64同内容shader每次CREATE新编译的机制已改为生产共用、设备拥有的canonical DXSO cache；
+  完整token/domain校验，只有验证后的胜者注册，shader与metadata成套交接，失败注册不盲重试。
+  独审无阻断项；真实DXSO CPU在Medium非输入Desktop 88条通过。完整新x86 DLL/GPU缓存收益
+  尚在验证，不能用CPU通过代替adapter/GPU/内存收益。独特shader工作集仍未有界、hit仍有token复制成本。
+- VVL/层来源纯读方49/10用例通过；真实VVL仍待匹配完整运行门。玩家DLL未覆盖、未启动游戏。
+- 详见 `docs/research/2026-10-22-dxso-canonical-module-cache.md` 与更新的Presenter隔离回执；
+  依然是受限D3D9开发链，非完整WarVK迁移或发布。
+
+## 2026-10-22：M0死槽位账户复跑与受限验证环境定位（开发续批）
+
+- M0 r2在真正非输入Desktop通过：54条native账户断言、96轮/256Query/319488像素零错，
+  1487/1487实际回执读方变异；资源与句柄最终归零、host自然退出109ms。源、参考与玩家DLL保全。
+  x86四个排空点private均2318336B，但x64排空点增长12804096B，不能宣称完整无泄漏或游戏收益。
+- 真实销毁变异第一轮未执行到目标：CreateDevice响应超时，`0x88760868`，保留失败不计KILLED；
+  原始Job为空、Desktop关闭。门禁新增薄归档成员冻结与预期exit1的独立清理认证，未改写raw失败值。
+  第二轮真实命中dead容量12B，前三检查点通过，第四精确拒绝；fixture exit1、child自然exit0/125ms，
+  输入保全。此轮KILLED不追认第一轮超时，也不解释其原因。
+- 独立VVL/隐式层过滤需要有效Medium子进程；受限CPU探针与kernel32-only两宽度探针均在入口前
+  `0xC0000142`。只读检查证明WinSta0/专用Desktop全权限AccessCheck通过，不能归咎Desktop ACL。
+  派生令牌默认DACL仍仅BA/SY全权、logon读执行；BA已经deny-only，缺当前用户allow。
+  此为下一最小因果诊断候选，尚未宣布根因。没有改共享安全、系统、玩家环境或放宽超时。
+- 详见`docs/research/2026-10-22-x64-memory-account.md`；所有结果仍为受限D3D9实验，
+  完整WarVK/游戏迁移、实际游戏x86内存和性能/视觉门保持未覆盖。
+
+## 2026-10-22：原 Presenter 接线、C2 资源复用与退出红门（开发 checkpoint）
+
+- 真正x86 D3D9 COM→IPC→x64原DXSO/DXVK已接原Presenter/SwapchainBlitter；全部新GPU验证在
+  非输入Win32隔离Desktop，原子Job与精确PID/creation收口，不切桌面、不发全局输入、不碰玩家DLL。
+- Fresh Clear→Present暴露deferred clear未物化：现在准确source沿原external release/acquire交接，
+  不用读回预热。健康owner先用原device idle排空CPU submit/finish尾部；它不是零等待，也未证明
+  是所有历史退出延迟的根因。r7的37case通过保留为限定证据，后续r8/r9重新发现退出红门。
+- C2按`id/generation`绑定资源并贯穿六类draw输入；只有准确Destroy成功后才允许复用，公开COM
+  release不提前释放private绑定。Query具备独立句柄与revision，同一GPU serial可重复Issue。
+  同时容量、预算及GPU退休不放宽，不再受累计64次创建/Issue限制。
+- R1/Q1 r2实际COM96轮绘制/319488像素及256次Query，raw51draw/169728像素、61个拒绝/恢复
+  反例均零错；资源/逻辑句柄清零并正常退出，独审复核原始日志/身份/读方变异。r1的45秒超时
+  只到初始化日志，原因未知；新增稀疏里程碑不是已修复的证明。
+- 共用修改fresh x86产品DLL全量构建474步、配置内116/116回归与全目标no-work通过；
+  34476032B / `5A8B5B691BBB18473D975DC3CAB1BEDD3FB641A938D10E8AB5A6FFBA9BECAB8C`。
+  后续变化在开发host/测试诊断，不覆盖玩家DLL，warnings保留。
+- **未过门**：r8连续256Present/1048576像素正确但首个5秒退出超时；r9的8帧诊断例也失败，
+  已到`wmain-locals-complete`后仍未退出。保留r8二进制repeat3复现5016ms，三份精确进程快照
+  只剩原主线程；后续r9精确小转储定位到系统OpenGL的palette-watcher退出等待（Sleep50ms×最多100次），
+  已非“没有栈”，但谁引入/保留该watcher尚未归因。不扩大时限或secondary退出追认。
+  隐式层关闭对照发现高完整性进程的环境变量未生效，实际层仍加载；独立VVL尚未实跑通过。
+- 新增M0显式、按值、身份绑定的两进程内存账户；r1隔离桌面真实96轮/256Query/319488像素零错，
+  8个窗口及真实回执1487条读方变异通过。x86 private最大采样2322432B；x64 drained private仍增长
+  13484032B未分解，不称内存平台已稳定。独审要求补dead-slot残留容量反例；没有游戏内存节省结论。
+  详见[内存账户](../research/2026-10-22-x64-memory-account.md)。
+- 产品异步/背压、完整D3D9和WarVK pass、Reset及游戏VA/commit/尾延迟仍待验；代理继续拒绝Game.dll。
+  未部署、未启动游戏、未修改系统、未提交推送发布。详见[Presenter回执](../research/2026-10-22-x64-d3d9-presenter-isolation.md)、
+  [资源与Query回执](../research/2026-10-22-x64-resource-generation-and-query.md)和[迁移路线图](../plan/2026-10-11-x64-render-migration.md)。
+
+## 2026-10-22：关闭 x64 对照的生产 COM 退出红门（开发 checkpoint，未接游戏）
+
+- PostFX 的纹理/surface/shader/声明/VB、ImGui backend/cursor 改用 device-owned private 引用，
+  创建结果先 private 接管再交还临时 public；外部 Create/GetDevice/stateblock 的公开保活不变。
+  ImGui 从固定 SHA 的 upstream backend 生成七个明确前缀入口，未修改 upstream，产品未混入 stock Init。
+  初始 device RAII 保活、部分初始化失败清理与合法重试接入实际创建路径；未声称所有 OOM 已覆盖。
+- UI 按 exact device/context/window 所有者处理 Reset/Present/cursor 和两条 WndProc；退出先撤回回调，
+  保留资源经过原 CS/GPU drain 后销毁，不在 CRT detach 隐式回收 GPU。未宣称任意多线程 UI 安全。
+- Reset 审计发现额外生产缺口：实例缓冲是绑定首设备的进程 singleton，未启用自动 instancing 时 Reset
+  也会创建 6 MiB DEFAULT VB。现由每 device 惰性独占，移除第二层全局裸缓存，VB/声明/captured texture
+  用 private 引用，锁定指针归实例，执行入口筛选 owner。带锁 final Release 在 Flush/drain 前解锁，
+  避免 staging Unlock 在最终 idle 后追加上传。未启用实验 instancing，未改预算/准入/GPU 退役语义。
+- 全量构建抓到旧 DXSO 抽取漏改的 material 构造调用，已同步三参数生产合同。独立 fresh 配置 r1 的
+  Meson subproject 路径失败与 r2 编译失败保留；最终产品 r4 完整构建/no-work 通过，已有 warning 未抹除。
+- 原门实跑 `x64-d3d9-20261022-r1`：remote/reference × normal/invalid 四例各 2548 像素零错，
+  shader/image 身份匹配，设备/factory 最终 refs=0/0 且正常退出；四个总判定位全 true。
+  旧 `x64-d3d9-20261011-r4` 的 refs15/总 false 不改写、不追认。
+- 同一产品对象独立重链 test-only companion（不增产品 export）：默认与 staging 两配置各 3 周期、
+  6 台设备、60 probe、147 实际 GPU draw；PostFX 6144/光标纹理1251/实例保留纹理144像素分别零错，
+  外部 DEFAULT Reset 真拒绝3次、合法 Reset6次、外部 texture/GetDevice 保活与双设备隔离通过，正常卸载/关窗。
+  仅均匀低亮 PostFX oracle、cursor payload+draw；不外推高亮Bloom/ACES、最终UI像素或游戏视觉。
+- staging r1 native/config 虽通过，总门因 EXE 相对 crash 状态污染旧 evidence 目录正确失败；旧证据不恢复。
+  改为新目录内 EXE/DLL 精确物理副本，重新生成默认 r2 和 staging r2，全输入/旧基线保全通过。
+  staging 依据实际 effective config 与冻结源码，不冒充直接量到 map-mode/copy 次数。
+- 定向静态60方法、独立lifetime读方22方法、D3D9/buffer/GPU读方122方法通过；本构建配置 **Meson116/116**、
+  全目标 no-work，源码与产品身份未漂移。重复测试不相加为独立覆盖量，也不叫全项目/游戏全门通过。
+- 产品 DLL **34,476,032 B / `AF5F6282882FFE64B502859E4BFDF36031A69E658DC093158067722E4B044CEF`**。
+  玩家DLL `1FFE0BD1…EE35CF`、旧天气DLL `8A156518…4090CE` 保持原样；无游戏/部署/系统修改/提交推送发布。
+- 下一门仍是原 Presenter 接入当前真实 x64 D3D9 输出；当前远端 Present=E_NOTIMPL。
+  跨线程最后 Release、默认关闭实例化的异常/锁定 replay、全 D3D9/换图/故障、游戏内存与尾延迟收益仍未验收。
+  详见[本批完整回执](../research/2026-10-22-device-owned-com-lifetime.md)与[更新路线图](../plan/2026-10-11-x64-render-migration.md)。
+
+## 2026-10-11：实际 x86 D3D9 → x64 DXSO/DXVK 离屏绘制（受限开发切片；总门仍有红项）
+
+- 不再停在独立 Vulkan demo：真正 Direct3DCreate9/COM/Lock/shader/state/DrawIndexedPrimitive/query/readback
+  通过固定窗口、专属 I/O owner 到原 DXSO/DXVK。默认不接产品、Game.dll进程拒绝，Present明确E_NOTIMPL；
+  64×64/D32F/单stream与texture/受限SM3，不声称完整兼容或游戏减量。
+- D0共享：DxsoOptions显式依赖device/options/常量布局，十个原SPIR-V helper抽取正文相同并只编进dxso_lib。
+  五个实际生产x86 TU按原flags隔离编译成功，未重新生成旧build/链接新DLL；旧DLL/原对象SHA不变。
+- 实跑抓到descriptor提交缺口：r2三draw都只得到clear，1156像素失败。getSyncHandle也负责发布未满descriptor块，
+  旧direct endRecording遗漏它；现统一到endRecording收尾/finalize前，普通flush共用同一出口。
+  r3、最终r4合法绘制恢复；不关descriptorbuffer、不改shader/预算/剔除。失败原证据保留。
+- 新接线两边界：仅draw纯预检ProfileRejected转INVALIDCALL，GPU/owner错误仍终态；健康idle等待首字节，
+  header/body仍原5秒期限且真实cancel/drain。6500ms后合法API、坏TEXCOORD1 VS拒绝后原3draw全部实测。
+- 最终r4远端正常/invalid均通过，每例2548像素0错、全图FNV97937de3dc0c0c6d；GPU各14/15完成并退休，
+  拒绝draw不提交，remote COM归零/helper退出0。shader scanner两宽度各6525/0、wire各1222/0、idle各3场景，
+  实际读方反例59方法、共享静态11方法通过；旧RH0 16/16与实际DXVK缓冲4/4复跑通过。
+- **红项未掩盖**：保留单进程reference两轮图像均一致，但最终device Release仍15/退出2；源审与PostFX14个
+  public资源+ImGui1个public device持有相符，不是逐地址census。r4保持remoteGatePassed=true、
+  referenceImageMatched=true、referenceLifecyclePassed=false、总ok=false。下一批收紧这些device-owned内部引用。
+- 最终源1107项无漂移，x64编译数据库仅允许options/helper两D3D9 TU。无全项目门继承，validation layer/WSI/
+  完整D3D9/慢GPU与故障组合/游戏画面和内存收益仍未覆盖。原天气DLL 8A156518…4090CE未改；未启动游戏、
+  部署、改系统/私有共享核心、提交/推送/发布。详见[完整回执](../research/2026-10-11-x64-d3d9-first-draw.md)。
+- 收口显式复跑D3D9/buffer/GPU读方与共享边界四个CPU模块，133方法/15.282秒/退出0；
+  1107源码+五项最终产物/参考/编译数据库合计1112身份复核无漂移。不作新GPU/全项目通过，r4总红门不变。
+
+## 2026-10-11：回到长期主线，立即开始真实 x64 渲染迁移（开发 checkpoint，未接游戏）
+
+- 作者最新指令覆盖“64位延期”。路线定为薄 x86 Game/JASS/D3D9 兼容端→现有 DXVK/WarVK x64 宿主；
+  不以不完整 native capture 代替全画面，不复制 FORGE renderer、不把 RH2 小后端变成第二套产品引擎。
+  [实施计划](../plan/2026-10-11-x64-render-migration.md)、[真实 D3D9 边界](../plan/2026-10-11-x64-d3d9-migration-boundary.md)、
+  [人话结论及逐项证据](../research/2026-10-11-x64-render-migration-checkpoint.md)。
+- 主线窄修：`ResetAuthorState() noexcept` 不再临时 reserve/push 整表；锁内交换旧 registry，锁外原线程退休。
+  真实 registry/typed/Weather 两位宽各26检查、天气协议各211/0、既有JAPI协议通过；相同测试恢复旧源码的两份
+  隔离镜像均精确在真实 reserve 触发 bad_alloc。完整生产 JAPI TU 无测试宏独立编译通过，未链接新DLL。
+  不外推测试宏排除的 point/fog/Walk/Lightning/Curve 后端、GPU或实机低内存修复。
+- GPU前置：RH2真实x86↔x64几何绘制/外部图像双向GPU交还，五场景通过，wire两宽度各9518检查；
+  RH3真实x86隐藏HWND消息泵→x64 swapchain，6帧/resize/recreate/close，x86未加载Vulkan。
+  实际DXVK核心已fresh x64构建：原allocator/Context/submit/usage tracker，3批GPU fill/copy、3072字检验通过。
+  均不是前台视觉、游戏或完整D3D9迁移证明。
+  资源通道加入后，共用传输已再次实跑：RH2最终r4五场景、RH3最终r2隐藏窗口门通过。
+- X1新增固定4×64KiB SPSC命令队列，无运行调用内分配/锁/I/O/内部重试；Full不消费序号、不丢已接纳指令，
+  Stop与close/drain分开，CPUack不退休GPU。x86/x64各三轮，真实双线程每轮10000批通过；Fault并发仍未单独测。
+- 资源接线已实际落地：x86 producer→有界队列→独立IO worker→WRC1私有preflight/commit→x64现有DXVK BufferBackend。
+  两宽度各2432协议/资源/异常事务检查及独立99B golden；最终 `x64-render-20261011-buffers-r3` 四场景全过。
+  正例14命令/9 GPU批，6次上传229505B，3次GPU读回360509B与独立hash一致；包括分块、非对齐更新及销毁/重建。
+  三反例分别拒绝旧代际、错地图、越界：accepted/backendCalls=9、GPU=6，无额外执行。资源逻辑限额不是物理驻留/游戏减量。
+- 独审抓到并封堵读方误通过：bool/float混入整数字段、expectedRejected接受null、超宽DWORD PID；
+  校验在Win32 settlement前执行。新增37个实际读方反例方法，联合定向Python回归116/116；最终GPU接线另实跑重验。
+  原始native输出类型正确，旧反例失败和r1/r2中间回执保留，不用新脚本追认旧版本身份。
+- 未通过/待做：Khronos validation layer在当前高权限环境不可见，host-validation三份失败保留；未改注册表或静默关层。
+  产品异步owner/故障退出、真实D3D9 COM/Lock/state/query/Reset/Present、WarVK所有pass、游戏画面/内存/尾延迟仍未闭合。
+  阻塞lab transport只用于受外部watchdog监管的独立进程，不能直接链游戏渲染线程。
+- 天气预览停止扩功能，原前台艺术/性能与天气换图/Reset/resize/退出门保留；S1 early-cache异常事务仍是已登记债务，
+  不由这次Reset窄修覆盖。本批未启动游戏、部署、覆盖玩家DLL、改系统/私有共享核心、提交/推送/发布。
+  原天气DLL 34,467,840B / `8A156518…4090CE` 不变；此前114/282等整包门不继承给当前dirty源码。
+  收口时四份最终门禁的源码SHA清单均无漂移，本批构建/测试进程已结束。
+
+## 2026-10-10：可编排暴风雪晨间冻结（可测试预览，非稳定发布）
+
+- 12个天气JAPI、YDWE完整作者入口、单实例64关键帧、按值帧/地图/设备快照、固定GPU雪片与独立Medium雪雾/低空吹雪接入生产。没有天气启用环境门；雪不加入caster/Stage11/Arena，不扩阴影预算，不推进64位。完整[人话报告](../research/2026-10-10-weather-morning-report.md)与[作者文档](../../WarVK/WEATHER_API.md)。
+- 真实同脚本A/B定位并修共享real文本科学记数问题：原版S2R不识别e/E，旧微秒值被读成秒；旧3红保持失败、新35/0。Froxel读取改用已重建深度的viewport-local UV；最终实机消费域2560×1440、世界viewport(0,47,2560,1081)，没有改密度/网格/预算。近雪尺寸2–6→1–3，限定静帧可读性改善，低雪仍待美术调校。
+- 最终真实功能canary：15阶段、35检查/0错、13张1440p；长循环stress-b：70阶段、1083/0、32次开启/关闭、8次重建、7图，限定required全过。stress-a的70个UnsupportedFeature仍是失败；新fixture保留未实现PostFX调用并明确断言18，不宣称其总开关可用。读方隐藏第四坏帧、unknown回零、冻结参数被筛掉三反例实跑后补门，不追認旧结论。
+- final fresh LLVM22.1.8/Win32 DLL、BelowNormal/-j2编译与no-work；Meson114/114，完整静态282/282（现轮CPU探针实际执行）、SPIRV18/0；功能读方54/54、stress39/39、雪片26/26、volume17/17、API9/9；runtime164/0、生产协议211/0、retry80/0。作者文档例与demo两个完整PJass均EXIT0，未把它们当真实VM执行。
+- 同key天气当前账：Snow深度15MiB、天气volume约36.46MiB，反复开关/重建未累加；不含driver与retired峰值，普通雾账明确unknown。private尾段有回落但不认证无泄漏；CPU基准不外推GPU/FPS。仍缺前台性能/玩家艺术验收、移动远距/透明与战争迷雾、天气跨实际Reset/换图/extent、故障注入和自然退出。
+- 最终冻结DLL **34,467,840 B / `8A156518BD029D106EC009DC3C702D0005746E2E97E4589C1C18F8F4684090CE`**，PE32/i386；dirty主树独立LLVM候选，非release-clean镜像。玩家地图/DLL/Game保护SHA不变、无全局输入/注册表写；owned Job强制清场不是自然退出通过。不提交、推送、公开发布或自动部署；早轮坏证据与既有dirty/StormBreaker保留。
+- 已以CreateNew打包桌面 `WarVK-Weather-Preview-20261010.zip`：**7,415,531 B / `57AAC24B4D32E42BE09620C27C1D595F1F6D18EE17DF5CB8F2B1776D83F9D58E`**，14成员；目录/ZIP严格成员、每文件SHA、CRC及PE32审核通过，包内DLL是上述原字节。作者catalog/wrapper/常量/demo/说明与人话报告一起交付，stable/release全部标志false；生成回执为 `AutoTest/artifacts/weather-night-20261010/package-final-receipt.json`。无自动部署。
+- 最后[独立审查](../research/2026-10-10-weather-stress-independent-review.md)已收口：亲验三个旧读方误通过、修后39/39、Froxel源码与17/17模型、两张04E候选新尺寸图；没有在该11行域修正中确认新P0。审查未独立全量复算stress-b或做新Froxel画面全组合，主线程的新实机/包审计与其亲验分列。共享积分修正可能改变普通雾/光学guide的空间数值，不承诺视觉逐像素不变。
+
+## 2026-10-10：可编排暴风雪首轮整合（历史开发checkpoint，非发布）
+
+- 03:15追加实际门：fresh LLVM DLL与no-work、Meson114/114、fresh CPU目录全静态282/282。保留原111/114失败并区分残留OUTPUT与memcmp padding原因；未放宽测试。新drain变更仍需下一轮身份，详见整合回执第二轮。
+- 独立反例审查补雪片/雪雾资源准备异常隔离与120帧重试、旧地图Weather备用入口退休、only-weather关闭的一帧维护。CPU微基准235/0、默认new窗口0；不是整个GPU效果成本。正在补严格分离的真实JASS canary，未做像素验收。
+
+- 作者授权台北09:00前开发：新增12天气JAPI与YDWE分类、固定容量时间线、一次按值帧快照、GPU雪片和独立雪雾/低空吹雪；不进入caster/Stage11/Arena、不增加既有阴影预算。音乐仍使用原版API；建筑积雪/屋顶碰撞延期。
+- 独立Win32生产CPU：runtime164/0、真实协议175/0、资源重试80/0；实际编译SPIRV ABI18/0；Shader合同25、API静态7、volume静态10、Launcher反例24通过。MPQ副本pjass通过；未执行JASS VM，不等于画面已验收。
+- 全静态首跑282项中275退出0、7失败（旧探针路径5、旧字面合同2）；退出0内另有动态skip。全新LLVM构建目前仍在收口，root漏UI include已认领；不声称全绿。原GCC前端加载失败未改系统DLL，LLVM fresh目录与旧对象隔离。
+- 几何/深度布局、半像素、薄介质、地面低雪与位移周期已收紧；正在闭合天气分配异常不得停掉原雾的边界。玩家目录/原地图未改、未提交推送发布。后续验证与最终产物以[整合回执](../research/2026-10-10-programmable-blizzard-checkpoint.md)为准。
+
+## 2026-09-30：数据采集第一条材质交接链（源码与离线候选）
+
+- 不等待共享上游，补当前 D3D9 draw 状态 → native entry/exact alpha 元数据 → 最终 caster → resolved replay → schema-3 input export → 严格读方。新增按值观察，原 render/texture-stage/sampler/material/texture-transform bits 与 prepared shadow 材料分列；最终来源覆盖同步携带观察，不重新选择旧来源。详见 [实施回执](../research/2026-09-30-native-render-input-collection-checkpoint.md)。
+- 纠正 sampler/stage 索引差异；跨帧保留原 ShadowProducerSerial，不和 event/batch 帧混用；无最终 part/layer 的路径保持 Unknown，不为诊断改变渲染身份。Ambient 已含 WarVK SetMaterial 改写，不能称未修改原材质；完整动画/GEOA、实例寿命、原 geoset、纹理像素及全场景 pass 尚缺，`sharedRendererReady=false`。
+- 新 POD 344 B、prepared material 56 B；raw input 元数据上限 1472 B 并有生产 size 断言，完整/内部 CPU payload 准入预算 247.5/96.25 MiB。无新 GPU ring/锁/扫描；关闭 raw input 不额外读设备状态，但固定 POD 驻留与复制成本不为零。组件两路各 10 万次采集无堆分配，不外推帧性能。
+- BelowNormal/-j2 exact DLL 编译与 no-work、定向 Meson 8/8、POD 1296/encoder 262 检查、往返 7/合同 57/manifest 45/静态 27 + 受影响 75 个 Python 用例、memory 46+87 检查及六文件 py_compile 通过。不是全库/游戏/GPU/视觉验收。
+- 本地候选 PE32/i386 **36,551,002 B / 24C90B03AE1052882217BC24BA11990BB7B7F1E0784828D153587FDFDFB082FE**；不覆盖游戏 DLL、不复制原生资产、不部署、不提交推送、不把这份本树构建当作 release-clean 稳定候选。保留既有 dirty、StormBreaker 和 RC/evidence。
+- 保全核对：status 93→111，仅新增本批 18 个路径；92 个开工 dirty 文件中，四个本批重叠文件变化，其余 88 个 SHA 不变，无缺失。HEAD/StormBreaker HEAD/status 不变；最后收口编译/游戏进程 0、用户目录编辑器 PID 45456 新启动并原样保留，不能称全相关进程 0；编译资源已释放。
+
+## 2026-09-30：共享核心 W1-A 三份准备方案（纯文档）
+
+- 按作者已经确定的 GPLv3/另行授权、共同规则/两个后端、War3RenderCore 唯一上游方向，完成 [A1 Footman 数据映射](../plan/2026-09-30-shared-core-footman-data-mapping.md)、[A2 某帧某实例格式与比对设计](../plan/2026-09-30-shared-core-native-frame-export-contract.md)、[A3 宿主适配层](../plan/2026-09-30-shared-core-warvk-host-adapter.md)；总回执见 [W1 准备](../SHARED_RENDER_CORE_W1_PREP_2026-09-30.md)。本轮没有复制 FORGE 实现。
+- 校验边界：原/runtime geoset 和组 remap 分列；raw World 保留，未证明 W 组合不求逆；GEOA 与 draw alpha/ref 分列；最终来源被 native override 替换时旧证明不得沿用。宿主单一签发边界、CPU/实例/地图/设备/GPU 不同寿命设计与旧长期计划衔接，不改当前产品准入或渲染。
+- 当前仅完成方案和源码/回执核对；parser/comparator、adapter、MinGW 核心构建和跨编译器 golden 对照未实施。没有新 DLL、编译、游戏采集、部署、提交或推送；B 等作者通知，实跑需作者在场另行安排，不能把本轮文档检查写成运行/视觉或收益证明。
+
+## 2026-09-28：v1.22.02 RC1 干净构建与隔离回归（仅候选，发布门未通过）
+
+- 从本主树源码与固定 gitlink 冻结外部镜像 `D:/WarVK-Builds/v1.22.02-rc1-20260927/source`，排除用户 dirty StormBreaker 工作树；镜像清单 SHA-256 `4C7707EB66D3FBA394DC414742A1983E25B8E44F715473EB73A7B94C1E0563BA`。独立测试/正式配置均为 Win32，开发取证与内部 recorder 关闭；BelowNormal、`-j2` exact DLL 构建 467 edge exit 0，随后 no-work。正式候选 PE32/i386、版本 1.22.02，36,149,331 B / `07D6AE38F4969580F15C0E2C6B5966A955EA303ABF6201200C5BED8A92EBFC23`。
+- 断言开启 Meson 105/105，全量静态 279/279（冻结镜像 278，需 Git 历史的 geoset 身份脚本在原主树 5/5），帧证据 Python 56/56、截图 18/18、palette 生产往返 9907 检查/0 失败。正式配置审计 `ok=true`；以上是离线门，不是画面验收。
+- 首次跨图实例已实际完成 epoch 1→2→3，但旧 runner 在 JASS 阶段 marker 出现时提前取相，误判 B/A-return 仍为前地图；保留失败原始回执，修正为**等待目标 epoch + shadow-ready 再截图**并使分析器核对全局 epoch 时序与截图 epoch。第二次全新隔离 2560×1440、同 PID A→B→A 严格分析 `ok=true`，请求/应用 0→1→2、旧会话 collected 0→1→2，三段尾部 caster/receiver 有效，零新 GPU event/incident，玩家 DLL 未动。持久 charge 与全视觉仍未证。
+- `Hamg` Walk JASS 独立隔离回归：请求到达/接受、关闭后自动 Walk 被抑制、恢复后可出现；像素及其他单位/生命期未证。
+- 高压图第一次未达 game-ready：继承的重型取证环境变量及中文 `-loadfile` 路径是可检风险，不归因成产品崩溃。第二次隔离实例内用原字节 ASCII 地图别名、清除继承的诊断变量，完成 180.803 秒/341 采样/38 节点，无 device lost 或 GPU incident，原 DLL/进程均恢复。**实际分辨率 1902×963**；6 个互不连续采样 `HasCompleteShadowMap=0`、`ShadowMapDrawnCasters=0`，其后下一采样恢复，未复现历史粘滞无影，但不能声称阴影全程连续或 2560×1440 压力门通过。
+- 桌面 RC1 包 `C:/Users/Administrator/Desktop/WarVK-v1.22.02-RC1-20260928.zip` 已以 fail-if-exists 生成，**8,028,462 B / SHA-256 `71CBDD1943E88B0AF0D1DB7A4977C38BB112CE955A815F98E09BEFBA9D224686`**。包内 DLL 与未剥离候选原字节一致；7 个成员、每个 SHA、ZIP CRC、PE32/i386 和候选 manifest 审计通过，`releaseReady/productAccepted/stable` 等发布标志均为 false。包的首次脚本把含点的名称误用 `with_suffix` 生成 `WarVK-v1.22.zip`，随即修正脚本、将唯一生成档移到完整 RC1 名称并按新路径重审；未覆盖任何既有文件。
+- 仍缺菜单返回/再进图、D3D9 Reset、持久账户及其他单位/死亡/句柄复用和前台视觉；`docs/RELEASE_1.22.02.md` 保持 `releaseAuthorized=false`。本回执不提交、不推送、不创建公开 Release、不覆盖玩家现场。候选包仅用于下一轮明确标注的测试。
+
+## 2026-09-27：跨地图 Reset 触发缺口闭合（限定 A→B→A 候选，未发布）
+
+- 09-25 的同 PID A→B→A 已证实地图切换但 `shadowMapEpoch` 恒 1、Reset 请求/应用恒 0。本批在真实 `Hook_InitJassNatives` 前接入一次性地图会话信号，连续 Native 重建合并为一次请求；`MainRunner` 入口作缺信号兜底，完成后重新 armed，已有 GameExit disarm。仅请求设备关旧 producer gate，由 Present 原有事务应用与退休；无预算/剔除/caster 政策变化。
+- 当前 dirty 主树 exact DLL 以 Below Normal / `-j2` 构建 14 edge 并 no-work；PE32/i386 36,618,668 B / `83C1B7BE9E293A94C778FFEEE633C4A5F4089DD0C7AF6C136721FE866050B3E9`。生产共用状态机测试、接线静态 4/4、既有跨图静态 24/24、严格分析器反例 6/6 通过。
+- 唯一隔离 2560×1440、零 global input、同 PID **12980** 实机 A→B→A：DBWIN 在 B/A-return 各 3 次 Native 初始化中分别只记录 1 次 Reset 请求；三段 epoch **1→2→3**、requested/applied **0→1→2**、旧会话 collected **0→1→2**，尾部两独立状态帧均 receiver complete/producer ready，三段 drawn caster >0；无新增 GPU event/incident，输入 SHA 不变，AutoTest 所属进程已停止，玩家 DLL 未覆盖。严格分析 `ok=true`，同时 `persistentChargeAccountVerified=false`、`fullVisualAcceptance=false`、`releaseAuthorized=false`。
+- 完整输入、原始回执、截图审查范围和未覆盖门见[新候选记录](../research/2026-09-27-cross-map-transition-signal-aba.md)。本轮并未证明菜单换图、D3D9 Reset、高压持续性、全部像素或物理显存收益；不提交/推送/发布，已发布版建议不变。
+
+## 2026-09-25：真实同进程 A→B→A 换图门未通过（仅测试/诊断，未改产品）
+
+- 按用户要求自行设计并监督跨地图实机门。将两张已有编辑器保存地图的**副本**插入限时 `ChangeLevel` 与私有 GameCache/Preload marker；PJASS、MPQ 原脚本/候选读回 SHA 闭合。AutoTest 用单一实例/隔离桌面/零全局输入，在相同 War3 PID 完成 A→B→A，2560×1440 三张截图、三份 marker 与源文件三重身份留证；前台编辑器和玩家 DLL 未覆盖。
+- a 次发生 runner 假阳性（嵌套 `runtimeStatus` 解析错误，采样 0），当场撤销。b 次只读到管道子集，缺生命周期字段；严格判失败。c 次启动即 perf 记录停在约 101 帧，按精确进程身份清场，不能归因于换图。d 次有效样本 PID 58416、A/B/A 返回约 1.004/25.140/48.698 秒；三段独立状态帧 3/2/3，尾帧接收完整且 caster 绘制 146/147/148，无新增 GPU event/incident。
+- **阻断发布的真实反例**：`shadowMapEpoch` 三段恒 1；`shadowMapResetRequestedSerial` 与 `AppliedSerial` 恒 0；retired/collected 恒 0。地图切换发生，但新 M3 退休事务没有进入。这与 CPU 106/0、接线 80/0、静态 278/278 的离线通过并不矛盾。当前 Reset 仅从 `NET_EVENT_GAME_LEAVE` 注册链发起，而该单机 `ChangeLevel` 测试的 NetEventHook 启动 ready=0；事件缺失的精确原因待验证，不能武断等同于一个 Game.dll 函数错误。
+- 冻结回执、指标及完整失败列表见[实机门](../research/2026-09-25-cross-map-aba-runtime-gate.md)；新增独立 strict 分析器及 6 个正反例用例，`ok=false` / `releaseAuthorized=false`，不会把 marker、截图或重复状态读数单独算通过。原始视频/帧画面没有全面视觉验收，活跃 charge/perf 报告也未取得。本批不改产品源码、不构建、不部署、不提交/推送/发布；修复下一步必须补世界生命周期请求，再同 PID A→B→A、设备 Reset 与压力/尾延迟分别验收。已发布版“每张地图重启进程”建议继续保留。
+
+## 2026-09-25：Walk API 玩家无效回归——直接 CUnit handle 表项（隔离功能候选）
+
+- 只读核玩家现场：`E:/Work/Warcraft III/d3d9.dll` 与 09-24 构建 SHA 相同；地图新保存脚本确实调用 `WarVKSetUnitWalkLoopEnabled(gg_unit_Hamg_0033, false)`。原地图/DLL 未修改。该触发没有播放替代动画，这与“关闭自动重选”不同于“立刻停止当前 Walk”的 API 语义需分开。
+- 新增可重复的单进程隔离桌面自动化：从玩家地图的**副本**制作 PJASS 与 MPQ 读回一致的计时移动/Stand/恢复探针，在已有 AutoTest 实例中启动；内部测试快照分列 JASS setter、精确自动 Walk caller、抑制数、失败码与当前属性。原候选实测 DLL 已装、JASS 请求已到达，但 2 次 setter 均失败于 handle 类型检查，5 次自动 Walk 请求全未拦截。
+- 根因证据：该 `Hamg` 的 handle 表项直接指向 CUnit（rawcode `Hamg`，虚表 `+0x8C`=`Game.dll+0x67BB90`），不是原实现唯一接受的 CAgent→CUnit。修复只给具名 direct-CUnit 证据开门，CAgent 路径不改，其他地址仍 fail-closed。生产共用 predicate 宿主测试与 2/2 Meson 定向通过。
+- 修复候选 36,618,365 B / SHA-256 `1FFE0BD14C51C8E1D2A9EB94425A06260CD4B480A7CA735E13E946EA93EE35CF`，PE i386。两次 fresh-process 隔离测试均 game-ready、零 global input、源身份不变、零游戏残留；run c 的关闭/恢复 2 次请求均接受，576 次自动 Walk 请求中关闭期 574 次抑制，之后全局计数 2 次未抑制；run d 独立重复为 536/534/2。末尾 2 次未附对象键，不能证明同一个 `Hamg` 已恢复。两张最终帧只作图像样本，**不**冒充动画序列的像素验收。完整身份、证据路径与剩余语义见[本次诊断](../research/2026-09-25-unit-walk-japi-runtime-diagnosis.md)。
+- 玩家 DLL 仍为旧 `FF3B…`，未部署修复、未修改用户地图、未提交/推送。其他单位、移动途中调用时已经在播的 Walk、跨图/句柄复用/多人及真实玩家视觉仍未验收；本候选不得晋升稳定。
+
+## 2026-09-24：单位动画 API 作者菜单与正式启用边界
+
+- 修复上一轮遗漏：`WarVKSetUnitWalkLoopEnabled`、`WarVKClearUnitMovementAnimationOverride` 现登记在 `WarVK/action.txt`；两个返回 boolean 的播放 Override 助手登记在 `WarVK/call.txt`；`define.txt` 增独立“单位动画”分类，`README.md` 补入口和边界。上一轮仅有 JASS 包装，故旧 YDWE 菜单确实看不到这些函数。
+- 按作者决定移除 `DXVK_WAR3_UNIT_WALK_API` 环境门；支持的 Game.dll 初始化时尝试安装 Hook。目标序言和两处移动回调指令仍须精确匹配；不匹配即不安装、功能位不宣称可用，原游戏路径不变。单位未明确调用关闭时不会拦截 Walk。**环境门移除不代表游戏行为验收已经通过。**
+- 验证：目标 YDWE 自带 `triggerdata.lua`/writer/WTG checker 以本树 WarVK 层覆写加载，`databaseLoaded=true`、`wtgAccepted=true`、`unknownUiRecoveryUsed=false`；JAPI 集成静态 20/20、安全 5/5、模型灯兼容静态 7/7；两项 Meson 2/2；1.27a PJASS 13,628 行解析通过；Below Normal / `-j2` exact DLL 构建 4/4，随后 no-work。DLL 36,612,087 B / SHA-256 `FF3B7BD521F95935DB204EF2FEBAB828BDE85BA743E509292B9FA9F91B05F003`，仅为本脏树离线候选，非发布 DLL。
+- 安装边界：当前 YDWE 编辑器进程仍在运行，`E:/Work/War3/YDWE1.32.13 - MemoryHack/ui/WarVK` 是旧副本；本轮没有热覆盖该目录、没有触碰玩家 DLL、地图或游戏。关闭并重启编辑器且把完整 WarVK UI/JASS 层更新后，作者菜单才会刷新。真实移动动画、停止移动、死亡/销毁、换图与高压地图仍待实机验收。
+
+## 2026-09-23：单位移动 Walk 自动重选开关（默认关闭的离线候选）
+
+- 用户希望单位移动时可暂时不循环 Walk，而播放指定动画；DSH 以 `commandcode/deepseek/deepseek-v4.1-flash` 完成初查，主线程在 IDA 独立复核 `Game.dll` 两个移动回调、原版动画 Native 分离、虚表目标与浮点返回 ABI，并把三个关键地址的证据边界写回 IDA 注释。精确地址、身份、推理与未覆盖项见[逆向记录](../research/2026-09-23-unit-walk-animation-reverse-findings.md)。
+- 新增 JAPI `WarVKSetUnitWalkLoopEnabled(unit, boolean)`，以及按名称/序号播放的 Override 组合助手和 Clear；原版 `SetUnitAnimation`、`SetUnitAnimationByIndex`、`QueueUnitAnimation` 未 Hook。仅显式 `DXVK_WAR3_UNIT_WALK_API=1` 且两处调用指令与目标序言匹配才安装；默认原游戏行为。关闭自动 Walk 还须验证实时 handle→agent→unit 身份、单位存活和两个精确调用返回地址，失配回到原函数；JASS VM 重建清除状态。
+- 验证：Win32 DLL Below Normal / `-j2` 构建 exit 0，exact DLL no-work；Meson `war3_japi_v1_protocol` 与 `war3_unit_walk_policy` 2/2；JAPI 集成静态 19/19、安全静态 5/5；1.27a `common.j` + `blizzard.j` + 当前 `warvk_api.j` 的 pjass exit 0。曾因新命令把参数前缀写进命令名而使集成静态 1/19 失败，已改成既有分段序列化并复测；没有隐藏红门。构建态 DLL 36,612,087 B / SHA-256 `6B4C6118BB0B954D268F0648E07CD0F24AE30274987C14EE9F260F67D75872B6`，它还含本工作树其他未提交改动，**不是发布或玩家测试包**。
+- 游戏内 Hook 命中、单位动画持续性、死亡/销毁/复用、换图和高压地图仍未验收；不能声称玩家可用或进入正式配置。没有部署、启动游戏、关闭编辑器、提交或推送。本轮也修复 DSH 启动后令牌与 MCP 的动态交接（独立 DSH/dsh-mcp 工作树，HKCU 用户环境；新 MCP 进程验证成功），当前 Codex 任务中的旧 MCP 进程需重连才读取新配置。
+
+## 2026-09-22：R4/M3 换图资源承接与 live/retired 分账（离线候选）
+
+- 用户批准下一步攻克换图，并顺带推进长期重构。本批只处理已确认的 persistent 会话账和退休承接，不扩大 cap、不减少 caster、不改默认剔除、不引入 64 位或另一个生命周期 Manager。
+- **源码问题与修复**：旧 Reset 搬走 geometry/registry/expiry 后账仍留在单一 bytesUsed，退休收集也不扣账；现在分 live/retired，准入始终看两者总额，完成序号到达后只扣对应 session 的 charge。另把退休队列改为先准备稳定 list 节点、再进行无分配的 owners+账共同提交，避免资源搬入局部对象后 vector 扩容失败丢失保活。零收费 alias 仍按原 fence 保活；本账不是实际物理显存，现有 live GC 减账与外部 Rc 保活区别保留。
+- **失败恢复边界**：map/device 准备失败不进入 quarantine、不推进 applied；提交后 CPU 清理若失败，已退休资源仍有 owner。独立审查发现 tombstone 失败重试可能被提前开门/Populate 早退破坏，已补 pending latch、最后清理成功才解除、两处 reopening 拒绝 pending、Present 独立重试及 Populate 下游前再次关门。
+- **长期重构推进**：`war3_shadow_session_retirement.h` 是设备实际使用、CPU 测试共用的唯一 prepare/commit/collect 规则；11 组 owner 的承接由真实适配层和 no-throw 条件约束。Present 同次发布 total/live/retired，性能 summary 增两个 Last 字段、workloadSeries 尾部增两列，不挪旧索引或与 Arena/别名账相加。
+- **离线证据**：生产共用事务 **106 检查/0 失败**（真实 STL/失败 allocator、连续失败后恢复、A→B→A 账目模型、部分回收、零 serial、近 UINT64_MAX、保活）；生产接线 **80 检查/0 失败 + 12/12 内存变异被拒绝**；报告静态 6/6。断言开启 Meson **103/103**，静态最终 **278/278 脚本 exit 0**。首轮静态 **277/278** 的旧 direct-move 形状断言失败原样保留，已收紧到实际 transfer/commit/clear 顺序。旧 A9/M2-5B TEMP 独立重抽仍缺，本轮新 EXE probe/动态差分已跑，不误报全部历史子门通过。
+- **构建与身份**：固定依赖镜像 **3951 文件**；最终清单 `E:/WarVK-Builds/v1.22-maintenance-20260922-r3/source-review-final.json` / SHA `AEABBF5BE92C6FD2ED3EABAF271A4EA507BEA1D7F65A5D47FCD81DF4CC1919D7`。产品/CPU 源码冻结后未变，仅刷新两份 Python 静态脚本；镜像逐 SHA 0 差异，收口前 2910 个非归档依赖主树文件逐 SHA 一致。BelowNormal/-j2 exact DLL **466/466**、exact no-work、player-release 配置校验、PE `pei-i386/i386`、py_compile 通过；编译警告保留。
+- **未剥离候选**：**36,125,214 B / `7ECA06A72C480A4943029CDA1C6CB98B3B32AE64EB25CC964B2BACB3FF396642`**，CreateNew 等价原字节冻结 `E:/WarVK-Builds/v1.22-maintenance-20260922-r3/candidate-7eca06a7/d3d9.dll`。CPU JSON SHA `3CA30507B216E7B486CF1963A9850D70F111DE6D0F7ABEDB152FE98AA4E987E2`；静态摘要 SHA `27F61CA1C3E9B1282825C91B229FD961B831AEFF07B77F7DD2AAAE81EE2E218B`。完整终检在同目录 `final-verification.json`，随后只补本日志/路线图/本批研究回执。
+- **资源与验收边界**：编译资源已释放，终检编译/War3 为 0；玩家 DLL 仍为 `028565BCB33B6EB646E4915115B60CDA3C14C287A4225DAA50F8F6513F9E9BA3`，编辑器 PID 36012 保留，用户 StormBreaker dirty 未用于构建。没有部署、游戏、提交、推送或发布。本批 CPU A→B→A 模型不等于游戏换图，未宣称已修复某份玩家日志、FPS 改善或全面恢复；真实同进程换图/设备 Reset/压力与 GPU/尾延迟仍待验收。
+- **后续**：完成本批实际 A→B→A 验收；源码继续 GC expiry 异常边界、Registry/domain 账户/键，然后单条 CurrentDraw/M4。跨 Pass 统一职责和 64 位未完成；64 位继续延期。详见[会话退役合同](../research/2026-09-22-persistent-session-retirement-accounting.md)与[路线图 §8](../plan/2026-09-22-post-v12201-roadmap.md)。
+
+## 2026-09-22：R4/M3 第一切口——persistent geometry 发布事务（离线候选）
+
+- 用户要求按长期重构继续推进。本批把 `War3CreateShadowPersistentGeometryAfterMiss` 的 geometry map、registry、expiry heap、字节账发布收进生产与 CPU 测试共用的 `PublishPersistentGeometry`，不是另建 Manager 或仅搬文件。域准入、预算、GPU 创建、GC 与退役仍由原设备所有者负责；无新默认开关、无 64 位/Water/自动模型点光变化。
+- **先红后绿**：原发布顺序抽取后，真实 STL node/bucket/vector 分配失败注入得到 345 检查 / 106 失败 / exit 1；改为新节点可回滚、旧槽最后覆写、heap 成功后再加账后，同一测试 **345 检查 / 0 失败**。含新 key/已有槽、逐分配点、连续失败后恢复、ID 不回退、原槽地址/全字段/heap序列、未知异常回滚重抛和外部强引用保活；这是 CPU 证据，不是 GPU/玩家根因证明。
+- 成功路径采样：新 key 5 次容器分配、旧槽 3 次，与抽取旧序列一致；没有新增分配类别、锁或遍历，不据此宣称帧耗时等价。事务起点在 GC **之后**，不恢复已合法淘汰的资源；rollback 可保留 bucket 高水位，不能称物理显存或 CPU 内存完全复原。
+- 新静态接线门禁 **9/9**；反例脚本对照通过、**14/14 变异被拒绝**，回执 `E:/WarVK-Builds/v1.22-maintenance-20260922-r2/static-mutations/shadow_geometry_publication_mutation_results.json` / `2EBA55DDFEC10DAA440C4CEE9A5B2BF2CD4439115529CCA53F9CB242EDE5A9D4`。独立只读审查确认当前 STL 与生产类型前提成立；模板并不为任意自定义容器提供异常保证。
+- 新固定依赖镜像 **3946 文件**，清单 `source-review-final.json` / `6487DCB36F9EFD607332C40FB9BD67F7FFB5A1087C42A1ED1D9832881FD23EA5`，逐 SHA 复核上一镜像后创建；旧候选/回执不覆盖，用户 StormBreaker dirty 不读取构建。全量 CPU/静态及产品构建结果待本条后续收口，不预先计为通过。
+- **本批收口**：全新断言开启 CPU **102/102**；静态首跑 **274/276**，两项旧门钉住 device 内直接插入，已适配并加强为唯一事务入口/domain 同源值/四流绑定顺序，13+7 定向通过后全量重跑 **276/276 脚本 exit 0**。首跑失败记录保留，未追认；旧 A9/M2-5B TEMP 原始快照重抽子门仍跳过，不能称全部历史子门通过。最终静态摘要 SHA `E3C3628B8AA38FA670E9D8DD5978E97202FC867AF14907E3D41A136BF81B5E5C`；Meson JSON SHA `B78510E19047B5299F539B9A558F2B34D6B4186DE473651D1140508573C0AC66`。
+- BelowNormal/-j2 exact DLL 干净构建 **466/466**、exact no-work、正式配置 verifier `ok=true`、PE `pei-i386/i386`、py_compile 与 diff 空白通过。未剥离候选 **36,157,944 B / C65CA2B2FB755AE78D5A65455A49D04577839AB896E5E70A3D043B147CFC4F33**，原字节冻结 `E:/WarVK-Builds/v1.22-maintenance-20260922-r2/candidate-c65ca2b2/d3d9.dll`。最终输入清单 `source-final.json` / `07B38D73E216ADEBAB48FCE4EE59FFBBB79217AEDA1D51CBE05D3AD44C8B7762` 仅更新两份 Python 门；3946 文件逐 SHA 0 差异，产品输入不变。随后只补本批三份文档回执。
+- **编译资源已释放**；终检编译/War3 进程 0，用户编辑器 PID 36012 保留。玩家 DLL 仍为 `028565BCB33B6EB646E4915115B60CDA3C14C287A4225DAA50F8F6513F9E9BA3`。本批未部署、未游戏、未提交/发布，没有新 GPU/画面或性能结论。
+- **下一独立问题**：Reset 将 persistent 几何移到 retired 后，字节账未随其转移、收集时也未扣除；可能在旧资源已释放后继续占用新地图准入额度。已在研究文档登记为源码风险，尚无运行复现；下一批先定义 live/retired 账户与 GPU 在途成本，再做生产生命周期故障注入，不能简单清零或扩池。M4、跨 Pass、实机和长期性能仍未完成。
+- 详见[事务合同与验证](../research/2026-09-22-persistent-geometry-publication-transaction.md)。本批不部署、不启动游戏、不提交/发布；玩家 DLL 和用户编辑器保留。
+
+## 2026-09-22：发布后首批维护——恢复证据按尝试闭合、截图 I/O 取消交接（离线候选）
+
+- 用户授权先解决问题和渐进式重构、后做 64 位。主树仍为 `codex/v1.22-main-tree-20260920` / HEAD `a2054a9776e40edc3f01f6f390c06037965b8ef2`；本批不修改阴影选择、caster 准入、剔除默认、预算上限、GPU fence 或已发布附件，未启动 64 位产品接入。
+- **恢复证据不再跨尝试拼接**：真实记录器将累计阶段观察与当前 `attemptSerial` 的证明分离，只有同一已知尝试内、来源/hit 一致且有序的 Served→Enqueued→Drawn 才可闭合；未知、A→B→A、清空来源与错序不能借旧状态认证。同帧合并仅限无中间推进的等价邻接事件；回退阶段/冲突可见且使当前证明失效。终态携带当前尝试与真实 draw 载荷，不借用旧 draw。外层 schema 7 不变，palette 扩展 v5 使用 `data[5]` 传完整 64 位尝试号，旧 v1–v4 仍严格读取但缺尝试证据时不能认证同对象恢复。
+- **截图退出可请求取消私有文件 I/O**：保留 `std::thread`，worker 复制自己的真实线程句柄并发布；关闭方在私有文件阶段请求 `CancelSynchronousIo`，始终等待实际 join 后才关闭句柄/释放对象。取消成功、未找到 I/O 或查询失败均不当作完成；句柄复制/观察失败回原 join。Logger 不在可取消阶段，join 后未终结的历史请求明确失败完成，不伪造 GPU 已退役。驱动拒绝取消、rename/元数据/Logger 停滞仍可阻塞，不承诺硬退出时限。
+- **成本边界**：记录器固定表从 289,064 到 370,984 B（+80 KiB CPU 诊断状态），没有逐事件堆分配、额外矩阵扫描或渲染锁；该子门仍默认关闭。截图门只在保存/退出使用，不把 I/O 放进 Present。未测游戏帧时或尾延迟，不宣称 FPS/显存收益。
+- **统一离线验证**：断言开启 Meson **101/101**；最终真实记录器 45/45、跨尝试反例 **64** 检查、截图生产共用控制 122 检查、记录器→转换器→环→导出→正式读方 **9907 检查/0 失败**。两个 Python 正式读方 **192 测试**通过，相关 py_compile 与 diff 空白检查通过。截图 CPU 测试包含三轮实际阻塞同步管道 WriteFile 取消，但未实例化完整 Vulkan/游戏 `Impl::save`，不是慢磁盘实机验收。
+- **静态回归 275/275 exit 0**，并单列 A9/M2-5B 两项旧 TEMP 原始快照缺失造成的“独立重新抽取”未覆盖；它们的本轮新编译 probe/动态差分已实际运行。首轮静态 267/275（两个旧版本形状断言和六项环境依赖失败）原回执保留；修正版本钉点、接入本轮新 EXE/只读历史查询后重跑，不弱化缺链和来源门。另有一次配置编排把 Meson stderr 进度当 PowerShell 异常，保留不完整目录并用新 `build32-tests-v2` 完成配置，未伪装为首次成功。
+- **源码与构建闭合**：仅从固定 gitlink 导出依赖，排除用户 StormBreaker dirty/旧 build32。清单 `E:/WarVK-Builds/v1.22-maintenance-20260922-r1/source-final.json` 包含 3942 文件，SHA-256 `64153D3191F807A467578847E53AD6E598B845BA8C003270FAEBA137A8334E53`。构建后镜像逐 SHA 0 差异；2901 个非归档依赖主树文件仅路线图后补文字不同，随后只补本回执与研究文档。BelowNormal/-j2 exact DLL **466/466** exit 0、exact no-work、player-release 配置审计通过；编译警告留在日志，不声称零警告。
+- **未剥离候选**：`E:/WarVK-Builds/v1.22-maintenance-20260922-r1/build32-product/src/d3d9/d3d9.dll`，PE `pei-i386/i386`，**36,156,663 B / 8238712B18619647801223F7EEFA639972CC640081B34EDC6138A9522727988D**。首次静态回执 SHA `8223591394DC4BF8BD1D3BC4E60A06AB312E6A51FCF425563ECFCBB1D41E9889`；首次 Meson JSON 回执 SHA `0FD35AD44E479F6358F72FFAE890231523EB8433066631A057B4F90F8EE52872`（后者保留在 `pre-review-test-receipts`，最终见下条）。
+- **最终反例复核追加**：独立复核发现读方仍用“全链首次 S/E/D”顺序误拒旧 attempt 缺 S 或 E 后的新完整重试。本批修正 v5 RejectionRecovery 读方，顺序与 D 见证由当前 attempt 证明负责，历史真正降秩保持粘性；v1–v4 和 v5 Observation 原规则不动。真实往返新增 M/N 正例、O 真降秩负例，追加 4 个测试构建 edge 后重跑上述 101/192/275 与 9907 检查全部通过。只刷新五个读方/测试文件，DLL 产品输入与 SHA 不变，exact no-work 再确认。
+- **最终收口清单**：`source-review-final.json` **3942 文件** / SHA `CCD6435E1E8E703BB0B8F31F107C3DE4ED093F6D7A58BA7C63539AEBDBCD25FE`；镜像逐 SHA 0 差异，主树差异仅四份收口文档。最终 `static-results-review-final/summary.json` SHA `885D66330BAC24399863099F0B01785437E30C7375FD462105203091E3110D1B`，来源清单/三个动态 EXE 前后不变；最终 Meson JSON SHA `3AC773B1A1DDA31355EECF1BD41925AC32782ADA79D73D68363CB8F726DB3157`。生成清单时曾因 Windows PowerShell 默认编码误写两个依赖文档的中文路径，原清单保留为 `source-review-final-before-utf8-correction.json`，已修正路径并全量复核；没有改动相应依赖字节，测试回执记录的是纠正前清单哈希，不能混写成纠正后身份。
+- **没有部署、启动游戏、提交、推送或发布**；玩家 `E:/Work/Warcraft III/d3d9.dll` 仍为 `028565BCB33B6EB646E4915115B60CDA3C14C287A4225DAA50F8F6513F9E9BA3`。终检编译/War3 进程 0，编译资源已释放；用户编辑器 `worldeditydwe.exe` PID 36012 已于 15:57 启动，原样保留，未操控或关闭，不把它报为“所有相关进程 0”。玩家视觉、压力恢复、A→B→A、正常/慢盘真实截图退出、GPU 与尾延迟仍需独立验证；生产未知身份/尝试仍不得认证。
+- **下一批 R4/M3**：已定位 `War3CreateShadowPersistentGeometryAfterMiss` 中 geometry map→registry→字节账户→expiry queue 的部分发布风险，先做实际生产函数分配失败注入及事务回滚，再做单条 CurrentDraw/M4 交接。该风险是源码审计发现，尚未复现为玩家崩溃，本批未修改此路径。64 位、Water 与自动模型点光继续延期。
+- 详见[恢复证明合同](../research/2026-09-22-palette-attempt-recovery-contract.md)、[截图退出合同](../research/2026-09-22-screenshot-synchronous-io-cancellation.md)及[后续路线图](../plan/2026-09-22-post-v12201-roadmap.md)。
+
+## 2026-09-22：发布后路线图核对（仅计划，不修改产品）
+
+- 以主目录 HEAD a2054a9 / 已发布 v1.22.01 为基线，核对源码、发布范围与历史长期计划；开发前只有用户 StormBreaker dirty，原样保留。
+- 新建 [后续路线图](../plan/2026-09-22-post-v12201-roadmap.md)：先稳定基线与跨 attempt/慢 I/O 维护，再根据实测做采集/复制减量，逐链收口 Registry/M3、CurrentDraw/M4 和后端决策；配置/API 覆盖可离线并行，提前剔除需独立证明。
+- 动态预算、快照切片复用、Arena 缩页、S2 局部成本及正式整合已实现，不重复列为未做；区分剩余实机门与未实现职责。旧 A9/A10、Registry“未导出”和09-19百分比不能直接当现状。
+- 本轮仅文档整理及只读复核，未重跑测试、构建、部署、启动游戏、提交或推送；没有新增性能收益/视觉修复声明，稳定 CHANGELOG 与发布附件未改。
+
 ## 2026-09-20 21:29 台北：v1.22.01正式发布完成
 
 - 源码提交7e281568862ba40de3be07e98d108c20144b93e7（63文件/+1943/-313）与新annotated v1.22.01已atomic、fast-forward推送origin/main；无force、未改旧版本。Release ID392439670于2026-09-20T13:29:12Z公开，draft=false、prerelease=false、latest=v1.22.01。

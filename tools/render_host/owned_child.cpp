@@ -32,7 +32,7 @@ std::wstring QuoteAbsoluteFile(const std::wstring& path) {
   return L"\""+path+L"\"";
 }
 OwnedChild::OwnedChild(const std::wstring& executable,const std::wstring& arguments,
-                       const std::wstring& log) {
+                       const std::wstring& log,const std::wstring& desktop) {
   auto command=QuoteAbsoluteFile(executable)+L" "+arguments;
   QuoteAbsoluteFile(log);
   if(arguments.find_first_of(L"\r\n")!=std::wstring::npos)
@@ -53,6 +53,9 @@ OwnedChild::OwnedChild(const std::wstring& executable,const std::wstring& argume
      !UpdateProcThreadAttribute(attributes.list,0,PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
       inherited,sizeof(inherited),nullptr,nullptr))Fail();
   STARTUPINFOEXW startup{};startup.StartupInfo.cb=sizeof(startup);
+  // Explicit only when requested by an isolation-aware owner; other lab
+  // protocols retain their previous inherited-desktop behavior.
+  startup.StartupInfo.lpDesktop=desktop.empty()?nullptr:const_cast<wchar_t*>(desktop.c_str());
   startup.lpAttributeList=attributes.list;
   startup.StartupInfo.dwFlags=STARTF_USESTDHANDLES;
   startup.StartupInfo.hStdOutput=output.get();startup.StartupInfo.hStdError=output.get();

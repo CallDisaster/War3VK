@@ -1,6 +1,9 @@
 // Phase 7.99 marker bump 034957
 #include "d3d9_device.h"
+#include "d3d9_fixed_function_keys.h"
+#include "d3d9_sampler_key.h"
 #include "war3/memory/war3_memory_budget_sample.h"
+#include "war3/memory/war3_lazy_thread_array.h"
 #include "../dxvk/dxvk_buffer_allocation_guard.h"
 #include "war3/render/war3_draw_time_snapshot_lifetime.h"
 #include "war3/tools/war3_data_collection_tree.h"
@@ -9,6 +12,7 @@
 #include "d3d9_war3_hook.h"
 #include "d3d9_war3_pipeline.h"
 #include "d3d9_war3_volumetric_light.h"
+#include "d3d9_war3_weather.h"
 #include "war3/core/war3_internal_test_config.h"
 #include "war3/render/war3_sun_light_policy.h"
 #include "war3/core/war3_game_structs.h"
@@ -63,9 +67,11 @@
 #include "war3/gpu_skin/war3_persistent_gpu_package_stage11_observe_adapter.h"
 #include "war3/native/war3_native_shadow_hint.h"
 #include "war3/platform/war3_runtime_bootstrap.h"
+#include "war3/platform/war3_vram_preset.h"
 #include "war3/shadow/war3_shadow_renderer_core.h"
 #include "war3/shadow/war3_shadow_native_runtime.h"
 #include "war3/shadow/war3_shadow_alpha_test_payload.h"
+#include "war3/shadow/war3_shadow_geometry_publication.h"
 #include "war3/shader/war3_shader_manager.h"
 #include "war3/state/war3_render_state.h"
 #include "war3/tools/war3_diagnostics_hub.h"
@@ -98,7 +104,6 @@
 #include "d3d9_vertex_declaration.h"
 #include "d3d9_volume.h" // Added by user instruction
 #include "d3d9_war3_hook.h"
-#include "imgui_impl_dx9.h" // Added by user instruction
 #include "war3/reimpl/war3_instance_buffer.h"
 #include "war3/reimpl/war3_shader_patcher.h"
 #include "war3/ui/war3_imgui.h"
@@ -4600,8 +4605,19 @@ War3BuildShadowMaterialSignatureCached(
   hash = bit::fnv1a_iter(hash, renderable.transparentSortKey);
   hash = bit::fnv1a_iter(hash, uint32_t(renderable.queueKind));
 
-  static thread_local std::array<CacheEntry, 16384> s_cache = {};
-  auto& entry = s_cache[size_t(hash) & (s_cache.size() - 1u)];
+  // Preserve this thread's 16384 entries and epoch/key rules, without making
+  // Windows copy a 1.75 MiB material table into every unrelated worker's TLS.
+  static thread_local war3::memory::LazyThreadArray<CacheEntry, 16384> s_cache;
+  auto* storage = s_cache.try_get();
+  if (!storage) {
+    // This cache is optional. Failed first backing allocation must neither
+    // escape through a native render hook nor drop an otherwise valid caster.
+    // Use the same uncached resolver as the explicit cache-off path; a later
+    // lookup may retry allocation without changing key/provenance semantics.
+    return dxvk::war3::shadow::BuildShadowMaterialSignatureForRenderable(
+        renderable);
+  }
+  auto& entry = (*storage)[size_t(hash) & (s_cache.size() - 1u)];
   if (entry.valid && entry.mapEpoch == mapEpoch &&
       entry.sceneNode == renderable.sceneNode &&
       // A resolved signature comes from the canonical sceneNode mesh/layer
@@ -8739,7 +8755,7 @@ D3D9DeviceEx::D3D9DeviceEx(D3D9InterfaceEx *pParent, D3D9Adapter *pAdapter,
     : m_parent(pParent), m_deviceType(DeviceType), m_window(hFocusWindow),
       m_behaviorFlags(BehaviorFlags), m_adapter(pAdapter),
       m_dxvkDevice(dxvkDevice), m_memoryAllocator(), m_shaderAllocator(),
-      m_ffModules(this), m_shaderModules(new D3D9ShaderModuleSet),
+      m_ffModules(dxvkDevice), m_shaderModules(new D3D9ShaderModuleSet),
       m_stagingBuffer(dxvkDevice, StagingBufferSize),
       m_stagingBufferFence(new sync::Fence()),
       m_d3d9Options(dxvkDevice, pParent->GetInstance()->config()),
@@ -8773,6 +8789,8 @@ D3D9DeviceEx::D3D9DeviceEx(D3D9InterfaceEx *pParent, D3D9Adapter *pAdapter,
   m_converter = new D3D9FormatHelper(m_dxvkDevice);
   war3dbg::InstallCrashHandlerOnce();
   TraceD3D9Device(traceOrdinal, "crash-handler-ready", this);
+  // VRAM-based defaults must exist before the pipeline reads its settings.
+  dxvk::war3::platform::InitVramPreset(*m_dxvkDevice->adapter());
   TraceD3D9Device(traceOrdinal, "war3-pipeline-begin", this);
   m_war3Pipeline = CreateWar3RenderPipeline(
       m_dxvkDevice, War3RenderPipelineAbi { });
@@ -8812,6 +8830,10 @@ D3D9DeviceEx::D3D9DeviceEx(D3D9InterfaceEx *pParent, D3D9Adapter *pAdapter,
   }
   {
     auto aaPass = std::make_unique<War3AAPass>(this);
+    m_war3Pipeline->RegisterPass(
+        "Weather", std::make_unique<War3WeatherPass>(this),
+        war3::runtime::IsWar3RuntimeModuleEnabled(
+            war3::runtime::War3RuntimeModule::PostFx));
     m_aaPass = aaPass.get();
     m_war3Pipeline->RegisterPass(
         "AA", std::move(aaPass),
@@ -8837,7 +8859,8 @@ D3D9DeviceEx::D3D9DeviceEx(D3D9InterfaceEx *pParent, D3D9Adapter *pAdapter,
   if (!(BehaviorFlags & D3DCREATE_FPU_PRESERVE))
     SetupFPU();
 
-  m_dxsoOptions = DxsoOptions(this, m_d3d9Options);
+  m_dxsoOptions = DxsoOptions(GetDXVKDevice(), m_d3d9Options,
+                            GetVertexConstantLayout().floatSize());
 
   // Check if VK_EXT_robustness2 is supported, so we can optimize the number of
   // constants we need to copy. Also check the required alignments.
@@ -9003,8 +9026,23 @@ D3D9DeviceEx::~D3D9DeviceEx() {
   war3::ClearActiveDeviceIfCurrent(this);
   // This guard must precede WarVK TLS/export/callback cleanup, not just the
   // downstream DXVK waits. At process detach those threads/TLS are already gone.
-  if (this_thread::isInModuleDetachment())
+  if (this_thread::isInModuleDetachment()) {
+    // Do not invoke the optional owner's COM cleanup under loader lock.
+    m_war3InstanceBuffer.release();
     return;
+  }
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationLog("normal-device-destruction");
+#endif
+  // Revoke callbacks before draining; retain UI resources until the actual GPU
+  // drain below, then destroy only the context owned by this device.
+  war3::War3Imgui::get().beginDeviceTeardown(this);
+  if (war3::reimpl::War3InstanceBuffer::GetActive(this))
+    war3::reimpl::War3InstanceBuffer::SetActive(nullptr);
+  // Unlock may emit a staging-buffer upload when direct mapping is disabled.
+  // Finish it before the final CS/GPU drain, while retaining storage until idle.
+  if (m_war3InstanceBuffer)
+    m_war3InstanceBuffer->Unlock();
   // [War3 Perf] Export HTML report before shutdown
   auto& perfMonitor = war3::War3PerfMonitor::instance();
   perfMonitor.exportHtmlReport("war3_perf_report.html");
@@ -9026,6 +9064,8 @@ D3D9DeviceEx::~D3D9DeviceEx() {
   // that recording finished; the GPU may still be executing those pipelines.
   // Drain the device before destroying any pass owner.
   m_dxvkDevice->waitForIdle(); // Sync Device
+  war3::War3Imgui::get().shutdown(this);
+  m_war3InstanceBuffer.reset();
 
   dxvk::war3::memory::ShadowArena_Shutdown(m_dxvkDevice.ptr());
 
@@ -9046,6 +9086,15 @@ D3D9DeviceEx::~D3D9DeviceEx() {
   m_ssaoPass = nullptr;
   m_aaPass = nullptr;
   m_war3PostProcess = nullptr;
+}
+
+war3::reimpl::War3InstanceBuffer* D3D9DeviceEx::GetWar3InstanceBuffer() {
+  if (!m_war3InstanceBuffer) {
+    auto owner = std::make_unique<war3::reimpl::War3InstanceBuffer>(this);
+    owner->Create();
+    m_war3InstanceBuffer = std::move(owner);
+  }
+  return m_war3InstanceBuffer.get();
 }
 
 void D3D9DeviceEx::War3AttachGpuSkinNativeBridge(uintptr_t gameBase) {
@@ -9978,7 +10027,7 @@ bool D3D9DeviceEx::War3GpuSkinPreflightNativeBypass(
       !vsBypassMainStateExact ||
       device->ShouldRecord() ||
       device->GetInstanceCount() != 1u ||
-      war3::reimpl::War3InstanceBuffer::GetActive() != nullptr ||
+      war3::reimpl::War3InstanceBuffer::GetActive(device) != nullptr ||
       dxvk::War3Hook::IsInShadowPass()) {
     return false;
   }
@@ -13473,12 +13522,15 @@ bool D3D9DeviceEx::War3ApplyShadowMapEpochResetAtPresent(
 
   m_war3ShadowSessionReady.store(false, std::memory_order_release);
   m_war3ShadowDiagTransitionState.store(2u, std::memory_order_release);
+  War3PreparedShadowRetirement prepared(m_war3RetiredShadowSessions);
+  if (!prepared)
+    return false; // Keep requested != applied; retry at a later Present.
   War3QuarantineShadowSessionAtPresent(retireSerial);
 
   // Map-wide render registries are reset only for the lifecycle transition,
   // not for a shadow tombstone overflow that merely rebuilds caster caches.
   dxvk::war3::render::War3LightningRuntime::instance().reset();
-  War3ResetShadowSessionState(retireSerial);
+  War3ResetShadowSessionState(retireSerial, prepared);
   War3ResetGpuSkinMapEpoch();
   const uint64_t deviceEpoch = m_war3GpuSkinDeviceEpoch;
   War3InvalidateShadowReceiverEpochOnCs(
@@ -13533,13 +13585,16 @@ bool D3D9DeviceEx::War3ApplyShadowDeviceEpochTransitionAtPresent(
 
   m_war3ShadowSessionReady.store(false, std::memory_order_release);
   m_war3ShadowDiagTransitionState.store(2u, std::memory_order_release);
+  War3PreparedShadowRetirement prepared(m_war3RetiredShadowSessions);
+  if (!prepared)
+    return false; // Do not publish the requested device epoch on failure.
   War3QuarantineShadowSessionAtPresent(retireSerial);
 
   // Every D3D shadow owner below contains draws or publications stamped with
   // the old device epoch. Move GPU-backed containers behind the completion
   // fence and clear only this device's CPU aliases; map-level semantic
   // registries remain valid because Warcraft did not change maps.
-  War3ResetShadowSessionState(retireSerial);
+  War3ResetShadowSessionState(retireSerial, prepared);
   War3InvalidateShadowReceiverEpochOnCs(
       m_war3GpuSkinMapEpoch, requested);
   m_war3ShadowDeviceEpochApplied.store(
@@ -14101,7 +14156,7 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::SetCursorProperties(
   const uint8_t *data = reinterpret_cast<const uint8_t *>(lockedBox.pBits);
 
   // [War3] Capture cursor for ImGui overlay (preserve high resolution)
-  if (war3::War3Imgui::get().isInitialized()) {
+  if (war3::War3Imgui::get().isOwner(this)) {
     std::vector<uint8_t> packed(inputWidth * inputHeight * 4);
     for (uint32_t h = 0; h < inputHeight; h++) {
       std::memcpy(&packed[h * inputWidth * 4], &data[h * lockedBox.RowPitch],
@@ -14205,6 +14260,10 @@ UINT STDMETHODCALLTYPE D3D9DeviceEx::GetNumberOfSwapChains() {
 
 HRESULT STDMETHODCALLTYPE
 D3D9DeviceEx::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteApi(d3d9::migration::Api::Reset);
+  m_callerCensus.noteCall(d3d9::migration::Api::Reset, WARVK_MIGRATION_CALLER);
+#endif
   D3D9DeviceLock lock = LockDevice();
 
   // A Vulkan logical device cannot be recovered by a D3D9 Reset. Do not
@@ -14216,14 +14275,15 @@ D3D9DeviceEx::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
   War3ForceImmediatePresent(pPresentationParameters);
 
   // ImGui Invalidate
-  ImGui_ImplDX9_InvalidateDeviceObjects();
+  war3::War3Imgui::get().invalidateDeviceObjects(this);
 
   // [War3] Release PostFX resources (Default Pool) to allow Reset to succeed
   if (m_war3PostProcess)
     m_war3PostProcess->Shutdown();
 
   // [War3] Release Instance Buffer resources
-  dxvk::war3::reimpl::War3InstanceBuffer::Get(this)->OnLostDevice();
+  if (m_war3InstanceBuffer)
+    m_war3InstanceBuffer->OnLostDevice();
 
   Logger::info("Device reset");
   m_deviceLostState = D3D9DeviceLostState::Ok;
@@ -14314,10 +14374,11 @@ D3D9DeviceEx::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
     m_resetCtr++;
 
   // ImGui Restore
-  ImGui_ImplDX9_CreateDeviceObjects();
+  war3::War3Imgui::get().restoreDeviceObjects(this);
 
   // [War3] Restore Instance Buffer
-  dxvk::war3::reimpl::War3InstanceBuffer::Get(this)->OnResetDevice();
+  if (m_war3InstanceBuffer)
+    m_war3InstanceBuffer->OnResetDevice();
   War3ResetGpuSkinDeviceEpoch();
 
   return D3D_OK;
@@ -14327,6 +14388,9 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::Present(const RECT *pSourceRect,
                                                 const RECT *pDestRect,
                                                 HWND hDestWindowOverride,
                                                 const RGNDATA *pDirtyRegion) {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  m_callerCensus.noteCall(d3d9::migration::Api::Present, WARVK_MIGRATION_CALLER);
+#endif
   if (CheckVulkanDeviceLostFailStop("D3D9Device.Present"))
     return D3DERR_DEVICEREMOVED;
 
@@ -14382,6 +14446,14 @@ void STDMETHODCALLTYPE D3D9DeviceEx::GetGammaRamp(UINT iSwapChain,
 HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CreateTexture(
     UINT Width, UINT Height, UINT Levels, DWORD Usage, D3DFORMAT Format,
     D3DPOOL Pool, IDirect3DTexture9 **ppTexture, HANDLE *pSharedHandle) {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteTexture({d3d9::migration::TextureKind::Texture2D,
+      d3d9::migration::AllTextureFieldsKnown,
+      Width, Height, 1u, Levels, uint32_t(Format), Usage, uint32_t(Pool)});
+  m_callerCensus.noteTexture({d3d9::migration::TextureKind::Texture2D,
+      d3d9::migration::AllTextureFieldsKnown,
+      Width, Height, 1u, Levels, uint32_t(Format), Usage, uint32_t(Pool)}, WARVK_MIGRATION_CALLER);
+#endif
   InitReturnPtr(ppTexture);
 
   if (CheckVulkanDeviceLostFailStop("D3D9Device.CreateTexture"))
@@ -14457,6 +14529,14 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CreateVolumeTexture(
     UINT Width, UINT Height, UINT Depth, UINT Levels, DWORD Usage,
     D3DFORMAT Format, D3DPOOL Pool, IDirect3DVolumeTexture9 **ppVolumeTexture,
     HANDLE *pSharedHandle) {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteTexture({d3d9::migration::TextureKind::Volume,
+      d3d9::migration::AllTextureFieldsKnown,
+      Width, Height, Depth, Levels, uint32_t(Format), Usage, uint32_t(Pool)});
+  m_callerCensus.noteTexture({d3d9::migration::TextureKind::Volume,
+      d3d9::migration::AllTextureFieldsKnown,
+      Width, Height, Depth, Levels, uint32_t(Format), Usage, uint32_t(Pool)}, WARVK_MIGRATION_CALLER);
+#endif
   InitReturnPtr(ppVolumeTexture);
 
   if (CheckVulkanDeviceLostFailStop("D3D9Device.CreateVolumeTexture"))
@@ -14520,6 +14600,14 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CreateVolumeTexture(
 HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CreateCubeTexture(
     UINT EdgeLength, UINT Levels, DWORD Usage, D3DFORMAT Format, D3DPOOL Pool,
     IDirect3DCubeTexture9 **ppCubeTexture, HANDLE *pSharedHandle) {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteTexture({d3d9::migration::TextureKind::Cube,
+      d3d9::migration::AllTextureFieldsKnown,
+      EdgeLength, EdgeLength, 1u, Levels, uint32_t(Format), Usage, uint32_t(Pool)});
+  m_callerCensus.noteTexture({d3d9::migration::TextureKind::Cube,
+      d3d9::migration::AllTextureFieldsKnown,
+      EdgeLength, EdgeLength, 1u, Levels, uint32_t(Format), Usage, uint32_t(Pool)}, WARVK_MIGRATION_CALLER);
+#endif
   InitReturnPtr(ppCubeTexture);
 
   if (CheckVulkanDeviceLostFailStop("D3D9Device.CreateCubeTexture"))
@@ -14584,6 +14672,10 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CreateCubeTexture(
 HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CreateVertexBuffer(
     UINT Length, DWORD Usage, DWORD FVF, D3DPOOL Pool,
     IDirect3DVertexBuffer9 **ppVertexBuffer, HANDLE *pSharedHandle) {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteApi(d3d9::migration::Api::CreateVertexBuffer);
+  m_callerCensus.noteCall(d3d9::migration::Api::CreateVertexBuffer, WARVK_MIGRATION_CALLER);
+#endif
   InitReturnPtr(ppVertexBuffer);
 
   if (CheckVulkanDeviceLostFailStop("D3D9Device.CreateVertexBuffer"))
@@ -14618,6 +14710,10 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CreateVertexBuffer(
         new D3D9VertexBuffer(this, &desc, IsExtended());
     m_initializer->InitBuffer(buffer->GetCommonBuffer());
     *ppVertexBuffer = buffer.ref();
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+    m_bufferCensus.noteCreate(buffer->GetCommonBuffer()->m_bufferCensusCursor,
+        {d3d9::migration::BufferKind::Vertex, Length, Usage, uint32_t(Pool), 0u, FVF}, WARVK_MIGRATION_CALLER);
+#endif
 
     // The device cannot be reset if there's any remaining default resources
     if (desc.Pool == D3DPOOL_DEFAULT)
@@ -14633,6 +14729,10 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CreateVertexBuffer(
 HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CreateIndexBuffer(
     UINT Length, DWORD Usage, D3DFORMAT Format, D3DPOOL Pool,
     IDirect3DIndexBuffer9 **ppIndexBuffer, HANDLE *pSharedHandle) {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteApi(d3d9::migration::Api::CreateIndexBuffer);
+  m_callerCensus.noteCall(d3d9::migration::Api::CreateIndexBuffer, WARVK_MIGRATION_CALLER);
+#endif
   InitReturnPtr(ppIndexBuffer);
 
   if (CheckVulkanDeviceLostFailStop("D3D9Device.CreateIndexBuffer"))
@@ -14666,6 +14766,10 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CreateIndexBuffer(
         new D3D9IndexBuffer(this, &desc, IsExtended());
     m_initializer->InitBuffer(buffer->GetCommonBuffer());
     *ppIndexBuffer = buffer.ref();
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+    m_bufferCensus.noteCreate(buffer->GetCommonBuffer()->m_bufferCensusCursor,
+        {d3d9::migration::BufferKind::Index, Length, Usage, uint32_t(Pool), uint32_t(Format), 0u}, WARVK_MIGRATION_CALLER);
+#endif
 
     // The device cannot be reset if there's any remaining default resources
     if (desc.Pool == D3DPOOL_DEFAULT)
@@ -14682,6 +14786,10 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CreateRenderTarget(
     UINT Width, UINT Height, D3DFORMAT Format, D3DMULTISAMPLE_TYPE MultiSample,
     DWORD MultisampleQuality, BOOL Lockable, IDirect3DSurface9 **ppSurface,
     HANDLE *pSharedHandle) {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteApi(d3d9::migration::Api::CreateRenderTarget);
+  m_callerCensus.noteCall(d3d9::migration::Api::CreateRenderTarget, WARVK_MIGRATION_CALLER);
+#endif
   return CreateRenderTargetEx(Width, Height, Format, MultiSample,
                               MultisampleQuality, Lockable, ppSurface,
                               pSharedHandle, 0);
@@ -14691,6 +14799,10 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CreateDepthStencilSurface(
     UINT Width, UINT Height, D3DFORMAT Format, D3DMULTISAMPLE_TYPE MultiSample,
     DWORD MultisampleQuality, BOOL Discard, IDirect3DSurface9 **ppSurface,
     HANDLE *pSharedHandle) {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteApi(d3d9::migration::Api::CreateDepthStencilSurface);
+  m_callerCensus.noteCall(d3d9::migration::Api::CreateDepthStencilSurface, WARVK_MIGRATION_CALLER);
+#endif
   return CreateDepthStencilSurfaceEx(Width, Height, Format, MultiSample,
                                      MultisampleQuality, Discard, ppSurface,
                                      pSharedHandle, 0);
@@ -14699,6 +14811,10 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CreateDepthStencilSurface(
 HRESULT STDMETHODCALLTYPE D3D9DeviceEx::UpdateSurface(
     IDirect3DSurface9 *pSourceSurface, const RECT *pSourceRect,
     IDirect3DSurface9 *pDestinationSurface, const POINT *pDestPoint) {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteApi(d3d9::migration::Api::UpdateSurface);
+  m_callerCensus.noteCall(d3d9::migration::Api::UpdateSurface, WARVK_MIGRATION_CALLER);
+#endif
   D3D9DeviceLock lock = LockDevice();
 
   D3D9Surface *src = static_cast<D3D9Surface *>(pSourceSurface);
@@ -14778,6 +14894,10 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::UpdateSurface(
 HRESULT STDMETHODCALLTYPE
 D3D9DeviceEx::UpdateTexture(IDirect3DBaseTexture9 *pSourceTexture,
                             IDirect3DBaseTexture9 *pDestinationTexture) {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteApi(d3d9::migration::Api::UpdateTexture);
+  m_callerCensus.noteCall(d3d9::migration::Api::UpdateTexture, WARVK_MIGRATION_CALLER);
+#endif
   D3D9DeviceLock lock = LockDevice();
 
   if (!pDestinationTexture || !pSourceTexture)
@@ -14880,6 +15000,10 @@ D3D9DeviceEx::UpdateTexture(IDirect3DBaseTexture9 *pSourceTexture,
 
 HRESULT STDMETHODCALLTYPE D3D9DeviceEx::GetRenderTargetData(
     IDirect3DSurface9 *pRenderTarget, IDirect3DSurface9 *pDestSurface) {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteApi(d3d9::migration::Api::GetRenderTargetData);
+  m_callerCensus.noteCall(d3d9::migration::Api::GetRenderTargetData, WARVK_MIGRATION_CALLER);
+#endif
   D3D9DeviceLock lock = LockDevice();
 
   if (unlikely(IsDeviceLost())) {
@@ -14959,6 +15083,10 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::StretchRect(
     IDirect3DSurface9 *pSourceSurface, const RECT *pSourceRect,
     IDirect3DSurface9 *pDestSurface, const RECT *pDestRect,
     D3DTEXTUREFILTERTYPE Filter) {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteApi(d3d9::migration::Api::StretchRect);
+  m_callerCensus.noteCall(d3d9::migration::Api::StretchRect, WARVK_MIGRATION_CALLER);
+#endif
   D3D9DeviceLock lock = LockDevice();
   if (m_nativeColor.active) War3AbortNativeColor("stretch-rect");
 
@@ -15368,12 +15496,20 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::ColorFill(IDirect3DSurface9 *pSurface,
 HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CreateOffscreenPlainSurface(
     UINT Width, UINT Height, D3DFORMAT Format, D3DPOOL Pool,
     IDirect3DSurface9 **ppSurface, HANDLE *pSharedHandle) {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteApi(d3d9::migration::Api::CreateOffscreenPlainSurface);
+  m_callerCensus.noteCall(d3d9::migration::Api::CreateOffscreenPlainSurface, WARVK_MIGRATION_CALLER);
+#endif
   return CreateOffscreenPlainSurfaceEx(Width, Height, Format, Pool, ppSurface,
                                        pSharedHandle, 0);
 }
 
 HRESULT STDMETHODCALLTYPE D3D9DeviceEx::SetRenderTarget(
     DWORD RenderTargetIndex, IDirect3DSurface9 *pRenderTarget) {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteApi(d3d9::migration::Api::SetRenderTarget);
+  m_callerCensus.noteCall(d3d9::migration::Api::SetRenderTarget, WARVK_MIGRATION_CALLER);
+#endif
   D3D9DeviceLock lock = LockDevice();
 
   if (unlikely(pRenderTarget == nullptr && RenderTargetIndex == 0))
@@ -15531,6 +15667,10 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::GetRenderTarget(
 
 HRESULT STDMETHODCALLTYPE
 D3D9DeviceEx::SetDepthStencilSurface(IDirect3DSurface9 *pNewZStencil) {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteApi(d3d9::migration::Api::SetDepthStencilSurface);
+  m_callerCensus.noteCall(d3d9::migration::Api::SetDepthStencilSurface, WARVK_MIGRATION_CALLER);
+#endif
   D3D9DeviceLock lock = LockDevice();
 
   D3D9Surface *ds = static_cast<D3D9Surface *>(pNewZStencil);
@@ -15591,6 +15731,10 @@ D3D9DeviceEx::GetDepthStencilSurface(IDirect3DSurface9 **ppZStencilSurface) {
 // Some games don't even call them.
 
 HRESULT STDMETHODCALLTYPE D3D9DeviceEx::BeginScene() {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteApi(d3d9::migration::Api::BeginScene);
+  m_callerCensus.noteCall(d3d9::migration::Api::BeginScene, WARVK_MIGRATION_CALLER);
+#endif
   D3D9DeviceLock lock = LockDevice();
 
   if (CheckVulkanDeviceLostFailStop("D3D9Device.BeginScene"))
@@ -15605,6 +15749,10 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::BeginScene() {
 }
 
 HRESULT STDMETHODCALLTYPE D3D9DeviceEx::EndScene() {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteApi(d3d9::migration::Api::EndScene);
+  m_callerCensus.noteCall(d3d9::migration::Api::EndScene, WARVK_MIGRATION_CALLER);
+#endif
   D3D9DeviceLock lock = LockDevice();
 
   if (CheckVulkanDeviceLostFailStop("D3D9Device.EndScene"))
@@ -15643,6 +15791,10 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::Clear(DWORD Count,
                                               const D3DRECT *pRects,
                                               DWORD Flags, D3DCOLOR Color,
                                               float Z, DWORD Stencil) {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteApi(d3d9::migration::Api::Clear);
+  m_callerCensus.noteCall(d3d9::migration::Api::Clear, WARVK_MIGRATION_CALLER);
+#endif
   if (unlikely(!Count && pRects))
     return D3D_OK;
 
@@ -15808,6 +15960,10 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::Clear(DWORD Count,
 
 HRESULT STDMETHODCALLTYPE D3D9DeviceEx::SetTransform(
     D3DTRANSFORMSTATETYPE State, const D3DMATRIX *pMatrix) {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteApi(d3d9::migration::Api::SetTransform);
+  m_callerCensus.noteCall(d3d9::migration::Api::SetTransform, WARVK_MIGRATION_CALLER);
+#endif
   return SetStateTransform(GetTransformIndex(State), pMatrix);
 }
 
@@ -15842,6 +15998,10 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::MultiplyTransform(
 
 HRESULT STDMETHODCALLTYPE
 D3D9DeviceEx::SetViewport(const D3DVIEWPORT9 *pViewport) {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteApi(d3d9::migration::Api::SetViewport);
+  m_callerCensus.noteCall(d3d9::migration::Api::SetViewport, WARVK_MIGRATION_CALLER);
+#endif
   D3D9DeviceLock lock = LockDevice();
 
   // Outright crashes on native, but let's be
@@ -15887,6 +16047,10 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::GetViewport(D3DVIEWPORT9 *pViewport) {
 
 HRESULT STDMETHODCALLTYPE
 D3D9DeviceEx::SetMaterial(const D3DMATERIAL9 *pMaterial) {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteApi(d3d9::migration::Api::SetMaterial);
+  m_callerCensus.noteCall(d3d9::migration::Api::SetMaterial, WARVK_MIGRATION_CALLER);
+#endif
   D3D9DeviceLock lock = LockDevice();
 
   if (unlikely(pMaterial == nullptr))
@@ -15929,6 +16093,10 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::GetMaterial(D3DMATERIAL9 *pMaterial) {
 
 HRESULT STDMETHODCALLTYPE D3D9DeviceEx::SetLight(DWORD Index,
                                                  const D3DLIGHT9 *pLight) {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteApi(d3d9::migration::Api::SetLight);
+  m_callerCensus.noteCall(d3d9::migration::Api::SetLight, WARVK_MIGRATION_CALLER);
+#endif
   D3D9DeviceLock lock = LockDevice();
 
   if (unlikely(pLight == nullptr))
@@ -16032,6 +16200,10 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::GetLight(DWORD Index,
 }
 
 HRESULT STDMETHODCALLTYPE D3D9DeviceEx::LightEnable(DWORD Index, BOOL Enable) {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteApi(d3d9::migration::Api::LightEnable);
+  m_callerCensus.noteCall(d3d9::migration::Api::LightEnable, WARVK_MIGRATION_CALLER);
+#endif
   D3D9DeviceLock lock = LockDevice();
 
   if (unlikely(ShouldRecord())) {
@@ -16130,6 +16302,10 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::GetClipPlane(DWORD Index,
 
 HRESULT STDMETHODCALLTYPE D3D9DeviceEx::SetRenderState(D3DRENDERSTATETYPE State,
                                                        DWORD Value) {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteApi(d3d9::migration::Api::SetRenderState);
+  m_callerCensus.noteState(d3d9::migration::Api::SetRenderState, d3d9::migration::StateKind::Render, uint32_t(State), WARVK_MIGRATION_CALLER);
+#endif
   // [War3] State-Aware Batching - DISABLED: Causes rendering issues (red cubes,
   // wrong positions) if (auto &cb =
   // dxvk::war3::reimpl::GetBatchFlushCallback())
@@ -16581,6 +16757,10 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::GetRenderState(D3DRENDERSTATETYPE State,
 
 HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CreateStateBlock(
     D3DSTATEBLOCKTYPE Type, IDirect3DStateBlock9 **ppSB) {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteApi(d3d9::migration::Api::CreateStateBlock);
+  m_callerCensus.noteCall(d3d9::migration::Api::CreateStateBlock, WARVK_MIGRATION_CALLER);
+#endif
   D3D9DeviceLock lock = LockDevice();
 
   // A state block can not be created while another is being recorded.
@@ -16614,6 +16794,10 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CreateStateBlock(
 }
 
 HRESULT STDMETHODCALLTYPE D3D9DeviceEx::BeginStateBlock() {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteApi(d3d9::migration::Api::BeginStateBlock);
+  m_callerCensus.noteCall(d3d9::migration::Api::BeginStateBlock, WARVK_MIGRATION_CALLER);
+#endif
   D3D9DeviceLock lock = LockDevice();
 
   // Only one state block can be recorded at a given time.
@@ -16627,6 +16811,10 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::BeginStateBlock() {
 
 HRESULT STDMETHODCALLTYPE
 D3D9DeviceEx::EndStateBlock(IDirect3DStateBlock9 **ppSB) {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteApi(d3d9::migration::Api::EndStateBlock);
+  m_callerCensus.noteCall(d3d9::migration::Api::EndStateBlock, WARVK_MIGRATION_CALLER);
+#endif
   D3D9DeviceLock lock = LockDevice();
 
   // Recording a state block can't end if recording hasn't been started.
@@ -16688,13 +16876,17 @@ D3D9DeviceEx::GetTexture(DWORD Stage, IDirect3DBaseTexture9 **ppTexture) {
 
 HRESULT STDMETHODCALLTYPE
 D3D9DeviceEx::SetTexture(DWORD Stage, IDirect3DBaseTexture9 *pTexture) {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteApi(d3d9::migration::Api::SetTexture);
+  m_callerCensus.noteCall(d3d9::migration::Api::SetTexture, WARVK_MIGRATION_CALLER);
+#endif
   // [War3] State-Aware Batching - DISABLED: Causes rendering issues
   // if (auto &cb = dxvk::war3::reimpl::GetBatchFlushCallback())
   //   cb(this);
 
   // [War3] State-Aware Batching
   if (dxvk::war3::reimpl::War3InstanceBuffer *buf =
-          dxvk::war3::reimpl::War3InstanceBuffer::GetActive()) {
+          dxvk::war3::reimpl::War3InstanceBuffer::GetActive(this)) {
     buf->OnSetTexture(Stage, pTexture);
   }
 
@@ -16733,6 +16925,10 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::GetTextureStageState(
 
 HRESULT STDMETHODCALLTYPE D3D9DeviceEx::SetTextureStageState(
     DWORD Stage, D3DTEXTURESTAGESTATETYPE Type, DWORD Value) {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteApi(d3d9::migration::Api::SetTextureStageState);
+  m_callerCensus.noteState(d3d9::migration::Api::SetTextureStageState, d3d9::migration::StateKind::TextureStage, uint32_t(Type), WARVK_MIGRATION_CALLER);
+#endif
   // [War3] State-Aware Batching - DISABLED: Causes rendering issues
   // if (auto &cb = dxvk::war3::reimpl::GetBatchFlushCallback())
   //   cb(this);
@@ -16762,6 +16958,10 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::GetSamplerState(
 
 HRESULT STDMETHODCALLTYPE D3D9DeviceEx::SetSamplerState(
     DWORD Sampler, D3DSAMPLERSTATETYPE Type, DWORD Value) {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteApi(d3d9::migration::Api::SetSamplerState);
+  m_callerCensus.noteState(d3d9::migration::Api::SetSamplerState, d3d9::migration::StateKind::Sampler, uint32_t(Type), WARVK_MIGRATION_CALLER);
+#endif
   if (unlikely(InvalidSampler(Sampler)))
     return D3D_OK;
 
@@ -16857,6 +17057,10 @@ D3D9DeviceEx::GetCurrentTexturePalette(UINT *PaletteNumber) {
 }
 
 HRESULT STDMETHODCALLTYPE D3D9DeviceEx::SetScissorRect(const RECT *pRect) {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteApi(d3d9::migration::Api::SetScissorRect);
+  m_callerCensus.noteCall(d3d9::migration::Api::SetScissorRect, WARVK_MIGRATION_CALLER);
+#endif
   D3D9DeviceLock lock = LockDevice();
 
   if (unlikely(pRect == nullptr))
@@ -16926,6 +17130,11 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::DrawPrimitive(
   war3::hooks::War3HotHookCallTiming dxvkDrawTiming(
       war3::hooks::War3HotHookId::D3D9DrawPrimitive, 4u);
   D3D9DeviceLock lock = LockDevice();
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteDraw(d3d9::migration::DrawKind::Primitive,
+      PrimitiveType, PrimitiveCount, 0u, false, 0u, false, D3DFMT_UNKNOWN, false);
+  m_callerCensus.noteDraw(d3d9::migration::DrawKind::Primitive, uint32_t(PrimitiveType), PrimitiveCount, 0u, false, WARVK_MIGRATION_CALLER);
+#endif
 
   if (CheckVulkanDeviceLostFailStop("D3D9Device.DrawPrimitive"))
     return D3DERR_DEVICEREMOVED;
@@ -17056,7 +17265,7 @@ void D3D9DeviceEx::War3MaybeInsertBeforeUi(bool forceFrameEnd) {
   // 仅在显式启用开关时，才在 UI 渲染前插入 ImGui。
   static const bool s_imguiBeforeUi =
       env::getEnvVar("DXVK_WAR3_IMGUI_BEFORE_UI") == "1";
-  if (s_imguiBeforeUi && War3Hook::IsUiRendering() &&
+  if (s_imguiBeforeUi && war3::War3Imgui::get().isOwner(this) && War3Hook::IsUiRendering() &&
       !war3::War3Imgui::get().hasRenderedThisFrame()) {
     IDirect3DStateBlock9 *sb = nullptr;
     if (SUCCEEDED(this->CreateStateBlock(D3DSBT_ALL, &sb))) {
@@ -17923,13 +18132,13 @@ void D3D9DeviceEx::War3MaybeInsertBeforeUi(bool forceFrameEnd) {
   m_war3Scene.shadowPersistentPool.bytesCap =
       War3GetShadowPersistentPoolCapBytes();
   m_war3Scene.shadowPersistentPool.bytesUsed =
-      m_war3ShadowPersistentBytesUsed;
+      m_war3ShadowPersistentCharges.total();
   m_war3Scene.shadowPersistentPool.bytesEvicted =
       m_war3ShadowPersistentBytesEvicted;
   m_war3Scene.shadowPersistentPool.liveGeometryCount =
       static_cast<uint32_t>(m_war3ShadowPersistentGeometries.size());
   m_war3Scene.shadowStats.persistentPoolBytesUsed =
-      m_war3ShadowPersistentBytesUsed;
+      m_war3ShadowPersistentCharges.total();
   m_war3Scene.shadowStats.persistentPoolBytesEvicted =
       m_war3ShadowPersistentBytesEvicted;
   m_war3Scene.shadowStats.fallbackBudgetBytes =
@@ -17973,6 +18182,7 @@ void D3D9DeviceEx::War3MaybeInsertBeforeUi(bool forceFrameEnd) {
   input.frameSerial = pipelineFrameSerial;
   input.mapEpoch = m_war3GpuSkinMapEpoch;
   input.deviceEpoch = m_war3GpuSkinDeviceEpoch;
+  m_war3Pipeline->CaptureWeatherSnapshot(input);
   War3SealShadowProducerCompleteness(input.scene, input.frameSerial,
                                      input.mapEpoch, input.deviceEpoch);
   War3PublishNativeColor(input);
@@ -19476,7 +19686,7 @@ void D3D9DeviceEx::War3GcShadowPersistentGeometry() {
   // "正在被淘汰的那条常驻 geometry"（domain 与 geometryId 双向一致）时才擦除它。
   // 槽位已被同 key 的更新条目接管、或 domain 不一致时擦除会破坏别的 domain 的
   // live 槽位，因此拒绝擦除并计数。被淘汰的常驻条目本身与
-  // m_war3ShadowPersistentBytesUsed 字节账照旧回收，隔离不改变既有回收语义。
+  // m_war3ShadowPersistentCharges.total() 字节账照旧回收，隔离不改变既有回收语义。
   const auto eraseOwnedRegistrySlot =
       [this](dxvk::war3::shadow::ShadowGeometryDomain domain,
              const War3ShadowGeometryRegistryKey &key, uint32_t geometryId) {
@@ -19530,10 +19740,7 @@ void D3D9DeviceEx::War3GcShadowPersistentGeometry() {
       m_war3ShadowPersistentDiagnosticsFrame.expiryAgeEvictions++;
       War3EraseS1TerrainEarlyAliasesForPersistentGeometry(token.geometryId);
       eraseOwnedRegistrySlot(entry.domain, entry.key, token.geometryId);
-      if (m_war3ShadowPersistentBytesUsed >= bytes)
-        m_war3ShadowPersistentBytesUsed -= bytes;
-      else
-        m_war3ShadowPersistentBytesUsed = 0;
+      m_war3ShadowPersistentCharges.releaseLive(bytes);
       m_war3ShadowPersistentBytesEvicted += bytes;
       m_war3Scene.shadowPersistentPool.evictedThisFrame++;
       m_war3ShadowPersistentGeometries.erase(entryIt);
@@ -19549,17 +19756,14 @@ void D3D9DeviceEx::War3GcShadowPersistentGeometry() {
     War3EraseS1TerrainEarlyAliasesForPersistentGeometry(geometryId);
     eraseOwnedRegistrySlot(entryIt->second.domain, entryIt->second.key,
                            geometryId);
-    if (m_war3ShadowPersistentBytesUsed >= bytes)
-      m_war3ShadowPersistentBytesUsed -= bytes;
-    else
-      m_war3ShadowPersistentBytesUsed = 0;
+    m_war3ShadowPersistentCharges.releaseLive(bytes);
     m_war3ShadowPersistentBytesEvicted += bytes;
     m_war3Scene.shadowPersistentPool.evictedThisFrame++;
     m_war3ShadowPersistentGeometries.erase(entryIt);
   };
 
   const uint64_t capBytes = War3GetShadowPersistentPoolCapBytes();
-  if (m_war3ShadowPersistentBytesUsed <= capBytes)
+  if (m_war3ShadowPersistentCharges.total() <= capBytes)
     return;
 
   std::vector<std::pair<uint64_t, uint32_t>> byAge;
@@ -19571,7 +19775,7 @@ void D3D9DeviceEx::War3GcShadowPersistentGeometry() {
             [](const auto &a, const auto &b) { return a.first < b.first; });
 
   for (const auto &item : byAge) {
-    if (m_war3ShadowPersistentBytesUsed <= capBytes)
+    if (m_war3ShadowPersistentCharges.total() <= capBytes)
       break;
     evictGeometry(item.second);
   }
@@ -19699,8 +19903,7 @@ bool D3D9DeviceEx::War3CreateShadowPersistentGeometryAfterMiss(
   War3GcShadowPersistentGeometry();
   const uint64_t capBytes = War3GetShadowPersistentPoolCapBytes();
   const bool fitsCapacity =
-      bytesNeeded <= capBytes &&
-      m_war3ShadowPersistentBytesUsed <= capBytes - bytesNeeded;
+      m_war3ShadowPersistentCharges.canAdmit(bytesNeeded, capBytes);
   if (!fitsCapacity) {
     diagnostics.capacityRejectAllCallers++;
     return fail(War3ShadowPersistentCreateFailure::Capacity);
@@ -19795,22 +19998,21 @@ bool D3D9DeviceEx::War3CreateShadowPersistentGeometryAfterMiss(
   // 与 registry 槽位同源写入的显式 domain（形态 (a)）：GC / 退役按它做 owner-check。
   entry.domain = domain;
 
-  auto inserted =
-      m_war3ShadowPersistentGeometries.emplace(geometryId, std::move(entry));
-  if (!inserted.second)
-    return fail(War3ShadowPersistentCreateFailure::RegistryInsert);
-
-  auto &registryEntry = m_war3ShadowGeometryRegistry[key];
+  War3ShadowGeometryRegistryEntry registryEntry = {};
   registryEntry.geometryId = geometryId;
   registryEntry.instances = 1;
   registryEntry.instanceable = true;
   registryEntry.domain = domain;
 
-  m_war3ShadowPersistentBytesUsed += bytesNeeded;
-  m_war3ShadowPersistentExpiryQueue.push(
-      {m_war3ShadowPersistentFrameSerial, geometryId});
+  const auto inserted = dxvk::war3::shadow::PublishPersistentGeometry(
+      m_war3ShadowPersistentGeometries, m_war3ShadowGeometryRegistry,
+      m_war3ShadowPersistentExpiryQueue, m_war3ShadowPersistentCharges.live,
+      bytesNeeded, geometryId, key, std::move(entry), registryEntry,
+      War3ShadowPersistentExpiryEntry{m_war3ShadowPersistentFrameSerial, geometryId});
+  if (inserted == m_war3ShadowPersistentGeometries.end())
+    return fail(War3ShadowPersistentCreateFailure::RegistryInsert);
   outGeometryId = geometryId;
-  outGeometry = &inserted.first->second.geometry;
+  outGeometry = &inserted->second.geometry;
   outCreatedNew = true;
   return true;
 }
@@ -21716,6 +21918,7 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
         //   - 静态建筑（未 skin）：是该模型的 world 变换，顶点是模型本地空间
         // 不能强制 identity，否则静态建筑的本地空间顶点会跑到世界中心。
         draw.worldMatrix = entry.capturedWorldMatrix;
+        draw.nativeDrawMaterial = entry.nativeDrawMaterial;
         // 接入对应 IB（capture 已 copy）。
         // capture 时存好的 consumeVertexOffset 直接用：
         //   - wrap path：= BaseVertexIndex（让 GPU final = BaseVI + IB_value）
@@ -21907,6 +22110,7 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
     // consumed it; the next frame must perform a fresh exact-key lookup.
     draw.alphaTestEnabled = true;
     draw.alphaRef = semanticAlphaPayload.alphaRef;
+    draw.nativeDrawMaterial = semanticAlphaPayload.nativeDrawMaterial;
     draw.uvStorage = semanticAlphaPayload.uvStorage;
     draw.uvInfo = semanticAlphaPayload.uvInfo;
     draw.uvStride = semanticAlphaPayload.uvStride;
@@ -22597,13 +22801,13 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
     m_war3Scene.shadowStats.semanticSceneSubmittedFrameLocal++;
   }
 
-  m_war3Scene.shadowPersistentPool.bytesUsed = m_war3ShadowPersistentBytesUsed;
+  m_war3Scene.shadowPersistentPool.bytesUsed = m_war3ShadowPersistentCharges.total();
   m_war3Scene.shadowPersistentPool.bytesEvicted =
       m_war3ShadowPersistentBytesEvicted;
   m_war3Scene.shadowPersistentPool.liveGeometryCount =
       static_cast<uint32_t>(m_war3ShadowPersistentGeometries.size());
   m_war3Scene.shadowStats.persistentPoolBytesUsed =
-      m_war3ShadowPersistentBytesUsed;
+      m_war3ShadowPersistentCharges.total();
   m_war3Scene.shadowStats.persistentPoolBytesEvicted =
       m_war3ShadowPersistentBytesEvicted;
   return true;
@@ -23418,6 +23622,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer(
     War3CopyDrawTimeReplayDomain(draw, entry);
     draw.topology = entry.topology;
     draw.worldMatrix = entry.capturedWorldMatrix;
+    draw.nativeDrawMaterial = entry.nativeDrawMaterial;
     draw.vertexBlendEnabled = false;
     draw.vertexBlendIndexed = false;
     draw.vertexBlendCount = 0u;
@@ -23641,18 +23846,9 @@ uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer(
 
 void D3D9DeviceEx::War3CollectRetiredShadowSessions(
     uint64_t completedSerial) {
-  const size_t beforeCount = m_war3RetiredShadowSessions.size();
-  m_war3RetiredShadowSessions.erase(
-      std::remove_if(
-          m_war3RetiredShadowSessions.begin(),
-          m_war3RetiredShadowSessions.end(),
-          [completedSerial](const War3RetiredShadowSession& session) {
-            return session.retireSerial != 0u &&
-                   session.retireSerial <= completedSerial;
-          }),
-      m_war3RetiredShadowSessions.end());
-  const size_t collectedCount =
-      beforeCount - m_war3RetiredShadowSessions.size();
+  const size_t collectedCount = war3::shadow::CollectRetiredShadowSessions(
+      m_war3RetiredShadowSessions, m_war3ShadowPersistentCharges,
+      completedSerial);
   if (collectedCount != 0u) {
     m_war3ShadowDiagRetiredSessionCollectedCount.fetch_add(
         uint64_t(collectedCount), std::memory_order_relaxed);
@@ -24117,7 +24313,8 @@ void D3D9DeviceEx::War3SampleStage11BudgetAtPresent() {
   war3::War3PerfMonitor::instance().noteStage11BudgetSample(collector->result);
 }
 
-void D3D9DeviceEx::War3ResetShadowSessionState(uint64_t retireSerial) {
+void D3D9DeviceEx::War3ResetShadowSessionState(
+    uint64_t retireSerial, War3PreparedShadowRetirement& prepared) {
   using namespace dxvk::war3::render;
 
   // owner-check（reset 面，fail-closed）：整会话退役按容器 move 完成（不能选择性地
@@ -24143,26 +24340,45 @@ void D3D9DeviceEx::War3ResetShadowSessionState(uint64_t retireSerial) {
   // Move every resource-owning container as one session. The dedicated fence
   // releases it later; no Rc backing can disappear while old CS chunks still
   // reference it.
-  War3RetiredShadowSession retired = {};
-  retired.mapEpoch = m_war3GpuSkinMapEpoch;
-  retired.retireSerial = retireSerial;
-  retired.shadowAllocators = std::move(m_war3ShadowAllocators);
-  retired.shadowMappedAllocators = std::move(m_war3ShadowMappedAllocators);
-  retired.frozenGeometryCaches =
-      std::move(m_war3ShadowFrozenGeometryCaches);
-  retired.frameFreezeCatalog = std::move(m_war3FrameFreezeCatalog);
-  retired.geometryRegistry = std::move(m_war3ShadowGeometryRegistry);
-  retired.persistentGeometries =
-      std::move(m_war3ShadowPersistentGeometries);
-  retired.stage13RetainedCasters =
-      std::move(m_war3Stage13RetainedCasters);
-  retired.persistentExpiryQueue =
-      std::move(m_war3ShadowPersistentExpiryQueue);
-  retired.drawTimeVbCache = std::move(m_war3DrawTimeVBCache);
+  auto& retired = prepared.commit(
+      m_war3ShadowPersistentCharges, m_war3GpuSkinMapEpoch, retireSerial,
+      [this](War3RetiredShadowSession& target) noexcept {
+        using war3::shadow::TransferShadowSessionOwner;
+        // Rc move is not declared noexcept globally. These destinations are
+        // fresh/null: its audited implementation only transfers a pointer,
+        // zeros the source and decRefs a null destination (no destruction).
+        // Do not change Rc ABI/traits or move whole sessions on queue growth.
+        for (size_t i = 0; i < target.shadowAllocators.size(); ++i) {
+          auto& from = m_war3ShadowAllocators[i];
+          auto& to = target.shadowAllocators[i];
+          TransferShadowSessionOwner(to.chunks, from.chunks);
+          assert(to.currentChunk == nullptr);
+          to.currentChunk = std::move(from.currentChunk);
+          to.currentOffset = std::exchange(from.currentOffset, 0);
+        }
+        for (size_t i = 0; i < target.shadowMappedAllocators.size(); ++i) {
+          auto& from = m_war3ShadowMappedAllocators[i];
+          auto& to = target.shadowMappedAllocators[i];
+          TransferShadowSessionOwner(to.chunks, from.chunks);
+          assert(to.currentChunk == nullptr);
+          to.currentChunk = std::move(from.currentChunk);
+          to.currentMapPtr = std::exchange(from.currentMapPtr, nullptr);
+          to.currentOffset = std::exchange(from.currentOffset, 0);
+        }
+        TransferShadowSessionOwner(target.frozenGeometryCaches, m_war3ShadowFrozenGeometryCaches);
+        TransferShadowSessionOwner(target.frameFreezeCatalog, m_war3FrameFreezeCatalog);
+        TransferShadowSessionOwner(target.geometryRegistry, m_war3ShadowGeometryRegistry);
+        TransferShadowSessionOwner(target.persistentGeometries, m_war3ShadowPersistentGeometries);
+        TransferShadowSessionOwner(target.stage13RetainedCasters, m_war3Stage13RetainedCasters);
+        TransferShadowSessionOwner(target.persistentExpiryQueue, m_war3ShadowPersistentExpiryQueue);
+        TransferShadowSessionOwner(target.drawTimeVbCache, m_war3DrawTimeVBCache);
+        TransferShadowSessionOwner(target.s1TerrainCasterStash, m_war3S1TerrainCasterStash);
+        TransferShadowSessionOwner(target.s1TerrainEarlyCache, m_war3S1TerrainEarlyCache);
+      });
+  // Owner/charge commit is complete. CPU cleanup is deliberately outside the
+  // no-throw transfer: if it fails, the retired record still owns all resources.
   m_war3DrawTimeActiveLedger.resetSession();
   War3ResetStage11SnapshotPages();
-  retired.s1TerrainCasterStash = std::move(m_war3S1TerrainCasterStash);
-  retired.s1TerrainEarlyCache = std::move(m_war3S1TerrainEarlyCache);
 
   const auto saturatingAdd = [](uint64_t& total, uint64_t value) {
     const uint64_t limit = std::numeric_limits<uint64_t>::max();
@@ -24222,7 +24438,6 @@ void D3D9DeviceEx::War3ResetShadowSessionState(uint64_t retireSerial) {
   }
   m_war3ShadowDiagRetiredLastMapEpoch.store(
       retired.mapEpoch, std::memory_order_release);
-  m_war3RetiredShadowSessions.emplace_back(std::move(retired));
   War3RefreshRetiredShadowSessionDiagnostics();
 
   m_war3ShadowAllocators = {};
@@ -24316,6 +24531,7 @@ void D3D9DeviceEx::War3ResetShadowSessionState(uint64_t retireSerial) {
   m_war3SemanticPaletteCacheHashIndex.clear();
   dxvk::war3::shadow::War3ShadowDrawMetadataStore().clear();
   dxvk_war3_alpha_test_internal::ClearPayloadsForLifecycleOverflow();
+  m_war3ShadowTombstoneResetPending = false;
 }
 
 bool D3D9DeviceEx::War3DrainShadowCasterTombstones() {
@@ -24330,16 +24546,23 @@ bool D3D9DeviceEx::War3DrainShadowCasterTombstones() {
   bool historyOverflowed = false;
   SnapshotShadowCasterTombstonesAfter(
       m_war3ShadowTombstoneSerialSeen, tombstones, historyOverflowed);
-  m_war3ShadowTombstoneSerialSeen = publishedSerial;
-
   auto& visibleRegistry = VisibleRenderableRegistry::instance();
   bool retiredAnything = false;
   if (historyOverflowed) {
     // Missing even one authoritative removal is unsafe: fail closed and let
     // live producers rebuild every cache from current visibility.
-    War3ResetShadowSessionState(m_war3ShadowPersistentFrameSerial + 1u);
+    m_war3ShadowTombstoneResetPending = true;
+    m_war3ShadowSessionReady.store(false, std::memory_order_release);
+    War3PreparedShadowRetirement prepared(m_war3RetiredShadowSessions);
+    if (!prepared) {
+      // Present retries independently of Populate's closed producer gate.
+      // Neither Seen nor the pending latch may advance on allocation failure.
+      return false;
+    }
+    War3ResetShadowSessionState(m_war3ShadowPersistentFrameSerial + 1u, prepared);
     retiredAnything = true;
   }
+  m_war3ShadowTombstoneSerialSeen = publishedSerial;
 
   const auto appendIdentityKey =
       [](std::vector<uint64_t>& keys, uint32_t tag, uint64_t value) {
@@ -27586,6 +27809,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     draw.gpuSkinInput = entry.gpuSkinInput;
     draw.topology = entry.topology;
     draw.worldMatrix = entry.capturedWorldMatrix;
+    draw.nativeDrawMaterial = entry.nativeDrawMaterial;
     draw.vertexBlendEnabled = false;
     draw.vertexBlendIndexed = false;
     draw.vertexBlendCount = 0u;
@@ -29643,6 +29867,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateSemanticShadowScene(
   // Authoritative removal and stage-policy events outrank every grace/lease
   // path. Drain before any reuse/early-return decision in this populate.
   War3DrainShadowCasterTombstones();
+  if (!m_war3ShadowSessionReady.load(std::memory_order_acquire))
+    return 0u;
   if (unitsOnly)
     m_war3Scene.shadowStats.semanticScenePopulateUnitsOnlyCount++;
   // Phase B：Populate 入口默认不再双次全量 atomic summary（约 40+ load ×2）。
@@ -31038,13 +31264,13 @@ bool D3D9DeviceEx::War3ExecuteSemanticShadowSceneForValidation(
   m_war3Scene.shadowPersistentPool.bytesCap =
       War3GetShadowPersistentPoolCapBytes();
   m_war3Scene.shadowPersistentPool.bytesUsed =
-      m_war3ShadowPersistentBytesUsed;
+      m_war3ShadowPersistentCharges.total();
   m_war3Scene.shadowPersistentPool.bytesEvicted =
       m_war3ShadowPersistentBytesEvicted;
   m_war3Scene.shadowPersistentPool.liveGeometryCount =
       static_cast<uint32_t>(m_war3ShadowPersistentGeometries.size());
   m_war3Scene.shadowStats.persistentPoolBytesUsed =
-      m_war3ShadowPersistentBytesUsed;
+      m_war3ShadowPersistentCharges.total();
   m_war3Scene.shadowStats.persistentPoolBytesEvicted =
       m_war3ShadowPersistentBytesEvicted;
   m_war3Scene.shadowStats.fallbackBudgetBytes =
@@ -31066,6 +31292,7 @@ bool D3D9DeviceEx::War3ExecuteSemanticShadowSceneForValidation(
   input.frameSerial = pipelineFrameSerial;
   input.mapEpoch = m_war3GpuSkinMapEpoch;
   input.deviceEpoch = m_war3GpuSkinDeviceEpoch;
+  m_war3Pipeline->CaptureWeatherSnapshot(input);
   // EndFrame/SemanticValidation moves the same producer scene as BeforeUi.
   // Seal only after its final input stamp is known; an unsealed zero scene is
   // not permission for the receiver to publish or reuse a directional map.
@@ -31642,6 +31869,11 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::DrawIndexedPrimitive(
   war3::hooks::War3HotHookCallTiming dxvkDrawTiming(
       war3::hooks::War3HotHookId::D3D9DrawIndexedPrimitive, 4u);
   D3D9DeviceLock lock = LockDevice();
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteDraw(d3d9::migration::DrawKind::IndexedPrimitive,
+      PrimitiveType, PrimitiveCount, 0u, false, NumVertices, true, D3DFMT_UNKNOWN, false);
+  m_callerCensus.noteDraw(d3d9::migration::DrawKind::IndexedPrimitive, uint32_t(PrimitiveType), PrimitiveCount, NumVertices, true, WARVK_MIGRATION_CALLER);
+#endif
 
   if (CheckVulkanDeviceLostFailStop("D3D9Device.DrawIndexedPrimitive"))
     return D3DERR_DEVICEREMOVED;
@@ -31743,7 +31975,7 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::DrawIndexedPrimitive(
   }
 
   // [War3] Auto-Instancing Hook
-  if (auto *activeBuf = war3::reimpl::War3InstanceBuffer::GetActive()) {
+  if (auto *activeBuf = war3::reimpl::War3InstanceBuffer::GetActive(this)) {
     // Check if current shader supports instancing
     bool safeToInstance = false;
     if (m_state.vertexShader != nullptr) {
@@ -32434,6 +32666,12 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::DrawPrimitiveUP(
   war3::hooks::War3HotHookCallTiming dxvkDrawTiming(
       war3::hooks::War3HotHookId::D3D9DrawPrimitiveUP, 4u);
   D3D9DeviceLock lock = LockDevice();
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteDraw(d3d9::migration::DrawKind::PrimitiveUP,
+      PrimitiveType, PrimitiveCount, VertexStreamZeroStride, true,
+      0u, false, D3DFMT_UNKNOWN, false);
+  m_callerCensus.noteDraw(d3d9::migration::DrawKind::PrimitiveUP, uint32_t(PrimitiveType), PrimitiveCount, 0u, false, WARVK_MIGRATION_CALLER);
+#endif
 
   if (CheckVulkanDeviceLostFailStop("D3D9Device.DrawPrimitiveUP"))
     return D3DERR_DEVICEREMOVED;
@@ -32537,6 +32775,12 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::DrawIndexedPrimitiveUP(
   war3::hooks::War3HotHookCallTiming dxvkDrawTiming(
       war3::hooks::War3HotHookId::D3D9DrawIndexedPrimitiveUP, 4u);
   D3D9DeviceLock lock = LockDevice();
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteDraw(d3d9::migration::DrawKind::IndexedPrimitiveUP,
+      PrimitiveType, PrimitiveCount, VertexStreamZeroStride, true,
+      NumVertices, true, IndexDataFormat, true);
+  m_callerCensus.noteDraw(d3d9::migration::DrawKind::IndexedPrimitiveUP, uint32_t(PrimitiveType), PrimitiveCount, NumVertices, true, WARVK_MIGRATION_CALLER);
+#endif
 
   if (CheckVulkanDeviceLostFailStop("D3D9Device.DrawIndexedPrimitiveUP"))
     return D3DERR_DEVICEREMOVED;
@@ -32694,6 +32938,10 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::ProcessVertices(
     UINT SrcStartIndex, UINT DestIndex, UINT VertexCount,
     IDirect3DVertexBuffer9 *pDestBuffer,
     IDirect3DVertexDeclaration9 *pVertexDecl, DWORD Flags) {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteApi(d3d9::migration::Api::ProcessVertices);
+  m_callerCensus.noteCall(d3d9::migration::Api::ProcessVertices, WARVK_MIGRATION_CALLER);
+#endif
   D3D9DeviceLock lock = LockDevice();
 
   if (unlikely(pDestBuffer == nullptr))
@@ -32835,6 +33083,10 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::ProcessVertices(
 HRESULT STDMETHODCALLTYPE
 D3D9DeviceEx::CreateVertexDeclaration(const D3DVERTEXELEMENT9 *pVertexElements,
                                       IDirect3DVertexDeclaration9 **ppDecl) {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteApi(d3d9::migration::Api::CreateVertexDeclaration);
+  m_callerCensus.noteCall(d3d9::migration::Api::CreateVertexDeclaration, WARVK_MIGRATION_CALLER);
+#endif
   InitReturnPtr(ppDecl);
 
   if (unlikely(ppDecl == nullptr || pVertexElements == nullptr))
@@ -32859,6 +33111,10 @@ D3D9DeviceEx::CreateVertexDeclaration(const D3DVERTEXELEMENT9 *pVertexElements,
 
 HRESULT STDMETHODCALLTYPE
 D3D9DeviceEx::SetVertexDeclaration(IDirect3DVertexDeclaration9 *pDecl) {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteApi(d3d9::migration::Api::SetVertexDeclaration);
+  m_callerCensus.noteCall(d3d9::migration::Api::SetVertexDeclaration, WARVK_MIGRATION_CALLER);
+#endif
   D3D9DeviceLock lock = LockDevice();
 
   D3D9VertexDecl *decl = static_cast<D3D9VertexDecl *>(pDecl);
@@ -32917,6 +33173,10 @@ D3D9DeviceEx::GetVertexDeclaration(IDirect3DVertexDeclaration9 **ppDecl) {
 }
 
 HRESULT STDMETHODCALLTYPE D3D9DeviceEx::SetFVF(DWORD FVF) {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteApi(d3d9::migration::Api::SetFVF);
+  m_callerCensus.noteFvf(uint32_t(FVF), WARVK_MIGRATION_CALLER);
+#endif
   D3D9DeviceLock lock = LockDevice();
 
   if (FVF == 0)
@@ -32948,6 +33208,10 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::GetFVF(DWORD *pFVF) {
 
 HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CreateVertexShader(
     const DWORD *pFunction, IDirect3DVertexShader9 **ppShader) {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteApi(d3d9::migration::Api::CreateVertexShader);
+  m_callerCensus.noteCall(d3d9::migration::Api::CreateVertexShader, WARVK_MIGRATION_CALLER);
+#endif
   // CreateVertexShader does not init the
   // return ptr unlike CreatePixelShader
 
@@ -33005,6 +33269,10 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CreateVertexShader(
 
 HRESULT STDMETHODCALLTYPE
 D3D9DeviceEx::SetVertexShader(IDirect3DVertexShader9 *pShader) {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteApi(d3d9::migration::Api::SetVertexShader);
+  m_callerCensus.noteCall(d3d9::migration::Api::SetVertexShader, WARVK_MIGRATION_CALLER);
+#endif
   D3D9DeviceLock lock = LockDevice();
 
   if (unlikely(dxvk::War3Hook::IsInShadowPass())) {
@@ -33087,10 +33355,14 @@ D3D9DeviceEx::GetVertexShader(IDirect3DVertexShader9 **ppShader) {
 
 HRESULT STDMETHODCALLTYPE D3D9DeviceEx::SetVertexShaderConstantF(
     UINT StartRegister, const float *pConstantData, UINT Vector4fCount) {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteApi(d3d9::migration::Api::SetVertexShaderConstantF);
+  m_callerCensus.noteCall(d3d9::migration::Api::SetVertexShaderConstantF, WARVK_MIGRATION_CALLER);
+#endif
   D3D9DeviceLock lock = LockDevice();
 
   // [War3] Capture constants for Auto-Instancing
-  if (auto *activeBuf = war3::reimpl::War3InstanceBuffer::GetActive()) {
+  if (auto *activeBuf = war3::reimpl::War3InstanceBuffer::GetActive(this)) {
     activeBuf->CaptureConstants(StartRegister, pConstantData, Vector4fCount);
   }
 
@@ -33154,6 +33426,10 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::GetVertexShaderConstantB(
 HRESULT STDMETHODCALLTYPE D3D9DeviceEx::SetStreamSource(
     UINT StreamNumber, IDirect3DVertexBuffer9 *pStreamData, UINT OffsetInBytes,
     UINT Stride) {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteApi(d3d9::migration::Api::SetStreamSource);
+  m_callerCensus.noteCall(d3d9::migration::Api::SetStreamSource, WARVK_MIGRATION_CALLER);
+#endif
   D3D9DeviceLock lock = LockDevice();
 
   if (unlikely(StreamNumber >= caps::MaxStreams))
@@ -33291,6 +33567,10 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::GetStreamSourceFreq(UINT StreamNumber,
 
 HRESULT STDMETHODCALLTYPE
 D3D9DeviceEx::SetIndices(IDirect3DIndexBuffer9 *pIndexData) {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteApi(d3d9::migration::Api::SetIndices);
+  m_callerCensus.noteCall(d3d9::migration::Api::SetIndices, WARVK_MIGRATION_CALLER);
+#endif
   D3D9DeviceLock lock = LockDevice();
 
   if (unlikely(dxvk::War3Hook::IsInShadowPass())) {
@@ -33363,6 +33643,10 @@ D3D9DeviceEx::GetIndices(IDirect3DIndexBuffer9 **ppIndexData) {
 
 HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CreatePixelShader(
     const DWORD *pFunction, IDirect3DPixelShader9 **ppShader) {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteApi(d3d9::migration::Api::CreatePixelShader);
+  m_callerCensus.noteCall(d3d9::migration::Api::CreatePixelShader, WARVK_MIGRATION_CALLER);
+#endif
   InitReturnPtr(ppShader);
 
   if (unlikely(ppShader == nullptr))
@@ -33390,6 +33674,10 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CreatePixelShader(
 
 HRESULT STDMETHODCALLTYPE
 D3D9DeviceEx::SetPixelShader(IDirect3DPixelShader9 *pShader) {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteApi(d3d9::migration::Api::SetPixelShader);
+  m_callerCensus.noteCall(d3d9::migration::Api::SetPixelShader, WARVK_MIGRATION_CALLER);
+#endif
   D3D9DeviceLock lock = LockDevice();
 
   if (unlikely(dxvk::War3Hook::IsInShadowPass())) {
@@ -33534,6 +33822,10 @@ D3D9DeviceEx::GetPixelShader(IDirect3DPixelShader9 **ppShader) {
 
 HRESULT STDMETHODCALLTYPE D3D9DeviceEx::SetPixelShaderConstantF(
     UINT StartRegister, const float *pConstantData, UINT Vector4fCount) {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteApi(d3d9::migration::Api::SetPixelShaderConstantF);
+  m_callerCensus.noteCall(d3d9::migration::Api::SetPixelShaderConstantF, WARVK_MIGRATION_CALLER);
+#endif
   D3D9DeviceLock lock = LockDevice();
 
   return SetShaderConstants<DxsoProgramTypes::PixelShader,
@@ -33743,6 +34035,9 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
                                                   HWND hDestWindowOverride,
                                                   const RGNDATA *pDirtyRegion,
                                                   DWORD dwFlags) {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationPresent();
+#endif
   if (CheckVulkanDeviceLostFailStop("D3D9Device.PresentEx"))
     return D3DERR_DEVICEREMOVED;
 
@@ -33793,7 +34088,8 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
         m_war3ShadowDeviceRebindPending.load(std::memory_order_acquire) ||
         m_war3ShadowDeviceEpochRequested.load(std::memory_order_acquire) !=
             m_war3ShadowDeviceEpochApplied.load(std::memory_order_acquire);
-    if (mapEpochTransitionPending || deviceEpochTransitionPending) {
+    if (mapEpochTransitionPending || deviceEpochTransitionPending ||
+        m_war3ShadowTombstoneResetPending) {
       bool mapEpochTransition = false;
       bool deviceEpochTransition = false;
       const bool stillActiveOwner = war3::RunWithActiveDevicePublication(
@@ -33804,6 +34100,8 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
             deviceEpochTransition =
                 War3ApplyShadowDeviceEpochTransitionAtPresent(
                     retiringFrameSerial);
+            if (m_war3ShadowTombstoneResetPending)
+              War3DrainShadowCasterTombstones();
           });
       if (!stillActiveOwner)
         m_war3ShadowSessionReady.store(false, std::memory_order_release);
@@ -33954,7 +34252,7 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
       const bool arenaReady = arenaOwned &&
           dxvk::war3::memory::ShadowArena_BeginFrame(
               nextFrameSerial, completedSerial);
-      const bool resetFullyApplied =
+      const bool resetFullyApplied = !m_war3ShadowTombstoneResetPending &&
           m_war3ShadowMapResetRequestedSerial.load(
               std::memory_order_acquire) ==
               m_war3ShadowMapResetAppliedSerial &&
@@ -33978,7 +34276,7 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
           m_war3ShadowArenaFence != nullptr
               ? m_war3ShadowArenaFence->value()
               : std::numeric_limits<uint64_t>::max());
-      const bool resetFullyApplied =
+      const bool resetFullyApplied = !m_war3ShadowTombstoneResetPending &&
           m_war3ShadowMapResetRequestedSerial.load(
               std::memory_order_acquire) ==
               m_war3ShadowMapResetAppliedSerial &&
@@ -34101,7 +34399,9 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
     stats.expiryQueueSize =
         static_cast<uint64_t>(m_war3ShadowPersistentExpiryQueue.size());
     stats.bytesCap = War3GetShadowPersistentPoolCapBytes();
-    stats.bytesUsed = m_war3ShadowPersistentBytesUsed;
+    stats.bytesUsed = m_war3ShadowPersistentCharges.total();
+    stats.bytesLive = m_war3ShadowPersistentCharges.live;
+    stats.bytesRetired = m_war3ShadowPersistentCharges.retired;
     stats.bytesEvicted = m_war3ShadowPersistentBytesEvicted;
     stats.liveGeometryCount =
         static_cast<uint64_t>(m_war3ShadowPersistentGeometries.size());
@@ -34287,13 +34587,13 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
   m_war3Scene.shadowPersistentPool.bytesCap =
       War3GetShadowPersistentPoolCapBytes();
   m_war3Scene.shadowPersistentPool.bytesUsed =
-      m_war3ShadowPersistentBytesUsed;
+      m_war3ShadowPersistentCharges.total();
   m_war3Scene.shadowPersistentPool.bytesEvicted =
       m_war3ShadowPersistentBytesEvicted;
   m_war3Scene.shadowPersistentPool.liveGeometryCount =
       static_cast<uint32_t>(m_war3ShadowPersistentGeometries.size());
   m_war3Scene.shadowStats.persistentPoolBytesUsed =
-      m_war3ShadowPersistentBytesUsed;
+      m_war3ShadowPersistentCharges.total();
   m_war3Scene.shadowStats.persistentPoolBytesEvicted =
       m_war3ShadowPersistentBytesEvicted;
   m_war3Scene.shadowStats.fallbackBudgetBytes =
@@ -38094,51 +38394,7 @@ void D3D9DeviceEx::BindSampler(DWORD Sampler) {
           cIsMultiMip = tex && (tex->Desc()->MipLevels > 1u),
           cIsDepth = bool(m_textureSlotTracking.depth & (1u << Sampler)),
           cBindId = m_samplerBindCount](DxvkContext *ctx) {
-    DxvkSamplerKey key = {};
-
-    key.setFilter(DecodeFilter(cState.minFilter),
-                  DecodeFilter(cState.magFilter),
-                  DecodeMipFilter(cState.mipFilter));
-
-    if (cIsCube) {
-      key.setAddressModes(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-                          VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-                          VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
-
-      key.setLegacyCubeFilter(!m_d3d9Options.seamlessCubes);
-    } else {
-      key.setAddressModes(DecodeAddressMode(cState.addressU),
-                          DecodeAddressMode(cState.addressV),
-                          DecodeAddressMode(cState.addressW));
-    }
-
-    key.setDepthCompare(cIsDepth, VK_COMPARE_OP_LESS_OR_EQUAL);
-
-    if (cState.mipFilter) {
-      uint32_t anisotropy = cState.maxAnisotropy;
-
-      // Anisotropic filtering doesn't make any sense with only one mip
-      if (cState.minFilter != D3DTEXF_ANISOTROPIC || !cIsMultiMip)
-        anisotropy = 0u;
-
-      // Forcing anisotropic filtering doesn't make any sense with only one mip
-      if (m_d3d9Options.samplerAnisotropy != -1 && cIsMultiMip &&
-          cState.minFilter > D3DTEXF_POINT)
-        anisotropy = m_d3d9Options.samplerAnisotropy;
-
-      key.setAniso(anisotropy);
-
-      float lodBias = cState.mipLodBias;
-      lodBias += m_d3d9Options.samplerLodBias;
-
-      if (m_d3d9Options.clampNegativeLodBias)
-        lodBias = std::max(lodBias, 0.0f);
-
-      key.setLodRange(float(cState.maxMipLevel), 16.0f, lodBias);
-    }
-
-    if (key.u.p.hasBorder)
-      DecodeD3DCOLOR(cState.borderColor, key.borderColor.float32);
+    const DxvkSamplerKey key = BuildD3D9SamplerKey(cState,cIsCube,cIsMultiMip,cIsDepth,m_d3d9Options);
 
     VkShaderStageFlags stage =
         VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
@@ -38864,100 +39120,9 @@ HRESULT D3D9DeviceEx::SetShaderConstants(UINT StartRegister,
   return D3D_OK;
 }
 
-D3D9FFShaderKeyVS
-D3D9DeviceEx::BuildFFKeyVS(D3D9FF_VertexBlendMode vertexBlendMode,
-                           bool indexedVertexBlend) const {
-  D3D9FFShaderKeyVS key;
-  key.Data.Contents.NativeLightSplit = m_nativeLightSplit;
-  key.Data.Contents.VertexHasPositionT =
-      m_state.vertexDecl != nullptr &&
-      m_state.vertexDecl->TestFlag(D3D9VertexDeclFlag::HasPositionT);
-  key.Data.Contents.VertexHasColor0 =
-      m_state.vertexDecl != nullptr &&
-      m_state.vertexDecl->TestFlag(D3D9VertexDeclFlag::HasColor0);
-  key.Data.Contents.VertexHasColor1 =
-      m_state.vertexDecl != nullptr &&
-      m_state.vertexDecl->TestFlag(D3D9VertexDeclFlag::HasColor1);
-  key.Data.Contents.VertexHasPointSize =
-      m_state.vertexDecl != nullptr &&
-      m_state.vertexDecl->TestFlag(D3D9VertexDeclFlag::HasPointSize);
-  key.Data.Contents.VertexHasFog =
-      m_state.vertexDecl != nullptr &&
-      m_state.vertexDecl->TestFlag(D3D9VertexDeclFlag::HasFog);
-
-  bool lighting = m_state.renderStates[D3DRS_LIGHTING] != 0 &&
-                  !key.Data.Contents.VertexHasPositionT;
-  bool colorVertex = m_state.renderStates[D3DRS_COLORVERTEX] != 0;
-  uint32_t mask =
-      (lighting && colorVertex)
-          ? (key.Data.Contents.VertexHasColor0 ? D3DMCS_COLOR1
-                                               : D3DMCS_MATERIAL) |
-                (key.Data.Contents.VertexHasColor1 ? D3DMCS_COLOR2
-                                                   : D3DMCS_MATERIAL)
-          : 0;
-
-  key.Data.Contents.UseLighting = lighting;
-  key.Data.Contents.NormalizeNormals =
-      m_state.renderStates[D3DRS_NORMALIZENORMALS];
-  key.Data.Contents.LocalViewer =
-      m_state.renderStates[D3DRS_LOCALVIEWER] && lighting;
-
-  key.Data.Contents.RangeFog = m_state.renderStates[D3DRS_RANGEFOGENABLE];
-
-  key.Data.Contents.DiffuseSource =
-      m_state.renderStates[D3DRS_DIFFUSEMATERIALSOURCE] & mask;
-  key.Data.Contents.AmbientSource =
-      m_state.renderStates[D3DRS_AMBIENTMATERIALSOURCE] & mask;
-  key.Data.Contents.SpecularSource =
-      m_state.renderStates[D3DRS_SPECULARMATERIALSOURCE] & mask;
-  key.Data.Contents.EmissiveSource =
-      m_state.renderStates[D3DRS_EMISSIVEMATERIALSOURCE] & mask;
-
-  key.Data.Contents.SpecularEnabled =
-      m_state.renderStates[D3DRS_SPECULARENABLE];
-
-  uint32_t lightCount = 0;
-
-  if (key.Data.Contents.UseLighting) {
-    for (uint32_t i = 0; i < caps::MaxEnabledLights; i++) {
-      if (m_state.enabledLightIndices[i] !=
-          std::numeric_limits<uint32_t>::max())
-        lightCount++;
-    }
-  }
-
-  key.Data.Contents.LightCount = lightCount;
-
-  for (uint32_t i = 0; i < caps::MaxTextureBlendStages; i++) {
-    uint32_t transformFlags =
-        m_state.textureStages[i][DXVK_TSS_TEXTURETRANSFORMFLAGS] &
-        ~(D3DTTFF_PROJECTED);
-    uint32_t index = m_state.textureStages[i][DXVK_TSS_TEXCOORDINDEX];
-    uint32_t indexFlags = (index & TCIMask) >> TCIOffset;
-
-    transformFlags &= 0b111;
-    index &= 0b111;
-
-    key.Data.Contents.TransformFlags |= transformFlags << (i * 3);
-    key.Data.Contents.TexcoordFlags |= indexFlags << (i * 3);
-    key.Data.Contents.TexcoordIndices |= index << (i * 3);
-  }
-
-  key.Data.Contents.VertexTexcoordDeclMask =
-      m_state.vertexDecl != nullptr ? m_state.vertexDecl->GetTexcoordMask() : 0;
-
-  key.Data.Contents.VertexBlendMode = uint32_t(vertexBlendMode);
-
-  if (vertexBlendMode == D3D9FF_VertexBlendMode_Normal) {
-    key.Data.Contents.VertexBlendIndexed = indexedVertexBlend;
-    key.Data.Contents.VertexBlendCount =
-        m_state.renderStates[D3DRS_VERTEXBLEND] & 0xff;
-  }
-
-  key.Data.Contents.VertexClipping =
-      m_state.renderStates[D3DRS_CLIPPLANEENABLE] != 0;
-
-  return key;
+D3D9FFShaderKeyVS D3D9DeviceEx::BuildFFKeyVS(D3D9FF_VertexBlendMode vertexBlendMode,
+    bool indexedVertexBlend) const {
+  return BuildFixedFunctionVSKey(m_state, m_nativeLightSplit, vertexBlendMode, indexedVertexBlend);
 }
 
 void D3D9DeviceEx::UpdateFixedFunctionVS() {
@@ -38998,9 +39163,12 @@ void D3D9DeviceEx::UpdateFixedFunctionVS() {
     m_dirty.clr(D3D9DeviceDirtyFlag::FFVertexShader);
 
     D3D9FFShaderKeyVS key = BuildFFKeyVS(vertexBlendMode, indexedVertexBlend);
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+    MigrationNoteVsKey(key.Data);
+#endif
 
     EmitCs([this, cKey = key, &cShaders = m_ffModules](DxvkContext *ctx) {
-      auto shader = cShaders.GetShaderModule(this, cKey);
+      auto shader = cShaders.GetShaderModule(m_dxvkDevice, &m_d3d9Options, cKey);
       ctx->bindShader<VK_SHADER_STAGE_VERTEX_BIT>(shader.GetShader());
     });
   }
@@ -39042,22 +39210,12 @@ void D3D9DeviceEx::UpdateFixedFunctionVS() {
 
     auto mapPtr = m_vsFixedFunction.AllocSlice();
 
-    auto WorldView = m_state.transforms[GetTransformIndex(D3DTS_VIEW)] *
-                     m_state.transforms[GetTransformIndex(D3DTS_WORLD)];
-    auto NormalMatrix = inverse(WorldView);
-
     D3D9FixedFunctionVS *data = reinterpret_cast<D3D9FixedFunctionVS *>(mapPtr);
-    data->WorldView = WorldView;
-    data->NormalMatrix = NormalMatrix;
-    data->InverseView =
-        transpose(inverse(m_state.transforms[GetTransformIndex(D3DTS_VIEW)]));
-    data->Projection = m_state.transforms[GetTransformIndex(D3DTS_PROJECTION)];
-
-    for (uint32_t i = 0; i < data->TexcoordMatrices.size(); i++)
-      data->TexcoordMatrices[i] =
-          m_state.transforms[GetTransformIndex(D3DTS_TEXTURE0) + i];
-
-    data->ViewportInfo = m_viewportInfo;
+    FillFixedFunctionTransforms(data,
+        m_state.transforms[GetTransformIndex(D3DTS_WORLD)],
+        m_state.transforms[GetTransformIndex(D3DTS_VIEW)],
+        m_state.transforms[GetTransformIndex(D3DTS_PROJECTION)],
+        &m_state.transforms[GetTransformIndex(D3DTS_TEXTURE0)],m_viewportInfo);
 
     DecodeD3DCOLOR(m_state.renderStates[D3DRS_AMBIENT],
                    data->GlobalAmbient.data);
@@ -39080,7 +39238,11 @@ void D3D9DeviceEx::UpdateFixedFunctionVS() {
     data->TweenFactor =
         bit::cast<float>(m_state.renderStates[D3DRS_TWEENFACTOR]);
     if (useUbershader) {
-      data->Key = BuildFFKeyVS(vertexBlendMode, indexedVertexBlend).Data;
+      const auto key = BuildFFKeyVS(vertexBlendMode, indexedVertexBlend).Data;
+      data->Key = key;
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+      MigrationNoteVsKey(key);
+#endif
     }
   }
 
@@ -39105,79 +39267,7 @@ void D3D9DeviceEx::UpdateFixedFunctionVS() {
 }
 
 D3D9FFShaderKeyFS D3D9DeviceEx::BuildFFKeyFS() const {
-  // Used args for a given operation.
-  auto ArgsMask = [](DWORD Op) {
-    switch (Op) {
-    case D3DTOP_DISABLE:
-      return 0b000u; // No Args
-    case D3DTOP_SELECTARG1:
-    case D3DTOP_PREMODULATE:
-      return 0b010u; // Arg 1
-    case D3DTOP_SELECTARG2:
-      return 0b100u; // Arg 2
-    case D3DTOP_MULTIPLYADD:
-    case D3DTOP_LERP:
-      return 0b111u; // Arg 0, 1, 2
-    default:
-      return 0b110u; // Arg 1, 2
-    }
-  };
-
-  D3D9FFShaderKeyFS key;
-
-  uint32_t activeTextureStageCount = 0;
-  for (uint32_t i = 0; i < caps::TextureStageCount; i++) {
-    auto &stage = key.Stages[i].Contents;
-    auto &data = m_state.textureStages[i];
-
-    // Subsequent stages do not occur if this is true.
-    if (data[DXVK_TSS_COLOROP] == D3DTOP_DISABLE)
-      break;
-
-    // If the stage is invalid (ie. no texture bound),
-    // this and all subsequent stages get disabled.
-    if (m_state.textures[i] == nullptr) {
-      if (((data[DXVK_TSS_COLORARG0] & D3DTA_SELECTMASK) == D3DTA_TEXTURE &&
-           (ArgsMask(data[DXVK_TSS_COLOROP]) & (1 << 0u))) ||
-          ((data[DXVK_TSS_COLORARG1] & D3DTA_SELECTMASK) == D3DTA_TEXTURE &&
-           (ArgsMask(data[DXVK_TSS_COLOROP]) & (1 << 1u))) ||
-          ((data[DXVK_TSS_COLORARG2] & D3DTA_SELECTMASK) == D3DTA_TEXTURE &&
-           (ArgsMask(data[DXVK_TSS_COLOROP]) & (1 << 2u))))
-        break;
-    }
-
-    stage.ColorOp = data[DXVK_TSS_COLOROP];
-    stage.AlphaOp = data[DXVK_TSS_ALPHAOP];
-
-    stage.ColorArg0 = data[DXVK_TSS_COLORARG0];
-    stage.ColorArg1 = data[DXVK_TSS_COLORARG1];
-    stage.ColorArg2 = data[DXVK_TSS_COLORARG2];
-
-    stage.AlphaArg0 = data[DXVK_TSS_ALPHAARG0];
-    stage.AlphaArg1 = data[DXVK_TSS_ALPHAARG1];
-    stage.AlphaArg2 = data[DXVK_TSS_ALPHAARG2];
-
-    stage.ResultIsTemp = data[DXVK_TSS_RESULTARG] == D3DTA_TEMP;
-
-    activeTextureStageCount = i + 1;
-  }
-
-  auto &stage0 = key.Stages[0].Contents;
-
-  if (stage0.ResultIsTemp && stage0.ColorOp != D3DTOP_DISABLE &&
-      stage0.AlphaOp == D3DTOP_DISABLE) {
-    stage0.AlphaOp = D3DTOP_SELECTARG1;
-    stage0.AlphaArg1 = D3DTA_DIFFUSE;
-  }
-
-  stage0.GlobalSpecularEnable = m_state.renderStates[D3DRS_SPECULARENABLE];
-  stage0.NativeLightSplit = m_nativeLightSplit;
-
-  // The last stage *always* writes to current.
-  if (activeTextureStageCount >= 1)
-    key.Stages[activeTextureStageCount - 1].Contents.ResultIsTemp = false;
-
-  return key;
+  return BuildFixedFunctionFSKey(m_state, m_nativeLightSplit);
 }
 
 void D3D9DeviceEx::UpdateFixedFunctionPS() {
@@ -39189,110 +39279,16 @@ void D3D9DeviceEx::UpdateFixedFunctionPS() {
   const bool useUbershader = m_d3d9Options.ffUbershaderFS && !m_nativeLightSplit;
 
   D3D9FFShaderKeyFS key = BuildFFKeyFS();
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  MigrationNoteFsKey(key);
+#endif
   if (useUbershader && m_dirty.test(D3D9DeviceDirtyFlag::FFPixelShader)) {
     // The flags are set based on the specialized shaders.
     m_dirty.clr(D3D9DeviceDirtyFlag::FFPixelShader);
     m_dirty.set(D3D9DeviceDirtyFlag::FFPixelData);
 
-    // Spec constants...
-    uint32_t activeTextureStageCount;
-    for (activeTextureStageCount = 0;
-         activeTextureStageCount < caps::TextureStageCount;
-         activeTextureStageCount++) {
-      auto &stage = key.Stages[activeTextureStageCount].Contents;
-      if (stage.ColorOp == D3DTOP_DISABLE)
-        break;
-    }
-
-    const auto repackArg = [](uint32_t arg) {
-      return (arg & 0b111u) | ((arg & 0b110000u) >> 1u);
-    };
-
-    uint32_t lastActiveTextureStage = std::max(activeTextureStageCount, 1u) -
-                                      1u; // Subtract 1 to make it fit 3 bits
-    bool dirty =
-        m_specInfo.set<D3D9SpecConstantId::SpecFFLastActiveTextureStage>(
-            lastActiveTextureStage);
-    dirty |= m_specInfo.set<D3D9SpecConstantId::SpecFFGlobalSpecularEnabled>(
+    const bool dirty = UpdateFixedFunctionSpecialization(m_specInfo, key,
         m_state.renderStates[D3DRS_SPECULARENABLE]);
-    constexpr uint32_t perTextureStageSpecConsts =
-        static_cast<uint32_t>(D3D9SpecConstantId::SpecFFTextureStage1ColorOp) -
-        static_cast<uint32_t>(D3D9SpecConstantId::SpecFFTextureStage0ColorOp);
-    for (uint32_t i = 0; i < 4; i++) {
-      if (i <= activeTextureStageCount) {
-        dirty |=
-            m_specInfo.set(static_cast<D3D9SpecConstantId>(
-                               D3D9SpecConstantId::SpecFFTextureStage0ColorOp +
-                               perTextureStageSpecConsts * i),
-                           key.Stages[i].Contents.ColorOp);
-        dirty |= m_specInfo.set(
-            static_cast<D3D9SpecConstantId>(
-                D3D9SpecConstantId::SpecFFTextureStage0ColorArg1 +
-                perTextureStageSpecConsts * i),
-            repackArg(key.Stages[i].Contents.ColorArg1));
-        dirty |= m_specInfo.set(
-            static_cast<D3D9SpecConstantId>(
-                D3D9SpecConstantId::SpecFFTextureStage0ColorArg2 +
-                perTextureStageSpecConsts * i),
-            repackArg(key.Stages[i].Contents.ColorArg2));
-        dirty |=
-            m_specInfo.set(static_cast<D3D9SpecConstantId>(
-                               D3D9SpecConstantId::SpecFFTextureStage0AlphaOp +
-                               perTextureStageSpecConsts * i),
-                           key.Stages[i].Contents.AlphaOp);
-        dirty |= m_specInfo.set(
-            static_cast<D3D9SpecConstantId>(
-                D3D9SpecConstantId::SpecFFTextureStage0AlphaArg1 +
-                perTextureStageSpecConsts * i),
-            repackArg(key.Stages[i].Contents.AlphaArg1));
-        dirty |= m_specInfo.set(
-            static_cast<D3D9SpecConstantId>(
-                D3D9SpecConstantId::SpecFFTextureStage0AlphaArg2 +
-                perTextureStageSpecConsts * i),
-            repackArg(key.Stages[i].Contents.AlphaArg2));
-        dirty |= m_specInfo.set(
-            static_cast<D3D9SpecConstantId>(
-                D3D9SpecConstantId::SpecFFTextureStage0ResultIsTemp +
-                perTextureStageSpecConsts * i),
-            key.Stages[i].Contents.ResultIsTemp);
-      } else {
-        dirty |=
-            m_specInfo.set(static_cast<D3D9SpecConstantId>(
-                               D3D9SpecConstantId::SpecFFTextureStage0ColorOp +
-                               perTextureStageSpecConsts * i),
-                           0);
-        dirty |= m_specInfo.set(
-            static_cast<D3D9SpecConstantId>(
-                D3D9SpecConstantId::SpecFFTextureStage0ColorArg1 +
-                perTextureStageSpecConsts * i),
-            0);
-        dirty |= m_specInfo.set(
-            static_cast<D3D9SpecConstantId>(
-                D3D9SpecConstantId::SpecFFTextureStage0ColorArg2 +
-                perTextureStageSpecConsts * i),
-            0);
-        dirty |=
-            m_specInfo.set(static_cast<D3D9SpecConstantId>(
-                               D3D9SpecConstantId::SpecFFTextureStage0AlphaOp +
-                               perTextureStageSpecConsts * i),
-                           0);
-        dirty |= m_specInfo.set(
-            static_cast<D3D9SpecConstantId>(
-                D3D9SpecConstantId::SpecFFTextureStage0AlphaArg1 +
-                perTextureStageSpecConsts * i),
-            0);
-        dirty |= m_specInfo.set(
-            static_cast<D3D9SpecConstantId>(
-                D3D9SpecConstantId::SpecFFTextureStage0AlphaArg2 +
-                perTextureStageSpecConsts * i),
-            0);
-        dirty |= m_specInfo.set(
-            static_cast<D3D9SpecConstantId>(
-                D3D9SpecConstantId::SpecFFTextureStage0ResultIsTemp +
-                perTextureStageSpecConsts * i),
-            0);
-      }
-    }
     if (dirty) {
       m_dirty.set(D3D9DeviceDirtyFlag::SpecializationEntries);
     }
@@ -39300,7 +39296,7 @@ void D3D9DeviceEx::UpdateFixedFunctionPS() {
     m_dirty.clr(D3D9DeviceDirtyFlag::FFPixelShader);
 
     EmitCs([this, cKey = key, &cShaders = m_ffModules](DxvkContext *ctx) {
-      auto shader = cShaders.GetShaderModule(this, cKey);
+      auto shader = cShaders.GetShaderModule(m_dxvkDevice, &m_d3d9Options, cKey);
       ctx->bindShader<VK_SHADER_STAGE_FRAGMENT_BIT>(shader.GetShader());
     });
   }
@@ -40250,6 +40246,36 @@ bool D3D9DeviceEx::ValidateSharedBuffer(
   /* ignore failures for legacy Proton implementation */
   return true;
 }
+war3::render::native_input::NativeDrawMaterialFacts
+D3D9DeviceEx::War3CaptureNativeDrawMaterialFacts(
+    void* renderablePart, uint32_t layerIndex) const {
+  // Only already-owned CPU state, on the draw owner thread. No native reads.
+  if (!war3::tools::evidence::InputsEnabled()) return {};
+  namespace n = war3::render::native_input;
+  const n::MaterialFactsKey key{
+    m_war3ShadowPersistentFrameSerial, m_war3GpuSkinMapEpoch,
+    m_war3GpuSkinDeviceEpoch, uint64_t(uintptr_t(renderablePart)), layerIndex,
+    uint32_t(m_state.vertexShader != nullptr) |
+      (uint32_t(m_state.pixelShader != nullptr) << 1)};
+  if (!n::MaterialFactsKeyValid(key)) return {};
+  uint32_t render[n::RenderStateCount], stage[n::StageStateCount], sampler[n::SamplerStateCount];
+  uint32_t material[n::MaterialWordCount], transform[n::TextureTransformWordCount];
+  for (size_t i = 0; i < n::RenderStateCount; ++i)
+    render[i] = m_state.renderStates[n::RenderStates[i]];
+  for (size_t i = 0; i < n::StageStateCount; ++i)
+    stage[i] = m_state.textureStages[0][RemapTextureStageStateType(
+      D3DTEXTURESTAGESTATETYPE(n::StageStates[i]))];
+  for (size_t i = 0; i < n::SamplerStateCount; ++i)
+    sampler[i] = m_state.samplerStates[0][n::SamplerStates[i]];
+  static_assert(sizeof(D3DMATERIAL9) == sizeof(material), "D3D9 material wire storage");
+  static_assert(offsetof(D3DMATERIAL9, Power) == 16 * sizeof(float), "D3D9 material order");
+  std::memcpy(material, &m_state.material, sizeof(material));
+  const auto& texture0 = m_state.transforms[GetTransformIndex(D3DTS_TEXTURE0)];
+  static_assert(sizeof(texture0) == sizeof(transform), "Matrix4 raw storage");
+  std::memcpy(transform, &texture0, sizeof(transform));
+  return n::CaptureMaterialFacts(true, key, {render, stage, sampler, material, transform});
+}
+
 bool D3D9DeviceEx::War3CaptureShadowDrawMetadata(
     D3DPRIMITIVETYPE primitiveType, INT baseVertexIndex,
     UINT minVertexIndex, UINT numVertices, UINT startVal, UINT countVal,
@@ -40789,6 +40815,8 @@ bool D3D9DeviceEx::War3CaptureShadowDrawMetadata(
   metadata.alpha.uvInfo = uvInfo;
   metadata.alpha.diffuseTexture = diffuseTexture;
   metadata.alpha.renderablePart = contract.renderablePart;
+  metadata.alpha.nativeDrawMaterial = War3CaptureNativeDrawMaterialFacts(
+      contract.renderablePart, exactQuery.layerIndex);
   metadata.alpha.sceneNode = contract.sceneNode;
   metadata.alpha.worldObjectEntry = contract.worldObjectEntry;
   metadata.alpha.producerStage = int16_t(stage);
@@ -43165,6 +43193,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                 }
                 cached.capturedWorldMatrix =
                     m_state.transforms[GetTransformIndex(D3DTS_WORLD)];
+                cached.nativeDrawMaterial = War3CaptureNativeDrawMaterialFacts(
+                    cached.renderablePart, cached.layerIndex);
                 cached.sceneNode = vbCacheContract.sceneNode != nullptr
                                        ? vbCacheContract.sceneNode
                                        : semantic.sceneNode;
@@ -43354,6 +43384,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         // 矩阵通常是 identity，效果等价。
         entry.capturedWorldMatrix =
             m_state.transforms[GetTransformIndex(D3DTS_WORLD)];
+        entry.nativeDrawMaterial = War3CaptureNativeDrawMaterialFacts(
+            entry.renderablePart, entry.layerIndex);
         // 记录 alpha test / blend / 纹理状态。
         // bypass capture 路径不会走 legacy ShadowCapture 的 alpha-test 分支，
         // 所以这里自己读 D3D state 给 consume 端用。
@@ -46170,6 +46202,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
 
     if (!finalizeShadowDrawCommon(draw))
       return true;
+    draw.nativeDrawMaterial = War3CaptureNativeDrawMaterialFacts(
+        draw.shadowRenderablePart, draw.shadowLayerIndex);
     shadowCapturePostTiming.enter(War3ShadowCapturePostPhase::Submit);
 
     War3ShadowInstanceRef instance = {};
@@ -46224,13 +46258,13 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       m_war3Scene.shadowStats.potentialFreezeReuseHits++;
       m_war3Scene.shadowStats.instancedGeometryDrawsSaved++;
     }
-    m_war3Scene.shadowPersistentPool.bytesUsed = m_war3ShadowPersistentBytesUsed;
+    m_war3Scene.shadowPersistentPool.bytesUsed = m_war3ShadowPersistentCharges.total();
     m_war3Scene.shadowPersistentPool.bytesEvicted =
         m_war3ShadowPersistentBytesEvicted;
     m_war3Scene.shadowPersistentPool.liveGeometryCount =
         static_cast<uint32_t>(m_war3ShadowPersistentGeometries.size());
     m_war3Scene.shadowStats.persistentPoolBytesUsed =
-        m_war3ShadowPersistentBytesUsed;
+        m_war3ShadowPersistentCharges.total();
     m_war3Scene.shadowStats.persistentPoolBytesEvicted =
         m_war3ShadowPersistentBytesEvicted;
     return true;
@@ -48728,10 +48762,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       War3GcShadowPersistentGeometry();
       const uint64_t persistentCapBytes =
           War3GetShadowPersistentPoolCapBytes();
-      const bool fastFitsCapacity =
-          fastBytesNeeded <= persistentCapBytes &&
-          m_war3ShadowPersistentBytesUsed <=
-              persistentCapBytes - fastBytesNeeded;
+      const bool fastFitsCapacity = m_war3ShadowPersistentCharges.canAdmit(
+          fastBytesNeeded, persistentCapBytes);
       if (!fastFitsCapacity) {
         auto& diagnostics = m_war3ShadowPersistentDiagnosticsFrame;
         diagnostics.createAttempts++;
@@ -49004,6 +49036,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       shadowCapturePersistentTiming.pause();
       if (!finalizeShadowDrawCommon(compatDraw))
         return;
+      compatDraw.nativeDrawMaterial = War3CaptureNativeDrawMaterialFacts(
+          compatDraw.shadowRenderablePart, compatDraw.shadowLayerIndex);
       shadowCapturePostTiming.enter(War3ShadowCapturePostPhase::Submit);
       instance.boundsCenter = compatDraw.boundsCenter;
       instance.boundsRadius = compatDraw.boundsRadius;
@@ -49062,13 +49096,13 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         m_war3Scene.shadowStats.instancedGeometryDrawsSaved++;
       }
       m_war3Scene.shadowPersistentPool.bytesUsed =
-          m_war3ShadowPersistentBytesUsed;
+          m_war3ShadowPersistentCharges.total();
       m_war3Scene.shadowPersistentPool.bytesEvicted =
           m_war3ShadowPersistentBytesEvicted;
       m_war3Scene.shadowPersistentPool.liveGeometryCount =
           static_cast<uint32_t>(m_war3ShadowPersistentGeometries.size());
       m_war3Scene.shadowStats.persistentPoolBytesUsed =
-          m_war3ShadowPersistentBytesUsed;
+          m_war3ShadowPersistentCharges.total();
       m_war3Scene.shadowStats.persistentPoolBytesEvicted =
           m_war3ShadowPersistentBytesEvicted;
       return;
@@ -50389,6 +50423,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   }
   if (!finalizeShadowDrawCommon(draw))
     return;
+  draw.nativeDrawMaterial = War3CaptureNativeDrawMaterialFacts(
+      draw.shadowRenderablePart, draw.shadowLayerIndex);
   shadowCapturePostTiming.enter(War3ShadowCapturePostPhase::Submit);
   if (stage13CpuRetentionPath) {
     War3ShadowCasterDraw retainedDraw = draw;

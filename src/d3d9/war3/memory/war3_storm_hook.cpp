@@ -14,6 +14,8 @@
 #include "../hooks/war3_hook_install_util.h"
 #include "../hooks/war3_hook_perf.h"
 #include "war3_storm_native_small_repair.h"
+#include "war3_storm_low_domain.h"
+#include "war3_storm_realloc_contract.h"
 #include "war3_tlsf_pool.h"
 
 #include <MinHook.h>
@@ -509,13 +511,6 @@ struct NativeLargeBlockInfo {
   size_t counterCorrection = 0;
 };
 
-bool NativeReallocReleasedOldPointer(void *oldPtr, void *newPtr,
-                                     size_t newSize) noexcept {
-  // Storm 405 把 size==0 定义为释放旧块，成功返回 nullptr；这里与
-  // StormBreaker v1.3.0 的原生大块计数合同保持一致。
-  return oldPtr && ((newPtr && newPtr != oldPtr) || newSize == 0);
-}
-
 NativeLargeBlockInfo QueryNativeLargeBlockForCounterFix(void *userPtr) {
   NativeLargeBlockInfo info{};
   if (!userPtr)
@@ -604,7 +599,7 @@ void *CallOriginalReAlloc(int ecx, int edx, void *oldPtr, size_t newSize,
   if (result)
     ForgetFreedPointer(result);
   if ((flags & 0x10u) == 0u &&
-      NativeReallocReleasedOldPointer(oldPtr, result, newSize))
+      NativeReallocReleasedOldPointer(oldPtr, result))
     ApplyNativeLargeFreeCounterCorrection(nativeLargeInfo);
   return result;
 }
@@ -677,9 +672,12 @@ HookBatchInstallResult InstallStormHookBatch(StormHookBinding *bindings,
   if (applyStatus != MH_OK) {
     war3dbg::Print("DXVK War3[StormHook]: 批次启用失败 status=%d\n",
                    static_cast<int>(applyStatus));
-    return RollbackStormHookBatch(bindings, count)
-               ? HookBatchInstallResult::CleanFailure
-               : HookBatchInstallResult::IndeterminateFailure;
+    // A failed batch may already have admitted a detour on another thread.
+    // Disable entry points, but retain every trampoline/original pointer until
+    // process exit; successful removal would NOT prove no callback is in flight.
+    for (size_t i = 0; i < count; ++i)
+      if (bindings[i].created) MH_DisableHook(bindings[i].target);
+    return HookBatchInstallResult::IndeterminateFailure;
   }
   for (size_t i = 0; i < count; ++i) {
     hooks::RecordHookInstallState(
@@ -753,6 +751,8 @@ void *__fastcall Hooked_SMemAlloc(int ecx, int edx, size_t size,
     hooks::War3HotHookNativeScope nativeTiming(hookTiming);
     return CallOriginalAlloc(ecx, edx, size, name, argList, flags);
   };
+  if (StormLowDomain_RequiresNativeAllocation(name, static_cast<int32_t>(argList)))
+    return callNativeOriginal();
   const size_t threshold =
       g_largeBlockThreshold.load(std::memory_order_relaxed);
   if (!g_redirectEnabled.load(std::memory_order_acquire) || size < threshold ||
@@ -1035,7 +1035,7 @@ bool StormHook_Install() {
     return false;
   }
 
-  StormHookBinding bindings[5] = {};
+  StormHookBinding bindings[6] = {};
   if (!VerifyStorm127a(hStorm, bindings)) {
     war3dbg::Print(
         "DXVK War3[StormHook]: Storm 1.27a SHA-256/PE/RVA/前导字节校验失败，保持原生\n");
@@ -1051,8 +1051,9 @@ bool StormHook_Install() {
   bindings[3].detour = reinterpret_cast<LPVOID>(Hooked_SMemReAlloc);
   bindings[3].original = reinterpret_cast<LPVOID *>(&g_origReAlloc);
 
-  StormNativeSmallRepairHookDesc repair = {};
-  if (!StormNativeSmallRepair_Prepare(hStorm, &repair))
+  StormNativeSmallRepairHookDesc repair = {}, lowDomain = {};
+  if (!StormLowDomain_Prepare(hStorm, &lowDomain) ||
+      !StormNativeSmallRepair_Prepare(hStorm, &repair))
     return false;
 
   // 只在全部只读身份/前导字节检查通过后发布兼容信号，避免 standalone
@@ -1063,6 +1064,7 @@ bool StormHook_Install() {
   // event 只能通知尚未越过 OpenEvent 检查的旧 standalone。发布后再做一次
   // 精确前导字节核验，把检查窗口内已经修改目标的并发安装拒绝掉。
   if (!VerifyStorm127a(hStorm, bindings) ||
+      !StormLowDomain_Prepare(hStorm, &lowDomain) ||
       !StormNativeSmallRepair_Prepare(hStorm, &repair)) {
     war3dbg::Print(
         "DXVK War3[StormHook]: 兼容信号发布后目标前导字节发生漂移，拒绝双重 Hook\n");
@@ -1078,11 +1080,37 @@ bool StormHook_Install() {
     bindings[bindingCount].original = repair.originalStorage;
     ++bindingCount;
   }
+  if (lowDomain.target) {
+    bindings[bindingCount].name = "StormHeap_Create/MDLDATA-low-address";
+    bindings[bindingCount].target = lowDomain.target;
+    bindings[bindingCount].detour = lowDomain.detour;
+    bindings[bindingCount].original = lowDomain.originalStorage;
+    ++bindingCount;
+  }
+
+  if (!StormLowDomain_PublishImport()) {
+    if (StormLowDomain_RollbackImport()) {
+      ReleaseIntegrationSignal();
+    } else {
+      g_redirectEnabled.store(false, std::memory_order_release);
+      g_installHealthy.store(false, std::memory_order_release);
+      g_installed.store(true, std::memory_order_release);
+      war3dbg::Print("DXVK Storm MDLDATA: import rollback unproven; resident pass-through, reinstall refused\n");
+    }
+    return false;
+  }
 
   g_redirectEnabled.store(false, std::memory_order_release);
   const HookBatchInstallResult installResult =
       InstallStormHookBatch(bindings, bindingCount);
   if (installResult == HookBatchInstallResult::CleanFailure) {
+    if (!StormLowDomain_RollbackImport()) {
+      g_redirectEnabled.store(false, std::memory_order_release);
+      g_installHealthy.store(false, std::memory_order_release);
+      g_installed.store(true, std::memory_order_release);
+      war3dbg::Print("DXVK Storm MDLDATA: import rollback unproven after hook rollback; reinstall refused\n");
+      return false;
+    }
     g_origAlloc = nullptr;
     g_origFree = nullptr;
     g_origGetSize = nullptr;
@@ -1093,6 +1121,9 @@ bool StormHook_Install() {
     return false;
   }
   if (installResult == HookBatchInstallResult::IndeterminateFailure) {
+    const bool importRestored = StormLowDomain_RollbackImport();
+    if (!importRestored)
+      war3dbg::Print("DXVK Storm MDLDATA: import rollback unproven with hook rollback; resident pass-through\n");
     // 任何可能仍活跃的 detour 都必须保留 trampoline。redirect 关闭后，
     // 四个导出只透传原生路径；installed=true 只用于禁止危险的再次安装。
     g_redirectEnabled.store(false, std::memory_order_release);
@@ -1104,14 +1135,15 @@ bool StormHook_Install() {
     return false;
   }
 
+  StormLowDomain_ActivateAfterBatch();
   g_installHealthy.store(true, std::memory_order_release);
   g_redirectEnabled.store(true, std::memory_order_release);
   g_installed.store(true, std::memory_order_release);
   war3dbg::Print(
       "DXVK War3[StormHook]: policy=stable-large-four-hook backend=tlsf "
-      "threshold=0x%zX nativeSmallRepair=%s fullTakeover=0 hooks=%zu\n",
+      "threshold=0x%zX nativeSmallRepair=%s fullTakeover=0 hooks=%zu mdlLowAddress=%u\n",
       g_largeBlockThreshold.load(std::memory_order_relaxed),
-      StormNativeSmallRepair_GetModeName(), bindingCount);
+      StormNativeSmallRepair_GetModeName(), bindingCount, StormLowDomain_GetStats().enabled);
 
   return true;
 }

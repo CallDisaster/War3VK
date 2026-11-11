@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <string>
 
+struct IDirect3DDevice9;
+
 namespace dxvk {
 class D3D9DeviceEx;
 class D3D9Surface;
@@ -96,7 +98,8 @@ bool SubmitFrameCaptureRequest(const std::string& requestId,
 
 bool HasPendingFrameCaptureRequest();
 
-bool ProcessPendingFrameCapture(D3D9DeviceEx* device, D3D9Surface* sourceSurface,
+// Public D3D9 interface only, no link edge into the device class (S2 cut).
+bool ProcessPendingFrameCapture(IDirect3DDevice9* device, D3D9Surface* sourceSurface,
                                 War3FrameCaptureResult* outResult = nullptr);
 
 } // namespace dxvk::war3::tools

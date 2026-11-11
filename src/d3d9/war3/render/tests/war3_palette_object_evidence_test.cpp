@@ -254,6 +254,13 @@ PaletteObjectFrames MakeFrames(uint64_t frame) {
   return frames; // 其余帧域与 unknown 标记保持默认（manifestUnknown/nativeUnknown = true）
 }
 
+// 完整恢复正例必须显式关联同一尝试；MakeFrames 的 unknown 默认仍用于未知口径测试。
+PaletteObjectFrames KnownFrames(uint64_t frame, uint64_t attemptSerial) {
+  PaletteObjectFrames frames = MakeFrames(frame);
+  frames.attemptSerial = attemptSerial;
+  return frames;
+}
+
 bool SameKeyFull(const PaletteObjectKey& a, const PaletteObjectKey& b) {
   return a.renderablePart == b.renderablePart && a.runtimeModelPtr == b.runtimeModelPtr &&
          a.jHandle == b.jHandle && a.rawcode == b.rawcode &&
@@ -390,15 +397,16 @@ bool Case2ClosedChain() {
   rejectFrames.manifestUnknown = false;
   rejectFrames.nativeUnknown = false;
 
-  PaletteObjectFrames servedFrames = MakeFrames(503u);
-  PaletteObjectFrames enqueuedFrames = MakeFrames(504u);
-  PaletteObjectFrames drawnFrames = MakeFrames(505u);
+  // Case2 验证完整链结算；来源切换的透传反例另由 Case19 保留。
+  PaletteObjectFrames servedFrames = KnownFrames(503u, 2u);
+  PaletteObjectFrames enqueuedFrames = KnownFrames(504u, 2u);
+  PaletteObjectFrames drawnFrames = KnownFrames(505u, 2u);
 
   rec.NoteReject(key, PaletteObjectRejectReason::R1, rejectFrames);
   rec.NoteServed(key, PaletteObjectSource::ProducerSnapshot, 0xABCDu, servedFrames);
   rec.NoteEnqueued(key, PaletteObjectSource::ProducerSnapshot, 0xABCDu,
                    enqueuedFrames, false);
-  rec.NoteDrawn(key, PaletteObjectSource::DrawTimeCaptured, 0xEEEEu, drawnFrames,
+  rec.NoteDrawn(key, PaletteObjectSource::ProducerSnapshot, 0xABCDu, drawnFrames,
                 false);
   rec.CloseWindow(600u);
 
@@ -449,9 +457,9 @@ bool Case2ClosedChain() {
     ok &= Require(drawn.stage == PaletteObjectStage::Drawn, "event3 stage Drawn");
     ok &= Require(drawn.sawDraw, "event3 records the draw-command stage");
     ok &= Require(drawn.frames.renderFrame == 505u, "event3 renderFrame");
-    ok &= Require(drawn.source == PaletteObjectSource::DrawTimeCaptured,
-                  "event3 source is the draw-time value, not the last Served value");
-    ok &= Require(drawn.hitKey == 0xEEEEu, "event3 hitKey is the draw-time value");
+    ok &= Require(drawn.source == PaletteObjectSource::ProducerSnapshot,
+                  "event3 carries the matching source supplied at draw time");
+    ok &= Require(drawn.hitKey == 0xABCDu, "event3 carries the matching draw-time hitKey");
     ok &= Require(drawn.deltaFrames == 0u,
                   "live Drawn deltaFrames must be 0 as well (the delta belongs to the terminal)");
 
@@ -1359,11 +1367,12 @@ bool Case14CloseWindowClosesTheWindow() {
   const uint32_t storedBeforeFrame = g_stored;
   for (uint32_t i = 0u; i < kKeys; ++i) {
     const PaletteObjectKey key = MakeKey(0x140000u + i);
-    const PaletteObjectFrames frames = MakeFrames(1001u);
+    // Case14 的 16 条完整链用于验证关窗预算；每条都需有效尝试与非零命中键。
+    const PaletteObjectFrames frames = KnownFrames(1001u, i);
     rec.NoteReject(key, PaletteObjectRejectReason::R1, frames);
-    rec.NoteServed(key, PaletteObjectSource::ArenaSlot, i, frames);
-    rec.NoteEnqueued(key, PaletteObjectSource::ProducerSnapshot, i, frames, false);
-    rec.NoteDrawn(key, PaletteObjectSource::DrawTimeCaptured, i, frames, false);
+    rec.NoteServed(key, PaletteObjectSource::ArenaSlot, i + 1u, frames);
+    rec.NoteEnqueued(key, PaletteObjectSource::ArenaSlot, i + 1u, frames, false);
+    rec.NoteDrawn(key, PaletteObjectSource::ArenaSlot, i + 1u, frames, false);
   }
   ok &= Require(g_stored - storedBeforeFrame == PaletteObjectEvidence::kPerFrameBudget,
                 "the frame must emit exactly the 64-event per-frame budget");
@@ -1781,39 +1790,41 @@ ScenarioOutcome RunRecoveredScenario(uint32_t scenario, const PaletteObjectKey& 
   rec.Reset(1000u, 2000u);
   ResetCollector();
   rec.NoteReject(key, PaletteObjectRejectReason::R1, MakeFrames(10u)); // 建条目
+  // Case18 每个反例的正常部分也关联同次且匹配来源；只有命名故障破坏完整恢复。
+  // 未知尝试口径由 Case30/33 及跨 attempt 专项回归单独覆盖。
   switch (scenario) {
-  case 0: // 正对照：完整链
-    rec.NoteServed(key, PaletteObjectSource::ProducerSnapshot, 1u, MakeFrames(20u));
-    rec.NoteEnqueued(key, PaletteObjectSource::ArenaSlot, 2u, MakeFrames(21u), false);
-    rec.NoteDrawn(key, PaletteObjectSource::DrawTimeCaptured, 3u, MakeFrames(22u), false);
+  case 0: // 正对照：同一次已知尝试的匹配完整链
+    rec.NoteServed(key, PaletteObjectSource::ProducerSnapshot, 1u, KnownFrames(20u, 18u));
+    rec.NoteEnqueued(key, PaletteObjectSource::ProducerSnapshot, 1u, KnownFrames(21u, 18u), false);
+    rec.NoteDrawn(key, PaletteObjectSource::ProducerSnapshot, 1u, KnownFrames(22u, 18u), false);
     break;
   case 1: // 缺 Served
-    rec.NoteEnqueued(key, PaletteObjectSource::ArenaSlot, 2u, MakeFrames(21u), false);
-    rec.NoteDrawn(key, PaletteObjectSource::DrawTimeCaptured, 3u, MakeFrames(22u), false);
+    rec.NoteEnqueued(key, PaletteObjectSource::ProducerSnapshot, 1u, KnownFrames(21u, 18u), false);
+    rec.NoteDrawn(key, PaletteObjectSource::ProducerSnapshot, 1u, KnownFrames(22u, 18u), false);
     break;
   case 2: // 缺 Enqueued
-    rec.NoteServed(key, PaletteObjectSource::ProducerSnapshot, 1u, MakeFrames(20u));
-    rec.NoteDrawn(key, PaletteObjectSource::DrawTimeCaptured, 3u, MakeFrames(22u), false);
+    rec.NoteServed(key, PaletteObjectSource::ProducerSnapshot, 1u, KnownFrames(20u, 18u));
+    rec.NoteDrawn(key, PaletteObjectSource::ProducerSnapshot, 1u, KnownFrames(22u, 18u), false);
     break;
   case 3: // 缺 Drawn
-    rec.NoteServed(key, PaletteObjectSource::ProducerSnapshot, 1u, MakeFrames(20u));
-    rec.NoteEnqueued(key, PaletteObjectSource::ArenaSlot, 2u, MakeFrames(21u), false);
+    rec.NoteServed(key, PaletteObjectSource::ProducerSnapshot, 1u, KnownFrames(20u, 18u));
+    rec.NoteEnqueued(key, PaletteObjectSource::ProducerSnapshot, 1u, KnownFrames(21u, 18u), false);
     break;
   case 4: // 顺序回退：Drawn 之后再来一条 Served
-    rec.NoteServed(key, PaletteObjectSource::ProducerSnapshot, 1u, MakeFrames(20u));
-    rec.NoteEnqueued(key, PaletteObjectSource::ArenaSlot, 2u, MakeFrames(21u), false);
-    rec.NoteDrawn(key, PaletteObjectSource::DrawTimeCaptured, 3u, MakeFrames(22u), false);
-    rec.NoteServed(key, PaletteObjectSource::PoseKernel, 4u, MakeFrames(23u));
+    rec.NoteServed(key, PaletteObjectSource::ProducerSnapshot, 1u, KnownFrames(20u, 18u));
+    rec.NoteEnqueued(key, PaletteObjectSource::ProducerSnapshot, 1u, KnownFrames(21u, 18u), false);
+    rec.NoteDrawn(key, PaletteObjectSource::ProducerSnapshot, 1u, KnownFrames(22u, 18u), false);
+    rec.NoteServed(key, PaletteObjectSource::PoseKernel, 4u, KnownFrames(23u, 18u));
     break;
   case 5: // draw 时 native override 清空了语义 palette
-    rec.NoteServed(key, PaletteObjectSource::ProducerSnapshot, 1u, MakeFrames(20u));
-    rec.NoteEnqueued(key, PaletteObjectSource::ArenaSlot, 2u, MakeFrames(21u), false);
-    rec.NoteDrawn(key, PaletteObjectSource::DrawTimeCaptured, 3u, MakeFrames(22u), true);
+    rec.NoteServed(key, PaletteObjectSource::ProducerSnapshot, 1u, KnownFrames(20u, 18u));
+    rec.NoteEnqueued(key, PaletteObjectSource::ProducerSnapshot, 1u, KnownFrames(21u, 18u), false);
+    rec.NoteDrawn(key, PaletteObjectSource::ProducerSnapshot, 1u, KnownFrames(22u, 18u), true);
     break;
   case 6: // drawSource == None（本次 draw 没有携带任何来源）
-    rec.NoteServed(key, PaletteObjectSource::ProducerSnapshot, 1u, MakeFrames(20u));
-    rec.NoteEnqueued(key, PaletteObjectSource::ArenaSlot, 2u, MakeFrames(21u), false);
-    rec.NoteDrawn(key, PaletteObjectSource::None, 0u, MakeFrames(22u), false);
+    rec.NoteServed(key, PaletteObjectSource::ProducerSnapshot, 1u, KnownFrames(20u, 18u));
+    rec.NoteEnqueued(key, PaletteObjectSource::ProducerSnapshot, 1u, KnownFrames(21u, 18u), false);
+    rec.NoteDrawn(key, PaletteObjectSource::None, 0u, KnownFrames(22u, 18u), false);
     break;
   default:
     break;
@@ -2104,9 +2115,10 @@ void RunReentryScenarioB(ReentryScenarioOutcome* out) {
   rec.Reset(0x20260917u, 0x20260918u);
   const PaletteObjectKey key = MakeKey(0x1B00000u);
   rec.NoteReject(key, PaletteObjectRejectReason::R1, MakeFrames(10u));
-  rec.NoteServed(key, PaletteObjectSource::ProducerSnapshot, 0x501u, MakeFrames(11u));
-  rec.NoteEnqueued(key, PaletteObjectSource::ArenaSlot, 0x502u, MakeFrames(12u), false);
-  rec.NoteDrawn(key, PaletteObjectSource::DrawTimeCaptured, 0x503u, MakeFrames(13u), false);
+  // Case20B 的重入发生在合法完整链的 D；保留原 draw-time 载荷及终态断言。
+  rec.NoteServed(key, PaletteObjectSource::DrawTimeCaptured, 0x503u, KnownFrames(11u, 20u));
+  rec.NoteEnqueued(key, PaletteObjectSource::DrawTimeCaptured, 0x503u, KnownFrames(12u, 20u), false);
+  rec.NoteDrawn(key, PaletteObjectSource::DrawTimeCaptured, 0x503u, KnownFrames(13u, 20u), false);
   // 窗口已在重入里关闭 ⇒ 以下两个观测必须早退（不得再产生事件、不得改变任何计数）。
   rec.NoteReject(key, PaletteObjectRejectReason::R2, MakeFrames(14u));
   rec.NoteServed(key, PaletteObjectSource::PoseKernel, 0x504u, MakeFrames(15u));
@@ -2397,9 +2409,10 @@ void RunCapacityFreezeWorker(void* argument) {
   // 3) pre 区先建一条**完整链**：容量冻结时它的终态必须结算为 Recovered。
   const PaletteObjectKey recoveredKey = MakeKey(0x2100000u);
   rec.NoteReject(recoveredKey, PaletteObjectRejectReason::R1, MakeFrames(10u));
-  rec.NoteServed(recoveredKey, PaletteObjectSource::ProducerSnapshot, 0x601u, MakeFrames(11u));
-  rec.NoteEnqueued(recoveredKey, PaletteObjectSource::ArenaSlot, 0x602u, MakeFrames(12u), false);
-  rec.NoteDrawn(recoveredKey, PaletteObjectSource::DrawTimeCaptured, 0x603u, MakeFrames(13u),
+  // Case21 将环冻结/丢失记账与恢复准入分开：pre 链本身必须满足同次来源合同。
+  rec.NoteServed(recoveredKey, PaletteObjectSource::DrawTimeCaptured, 0x603u, KnownFrames(11u, 21u));
+  rec.NoteEnqueued(recoveredKey, PaletteObjectSource::DrawTimeCaptured, 0x603u, KnownFrames(12u, 21u), false);
+  rec.NoteDrawn(recoveredKey, PaletteObjectSource::DrawTimeCaptured, 0x603u, KnownFrames(13u, 21u),
                 false);
 
   // 4) 真实生产 trigger 入口（等价 Control(action=trigger, postPresents=100)）。
@@ -3052,12 +3065,13 @@ bool Case24FirstSightObservationChain() {
   TrackObject(recoveryKey, 800u, PaletteObjectRejectReason::R1);
   ok &= Require(rec.counters().firstSightEmitted == 0u,
                 "recovery chain must not emit FirstSight");
+  // Case24 只在恢复正对照补同次尝试；上面的弱身份/未知观察链保持原口径。
   rec.NoteServed(recoveryKey, PaletteObjectSource::OwnedPartSnapshot, 0x77u,
-                 MakeFrames(801u));
-  rec.NoteEnqueued(recoveryKey, PaletteObjectSource::OwnedPartSnapshot, 0x78u,
-                   MakeFrames(802u), false);
-  rec.NoteDrawn(recoveryKey, PaletteObjectSource::DrawTimeCaptured, 0x79u,
-                MakeFrames(803u), false);
+                 KnownFrames(801u, 24u));
+  rec.NoteEnqueued(recoveryKey, PaletteObjectSource::OwnedPartSnapshot, 0x77u,
+                   KnownFrames(802u, 24u), false);
+  rec.NoteDrawn(recoveryKey, PaletteObjectSource::OwnedPartSnapshot, 0x77u,
+                KnownFrames(803u, 24u), false);
   rec.CloseWindow(804u);
   const PaletteObjectEventRecord* recoveryTerminal = LastEvent();
   ok &= Require(recoveryTerminal != nullptr, "recovery chain must settle");
@@ -3151,16 +3165,17 @@ bool Case26RecoveredRequiresRejectFact() {
   rec.Configure(&Collect, &g_contextMarker);
   rec.Reset(1000u, 2000u);
   ResetCollector();
-  const PaletteObjectFrames served = MakeFrames(503u);
-  const PaletteObjectFrames enqueued = MakeFrames(504u);
-  const PaletteObjectFrames drawn = MakeFrames(505u);
+  // Case26 两侧使用同样有效的 S/E/D，唯一认证差异仍是有无真实拒绝事实。
+  const PaletteObjectFrames served = KnownFrames(503u, 26u);
+  const PaletteObjectFrames enqueued = KnownFrames(504u, 26u);
+  const PaletteObjectFrames drawn = KnownFrames(505u, 26u);
 
   // ① 观察链：无拒绝事实，却走完了 S/E/D。
   const PaletteObjectKey observed = MakeKey(0x40000u);
   rec.NoteFirstSight(observed, MakeFrames(500u));
   rec.NoteServed(observed, PaletteObjectSource::ProducerSnapshot, 0xABCDu, served);
   rec.NoteEnqueued(observed, PaletteObjectSource::ProducerSnapshot, 0xABCDu, enqueued, false);
-  rec.NoteDrawn(observed, PaletteObjectSource::DrawTimeCaptured, 0xEEEEu, drawn, false);
+  rec.NoteDrawn(observed, PaletteObjectSource::ProducerSnapshot, 0xABCDu, drawn, false);
   rec.CloseWindow(600u);
   bool observedSettled = false;
   bool observedRecovered = false;
@@ -3206,7 +3221,7 @@ bool Case26RecoveredRequiresRejectFact() {
   rec.NoteReject(rejected, PaletteObjectRejectReason::R1, MakeFrames(500u));
   rec.NoteServed(rejected, PaletteObjectSource::ProducerSnapshot, 0xABCDu, served);
   rec.NoteEnqueued(rejected, PaletteObjectSource::ProducerSnapshot, 0xABCDu, enqueued, false);
-  rec.NoteDrawn(rejected, PaletteObjectSource::DrawTimeCaptured, 0xEEEEu, drawn, false);
+  rec.NoteDrawn(rejected, PaletteObjectSource::ProducerSnapshot, 0xABCDu, drawn, false);
   rec.CloseWindow(600u);
   bool rejectedRecovered = false;
   for (uint32_t i = 0u; i < g_stored; ++i)
@@ -3499,13 +3514,13 @@ bool Case31AttemptScopedOrdering() {
     rec.NoteReject(key, PaletteObjectRejectReason::R1, f);
     f.renderFrame = 1001u; rec.NoteServed(key, PaletteObjectSource::ProducerSnapshot, 0x1u, f);
     f.renderFrame = 1002u; rec.NoteEnqueued(key, PaletteObjectSource::ProducerSnapshot, 0x1u, f, false);
-    f.renderFrame = 1003u; rec.NoteDrawn(key, PaletteObjectSource::DrawTimeCaptured, 0x2u, f, false);
+    f.renderFrame = 1003u; rec.NoteDrawn(key, PaletteObjectSource::ProducerSnapshot, 0x1u, f, false);
     // 第二次尝试：**新的明确关联尝试号**。
     f.renderFrame = 1010u; f.attemptSerial = 8u;
     rec.NoteReject(key, PaletteObjectRejectReason::R1, f);
     f.renderFrame = 1011u; rec.NoteServed(key, PaletteObjectSource::ProducerSnapshot, 0x1u, f);
     f.renderFrame = 1012u; rec.NoteEnqueued(key, PaletteObjectSource::ProducerSnapshot, 0x1u, f, false);
-    f.renderFrame = 1013u; rec.NoteDrawn(key, PaletteObjectSource::DrawTimeCaptured, 0x2u, f, false);
+    f.renderFrame = 1013u; rec.NoteDrawn(key, PaletteObjectSource::ProducerSnapshot, 0x1u, f, false);
     rec.CloseWindow(1100u);
     const PaletteObjectTerminal term = TerminalOfKey(key);
     std::printf("    [K3-31] twoAttemptsDistinctSerial terminal=%s closedRecovered=%llu\n",
@@ -3528,7 +3543,8 @@ bool Case31AttemptScopedOrdering() {
     rec2.NoteReject(key, PaletteObjectRejectReason::R1, f);
     f.renderFrame = 2001u; rec2.NoteServed(key, PaletteObjectSource::ProducerSnapshot, 0x1u, f);
     f.renderFrame = 2002u; rec2.NoteEnqueued(key, PaletteObjectSource::ProducerSnapshot, 0x1u, f, false);
-    f.renderFrame = 2003u; rec2.NoteDrawn(key, PaletteObjectSource::DrawTimeCaptured, 0x2u, f, false);
+    // Case31 回退前先形成合法链，避免反例因为来源不匹配而真空通过。
+    f.renderFrame = 2003u; rec2.NoteDrawn(key, PaletteObjectSource::ProducerSnapshot, 0x1u, f, false);
     // 同一尝试内**回退**到 Rejected ⇒ 必须仍被判违规 ⇒ 不得判 Recovered。
     f.renderFrame = 2004u;
     rec2.NoteReject(key, PaletteObjectRejectReason::R1, f);
@@ -3613,9 +3629,10 @@ bool Case35BothChainsServedRouting() {
   {
     const PaletteObjectKey k = MakeKey(0x951u);
     rec.NoteReject(k, PaletteObjectRejectReason::R1, MakeFrames(20u));
-    rec.NoteServed(k, src, 7u, MakeFrames(21u));
-    rec.NoteEnqueued(k, src, 7u, MakeFrames(21u), false);
-    rec.NoteDrawn(k, src, 7u, MakeFrames(21u), false);
+    // Case35 对照/双链两侧均使用已知完整尝试，只检验链路分发。
+    rec.NoteServed(k, src, 7u, KnownFrames(21u, 35u));
+    rec.NoteEnqueued(k, src, 7u, KnownFrames(21u, 35u), false);
+    rec.NoteDrawn(k, src, 7u, KnownFrames(21u, 35u), false);
     rec.CloseWindow(22u);
     const auto& c = rec.counters();
     std::printf("    [OWN-35-control  ] recovered=%llu unclosed=%llu windowExpired=%llu obsClosed=%llu\n",
@@ -3636,9 +3653,9 @@ bool Case35BothChainsServedRouting() {
     const PaletteObjectKey k = MakeKey(0x952u);
     rec.NoteReject(k, PaletteObjectRejectReason::R1, MakeFrames(30u));
     rec.NoteFirstSight(k, MakeFrames(31u));
-    rec.NoteServed(k, src, 7u, MakeFrames(32u));
-    rec.NoteEnqueued(k, src, 7u, MakeFrames(32u), false);
-    rec.NoteDrawn(k, src, 7u, MakeFrames(32u), false);
+    rec.NoteServed(k, src, 7u, KnownFrames(32u, 35u));
+    rec.NoteEnqueued(k, src, 7u, KnownFrames(32u, 35u), false);
+    rec.NoteDrawn(k, src, 7u, KnownFrames(32u, 35u), false);
     rec.CloseWindow(33u);
     const auto& c = rec.counters();
     std::printf("    [OWN-35-dualchain] recovered=%llu unclosed=%llu windowExpired=%llu obsClosed=%llu\n",

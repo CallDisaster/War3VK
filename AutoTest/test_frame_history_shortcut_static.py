@@ -21,7 +21,7 @@ class ShortcutContracts(unittest.TestCase):
         render=s.split('void War3Imgui::render(bool inScene)',1)[1].split('void War3Imgui::drawFrameRecorderPanel()',1)[0]
         panel=s.split('void War3Imgui::drawFrameRecorderPanel()',1)[1].split('void War3Imgui::drawDebugWindow()',1)[0]
         console=s.split('void War3Imgui::drawDebugWindow()',1)[1]
-        self.assertIn('!m_initialized || m_hasRendered || !m_visible',render)
+        self.assertIn('!m_initialized || m_retiring || m_hasRendered || !m_visible',render)
         self.assertNotIn('WarVK recorder status',render)
         self.assertIn('drawFrameRecorderPanel();',console)
         self.assertIn('Ctrl+Shift+C',panel)

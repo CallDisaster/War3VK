@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import unittest
 from pathlib import Path
 
@@ -7,6 +8,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DEVICE = (ROOT / "src/d3d9/d3d9_device.cpp").read_text(encoding="utf-8")
 DEVICE_H = (ROOT / "src/d3d9/d3d9_device.h").read_text(encoding="utf-8")
+RETIREMENT = (
+    ROOT / "src/d3d9/war3/shadow/war3_shadow_session_retirement.h"
+).read_text(encoding="utf-8")
 HOOK = (ROOT / "src/d3d9/d3d9_war3_hook.cpp").read_text(encoding="utf-8")
 WAR3 = (ROOT / "src/d3d9/war3/war3.cpp").read_text(encoding="utf-8")
 VISUAL_BRIDGE = (
@@ -68,6 +72,29 @@ def body(text: str, signature: str, next_signature: str) -> str:
     start = text.index(signature)
     end = text.index(next_signature, start + len(signature))
     return text[start:end]
+
+
+def code_only(source: str) -> str:
+    """Blank comments/literals so retirement prose cannot satisfy a fence gate."""
+    tokens = re.compile(
+        r'//[^\n]*|/\*.*?\*/|R"(?P<delimiter>[^ ()\\\t\r\n]{0,16})'
+        r'\(.*?\)(?P=delimiter)"|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'',
+        re.DOTALL,
+    )
+    return tokens.sub(lambda match: re.sub(r"[^\n]", " ", match.group()), source)
+
+
+def braced_body(source: str, marker: str) -> str:
+    start = source.index("{", source.index(marker))
+    depth = 0
+    for end in range(start, len(source)):
+        if source[end] == "{":
+            depth += 1
+        elif source[end] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start + 1:end]
+    raise AssertionError(f"Unterminated production body: {marker}")
 
 
 class ShadowCrossMapLifecycleStaticTests(unittest.TestCase):
@@ -310,7 +337,7 @@ class ShadowCrossMapLifecycleStaticTests(unittest.TestCase):
         )
         for token in (
             "War3QuarantineShadowSessionAtPresent(retireSerial)",
-            "War3ResetShadowSessionState(retireSerial)",
+            "War3ResetShadowSessionState(retireSerial, prepared)",
             "War3InvalidateShadowReceiverEpochOnCs(",
             "m_war3ShadowDeviceEpochApplied.store(",
             "m_war3ShadowDeviceRebindPending.store(",
@@ -743,7 +770,28 @@ class ShadowCrossMapLifecycleStaticTests(unittest.TestCase):
             "void D3D9DeviceEx::War3CollectRetiredShadowSessions",
             "void D3D9DeviceEx::War3RefreshRetiredShadowSessionDiagnostics",
         )
-        self.assertIn("session.retireSerial <= completedSerial", collect)
+        collect = code_only(collect)
+        self.assertRegex(
+            collect,
+            r"const\s+size_t\s+collectedCount\s*=\s*war3::shadow::CollectRetiredShadowSessions\s*\("
+            r"\s*m_war3RetiredShadowSessions\s*,\s*m_war3ShadowPersistentCharges\s*,\s*completedSerial\s*\)\s*;",
+        )
+        self.assertNotRegex(collect, r"m_war3RetiredShadowSessions\s*\.\s*(?:erase|clear)\s*\(")
+        helper_collect = braced_body(code_only(RETIREMENT), "size_t CollectRetiredShadowSessions(")
+        # Same completed-serial obligation, now in the production-shared helper:
+        # unknown serials and inconsistent charges must not release owners, and
+        # the recorded charge is debited only after the eligible node is erased.
+        self.assertIsNotNone(re.fullmatch(
+            r"\s*size_t\s+collected\s*=\s*0\s*;"
+            r"\s*for\s*\(\s*auto\s+it\s*=\s*queue\.begin\(\)\s*;\s*it\s*!=\s*queue\.end\(\)\s*;\s*\)\s*\{"
+            r"\s*if\s*\(\s*it->retireSerial\s*==\s*0\s*\|\|\s*it->retireSerial\s*>\s*completedSerial"
+            r"\s*\|\|\s*it->persistentChargeBytes\s*>\s*charges\.retired\s*\)\s*\{"
+            r"\s*\+\+it\s*;\s*continue\s*;\s*\}"
+            r"\s*const\s+uint64_t\s+bytes\s*=\s*it->persistentChargeBytes\s*;"
+            r"\s*it\s*=\s*queue\.erase\(it\)\s*;\s*charges\.retired\s*-=\s*bytes\s*;"
+            r"\s*\+\+collected\s*;\s*\}\s*return\s+collected\s*;\s*",
+            helper_collect,
+        ))
         self.assertIn("m_war3ShadowDiagRetiredSessionCollectedCount.fetch_add", collect)
         self.assertIn("War3RefreshRetiredShadowSessionDiagnostics()", collect)
 

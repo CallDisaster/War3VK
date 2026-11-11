@@ -1,5 +1,6 @@
 #include "war3_instance_buffer.h"
 #include "../../d3d9_shader.h"
+#include "../../d3d9_texture.h"
 #include "../../d3d9_war3_debug.h"
 #include "war3_render_types.h"
 
@@ -7,17 +8,10 @@ namespace dxvk {
 namespace war3 {
 namespace reimpl {
 
-thread_local InstanceData *War3InstanceBuffer::s_activeLockedPtr = nullptr;
 thread_local War3InstanceBuffer *War3InstanceBuffer::s_activeBuffer = nullptr;
 
 War3InstanceBuffer *War3InstanceBuffer::Get(D3D9DeviceEx *device) {
-  static War3InstanceBuffer s_buffer(device);
-  static bool s_init = false;
-  if (!s_init) {
-    s_init = true;
-    s_buffer.Create();
-  }
-  return &s_buffer;
+  return device ? device->GetWar3InstanceBuffer() : nullptr;
 }
 
 void War3InstanceBuffer::SetActive(War3InstanceBuffer *buffer) {
@@ -26,21 +20,26 @@ void War3InstanceBuffer::SetActive(War3InstanceBuffer *buffer) {
 
 War3InstanceBuffer *War3InstanceBuffer::GetActive() { return s_activeBuffer; }
 
+War3InstanceBuffer *War3InstanceBuffer::GetActive(D3D9DeviceEx *device) {
+  return s_activeBuffer && s_activeBuffer->m_device == device ? s_activeBuffer : nullptr;
+}
+
 void War3InstanceBuffer::Bind(uint32_t streamIdx, uint32_t baseInstanceOffset) {
-  if (m_buffer && m_device) {
+  if (m_buffer != nullptr && m_device) {
+    // The per-device owner retains storage without retaining the device.
     uint32_t offsetInBytes = baseInstanceOffset * sizeof(InstanceData);
-    m_device->SetStreamSource(streamIdx, m_buffer, offsetInBytes,
+    m_device->SetStreamSource(streamIdx, m_buffer.ptr(), offsetInBytes,
                               sizeof(InstanceData));
   }
 }
 
 void War3InstanceBuffer::CaptureConstants(uint32_t startReg, const float *data,
                                           uint32_t count) {
-  if (!s_activeLockedPtr)
+  if (!m_lockedPtr || m_capturedInstanceCount >= m_maxBatchSize)
     return;
   // Map worldMatrix (c14-c17) -> worldMatrix[16]
   // Map color (c11) -> color[4]
-  InstanceData &dest = s_activeLockedPtr[m_capturedInstanceCount];
+  InstanceData &dest = m_lockedPtr[m_capturedInstanceCount];
 
   for (uint32_t i = 0; i < count; i++) {
     uint32_t reg = startReg + i;
@@ -58,13 +57,13 @@ void War3InstanceBuffer::CaptureTextureState() {
     return;
   for (uint32_t i = 0; i < 2;
        i++) { // Only track first 2 stages? Commonly used.
-    // Release old
-    if (m_capturedTextures[i]) {
-      m_capturedTextures[i]->Release();
-      m_capturedTextures[i] = nullptr;
-    }
-    // Get new (Adds Ref)
-    m_device->GetTexture(i, &m_capturedTextures[i]);
+    Com<IDirect3DBaseTexture9> texture;
+    m_device->GetTexture(i, &texture);
+    // Retain storage before releasing either the old private or temporary
+    // public owner; this is also safe when the texture did not change.
+    TextureRefPrivate(texture.ptr(), true);
+    TextureRefPrivate(m_capturedTextures[i], false);
+    m_capturedTextures[i] = texture.ptr();
   }
 }
 
@@ -95,21 +94,24 @@ void War3InstanceBuffer::RestoreTextureState() {
 }
 
 void War3InstanceBuffer::OnLostDevice() {
-  if (m_buffer) {
-    m_buffer->Release();
-    m_buffer = nullptr;
-  }
-  // Release captured textures?
+  if (s_activeBuffer == this)
+    s_activeBuffer = nullptr;
+  if (m_buffer != nullptr && m_lockedPtr)
+    m_buffer->Unlock();
+  m_lockedPtr = nullptr;
+  m_buffer = nullptr;
+  m_currentOffset = m_activeAllocationStart = m_drawnCountThisAlloc = 0;
+  m_capturedInstanceCount = m_maxBatchSize = 0;
+  m_isFull = false;
+  m_declCache.clear();
   for (auto &tex : m_capturedTextures) {
-    if (tex) {
-      tex->Release();
-      tex = nullptr;
-    }
+    TextureRefPrivate(tex, false);
+    tex = nullptr;
   }
 }
 
 void War3InstanceBuffer::OnResetDevice() {
-  if (!m_buffer) {
+  if (m_buffer == nullptr) {
     Create(m_maxInstances > 0 ? m_maxInstances : 4096);
   }
 }
@@ -127,48 +129,39 @@ bool War3InstanceBuffer::IsFull() const {
 }
 
 War3InstanceBuffer::War3InstanceBuffer(D3D9DeviceEx *device)
-    : m_device(device) {
-  s_activeBuffer = nullptr;
-  s_activeLockedPtr = nullptr;
-}
+    : m_device(device) { }
 
 War3InstanceBuffer::~War3InstanceBuffer() {
-  if (m_buffer) {
-    m_buffer->Release();
-    m_buffer = nullptr;
-  }
-  for (auto &pair : m_declCache) {
-    if (pair.second)
-      pair.second->Release();
-  }
-  m_declCache.clear();
+  OnLostDevice();
 }
 
 HRESULT War3InstanceBuffer::Create(uint32_t maxInstances) {
-  if (!m_device)
+  if (!m_device || !maxInstances || maxInstances > UINT32_MAX / sizeof(InstanceData))
     return D3DERR_INVALIDCALL;
-
-  m_maxInstances = maxInstances;
-  m_bufferSizeInBytes = maxInstances * sizeof(InstanceData);
-
+  Com<IDirect3DVertexBuffer9> buffer;
+  const uint32_t bytes = maxInstances * sizeof(InstanceData);
   if (FAILED(m_device->CreateVertexBuffer(
-          m_bufferSizeInBytes, D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY, 0,
-          D3DPOOL_DEFAULT, &m_buffer, nullptr))) {
+          bytes, D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY, 0,
+          D3DPOOL_DEFAULT, &buffer, nullptr))) {
     WAR3_RENDER_LOG("Failed to create War3InstanceBuffer\n");
     return E_FAIL;
   }
 
+  OnLostDevice();
+  m_buffer = static_cast<D3D9VertexBuffer*>(buffer.ptr());
+  m_maxInstances = maxInstances;
+  m_bufferSizeInBytes = bytes;
   return D3D_OK;
 }
 
 InstanceData *War3InstanceBuffer::Alloc(uint32_t count,
                                         uint32_t &outBaseOffset) {
-  if (!m_buffer)
+  if (m_buffer == nullptr || m_lockedPtr || !count || count > m_maxInstances)
     return nullptr;
 
   // Simple ring buffer allocation
   // Check if wrap needed
-  if (m_currentOffset + count > m_maxInstances) {
+  if (count > m_maxInstances - m_currentOffset) {
     m_currentOffset = 0; // DISCARD happens on Lock
   }
 
@@ -192,7 +185,7 @@ InstanceData *War3InstanceBuffer::Alloc(uint32_t count,
   m_allocsThisFrame++;
 
   // Reset batch state
-  s_activeLockedPtr = static_cast<InstanceData *>(ptr);
+  m_lockedPtr = static_cast<InstanceData *>(ptr);
   m_capturedInstanceCount = 0;
   m_maxBatchSize = count;
 
@@ -200,13 +193,13 @@ InstanceData *War3InstanceBuffer::Alloc(uint32_t count,
   m_activeAllocationStart = m_currentOffset - count;
   m_drawnCountThisAlloc = 0;
 
-  return s_activeLockedPtr;
+  return m_lockedPtr;
 }
 
 void War3InstanceBuffer::Unlock() {
-  if (m_buffer) {
+  if (m_buffer != nullptr && m_lockedPtr) {
     m_buffer->Unlock();
-    s_activeLockedPtr =
+    m_lockedPtr =
         nullptr; // Clear it so we don't accidentally write to it
   }
 }
@@ -309,7 +302,7 @@ void War3InstanceBuffer::FlushBatch() {
 
 void War3InstanceBuffer::OnSetTexture(uint32_t stage,
                                       IDirect3DBaseTexture9 *texture) {
-  if (!s_activeBuffer || !s_activeLockedPtr)
+  if (s_activeBuffer != this || !m_lockedPtr)
     return;
 
   // Only track stage 0 and 1 for now (TeamColor is usually 1, Diffuse 0)
@@ -322,12 +315,9 @@ void War3InstanceBuffer::OnSetTexture(uint32_t stage,
     FlushBatch();
 
     // Update state to NEW texture
-    if (m_capturedTextures[stage])
-      m_capturedTextures[stage]->Release();
-
+    TextureRefPrivate(texture, true);
+    TextureRefPrivate(m_capturedTextures[stage], false);
     m_capturedTextures[stage] = texture;
-    if (m_capturedTextures[stage])
-      m_capturedTextures[stage]->AddRef();
   }
 }
 
@@ -338,9 +328,9 @@ void War3InstanceBuffer::ResolveTextureChange() {
 
 IDirect3DVertexDeclaration9 *War3InstanceBuffer::GetInstancedDeclaration(
     IDirect3DVertexDeclaration9 *originalDecl) {
-  if (m_declCache.count(originalDecl)) {
-    return m_declCache[originalDecl];
-  }
+  const auto cached = m_declCache.find(originalDecl);
+  if (cached != m_declCache.end())
+    return cached->second.instanced.ptr();
 
   D3DVERTEXELEMENT9 elements[MAXD3DDECLLENGTH + 1];
   UINT numElements = 0;
@@ -376,13 +366,16 @@ IDirect3DVertexDeclaration9 *War3InstanceBuffer::GetInstancedDeclaration(
 
   newElements.push_back(D3DDECL_END());
 
-  IDirect3DVertexDeclaration9 *newDecl = nullptr;
+  Com<IDirect3DVertexDeclaration9> newDecl;
   if (FAILED(m_device->CreateVertexDeclaration(newElements.data(), &newDecl))) {
     return nullptr;
   }
 
-  m_declCache[originalDecl] = newDecl;
-  return newDecl;
+  DeclarationEntry entry;
+  entry.original = static_cast<D3D9VertexDecl*>(originalDecl);
+  entry.instanced = static_cast<D3D9VertexDecl*>(newDecl.ptr());
+  auto inserted = m_declCache.emplace(originalDecl, std::move(entry));
+  return inserted.first->second.instanced.ptr();
 }
 
 } // namespace reimpl

@@ -396,7 +396,10 @@ namespace dxvk {
 
     auto iter = m_shaderLibraries.emplace(
       std::piecewise_construct,
-      std::tuple(),
+      // The explicit default key is also used by the value constructor.
+      // Avoid an empty piecewise key tuple (rejected by LLVM libc++ 22's
+      // key-extraction template) without changing the cache's null-FS key.
+      std::tuple(key),
       std::tuple(m_device, this, key));
     return &iter.first->second;
   }

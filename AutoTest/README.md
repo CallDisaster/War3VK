@@ -3,6 +3,87 @@
 本目录包含 War3 自动化测试 / 性能基线 / shadow trace 控制等"发布级"工具。
 历史调试脚本（按 phase 分组）已经归档到 `_archive/`，不参与日常验证。
 
+## 评审后的 VA / flight 等待测量（2026-10-29）
+
+当前先做 T1/T2，兼容面扩展暂停，见
+[测量与未覆盖](../docs/research/2026-10-29-x64-review-t1-t2-baseline.md)。
+`run_native_d3d9_survey.py --memory-review --normal-exit-test` 在 ready 后等待12秒，
+使用保留只读进程句柄采完整 x86 VA 表；不暂停/读取目标载荷，不由 MEM_PRIVATE 猜owner。
+`--cpu-recorder-review` 只在该模式中授权固定容量CPU事件环的 arm/freeze/discard，
+不启用raw inputs/图像历史。无census的构建可通过独立metadata/exit门，census仍为未覆盖。
+完整区域输出保存在`full-va-map.json`，终端只读摘要，保留非原子/partial状态。
+
+`run_d3d9_draw_batch_gate.py --wait-profile --event-completion --gpu-groups --draws 1025`
+启用开发宿主有界分段计时；可用`--reference-dll`指定同轮本地参照，另跑不带
+`--wait-profile`的成本对照与`--validation`的正确性门。测量对象是EVENT区间的CPU墙钟，
+不是纯GPU执行或游戏FPS。`analyze_d3d9_reuse_wait.py`拒绝缺区间/丢样/错序与不闭合时间。
+新增纯测试为`test_native_game_memory_review.py`、`test_d3d9_reuse_wait.py`；调查器
+权限/分类行为纳入已有`test_native_d3d9_survey_static.py`。真实回执与纯测试分列。
+
+## x64 基础兼容接线门（2026-10-29）
+
+`run_d3d9_factory_clear_gate.py --build-receipt <fresh-host-receipt> --output <new-artifact-dir>`
+检查预设备 Factory 查询、局部 Clear、紧凑 FVF、FF/SM3 混用、材质/方向光、变换和
+POSITIONT、多 mip/局部上传、格式与表面寿命；本地前后与两种远端配置做整图比较。可用 `--validation` 挂载固定身份
+VVL365，或 `--reference-dll <fresh-x86-product>` 验证共用生产代码重建后的本地路径。
+所有运行使用 restricted-Medium 非输入 Desktop、精确 Job、原始证据保全。
+`--optimized-pipelines` 强制两端关闭 GPL，并校验实际日志中的有效配置；
+验证层配方不能覆盖这个配置。后续 16 格式/表面与 sampler 两模式回执为
+`x64-sampler-gpu-20261029-r3/r4`，每端 225 图 / 3,686,400 通道，48 个真实 IPC
+反例覆盖故障不发布以及后续合法恢复。Alpha/fog/scissor/separate blend 随后的
+`x64-effects-gpu-20261029-r3/r4` 默认/优化门已通过，各端 269 图 / 4,407,296 通道
+完全相等、60 个实际 IPC 反例与恢复；`x64-effects-lifetime-20261029-r1` 96 轮通过。
+八纹理 stage / 独立 sampler 的 `x64-multitexture-gpu-20261029-r3/r4` 随后通过，
+每端 286 图 / 4,685,824 通道相等、72 个 IPC 反例/恢复；shader token 两宽各 6,560，
+wire 两宽各 1,454,388。`x64-multitexture-lifetime-20261029-r1` 的 96 轮亦通过；
+不能由这些旧回执追认。
+
+StateBlock / null-texture programmable draw 的 `x64-stateblock-gpu-20261029-r5/r6`
+两模式门随后通过：每端 297 图 / 4,866,048 通道相等，新增 StateBlock native 246 /
+remote 247 检查与 11 张图；raw 72 个拒绝/恢复不变。两位宽 wire 各 1,454,644，
+覆盖所有空引用组合的选择性允许与拒绝时不发布。完整范围、红门和候选身份见
+[StateBlock 回执](../docs/research/2026-10-29-x64-stateblock-integration.md)。
+该门仍不是 Warcraft 完整接入或新的内存/性能测量。
+同身份 `x64-stateblock-lifetime-20261029-r1` 的 96 轮 / 576 资源 / 256 Query 及原 raw
+故障恢复亦通过；公开引用归零与最终 host 物理资源归零在报告中分别说明。
+
+该门明确 `memoryMeasured=false`、`fullRendererMigrated=false`。按用户要求，
+Storm 与游戏进程内存对照必须等待完整游戏接入，不可用本门或旧 TLS 减量替代。
+FF 当前为同步事务；grouped 配置只验证与既有批次有序共存，不证明 FF 成本已优化。
+结果与失败原因见 [接线回执](../docs/research/2026-10-29-x64-fixed-function-integration.md)。
+
+## x64 D3D9 开发代理：批次、在途资源与完成通知（2026-10-28）
+
+这组测试为受限 64×64 COM → x64 原 DXSO/DXVK 路径，**不是 Warcraft 全画面迁移或发布门**。
+保留 Game.dll 拒绝与玩家 DLL；所有原生测试由唯一 owner 在 restricted-Medium、非输入 Desktop
+运行，使用独立 Job、精确 PID/创建时间及原始输出回执。不能把这些测试 DLL 复制到玩家目录。
+
+可复现入口（从仓库根目录执行，每次输出目录必须全新）：
+
+```powershell
+python -B AutoTest/run_d3d9_connection_async_cpu.py --output AutoTest/artifacts/<fresh-cpu>
+python -B AutoTest/run_d3d9_connection_fault_ipc.py --output AutoTest/artifacts/<fresh-fault> --event-wait
+python -B AutoTest/run_d3d9_draw_batch_gate.py --build-receipt AutoTest/artifacts/<frozen-host-build>/receipt.json --output AutoTest/artifacts/<fresh-gpu> --event-completion
+python -B AutoTest/run_d3d9_draw_batch_gate.py --build-receipt AutoTest/artifacts/<frozen-host-build>/receipt.json --output AutoTest/artifacts/<fresh-stress> --event-completion --draws 1025
+python -B AutoTest/run_d3d9_draw_batch_gate.py --build-receipt AutoTest/artifacts/<frozen-host-build>/receipt.json --output AutoTest/artifacts/<fresh-vvl> --event-completion --draws 1025 --validation
+```
+
+CPU 测试直接调用生产 Connection/队列边界；fault 使用真实双进程管道与恶意协议 peer，
+不证明 GPU。GPU gate 使用公共 COM 调用、原 shader 和独立像素判据，计时到 EVENT 完成，
+并检查批次整组拒绝/恢复、常量跨批寿命、纹理更新、在途 Destroy、代际复用和 Query 换代。
+VVL 使用项目已有的固定 1.4.365 层与原始回调，不能拿该模式的时间作性能结论。
+后续对照在上述 `--event-completion` 命令追加 `--gpu-groups`，比较四消息合并提交；
+再追加 `--state-reuse` 可测默认关闭的批内状态省略实验（尚无稳定性能收益）。
+新增真实非索引绘制、相邻深度/混合/写掩码变化、12 个非索引坏批次及恢复判据。
+Clear 前必须恢复整面 viewport；当前宿主不覆盖子视口/矩形 Clear。
+CPU 时间/周期来自保留的精确进程句柄，范围是含预热和读回的 44 帧，不是单帧 GPU 时间；
+短窗口 CPU 时间可能量化为零，不能据此宣称零开销。详见
+[本次合并与覆盖回执](../docs/research/2026-10-28-x64-submit-groups-and-nonindexed.md)。
+构建 owner 按 BelowNormal / `-j2`，fresh host 来自 `run_render_host_candidate_build.py`。
+严格 reader 为 `test_d3d9_draw_batch_reader.py`、`test_d3d9_connection_async_cpu_reader.py`
+和 `test_d3d9_connection_fault_ipc_reader.py`。完整版本身份与未覆盖项见
+[本轮证据](../docs/research/2026-10-28-x64-draw-batching-and-cost.md)。
+
 ## 发布级脚本（合并主线必用）
 
 | 文件 | 作用 |
@@ -49,6 +130,23 @@ py AutoTest\run_light_feature_matrix.py
 内部测试命令，截图只能使用内部 framebuffer 或隔离窗口的 `PrintWindow` 路径。
 若地图必须通过点击或按键才能进入，测试会 fail-closed；不会切换用户桌面，也不会
 自动回退到可见桌面。默认桌面上的显式人工测试仍可使用现有输入工具。
+
+## 受限 D3D9 / MDLDATA 开发诊断
+
+`run_native_d3d9_survey.py` 是真实游戏**观察**入口，不是发布门或x64游戏渲染器。
+它只写全新独立实例，绑定PID+creation time、精确模块/候选身份与受限Medium非输入Desktop；
+`--observe-only` 的期限清场不等于正常退出。没有成功打开控制管道时，不宣称地图ready已检查。
+
+MDLDATA探针另需开发构建 `warvk_mdl_allocation_trace_dev=true` 和运行参数
+`--mdl-allocation-trace`；默认关闭。不修改Game分支、LAA或分配策略。
+`run_mdl_trace_gate.py --build <独立build32_device_owner_目录> --output <全新artifacts子目录>`
+执行实际Core/ABI与C++日志→生产reader往返。`analyze_mdl_link_trace.py` 仅供准确所属进程/Job
+结束后读文件；`--process-exited` 是调用者的断言，不会自行证明进程已退出。
+高位字段可能是合法sentinel；高返回/函数返回也不自动认证存活、分配器路由或结构正确。
+
+当前实现与失败边界见
+[MDLDATA checkpoint](../docs/research/2026-10-23-mdldata-allocation-probe.md)。
+这些定向门不能替代全库回归、GPU/玩家视觉、前台性能和正常退出验收。
 
 ## 多实例稳定性测试
 
@@ -130,8 +228,11 @@ use_isolated_desktop=false
 
 该模式启动命令为
 `YDWE.exe -war3 -loadfile Maps\Test\WorldEditTestMap.w3x -closew2l`。当前机器的 Win32
-Desktop-object 路径已被安全隔离：实测显示栈可能令交互桌面黑屏，同时把 War3 留在非输入
-桌面，因此显式请求 `use_isolated_desktop=true` 会在启动前失败。使用可见桌面或 attach-only；
+Desktop-object 路径曾因黑屏风险被禁用；2026-08-11 的 `b0123bac` 已改为前述
+non-interactive-only 合同（不申请 SWITCHDESKTOP，检查输入桌面前后身份）。旧文档的
+“显式请求必定启动前失败”不是当前实现。隔离仍须按次验证实际线程 Desktop 身份，不能只查
+session 元数据；未通过不得回退到默认/可见桌面。共享显示驱动的黑屏/TDR 风险也不因隔离消失。
+2026-10-22 x64 验证先用独立非 GPU 探针，再单独验最小图形路径；隐藏 HWND 本身不是桌面隔离。
 `-closew2l` 禁止启动时再次转换候选图。工具先把候选图原子部署到
 专用沙盒短路径并复核源/目标 SHA-256；目标被占用或哈希不一致时直接失败，绝不复用旧的
 `WorldEditTestMap.w3x`。

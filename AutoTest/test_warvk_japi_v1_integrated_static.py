@@ -91,20 +91,22 @@ class WarVKJapiV1IntegratedStaticTests(unittest.TestCase):
             r'"([birds]*)",\s*[^,]+,\s*(true|false)\}',
             self.runtime,
         )
-        self.assertEqual(len(rows), 109)
+        self.assertEqual(len(rows), 122)
         cpp_commands = {
             name: (carrier, signature)
             for name, carrier, signature, _required in rows
         }
-        self.assertEqual(len(cpp_commands), 109)
+        self.assertEqual(len(cpp_commands), 122)
         self.assertEqual(cpp_commands['modelPointLights.setEnabled'], ('Preloader','sbb'))
         self.assertEqual(cpp_commands['modelPointLights.count'], ('Hotkey','s'))
         self.assertEqual(cpp_commands['modelPointLights.registered'], ('Hotkey','s'))
+        self.assertEqual(cpp_commands['unit.walkLoopEnabled'], ('Preloader','ib'))
 
         self.assertNotIn("JapiFunc", self.jass)
         self.assertNotRegex(self.jass, r"(?m)^\s*native\s+WarVK")
         jass_commands = {}
         public_functions = set()
+        all_jass_functions = set()
         for match in re.finditer(
             r"function\s+(WarVK\w+)\s+takes\b.*?\bendfunction",
             self.jass,
@@ -112,6 +114,7 @@ class WarVKJapiV1IntegratedStaticTests(unittest.TestCase):
         ):
             function_name = match.group(1)
             block = match.group(0)
+            all_jass_functions.add(function_name)
             command_match = re.search(r'"warvk:v1;([^"]+)"', block)
             if not command_match:
                 continue
@@ -133,7 +136,21 @@ class WarVKJapiV1IntegratedStaticTests(unittest.TestCase):
         ui_scripts = set(
             re.findall(r'(?m)^script = "(WarVK\w+)"$', self.action + self.call)
         )
-        self.assertTrue(ui_scripts.issubset(public_functions))
+        # GUI entries may also target JASS-only composition helpers. Only
+        # carrier wrappers must match the C++ command table one-to-one.
+        self.assertTrue(ui_scripts.issubset(all_jass_functions))
+        for name in (
+            "WarVKSetUnitWalkLoopEnabled",
+            "WarVKClearUnitMovementAnimationOverride",
+        ):
+            self.assertIn(f"[{name}]", self.action)
+            self.assertNotIn(f"[{name}]", self.call)
+        for name in (
+            "WarVKPlayUnitMovementAnimationOverride",
+            "WarVKPlayUnitMovementAnimationOverrideByIndex",
+        ):
+            self.assertIn(f"[{name}]", self.call)
+            self.assertNotIn(f"[{name}]", self.action)
         for hidden_until_implemented in (
             "WarVKSetOutlineEnabled",
             "WarVKSetOutlineColor",
@@ -163,6 +180,27 @@ class WarVKJapiV1IntegratedStaticTests(unittest.TestCase):
             "local_visual_only",
         ):
             self.assertNotIn(banned, combined)
+
+    def test_unit_walk_api_is_visible_without_an_environment_gate(self):
+        animation = (
+            ROOT / "src/d3d9/war3/game/war3_unit_animation_api.cpp"
+        ).read_text(encoding="utf-8")
+        hook = (ROOT / "src/d3d9/d3d9_war3_hook.cpp").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("DXVK_WAR3_UNIT_WALK_API", animation)
+        self.assertIn("InstallUnitWalkHook(gameInfo.base)", hook)
+        self.assertIn("kCUnitSetAnimationPropertyRva", animation)
+        self.assertIn("kWalkCallARva", animation)
+        self.assertIn("kWalkCallBRva", animation)
+        self.assertIn("TC_WarVKUnitAnimation=", self.define)
+        for name in (
+            "WarVKSetUnitWalkLoopEnabled",
+            "WarVKClearUnitMovementAnimationOverride",
+            "WarVKPlayUnitMovementAnimationOverride",
+            "WarVKPlayUnitMovementAnimationOverrideByIndex",
+        ):
+            self.assertIn(f'script = "{name}"', self.action + self.call)
 
     def test_ydwe_metadata_has_matching_arguments_and_hints(self):
         for kind, source in (("action", self.action), ("call", self.call)):
@@ -225,6 +263,7 @@ class WarVKJapiV1IntegratedStaticTests(unittest.TestCase):
             "kFeatureMathCurve",
             "kFeaturePolylineCurve",
             "kFeatureLocalFog",
+            "kFeatureUnitAnimation",
         ):
             self.assertIn(feature, implemented)
         for absent in (
@@ -239,6 +278,7 @@ class WarVKJapiV1IntegratedStaticTests(unittest.TestCase):
     def test_ydwe_categories_are_specific_and_root_is_system_only(self):
         for category in (
             "TC_WarVKDiagnostics",
+            "TC_WarVKUnitAnimation",
             "TC_WarVKSunShadow",
             "TC_WarVKLightingClock",
             "TC_WarVKPointLight",

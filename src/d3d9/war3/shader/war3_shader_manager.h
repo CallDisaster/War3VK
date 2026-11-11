@@ -93,7 +93,8 @@ namespace dxvk::war3 {
         void setGlobalMatrix(const std::string& name, const Matrix4& m);
         void setGlobalVertexRegisterAlias(const std::string& name, uint32_t reg);
         void setGlobalPixelRegisterAlias(const std::string& name, uint32_t reg);
-        void applyGlobalUniforms(D3D9DeviceEx* device) const;
+        // 只经公开的 D3D9 接口上传（S2 切口）；编译仍用 m_device。
+        void applyGlobalUniforms(IDirect3DDevice9* device) const;
         const ShaderConstantStore& getGlobalVertexConstants() const { return m_globalVsConstants; }
         const ShaderConstantStore& getGlobalPixelConstants() const { return m_globalPsConstants; }
         

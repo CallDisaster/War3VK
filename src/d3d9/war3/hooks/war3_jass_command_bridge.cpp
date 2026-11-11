@@ -1833,7 +1833,7 @@ JassCommandBridgeSelfTestResult RunJassCommandBridgeSelfTest(bool displayText) {
   }
   result.publicV1Ok =
       result.publicProtocolVersion == 1 &&
-      result.publicVersionText.find("WarVK JAPI 1.22.01") !=
+      result.publicVersionText.find("WarVK JAPI 1.22.02") !=
           std::string::npos;
 
   if (displayText) {

@@ -114,6 +114,51 @@ function WarVKIsRuntimeReady takes nothing returns boolean
     return GetLocalizedHotkey(payload) != 0
 endfunction
 
+// 1.27a 单位动画接口：只拦截游戏移动回调自动提交的 Walk；
+// 原版 SetUnitAnimation/SetUnitAnimationByIndex/QueueUnitAnimation 不变。
+// 不需要设置环境变量；不匹配已验证 Game.dll 的版本会保持原版行为并报告功能不可用。
+// 地图/JASS VM 复位自动清除；失效句柄不会静默绑定到新单位。
+// 单独关闭开关不会强制替换当前已经在播的 Walk；重新开启也只允许游戏下次移动更新自然选回 Walk。
+function WarVKSetUnitWalkLoopEnabled takes unit whichUnit, boolean enabled returns nothing
+    local string payload
+    if whichUnit == null then
+        return
+    endif
+    set payload = "warvk:v1;unit.walkLoopEnabled" + ";i:" + I2S(GetHandleId(whichUnit)) + ";b:" + WarVKBoolToken(enabled)
+    call Preloader(payload)
+endfunction
+
+// 原版播放接口的组合助手：先停止该单位移动时的自动 Walk 重选，再播放指定动画。
+// Override 在显式 Clear、地图切换或单位失效前保持；非循环动画结束后的画面
+// 由游戏本身决定，本接口不冻结动画时间，也不改变移动速度/路径/命令。
+function WarVKPlayUnitMovementAnimationOverride takes unit whichUnit, string animationName returns boolean
+    if whichUnit == null or animationName == null then
+        return false
+    endif
+    call WarVKSetUnitWalkLoopEnabled(whichUnit, false)
+    if WarVKGetLastErrorCode() != 0 then
+        return false
+    endif
+    call SetUnitAnimation(whichUnit, animationName)
+    return true
+endfunction
+
+function WarVKPlayUnitMovementAnimationOverrideByIndex takes unit whichUnit, integer sequenceIndex returns boolean
+    if whichUnit == null or sequenceIndex < 0 then
+        return false
+    endif
+    call WarVKSetUnitWalkLoopEnabled(whichUnit, false)
+    if WarVKGetLastErrorCode() != 0 then
+        return false
+    endif
+    call SetUnitAnimationByIndex(whichUnit, sequenceIndex)
+    return true
+endfunction
+
+function WarVKClearUnitMovementAnimationOverride takes unit whichUnit returns nothing
+    call WarVKSetUnitWalkLoopEnabled(whichUnit, true)
+endfunction
+
 // false 关闭太阳直射光及正常太阳阴影，不关闭环境光、点光或自发光。
 // 写入在下一渲染帧安全点生效；方向/颜色的手动控制还需关闭对应昼夜控制器。
 function WarVKSetSunEnabled takes boolean enabled returns nothing
@@ -354,6 +399,77 @@ endfunction
 function WarVKIsFogVolumeAlive takes integer fogId returns boolean
     local string payload = "warvk:v1;localFog.isAlive" + ";d:" + I2S(fogId)
     return GetLocalizedHotkey(payload) != 0
+endfunction
+
+// 室外暴风雪：最多一个受管实例、64个关键帧。创建时关闭；参数可在地图初始化时配置。
+// 风向为角度：0沿世界+X，90沿+Y；风速为世界单位/秒。接口不修改原版天气或游戏规则。
+function WarVKCreateSnowWeather takes integer seed returns integer
+    local string payload = "warvk:v1;weather.createSnow" + ";i:" + I2S(seed)
+    return GetLocalizedHotkey(payload)
+endfunction
+
+function WarVKDestroyWeather takes integer weatherId returns nothing
+    local string payload = "warvk:v1;weather.destroy" + ";d:" + I2S(weatherId)
+    call Preloader(payload)
+endfunction
+
+function WarVKIsWeatherAlive takes integer weatherId returns boolean
+    local string payload = "warvk:v1;weather.isAlive" + ";d:" + I2S(weatherId)
+    return GetLocalizedHotkey(payload) != 0
+endfunction
+
+// 区域为XY矩形和Z高度。最大值必须大于最小值；edgeFeather为0..0.5。
+function WarVKSetWeatherRegion takes integer weatherId, real minX, real minY, real maxX, real maxY, real bottomZ, real topZ, real edgeFeather returns nothing
+    local string payload = "warvk:v1;weather.setRegion" + ";d:" + I2S(weatherId) + ";r:" + R2S(minX) + ";r:" + R2S(minY) + ";r:" + R2S(maxX) + ";r:" + R2S(maxY) + ";r:" + R2S(bottomZ) + ";r:" + R2S(topZ) + ";r:" + R2S(edgeFeather)
+    call Preloader(payload)
+endfunction
+
+// false冻结演出时间并保留配置；true从保留时刻继续。
+function WarVKSetWeatherEnabled takes integer weatherId, boolean enabled returns nothing
+    local string payload = "warvk:v1;weather.setEnabled" + ";d:" + I2S(weatherId) + ";b:" + WarVKBoolToken(enabled)
+    call Preloader(payload)
+endfunction
+
+// 四个强度snowfall/gust/haze/lowSnow均为0..1；windSpeed为0..2048。
+// transitionSeconds为0..3600；设置目标会停止时间线，从当前天气平滑切入手动控制。
+function WarVKSetSnowWeatherTarget takes integer weatherId, real snowfall, real windAngle, real windSpeed, real gust, real haze, real lowSnow, real transitionSeconds returns nothing
+    local string payload = "warvk:v1;weather.setSnowTarget" + ";d:" + I2S(weatherId) + ";r:" + R2S(snowfall) + ";r:" + R2S(windAngle) + ";r:" + R2S(windSpeed) + ";r:" + R2S(gust) + ";r:" + R2S(haze) + ";r:" + R2S(lowSnow) + ";r:" + R2S(transitionSeconds)
+    call Preloader(payload)
+endfunction
+
+// 时间线播放期间不能编辑关键帧；先设置目标切回手动，再清除或添加。
+function WarVKClearWeatherKeyframes takes integer weatherId returns nothing
+    local string payload = "warvk:v1;weather.clearKeyframes" + ";d:" + I2S(weatherId)
+    call Preloader(payload)
+endfunction
+
+// 首关键帧必须为0秒，后续时间严格递增，0..86400；最后状态保持。
+function WarVKAddSnowWeatherKeyframe takes integer weatherId, real timeSeconds, real snowfall, real windAngle, real windSpeed, real gust, real haze, real lowSnow returns nothing
+    local string payload = "warvk:v1;weather.addSnowKeyframe" + ";d:" + I2S(weatherId) + ";r:" + R2S(timeSeconds) + ";r:" + R2S(snowfall) + ";r:" + R2S(windAngle) + ";r:" + R2S(windSpeed) + ";r:" + R2S(gust) + ";r:" + R2S(haze) + ";r:" + R2S(lowSnow)
+    call Preloader(payload)
+endfunction
+
+// 自动开启实例；从0..86400秒开始播放。音乐播放/暂停仍由原版声音函数协调。
+function WarVKPlayWeatherTimeline takes integer weatherId, real startSeconds returns nothing
+    local string payload = "warvk:v1;weather.playTimeline" + ";d:" + I2S(weatherId) + ";r:" + R2S(startSeconds)
+    call Preloader(payload)
+endfunction
+
+function WarVKSetWeatherPaused takes integer weatherId, boolean paused returns nothing
+    local string payload = "warvk:v1;weather.setPaused" + ";d:" + I2S(weatherId) + ";b:" + WarVKBoolToken(paused)
+    call Preloader(payload)
+endfunction
+
+// 跳转会重建天气历史；不是按过去的所有帧逐帧补算。
+function WarVKSetWeatherTime takes integer weatherId, real seconds returns nothing
+    local string payload = "warvk:v1;weather.setTime" + ";d:" + I2S(weatherId) + ";r:" + R2S(seconds)
+    call Preloader(payload)
+endfunction
+
+// 返回演出秒数；失败时返回0并保留错误码。该时钟与音乐播放位置由作者协调。
+function WarVKGetWeatherTime takes integer weatherId returns real
+    local string payload = "warvk:v1;weather.getTime" + ";d:" + I2S(weatherId)
+    return S2R(GetLocalizedString(payload))
 endfunction
 
 function WarVKSetOutlineEnabled takes boolean enabled returns nothing

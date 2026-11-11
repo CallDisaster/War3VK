@@ -34,6 +34,7 @@ PALETTE_OBJECT_FIRST_SIGHT_VERSION=3
 # 引入 `ObservationClosed=7`（Observation 链「观察已结算」，**不表示**阶段齐全），
 # 并（后续）把链型上 wire；v1/v2/v3 仍按各自契约解析，**不得**追溯套用 v4 的含义。
 PALETTE_OBJECT_CHAIN_TYPED_VERSION=4
+PALETTE_OBJECT_ATTEMPT_VERSION=5     # data[5] carries attemptSerial; U64_MAX = unknown
 PALETTE_OBJECT_VERSION_FIELD='version'
 PALETTE_OBJECT_LEGACY_BLOCK_FIELDS=frozenset({'watchCount','counters'})
 PALETTE_OBJECT_BLOCK_FIELDS={PALETTE_OBJECT_LEGACY_VERSION:
@@ -43,8 +44,10 @@ PALETTE_OBJECT_BLOCK_FIELDS={PALETTE_OBJECT_LEGACY_VERSION:
                              PALETTE_OBJECT_FIRST_SIGHT_VERSION:
                                  frozenset({'version','watchCount','counters'}),
                             # v4 与 v3 同字段集（链型**不在**头块字段里，而在记录的 `data[4]`；
-                            # 链型与尝试序号等字段**已随写方落地**，不得先登记后落空）。
+                            # v5 才把 data[5] 声明为尝试序号，头块字段集仍不变）。
                              PALETTE_OBJECT_CHAIN_TYPED_VERSION:
+                                 frozenset({'version','watchCount','counters'}),
+                             PALETTE_OBJECT_ATTEMPT_VERSION:
                                  frozenset({'version','watchCount','counters'})}
 FROZEN_EXTENSIONS={PALETTE_OBJECT_EXTENSION:tuple(sorted(PALETTE_OBJECT_BLOCK_FIELDS))}
 def require(ok,message):

@@ -5,6 +5,7 @@
 #include "d3d9_shader_validator.h"
 #include "war3/hooks/war3_hook_jass.h"
 #include "war3/platform/war3_native_device_resolver.h"
+#include "war3/platform/war3_startup_error.h"
 
 #include "d3d9_annotation.h"
 
@@ -26,8 +27,24 @@ HRESULT CreateD3D9(bool Extended, IDirect3D9Ex **ppDirect3D9Ex,
   if (!ppDirect3D9Ex)
     return D3DERR_INVALIDCALL;
 
-  *ppDirect3D9Ex =
-      ref(new D3D9InterfaceEx(Extended, pOverrideList, OverrideCount));
+  *ppDirect3D9Ex = nullptr;
+
+  // Errors here used to escape the extern "C" export and terminate the game
+  // without a word. Tell the player why, then fail the call normally.
+  try {
+    *ppDirect3D9Ex =
+        ref(new D3D9InterfaceEx(Extended, pOverrideList, OverrideCount));
+  } catch (const DxvkError &e) {
+    Logger::err(e.message());
+    war3::startup::ReportStartupFailure(war3::startup::FailureSite::Interface,
+                                        e.message());
+    return D3DERR_NOTAVAILABLE;
+  } catch (const std::exception &e) {
+    Logger::err(str::format("Direct3DCreate9: ", e.what()));
+    war3::startup::ReportStartupFailure(war3::startup::FailureSite::Interface,
+                                        e.what());
+    return D3DERR_NOTAVAILABLE;
+  }
   return D3D_OK;
 }
 } // namespace dxvk

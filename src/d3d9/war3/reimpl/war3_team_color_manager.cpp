@@ -13,7 +13,7 @@ War3TeamColorManager &War3TeamColorManager::Get() {
 
 War3TeamColorManager::~War3TeamColorManager() { Shutdown(); }
 
-HRESULT War3TeamColorManager::Initialize(D3D9DeviceEx *device) {
+HRESULT War3TeamColorManager::Initialize(IDirect3DDevice9 *device) {
   std::lock_guard<std::mutex> lock(m_mutex);
 
   if (m_device == device && m_isReady)

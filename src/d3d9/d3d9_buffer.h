@@ -25,6 +25,10 @@ namespace dxvk {
             UINT   SizeToLock,
             void** ppbData,
             DWORD  Flags) final {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+      // This public entry's own return address: the application's call site.
+      m_buffer.CensusLock(OffsetToLock, SizeToLock, Flags, __builtin_return_address(0));
+#endif
       return m_buffer.Lock(
         OffsetToLock,
         SizeToLock,
@@ -34,6 +38,9 @@ namespace dxvk {
     }
 
     HRESULT STDMETHODCALLTYPE Unlock() final {
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+      m_buffer.CensusUnlock();
+#endif
       return m_buffer.Unlock(reinterpret_cast<uintptr_t>(this));
     }
 

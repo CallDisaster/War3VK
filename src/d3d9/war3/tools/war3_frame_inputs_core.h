@@ -7,7 +7,7 @@ constexpr uint32_t BytesPerSlot = 256 * 1024;
 constexpr uint32_t DrawsPerSlot = 128;
 // Admission accounts for the complete lazily populated input pool, not just
 // the first 256-KiB buffer. Production asserts the metadata upper bound.
-constexpr uint32_t MaxDrawMetadataBytes = 1088; // Win32 Draw is 1040; round up to 64-byte units
+constexpr uint32_t MaxDrawMetadataBytes = 1472; // Includes owned native/final material facts; production size assertion below this cap.
 inline constexpr uint64_t HostPayloadBudgetForSlots(uint32_t slots) noexcept {
   return uint64_t(slots) *
     (BytesPerSlot + uint64_t(DrawsPerSlot) * MaxDrawMetadataBytes);

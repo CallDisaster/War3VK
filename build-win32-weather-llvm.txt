@@ -1,0 +1,21 @@
+[binaries]
+c = 'E:/Dev/Toolchains/warvk-rh0-llvm-mingw-20260616/portable/llvm-mingw-20260616-ucrt-x86_64/bin/i686-w64-mingw32-clang.exe'
+cpp = 'E:/Dev/Toolchains/warvk-rh0-llvm-mingw-20260616/portable/llvm-mingw-20260616-ucrt-x86_64/bin/i686-w64-mingw32-clang++.exe'
+ar = 'E:/Dev/Toolchains/warvk-rh0-llvm-mingw-20260616/portable/llvm-mingw-20260616-ucrt-x86_64/bin/llvm-ar.exe'
+strip = 'E:/Dev/Toolchains/warvk-rh0-llvm-mingw-20260616/portable/llvm-mingw-20260616-ucrt-x86_64/bin/llvm-strip.exe'
+windres = 'E:/Dev/Toolchains/warvk-rh0-llvm-mingw-20260616/portable/llvm-mingw-20260616-ucrt-x86_64/bin/i686-w64-mingw32-windres.exe'
+
+[properties]
+needs_exe_wrapper = false
+
+[host_machine]
+system = 'windows'
+cpu_family = 'x86'
+cpu = 'i686'
+endian = 'little'
+
+[built-in options]
+c_args = ['-IE:/Dev/Vulkan SDK/Include']
+cpp_args = ['-IE:/Dev/Vulkan SDK/Include']
+c_link_args = ['-LE:/Dev/Vulkan SDK/Lib32']
+cpp_link_args = ['-LE:/Dev/Vulkan SDK/Lib32']

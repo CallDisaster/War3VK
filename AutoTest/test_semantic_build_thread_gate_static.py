@@ -1801,19 +1801,28 @@ for _needle, _label in (
 #   ServedCandidate:  Entry::lastSource + Entry::lastHitKey
 #   Enqueued:         Entry::submitSource + Entry::submitHitKey + Entry::submitSelectionCleared
 #   Drawn:            Entry::drawSource + Entry::drawHitKey + Entry::drawSelectionCleared
+# v5 还须同 attempt 且最后推进仍是本阶段；R/S/E/D 中间有推进不得压缩成重复。
 # 计数契约：载荷等价 ⇒ m_counters.droppedDuplicatePerFrame++（按原样，不算损失）；
 #          载荷冲突 ⇒ m_counters.droppedPayloadConflict++（缺链必须可见；解析器列为损失）。
 D6_DEDUP_CASES = (
     ("void NoteReject(const PaletteObjectKey& key,", "Rejected",
-     r"if\s*\(\s*e->lastRejectReason\s*==\s*reason\s*\)"),
+     r"if\s*\(\s*e->lastRejectReason\s*==\s*reason\s*&&"
+     r"\s*e->lastRejectAttempt\s*==\s*frames\.attemptSerial\s*&&"
+     r"\s*e->recovery\.canCoalesce\(frames\.attemptSerial,\s*PaletteObjectStage::Rejected\)\s*\)"),
     ("void NoteServed(const PaletteObjectKey& key,", "ServedCandidate",
-     r"if\s*\(\s*e->lastSource\s*==\s*source\s*&&\s*e->lastHitKey\s*==\s*hitKey\s*\)"),
+     r"if\s*\(\s*e->lastSource\s*==\s*source\s*&&\s*e->lastHitKey\s*==\s*hitKey\s*&&"
+     r"\s*e->lastServedAttempt\s*==\s*frames\.attemptSerial\s*&&"
+     r"\s*e->recovery\.canCoalesce\(frames\.attemptSerial,\s*PaletteObjectStage::ServedCandidate\)\s*\)"),
     ("void NoteEnqueued(const PaletteObjectKey& key,", "Enqueued",
      r"if\s*\(\s*e->submitSource\s*==\s*source\s*&&\s*e->submitHitKey\s*==\s*hitKey\s*&&"
-     r"\s*e->submitSelectionCleared\s*==\s*selectionClearedByNativeOverride\s*\)"),
+     r"\s*e->submitSelectionCleared\s*==\s*selectionClearedByNativeOverride\s*&&"
+     r"\s*e->lastSubmitAttempt\s*==\s*frames\.attemptSerial\s*&&"
+     r"\s*e->recovery\.canCoalesce\(frames\.attemptSerial,\s*PaletteObjectStage::Enqueued\)\s*\)"),
     ("void NoteDrawn(const PaletteObjectKey& key,", "Drawn",
      r"if\s*\(\s*e->drawSource\s*==\s*source\s*&&\s*e->drawHitKey\s*==\s*hitKey\s*&&"
-     r"\s*e->drawSelectionCleared\s*==\s*selectionClearedByNativeOverride\s*\)"),
+     r"\s*e->drawSelectionCleared\s*==\s*selectionClearedByNativeOverride\s*&&"
+     r"\s*e->lastDrawAttempt\s*==\s*frames\.attemptSerial\s*&&"
+     r"\s*e->recovery\.canCoalesce\(frames\.attemptSerial,\s*PaletteObjectStage::Drawn\)\s*\)"),
 )
 _DUP_COUNTER = "m_counters.droppedDuplicatePerFrame++;"
 _CONFLICT_COUNTER = "m_counters.droppedPayloadConflict++;"
@@ -1841,6 +1850,63 @@ for _signature, _label, _payload_cond in D6_DEDUP_CASES:
         (_label, "11m(a): 冲突计数必须在等价重复计数之后（if / else 两分支）")
     assert re.search(r"\belse\b", _code[_dup_at:_conflict_at]), \
         (_label, "11m(a): 两个计数必须在同一 if/else 里（conflict 属于 else 分支）")
+    assert re.search(r"else\s*\{\s*m_counters\.droppedPayloadConflict\+\+;\s*"
+                     r"e->recovery\.invalid\s*=\s*true\s*;\s*\}\s*return\s*;",
+                     _code[_dup_at:]), \
+        (_label, "11m(a): 载荷/attempt/中间推进冲突须在同一 else 计损失并使当前证明失效")
+
+_COALESCE_CODE = strip_comments(extract_function(
+    RECORDER_H, "bool canCoalesce(uint64_t attempt, PaletteObjectStage stage) const noexcept {")[0])
+assert re.fullmatch(r"\{\s*return\s+serial\s*==\s*attempt\s*&&\s*lastStage\s*==\s*stage\s*;\s*\}",
+                    _COALESCE_CODE), \
+    "11m(a): 去重必须同时保留 attempt 与最后阶段，不能吞掉同帧 R→S/E/D→R 等回退"
+_RECOVERY_CODE = strip_comments(extract_function(
+    RECORDER_H, "void Observe(uint64_t attempt, PaletteObjectStage stage,")[0])
+assert re.search(r"if\s*\(attempt\s*==\s*~0ull\s*\|\|\s*serial\s*!=\s*attempt\)\s*\{\s*"
+                 r"\*this\s*=\s*\{\}\s*;\s*serial\s*=\s*attempt\s*;\s*\}\s*lastStage\s*=\s*stage\s*;",
+                 _RECOVERY_CODE), \
+    "11m(a): unknown 或 attempt 变化必须重置整份证明，且每次推进都记录最后阶段"
+assert re.search(r"invalid\s*\|=\s*selected\s*==\s*PaletteObjectSource::None\s*\|\|\s*"
+                 r"selected\s*==\s*PaletteObjectSource::Unknown\s*\|\|\s*hit\s*==\s*0u\s*\|\|\s*"
+                 r"cleared\s*\|\|\s*\(served\s*&&\s*\(selected\s*!=\s*source\s*\|\|\s*hit\s*!=\s*hitKey\)\)\s*;",
+                 _RECOVERY_CODE), \
+    "11m(a): 同 attempt 来源/hit/clear 错误必须 sticky invalid，后续重复不得覆盖为成功"
+assert re.search(r"invalid\s*\|=\s*\(stage\s*==\s*PaletteObjectStage::Enqueued\s*&&\s*!served\)\s*\|\|\s*"
+                 r"\(stage\s*==\s*PaletteObjectStage::Drawn\s*&&\s*\(!served\s*\|\|\s*!enqueued\)\)\s*;",
+                 _RECOVERY_CODE), \
+    "11m(a): 同 attempt 缺前段错误必须 sticky invalid"
+_COMPLETE_CODE = strip_comments(extract_function(RECORDER_H, "bool complete() const noexcept {")[0])
+assert re.fullmatch(r"\{\s*return\s+serial\s*!=\s*~0ull\s*&&\s*!invalid\s*&&\s*served\s*&&\s*"
+                   r"enqueued\s*&&\s*drawn\s*;\s*\}", _COMPLETE_CODE), \
+    "11m(a): 完整恢复须已知 attempt、未失效和该次 S/E/D，不能借累计 saw* 认证"
+for _signature, _stage in (
+        ("void NoteReject(const PaletteObjectKey& key,", "Rejected"),
+        ("void NoteFirstSight(const PaletteObjectKey& key,", "FirstSight"),
+        ("void NoteServed(const PaletteObjectKey& key,", "ServedCandidate"),
+        ("void NoteEnqueued(const PaletteObjectKey& key,", "Enqueued"),
+        ("void NoteDrawn(const PaletteObjectKey& key,", "Drawn")):
+    _attempt_call = r"e->recovery\.Observe\(frames\.attemptSerial,\s*PaletteObjectStage::" + _stage
+    if _stage in ("ServedCandidate", "Enqueued", "Drawn"):
+        _attempt_call += r",\s*source,\s*hitKey"
+    if _stage in ("Enqueued", "Drawn"):
+        _attempt_call += r",\s*selectionClearedByNativeOverride"
+    assert re.search(_attempt_call + r"\)\s*;", strip_comments(effective_body(_signature))), \
+        ("11m(a): 每个真实阶段必须把原始 attempt/来源/hit/clear 交给该次证明", _stage)
+assert re.search(r"closedChain\s*=\s*hasRejectFact\s*&&\s*e\.recovery\.complete\(\)\s*&&",
+                 CLOSE_WINDOW_CODE), \
+    "11m(a): 终态 Recovered 必须实际接入本 attempt 证明，不得仅保留未使用 helper"
+for _signature, _entry in (("void CloseWindow(uint64_t frame) {", r"e\."),
+                            ("void SettleObjectGone(Entry* e) {", r"e->")):
+    _terminal_code = strip_comments(extract_function(RECORDER_H, _signature)[0])
+    assert re.search(r"record\.frames\.attemptSerial\s*=\s*" + _entry + r"recovery\.serial\s*;",
+                     _terminal_code), \
+        ("11m(a): 两条终态路径须携带当前 attempt，不能沿用首帧 attempt", _signature)
+    for _record_field, _draw_field in (("source", "drawSource"), ("hitKey", "drawHitKey"),
+                                       ("selectionClearedByNativeOverride", "drawSelectionCleared")):
+        assert re.search(r"record\." + _record_field + r"\s*=\s*" + _entry +
+                         r"recovery\." + _draw_field + r"\s*;", _terminal_code), \
+            ("11m(a): 终态 D 载荷须属于当前 attempt，不得沿用更早 attempt 的累计 D", _signature,
+             _record_field)
 
 # 11m(b) 计数本体 + 导出链：记录器 Counters 字段、导出头块的规范十进制字符串。
 assert re.search(r"uint64_t\s+droppedPayloadConflict\s*=\s*0u\s*;", RECORDER_H), \
@@ -2075,11 +2141,13 @@ assert _frame_reader.analyze(_extension_root(1))['extensions'] == {'paletteObjec
 assert _frame_reader.analyze(_extension_root(3))['extensions'] == {'paletteObject': 3}, \
     '11p: 显式 version=3 必须被接受并上报'
 # 2026-09-18 阶段 C：4 也已成为**已登记**版本（v4 = 链型 + ObservationClosed）⇒
-# 从非法列表中移除 4、改用真正未登记的 5，并新增 v4 的**正向见证**（与 v3 对称）。
+# 从非法列表移除已登记版本，并为每个版本保留正向见证。
 # **要求未变**：未登记版本必须被拒绝；已登记版本必须被接受并上报。
 assert _frame_reader.analyze(_extension_root(4))['extensions'] == {'paletteObject': 4}, \
     '11p: 显式 version=4 必须被接受并上报'
-for _bad in (0, 5, 7, 99, -1, '2', 2.0, True):
+assert _frame_reader.analyze(_extension_root(5))['extensions'] == {'paletteObject': 5}, \
+    '11p: 显式 version=5 必须被接受并上报'
+for _bad in (0, 6, 7, 99, -1, '2', 2.0, True):
     try:
         _frame_reader.analyze(_extension_root(_bad))
     except ValueError:
@@ -2155,11 +2223,15 @@ assert 15 not in _palette_analyzer.reserved_bit_indices(2), \
 # 运行期反例（修前/修后同一份夹具）：同键 + Reset 前后各一条完整链。
 _palette_fixture = __import__('test_palette_object_evidence_analysis_static')
 _window_one = _palette_fixture.segment_chain_events(part=1, segment=1, sequence_base=1,
-                                                    frame_base=500, chain_sequence_base=1)
+                                                    frame_base=500, chain_sequence_base=1,
+                                                    format_version=5)
 _window_two = _palette_fixture.segment_chain_events(part=1, segment=2, sequence_base=6,
-                                                    frame_base=700, chain_sequence_base=1)
+                                                    frame_base=700, chain_sequence_base=1,
+                                                    format_version=5)
 _segmented = _palette_analyzer.analyze(_palette_fixture.envelope(
-    _window_one + _window_two, format_version=2))
+    _window_one + _window_two, format_version=5))
+assert _segmented['formatVersion'] == 5 and _segmented['attemptSerialCarried'], \
+    '11q: 认证正例必须显式携带 v5 attempt，构造器与导出根版本一致'
 assert _segmented['objectCount'] == 2 and _segmented['windowSegments'] == [1, 2], \
     ('11q: 同键不同窗口必须分成两条链', _segmented['objectCount'], _segmented['windowSegments'])
 assert len(_segmented['recovered']) == 2 and all(
@@ -2168,10 +2240,13 @@ assert len(_segmented['recovered']) == 2 and all(
 assert [chain['windowSegment'] for chain in _segmented['chains']] == [1, 2], \
     '11q: 每条链必须如实报告自己的分段量'
 # 同键但**没有**分段量（旧合同）：必须 fail-closed（整份导出被拒），绝不按顺序启发式拆分。
-_legacy_one = _palette_fixture.closed_chain_events(part=1, sequence_base=1, frame_base=500)
-_legacy_two = _palette_fixture.closed_chain_events(part=1, sequence_base=6, frame_base=700)
+_legacy_one = _palette_fixture.closed_chain_events(part=1, sequence_base=1, frame_base=500,
+                                                 format_version=1)
+_legacy_two = _palette_fixture.closed_chain_events(part=1, sequence_base=6, frame_base=700,
+                                                 format_version=1)
 try:
-    _palette_analyzer.analyze(_palette_fixture.envelope(_legacy_one + _legacy_two))
+    _palette_analyzer.analyze(_palette_fixture.envelope(_legacy_one + _legacy_two,
+                                                       format_version=1))
 except ValueError:
     pass
 else:
@@ -2179,14 +2254,15 @@ else:
 # 版本 2 缺少分段量（全 0）必须被拒。
 try:
     _palette_analyzer.analyze(_palette_fixture.envelope(
-        _palette_fixture.segment_chain_events(segment=0), format_version=2))
+        _palette_fixture.segment_chain_events(segment=0, format_version=2), format_version=2))
 except ValueError:
     pass
 else:
     raise AssertionError('11q: 版本 2 缺分段量必须被拒（不得退化成猜）')
 # 版本 2 未载明身份证明：阶段观察可以完整，但**不得**认证同对象恢复。
 _unproven = _palette_analyzer.analyze(_palette_fixture.envelope(
-    _palette_fixture.segment_chain_events(segment=1, identity_proof=0), format_version=2))
+    _palette_fixture.segment_chain_events(segment=1, identity_proof=0, format_version=2),
+    format_version=2))
 assert _unproven['recovered'] == [] and \
        'identityNotProven' in _unproven['chains'][0]['certificationRefusals'], \
     '11q/11p: identityWeak 的 0 本身不足以认证同对象恢复'
@@ -2287,11 +2363,15 @@ assert _sink_bits_written | set(_palette_analyzer.reserved_bit_indices()) == set
     "11r(d): words32 槽位必须恰好被「写入 ∪ 版本 1 保留零」铺满（其余保留位不得被写）"
 assert 3 in _sink_data_written and 15 in _sink_bits_written, \
     "11r(d): 两个版本 2 载体必须由生产转换点写入"
-assert _sink_data_written == {0, 1, 2, 3, 4, 9, 10, 11} and \
+assert _sink_data_written == {0, 1, 2, 3, 4, 5, 9, 10, 11} and \
        _sink_bits_written == {0, 1, 2, 5, 10, 12, 14, 15, 16, 18, 20, 21, 22, 23, 24, 25, 26, 27,
                               28, 29, 30, 31, 32, 33}, \
     ("11r(d): 转换点的写入集合不得新增未登记的槽位",
      sorted(_sink_data_written), sorted(_sink_bits_written))
+assert 'event.data[5] = record.frames.attemptSerial;' in _ENCODER_CODE_11R and \
+       set(_palette_analyzer.reserved_data_indices(5)) == {6, 7, 8} and \
+       5 in _palette_analyzer.reserved_data_indices(4), \
+    '11r(d): v5 唯一新增载体为record级attemptSerial；旧v4仍保留data[5]'
 assert 3 not in _palette_analyzer.reserved_data_indices(2) and \
        15 not in _palette_analyzer.reserved_bit_indices(2) and \
        3 in _palette_analyzer.reserved_data_indices(1) and \
@@ -2301,11 +2381,11 @@ assert 3 not in _palette_analyzer.reserved_data_indices(2) and \
 # 2026-09-18 批次 3（外部独立复审批定）：正常观察链引入阶段 FirstSight(5)，写方据此按
 # `firstSightUsed() ? 3 : 2` 抬版本；未使用首见链的导出仍是版本 2（旧读方行为一位不变）。
 # 因此本断言接受「字面 2」或「条件表达式 3:2」两种显式写法；下面的 version=1 仍被拒绝。
-# 阶段 C（2026-09-18）：写方改为**恒定 v4**。版本是契约，不再按 firstSightUsed() 动态选择，
-# 因此本断言由「字面 2 或条件表达式 3:2」收紧为「**必须恰好** version=4」，
+# v5：写方恒定声明attemptSerial载体。版本是契约，不按 firstSightUsed() 动态选择，
+# 因此本断言必须恰好 version=5，旧v4不可冒充带attempt的格式，
 # 并**显式禁止**动态选择回归 —— 比原断言更强，不是放宽。
-assert re.search(r'result\["version"\]\s*=\s*4\s*;', HEADER_JSON_CODE), \
-    "11r(d): 头块必须**恒定**写 version=4（阶段 C 的链型 + ObservationClosed 契约）"
+assert re.search(r'result\["version"\]\s*=\s*5\s*;', HEADER_JSON_CODE), \
+    "11r(d): 头块必须恒定写 version=5（v4链型/终态 + attemptSerial）"
 assert not re.search(
         r'result\["version"\]\s*=\s*PaletteObjectRecorder\(\)\.firstSightUsed\(\)',
         HEADER_JSON_CODE), \
@@ -2344,8 +2424,10 @@ for _needle, _label in (
          "往返编排测试必须按声明后的语义断言 words32[15] == identityProofKind"),
         ("must carry the record-level window segment",
          "往返编排测试必须在解析器结果上断言分段量"),
-        ("the production export must declare extension version 2",
-         "往返编排测试必须钉死生产导出 = 版本 2"),
+        ("check(expected_version == 5 and frame_evidence.PALETTE_OBJECT_ATTEMPT_VERSION == 5,",
+         "往返编排测试必须钉死生产导出 = 版本 5"),
+        ('block.get("version") == expected_version,',
+         "往返编排测试必须把实际导出头与钉死的版本 5 比较"),
         ("identityProven must follow the *declared* proof",
          "往返编排测试必须钉死 identityProven 只由**载明的**证明决定"),
         ("CERTIFIED_LIFECYCLE_IDENTITY",
@@ -2358,8 +2440,15 @@ assert "data[3..8] reserved must be zero" not in ROUNDTRIP_CPP, \
     "11r: 往返夹具不得再断言 data[3..8] 全为保留零（data[3] 已是声明后的语义）"
 assert "bits[15] reserved must be zero" not in ROUNDTRIP_CPP, \
     "11r: 往返夹具不得再断言 words32[15] 为保留零（它已是声明后的语义）"
-assert "data[3..8] reserved (0)" in ANALYZER, \
-    "11r: palette 读方 docstring 必须仍然描述旧合同的 data[3..8] 保留形状（版本 1 不放宽）"
+assert "data[5]  attemptSerial (v5+, U64_MAX unknown)" in ANALYZER and \
+       "data[6..8] reserved (0)" in ANALYZER and \
+       "Earlier versions require zero in slots not yet introduced by that version." in ANALYZER, \
+    "11r: palette 读方必须说明 v5 attempt 槽及旧版本未声明槽仍保留零"
+for _version, _reserved in ((1, set(range(3, 9))), (2, set(range(4, 9))),
+                             (3, set(range(4, 9))), (4, set(range(5, 9))),
+                             (5, set(range(6, 9)))):
+    assert set(_palette_analyzer.reserved_data_indices(_version)) == _reserved, \
+        ("11r: 各旧版本保留零域不得被 v5 放宽", _version, _reserved)
 
 print("semantic build thread gate static checks passed")
 

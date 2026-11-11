@@ -6,6 +6,30 @@ category = "TC_WarVK"
 script = "WarVKGetVersion"
 returns = string
 
+[WarVKPlayUnitMovementAnimationOverride]
+title = "移动中播放指定动画"
+description = "单位 ${whichUnit} 移动中播放动画 ${animationName}，并暂停自动 Walk；返回是否已发出播放请求。"
+comment = "先关闭该单位的自动 Walk 重选，再调用原版 SetUnitAnimation。返回 true 只表示请求已发出，不保证动画存在、循环或始终可见；结束后调用恢复动作。"
+category = "TC_WarVKUnitAnimation"
+script = "WarVKPlayUnitMovementAnimationOverride"
+returns = boolean
+[[.args]]
+type = unit
+[[.args]]
+type = string
+
+[WarVKPlayUnitMovementAnimationOverrideByIndex]
+title = "移动中按序号播放动画"
+description = "单位 ${whichUnit} 移动中播放序号 ${sequenceIndex} 的动画，并暂停自动 Walk；返回是否已发出播放请求。"
+comment = "先关闭该单位的自动 Walk 重选，再调用原版 SetUnitAnimationByIndex。返回 true 不证明序号有效或动画实际显示；结束后调用恢复动作。"
+category = "TC_WarVKUnitAnimation"
+script = "WarVKPlayUnitMovementAnimationOverrideByIndex"
+returns = boolean
+[[.args]]
+type = unit
+[[.args]]
+type = integer
+
 [WarVKGetProtocolVersion]
 title = "获取协议版本"
 description = "返回协议版本整数。"
@@ -499,5 +523,35 @@ returns = integer
 type = integer
 [[.args]]
 type = integer
+[[.args]]
+type = integer
+
+[WarVKCreateSnowWeather]
+title = "创建暴风雪"
+description = "使用随机种子 ${seed} 创建暴风雪实例并返回 weatherId。"
+comment = "最多一个实例，初始关闭；失败返回0并设置最后错误。可在地图初始化时配置，随后设置区域并开启或播放时间线。"
+category = "TC_WarVKWeather"
+script = "WarVKCreateSnowWeather"
+returns = integer
+[[.args]]
+type = integer
+
+[WarVKIsWeatherAlive]
+title = "查询天气有效"
+description = "查询天气 ${weatherId} 是否仍有效。"
+comment = "使用创建返回的正整数；销毁或换图后旧句柄无效。错误可查询最后错误码。"
+category = "TC_WarVKWeather"
+script = "WarVKIsWeatherAlive"
+returns = boolean
+[[.args]]
+type = integer
+
+[WarVKGetWeatherTime]
+title = "获取天气演出时间"
+description = "返回天气 ${weatherId} 当前的演出秒数。"
+comment = "暂停或关闭时冻结；失败返回0并设置最后错误。该时钟不读取音频设备播放位置，仅用于表现和调试。"
+category = "TC_WarVKWeather"
+script = "WarVKGetWeatherTime"
+returns = real
 [[.args]]
 type = integer

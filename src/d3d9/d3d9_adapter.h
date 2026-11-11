@@ -24,6 +24,12 @@ namespace dxvk {
             UINT             Ordinal,
             UINT             DisplayIndex);
 
+    // Render-host metadata owner. It owns an immutable options snapshot and
+    // has no D3D9 device, Game.dll or parent COM dependency. Native factories
+    // keep their existing live parent policy, including D3D8 mode changes.
+    D3D9Adapter(const D3D9Options& options, bool extended, bool d3d8Compatible,
+      Rc<DxvkAdapter> adapter, UINT ordinal, UINT displayIndex);
+
     HRESULT GetAdapterIdentifier(
             DWORD                   Flags,
             D3DADAPTER_IDENTIFIER9* pIdentifier);
@@ -137,7 +143,11 @@ namespace dxvk {
 
     void CacheIdentifierInfo();
 
-    D3D9InterfaceEx*              m_parent;
+    D3D9InterfaceEx*              m_parent = nullptr;
+    std::unique_ptr<D3D9Options>  m_hostOptions;
+    bool m_hostExtended = false;
+    bool m_hostD3D8Compatible = false;
+    const D3D9Options& GetOptions() const;
 
     Rc<DxvkAdapter>               m_adapter;
     UINT                          m_ordinal;

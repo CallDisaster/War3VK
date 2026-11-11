@@ -55,6 +55,11 @@ namespace dxvk::vk {
   }
 
   PFN_vkVoidFunction LibraryLoader::sym(VkInstance instance, const char* name) const {
+    // No Vulkan runtime installed: the function tables are still built,
+    // so resolve to null and let the instance report the missing loader.
+    if (!m_getInstanceProcAddr)
+      return nullptr;
+
     return m_getInstanceProcAddr(instance, name);
   }
 

@@ -47,12 +47,26 @@ namespace dxvk {
     CacheIdentifierInfo();
     // D3D9VkFormatTable needs to be constructed after we've cached the
     // identifier info and determined the proper vendorID to be used.
-    m_d3d9Formats = std::make_unique<D3D9VkFormatTable>(this, Adapter, m_parent->GetOptions());
+    m_d3d9Formats = std::make_unique<D3D9VkFormatTable>(this, Adapter, GetOptions());
 
     if (p9On12Args)
       m_9On12Args = *p9On12Args;
   }
 
+
+  D3D9Adapter::D3D9Adapter(const D3D9Options& options, bool extended,
+      bool d3d8Compatible, Rc<DxvkAdapter> adapter, UINT ordinal, UINT displayIndex)
+  : m_hostOptions(std::make_unique<D3D9Options>(options)),
+    m_hostExtended(extended), m_hostD3D8Compatible(d3d8Compatible),
+    m_adapter(adapter), m_ordinal(ordinal), m_displayIndex(displayIndex),
+    m_modeCacheFormat(D3D9Format::Unknown) {
+    CacheIdentifierInfo();
+    m_d3d9Formats = std::make_unique<D3D9VkFormatTable>(this, adapter, GetOptions());
+  }
+
+  const D3D9Options& D3D9Adapter::GetOptions() const {
+    return m_parent ? m_parent->GetOptions() : *m_hostOptions;
+  }
 
   template <size_t N>
   static void copyToStringArray(char (&dst)[N], const char* src) {
@@ -83,7 +97,7 @@ namespace dxvk {
     pIdentifier->VendorId               = m_vendorId;
     pIdentifier->Revision               = 0;
     pIdentifier->SubSysId               = 0;
-    pIdentifier->WHQLLevel              = m_parent->IsExtended() ? 1 : 0; // This doesn't check with the driver on Direct3D9Ex and is always 1.
+    pIdentifier->WHQLLevel              = IsExtended() ? 1 : 0; // This doesn't check with the driver on Direct3D9Ex and is always 1.
     pIdentifier->DriverVersion.QuadPart = INT64_MAX;
 
     return D3D_OK;
@@ -120,7 +134,7 @@ namespace dxvk {
     if (!IsSupportedAdapterFormat(AdapterFormat))
       return D3DERR_NOTAVAILABLE;
 
-    const bool isD3D8Compatible = m_parent->IsD3D8Compatible();
+    const bool isD3D8Compatible = IsD3D8Compatible();
     const bool isNvidia         = m_vendorId == uint32_t(DxvkGpuVendor::Nvidia);
     const bool isAmd            = m_vendorId == uint32_t(DxvkGpuVendor::Amd);
 
@@ -147,7 +161,7 @@ namespace dxvk {
     if (rt && volumeTexture)
       return D3DERR_NOTAVAILABLE;
 
-    if (unlikely(rt && CheckFormat == D3D9Format::A8 && m_parent->GetOptions().disableA8RT))
+    if (unlikely(rt && CheckFormat == D3D9Format::A8 && GetOptions().disableA8RT))
       return D3DERR_NOTAVAILABLE;
 
     // NULL RT format hack (supported across all
@@ -350,15 +364,15 @@ namespace dxvk {
       return D3DERR_INVALIDCALL;
 
     if (unlikely(DeviceType == D3DDEVTYPE_SW)) {
-      if (m_parent->IsD3D8Compatible())
+      if (IsD3D8Compatible())
         return D3DERR_INVALIDCALL;
       else
         return D3DERR_NOTAVAILABLE;
     }
 
-    auto& options = m_parent->GetOptions();
+    auto& options = GetOptions();
 
-    const uint32_t maxShaderModel = m_parent->IsD3D8Compatible() ? std::min(1u, options.shaderModel) : options.shaderModel;
+    const uint32_t maxShaderModel = IsD3D8Compatible() ? std::min(1u, options.shaderModel) : options.shaderModel;
     const auto& limits = m_adapter->deviceProperties().core.properties.limits;
 
     // TODO: Actually care about what the adapter supports here.
@@ -477,7 +491,7 @@ namespace dxvk {
                                     | D3DPBLENDCAPS_BLENDFACTOR;
 
     // Only 9Ex devices advertise D3DPBLENDCAPS_SRCCOLOR2 and D3DPBLENDCAPS_INVSRCCOLOR2
-    if (m_parent->IsExtended())
+    if (IsExtended())
       pCaps->SrcBlendCaps          |= D3DPBLENDCAPS_SRCCOLOR2
                                     | D3DPBLENDCAPS_INVSRCCOLOR2;
 
@@ -828,12 +842,12 @@ namespace dxvk {
 
 
   bool D3D9Adapter::IsExtended() const {
-    return m_parent->IsExtended();
+    return m_parent ? m_parent->IsExtended() : m_hostExtended;
   }
 
 
   bool D3D9Adapter::IsD3D8Compatible() const {
-    return m_parent->IsD3D8Compatible();
+    return m_parent ? m_parent->IsD3D8Compatible() : m_hostD3D8Compatible;
   }
 
 
@@ -888,7 +902,7 @@ namespace dxvk {
     if (!IsSupportedModeFormat(Format))
       return;
 
-    auto& options = m_parent->GetOptions();
+    auto& options = GetOptions();
 
     // Filter the modes considering the config option filters.
     FilterModesByFormat(Format, true);
@@ -921,7 +935,7 @@ namespace dxvk {
   void D3D9Adapter::FilterModesByFormat(
        D3D9Format Format,
        const bool ApplyOptionsFilters) {
-    auto& options = m_parent->GetOptions();
+    auto& options = GetOptions();
 
     const auto forcedRatio = Ratio<DWORD>(options.forceAspectRatio);
 
@@ -987,7 +1001,7 @@ namespace dxvk {
 
 
   void D3D9Adapter::CacheIdentifierInfo() {
-    auto& options = m_parent->GetOptions();
+    auto& options = GetOptions();
 
     const auto& props = m_adapter->deviceProperties();
 

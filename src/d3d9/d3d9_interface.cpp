@@ -5,6 +5,7 @@
 #include "d3d9_device.h"
 #include "d3d9_bridge.h"
 #include "d3d9_war3_hook.h"
+#include "war3/platform/war3_startup_error.h"
 
 #include "../util/util_singleton.h"
 
@@ -460,37 +461,39 @@ namespace dxvk {
       TraceD3D9Interface("create-dxvk-device-end", traceOrdinal, dxvkDevice.ptr());
 
       TraceD3D9Interface("device-ctor-begin", traceOrdinal, this);
-      auto* device = new D3D9DeviceEx(
+      // InitialReset creates device-owned children via public D3D9 APIs.
+      // Keep a real public owner while those temporary references come/go.
+      Com<D3D9DeviceEx> device = new D3D9DeviceEx(
         this,
         adapter,
         DeviceType,
         hFocusWindow,
         BehaviorFlags,
         dxvkDevice);
-      TraceD3D9Interface("device-ctor-end", traceOrdinal, device);
+      TraceD3D9Interface("device-ctor-end", traceOrdinal, device.ptr());
 
-      TraceD3D9Interface("initial-reset-begin", traceOrdinal, device);
+      TraceD3D9Interface("initial-reset-begin", traceOrdinal, device.ptr());
       hr = device->InitialReset(pPresentationParameters, pFullscreenDisplayMode);
-      TraceD3D9Interface("initial-reset-end", traceOrdinal, device);
+      TraceD3D9Interface("initial-reset-end", traceOrdinal, device.ptr());
 
       if (unlikely(FAILED(hr))) {
-        // D3D9DeviceEx 是 refCount==0 构造的 ComObject，此失败路径上尚未被任何
-        // ref()/Com<> 持有；InitialReset 失败（交换链创建/显存不足等）若直接
-        // return 会连同其 Rc<DxvkDevice>、adapter 引用整体泄漏。上游用
-        // Com<D3D9DeviceEx> RAII 持有，本改写版丢了 RAII，这里显式补 delete。
-        delete device;
         return hr;
       }
 
-      *ppReturnedDeviceInterface = ref(device);
-      
       // Install War3 Hooks immediately after device creation
-      TraceD3D9Interface("install-hooks-begin", traceOrdinal, device);
-      War3Hook::InstallHooks(device);
-      TraceD3D9Interface("install-hooks-end", traceOrdinal, device);
+      TraceD3D9Interface("install-hooks-begin", traceOrdinal, device.ptr());
+      War3Hook::InstallHooks(device.ptr());
+      TraceD3D9Interface("install-hooks-end", traceOrdinal, device.ptr());
+      *ppReturnedDeviceInterface = device.ref();
     }
     catch (const DxvkError& e) {
       Logger::err(e.message());
+      war3::startup::ReportStartupFailure(war3::startup::FailureSite::Device, e.message());
+      return D3DERR_NOTAVAILABLE;
+    }
+    catch (const std::exception& e) {
+      Logger::err(str::format("CreateDevice: ", e.what()));
+      war3::startup::ReportStartupFailure(war3::startup::FailureSite::Device, e.what());
       return D3DERR_NOTAVAILABLE;
     }
 

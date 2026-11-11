@@ -49,6 +49,7 @@ globals
     constant integer WARVK_FEATURE_MATH_CURVE = 8192
     constant integer WARVK_FEATURE_POLYLINE_CURVE = 16384
     constant integer WARVK_FEATURE_LOCAL_FOG = 32768
+    constant integer WARVK_FEATURE_WEATHER = 131072
     // 体积光后端。LEGACY 是当前发布兼容路径；FROXEL_* 为 2.0 候选。
     constant integer WARVK_VOLUMETRIC_BACKEND_LEGACY = 0
     constant integer WARVK_VOLUMETRIC_BACKEND_FROXEL_MEDIUM = 1
@@ -69,6 +70,7 @@ globals
     constant integer WARVK_OBJECT_POINT_LIGHT = 1
     constant integer WARVK_OBJECT_LIGHTNING = 2
     constant integer WARVK_OBJECT_LOCAL_FOG = 3
+    constant integer WARVK_OBJECT_WEATHER = 4
 
     // 闪电模板渲染模式。渲染器始终关闭深度写入；
     // 模式 1/3 仅开启相对场景的深度测试。

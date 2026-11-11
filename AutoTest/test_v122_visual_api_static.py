@@ -59,7 +59,9 @@ class VisualApiContracts(unittest.TestCase):
         cpp = read("src/d3d9/d3d9_war3_volumetric_light.cpp")
         self.assertIn('env::getEnvVar("DXVK_WAR3_VISUAL_API_DIAGNOSTICS") == "1"', cpp)
         witness = cpp[cpp.index("class VolumetricExecutionWitness"):cpp.index("class VolumetricExecutionWitness") + 700]
-        self.assertLess(witness.index("if (!enabled)"), witness.index("std::lock_guard"))
+        self.assertLess(witness.index("if (!enabled && !m_weatherOnly)"), witness.index("std::lock_guard"))
+        self.assertIn("g_volumetricExecutionDiagnostics", witness)
+        self.assertIn("g_weatherVolumeDiagnostics", witness)
         self.assertIn("outEffectiveBackend = static_cast<int32_t>(settings.quality)", cpp)
         self.assertIn("outEffectiveBackend = 0;", cpp)
         self.assertIn("execution.compositeSubmitted = true", cpp)

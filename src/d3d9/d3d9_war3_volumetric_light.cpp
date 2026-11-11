@@ -6,6 +6,7 @@
 #include "d3d9_war3_shadow.h"
 #include "war3/core/war3_internal_test_config.h"
 #include "war3/render/war3_hybrid_ray_tracing.h"
+#include "war3/tools/war3_perf_monitor.h"
 
 #include "../dxvk/dxvk_access.h"
 #include "../dxvk/dxvk_device.h"
@@ -23,7 +24,9 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstddef>
 #include <mutex>
+#include <new>
 #include <utility>
 
 namespace dxvk {
@@ -89,24 +92,34 @@ constexpr uint32_t kVolumetricDirectionalGuideTargetDivisor = 2u;
 constexpr uint64_t kVolumetricDirectionalGuideCellBudget = 100'000'000ull;
 constexpr uint64_t kVolumetricDirectionalGuideTraversalBudget =
     350'000'000ull;
+// Weather owns an independent Medium grid, two full-resolution copies and a
+// divisor-8 effect. Its nominal images/buffers must fit this additional cap.
+constexpr uint64_t kWeatherVolumeResourceBudget = 128u * 1024u * 1024u;
 constexpr uint32_t kVolumetricDirectionalGuideMinTraversalSteps = 64u;
 constexpr uint32_t kVolumetricDirectionalGuideMaxTraversalSteps = 1024u;
 
 std::mutex g_volumetricShaderWorkDiagnosticsMutex;
 War3VolumetricExecutionDiagnostics g_volumetricExecutionDiagnostics;
+War3VolumetricExecutionDiagnostics g_weatherVolumeDiagnostics;
 
 class VolumetricExecutionWitness {
 public:
+  explicit VolumetricExecutionWitness(bool weatherOnly = false)
+      : m_weatherOnly(weatherOnly) { }
   War3VolumetricExecutionDiagnostics value;
   ~VolumetricExecutionWitness() {
     static const bool enabled =
         env::getEnvVar("DXVK_WAR3_VISUAL_API_DIAGNOSTICS") == "1";
-    if (!enabled)
+    if (!enabled && !m_weatherOnly)
       return;
     std::lock_guard<std::mutex> lock(g_volumetricShaderWorkDiagnosticsMutex);
-    value.observedFrames = g_volumetricExecutionDiagnostics.observedFrames + 1u;
-    g_volumetricExecutionDiagnostics = value;
+    auto& target = m_weatherOnly ? g_weatherVolumeDiagnostics
+                                : g_volumetricExecutionDiagnostics;
+    value.observedFrames = target.observedFrames + 1u;
+    target = value;
   }
+private:
+  bool m_weatherOnly;
 };
 War3VolumetricShaderWorkRuntimeDiagnostics
     g_volumetricShaderWorkRuntimeDiagnostics = {};
@@ -203,6 +216,10 @@ struct VolumetricFogVolumeUniform {
     // z=normalized edge feather, w=reserved.
     Vector4 params;
   } volumes[kVolumetricMaxFogVolumes] = {};
+  Vector4 weatherMin = Vector4(0.0f);
+  Vector4 weatherMax = Vector4(0.0f);
+  Vector4 weatherControls = Vector4(0.0f);
+  Vector4 weatherMotion = Vector4(0.0f);
 };
 
 struct VolumetricCompositePushConstants {
@@ -261,8 +278,12 @@ struct VolumetricFroxelIntegratePushConstants {
 };
 static_assert(sizeof(VolumetricPointLightUniform) == 800u,
               "VolumetricPointLightUniform GLSL ABI drift");
-static_assert(sizeof(VolumetricFogVolumeUniform) == 528u,
+static_assert(sizeof(VolumetricFogVolumeUniform) == 592u,
               "VolumetricFogVolumeUniform GLSL ABI drift");
+static_assert(offsetof(VolumetricFogVolumeUniform, weatherMin) == 528u);
+static_assert(offsetof(VolumetricFogVolumeUniform, weatherMax) == 544u);
+static_assert(offsetof(VolumetricFogVolumeUniform, weatherControls) == 560u);
+static_assert(offsetof(VolumetricFogVolumeUniform, weatherMotion) == 576u);
 static_assert(sizeof(VolumetricCompositePushConstants) == 80u,
               "VolumetricCompositePushConstants GLSL ABI drift");
 static_assert(sizeof(VolumetricFroxelInjectPushConstants) == 80u,
@@ -552,14 +573,22 @@ War3VolumetricExecutionDiagnostics QueryWar3VolumetricExecutionDiagnostics() {
   return g_volumetricExecutionDiagnostics;
 }
 
+War3VolumetricExecutionDiagnostics QueryWar3WeatherVolumeDiagnostics() {
+  std::lock_guard<std::mutex> lock(g_volumetricShaderWorkDiagnosticsMutex);
+  return g_weatherVolumeDiagnostics;
+}
+
 War3VolumetricShaderWorkRuntimeDiagnostics
 QueryWar3VolumetricShaderWorkRuntimeDiagnostics() noexcept {
   std::lock_guard<std::mutex> lock(g_volumetricShaderWorkDiagnosticsMutex);
   return g_volumetricShaderWorkRuntimeDiagnostics;
 }
 
-War3VolumetricLightPass::War3VolumetricLightPass(D3D9DeviceEx* device)
-    : m_parent(device), m_device(device->GetDXVKDevice()) {
+War3VolumetricLightPass::War3VolumetricLightPass(D3D9DeviceEx* device,
+                                               bool weatherOnly)
+    : m_parent(device), m_device(device->GetDXVKDevice()),
+      m_weatherOnly(weatherOnly) {
+  try {
   DxvkSamplerKey linearKey = {};
   linearKey.setFilter(VK_FILTER_LINEAR, VK_FILTER_LINEAR,
                       VK_SAMPLER_MIPMAP_MODE_NEAREST);
@@ -628,9 +657,19 @@ War3VolumetricLightPass::War3VolumetricLightPass(D3D9DeviceEx* device)
     m_fogVolumeBuffers[slot] = m_device->createBuffer(
         fogVolumeInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
   }
+  } catch (...) {
+    // A throwing constructor does not run this class's destructor. No
+    // command has referenced these partial built-in pipelines yet.
+    releasePipelines();
+    throw;
+  }
 }
 
 War3VolumetricLightPass::~War3VolumetricLightPass() {
+  releasePipelines();
+}
+
+void War3VolumetricLightPass::releasePipelines() noexcept {
   auto vk = m_device->vkd();
   if (m_froxelInjectPipeline != VK_NULL_HANDLE)
     vk->vkDestroyPipeline(vk->device(), m_froxelInjectPipeline, nullptr);
@@ -638,6 +677,9 @@ War3VolumetricLightPass::~War3VolumetricLightPass() {
     vk->vkDestroyPipeline(vk->device(), m_froxelTemporalPipeline, nullptr);
   if (m_froxelIntegratePipeline != VK_NULL_HANDLE)
     vk->vkDestroyPipeline(vk->device(), m_froxelIntegratePipeline, nullptr);
+  m_froxelInjectPipeline = VK_NULL_HANDLE;
+  m_froxelTemporalPipeline = VK_NULL_HANDLE;
+  m_froxelIntegratePipeline = VK_NULL_HANDLE;
   for (auto& kv : m_pipelines) {
     if (kv.second != VK_NULL_HANDLE)
       vk->vkDestroyPipeline(vk->device(), kv.second, nullptr);
@@ -646,6 +688,8 @@ War3VolumetricLightPass::~War3VolumetricLightPass() {
     if (kv.second != VK_NULL_HANDLE)
       vk->vkDestroyPipeline(vk->device(), kv.second, nullptr);
   }
+  m_pipelines.clear();
+  m_compositePipelines.clear();
 }
 
 const DxvkPipelineLayout* War3VolumetricLightPass::createPipelineLayout() const {
@@ -765,7 +809,14 @@ VkPipeline War3VolumetricLightPass::getPipeline(const PipelineKey& key) {
     return it->second;
 
   VkPipeline pipeline = createPipeline(key);
-  m_pipelines.insert({key, pipeline});
+  if (pipeline == VK_NULL_HANDLE)
+    return pipeline;
+  try {
+    m_pipelines.insert({key, pipeline});
+  } catch (...) {
+    m_device->vkd()->vkDestroyPipeline(m_device->vkd()->device(), pipeline, nullptr);
+    throw;
+  }
   return pipeline;
 }
 
@@ -776,7 +827,14 @@ VkPipeline War3VolumetricLightPass::getCompositePipeline(
     return it->second;
 
   VkPipeline pipeline = createCompositePipeline(key);
-  m_compositePipelines.insert({key, pipeline});
+  if (pipeline == VK_NULL_HANDLE)
+    return pipeline;
+  try {
+    m_compositePipelines.insert({key, pipeline});
+  } catch (...) {
+    m_device->vkd()->vkDestroyPipeline(m_device->vkd()->device(), pipeline, nullptr);
+    throw;
+  }
   return pipeline;
 }
 
@@ -1130,6 +1188,7 @@ void War3VolumetricLightPass::invalidateFroxelHistory() {
   m_froxelHistoryFrameSerial = 0u;
   m_froxelHistoryMapEpoch = 0u;
   m_froxelHistoryDeviceEpoch = 0u;
+  m_froxelHistoryWeatherRevision = 0u;
   m_froxelHistoryNear = 0.0f;
   m_froxelHistoryFar = 0.0f;
 }
@@ -1194,15 +1253,24 @@ bool War3VolumetricLightPass::ensureFroxelResources(
   viewInfo.layerIndex = 0u;
   viewInfo.layerCount = 1u;
 
-  m_froxelCurrentImage =
+  Rc<DxvkImage> candidateCurrent =
       m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-  m_froxelCurrentView = m_froxelCurrentImage->createView(viewInfo);
+  Rc<DxvkImageView> candidateCurrentView = candidateCurrent->createView(viewInfo);
+  std::array<Rc<DxvkImage>, 2> candidateHistory;
+  std::array<Rc<DxvkImageView>, 2> candidateHistoryViews;
   for (uint32_t i = 0u; i < m_froxelHistoryImages.size(); ++i) {
-    m_froxelHistoryImages[i] =
+    candidateHistory[i] =
         m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    m_froxelHistoryViews[i] =
-        m_froxelHistoryImages[i]->createView(viewInfo);
+    candidateHistoryViews[i] = candidateHistory[i]->createView(viewInfo);
   }
+  // Publish only a complete set; a preparation failure cannot replace a
+  // subset while leaving old grid metadata or in-flight Rc uses behind.
+  if (!candidateCurrentView || !candidateHistoryViews[0] || !candidateHistoryViews[1])
+    return false;
+  m_froxelCurrentImage = std::move(candidateCurrent);
+  m_froxelCurrentView = std::move(candidateCurrentView);
+  m_froxelHistoryImages = std::move(candidateHistory);
+  m_froxelHistoryViews = std::move(candidateHistoryViews);
   m_froxelGridExtent = grid;
   m_froxelResourceQuality = quality;
   m_froxelHistoryIndex = 0u;
@@ -1211,8 +1279,7 @@ bool War3VolumetricLightPass::ensureFroxelResources(
          m_froxelHistoryViews[1];
 }
 
-void War3VolumetricLightPass::ensurePointShadowFallbackResources(
-    const Rc<DxvkCommandList>& ctx) {
+void War3VolumetricLightPass::preparePointShadowFallbackResources() {
   if (!m_pointShadowFallbackCube || !m_pointShadowFallbackCubeView) {
     DxvkImageCreateInfo info = {};
     info.type = VK_IMAGE_TYPE_2D;
@@ -1253,6 +1320,12 @@ void War3VolumetricLightPass::ensurePointShadowFallbackResources(
     m_pointShadowFallbackLayout.reset();
     m_pointShadowFallbackReady = false;
   }
+}
+
+void War3VolumetricLightPass::ensurePointShadowFallbackResources(
+    const Rc<DxvkCommandList>& ctx) {
+  if (!m_weatherOnly)
+    preparePointShadowFallbackResources();
 
   if (m_pointShadowFallbackReady)
     return;
@@ -1299,6 +1372,27 @@ void War3VolumetricLightPass::ensurePointShadowFallbackResources(
       m_pointShadowFallbackLayout, readTransition,
       *m_pointShadowFallbackCube, range);
   m_pointShadowFallbackReady = true;
+}
+
+void War3VolumetricLightPass::prepareWeatherDescriptors(
+    const War3PipelineInput& input) {
+  // DxvkImageView::getDescriptor may lazily allocate a Vulkan view. Warm
+  // every weather descriptor before world copies or beginRendering.
+  const auto prepare = [](const Rc<DxvkImageView>& view) {
+    if (view)
+      (void)view->getDescriptor();
+  };
+  prepare(input.colorView);
+  prepare(m_colorCopyView);
+  prepare(m_depthCopyView);
+  prepare(m_effectView);
+  prepare(m_effectStorageView);
+  prepare(m_directionalGuideBaseView);
+  prepare(m_directionalGuideBaseStorageView);
+  prepare(m_froxelCurrentView);
+  for (const auto& view : m_froxelHistoryViews)
+    prepare(view);
+  prepare(m_pointShadowFallbackCubeView);
 }
 
 void War3VolumetricLightPass::copyColor(const Rc<DxvkCommandList>& ctx,
@@ -1461,7 +1555,8 @@ bool War3VolumetricLightPass::drawVolumetricLight(
     uint32_t selectedPointCount, const Vector4& cameraPos,
     float farClearRaw, float rawDepthQuantum, bool farIsOne,
     const VkRect2D& effectScissor, int effectiveSamples,
-    uint32_t& outPointShadowedLightCount, int32_t& outEffectiveBackend) {
+    uint32_t& outPointShadowedLightCount, int32_t& outEffectiveBackend,
+    const War3VolumetricLightSettings& settings) {
   outPointShadowedLightCount = 0u;
   outEffectiveBackend = -1;
   m_directionalGuideReadyThisFrame = false;
@@ -1479,8 +1574,6 @@ bool War3VolumetricLightPass::drawVolumetricLight(
   // long since retired — no cross-frame WAR pre-barrier is needed.
   const uint32_t uboSlot =
       static_cast<uint32_t>(input.frameSerial % kUboRingSlots);
-
-  const auto& settings = input.settings->postFx.volumetricLight;
 
   const Vector4 frameSunColor = input.lighting != nullptr
       ? input.lighting->sunColor
@@ -1504,7 +1597,7 @@ bool War3VolumetricLightPass::drawVolumetricLight(
                                               : 0.0f,
                   0.0f, 64.0f, 0.0f);
   const float requestedSunIntensity =
-      configuredSunIntensity >= minSunIntensity ? configuredSunIntensity
+      !m_weatherOnly && configuredSunIntensity >= minSunIntensity ? configuredSunIntensity
                                                 : 0.0f;
   // 只有强度、没有颜色并不构成发光源。黑色/非法太阳既不能通过无源消光
   // 压暗底图，也不能在没有点光体积时强制执行全屏方向光路径。
@@ -1514,7 +1607,7 @@ bool War3VolumetricLightPass::drawVolumetricLight(
   const bool hasPointVolumeCandidate = selectedPointCount > 0u;
 
   auto* shadowPass =
-      m_parent ? m_parent->GetWar3ShadowReceiverPass() : nullptr;
+      !m_weatherOnly && m_parent ? m_parent->GetWar3ShadowReceiverPass() : nullptr;
 
   Rc<DxvkImageView> shadowMapView = nullptr;
   War3CsmData csmData = {};
@@ -1629,7 +1722,14 @@ bool War3VolumetricLightPass::drawVolumetricLight(
   key.format = effectImage->info().format;
   key.samples = VK_SAMPLE_COUNT_1_BIT;
 
-  VkPipeline pipeline = getPipeline(key);
+  VkPipeline pipeline = VK_NULL_HANDLE;
+  if (m_weatherOnly) {
+    const auto prepared = m_pipelines.find(key);
+    if (prepared != m_pipelines.end())
+      pipeline = prepared->second;
+  } else {
+    pipeline = getPipeline(key);
+  }
   if (pipeline == VK_NULL_HANDLE)
     return false;
 
@@ -1857,6 +1957,19 @@ bool War3VolumetricLightPass::drawVolumetricLight(
       0u, sizeof(VolumetricPointLightUniform));
 
   VolumetricFogVolumeUniform fogVolumeUbo = {};
+  if (m_weatherOnly && input.weather.enabled && input.weather.mapEpoch == input.mapEpoch &&
+      input.weather.deviceEpoch == input.deviceEpoch &&
+      input.weather.frameSerial == input.frameSerial) {
+    const auto& w = input.weather;
+    fogVolumeUbo.weatherMin = Vector4(w.region.minX, w.region.minY,
+        w.region.bottomZ, w.region.edgeFeather);
+    fogVolumeUbo.weatherMax = Vector4(w.region.maxX, w.region.maxY,
+        w.region.topZ, 0.0f);
+    fogVolumeUbo.weatherControls = Vector4(w.params.haze, w.params.lowSnow,
+        w.params.gust, 1.0f);
+    fogVolumeUbo.weatherMotion = Vector4(float(std::fmod(w.windDisplacementX, 786432.0)),
+        float(std::fmod(w.windDisplacementY, 786432.0)), float(w.timeSeconds), 0.0f);
+  }
   fogVolumeUbo.count = std::min<uint32_t>(
       fogVolumes.count, kVolumetricMaxFogVolumes);
   for (uint32_t i = 0u; i < fogVolumeUbo.count; ++i) {
@@ -2015,8 +2128,10 @@ bool War3VolumetricLightPass::drawVolumetricLight(
   const VkExtent3D fullExtent = m_colorCopy->info().extent;
   const bool froxelExtentAdmitted = wantsFroxel && m_effectStorageView;
 
-  if (froxelExtentAdmitted &&
-      ensureFroxelResources(fullExtent, settings.quality) &&
+  const bool froxelResourcesReady = froxelExtentAdmitted &&
+      (m_weatherOnly ? m_weatherFroxelPrepared
+                    : ensureFroxelResources(fullExtent, settings.quality));
+  if (froxelExtentAdmitted && froxelResourcesReady &&
       m_froxelInjectLayout && m_froxelTemporalLayout &&
       m_froxelIntegrateLayout &&
       m_froxelInjectPipeline != VK_NULL_HANDLE &&
@@ -2123,7 +2238,9 @@ bool War3VolumetricLightPass::drawVolumetricLight(
         input.deviceEpoch != 0u && input.mapEpoch == m_froxelHistoryMapEpoch &&
         input.deviceEpoch == m_froxelHistoryDeviceEpoch && consecutiveFrame &&
         sameDistribution && std::isfinite(cameraDelta) &&
-        cameraDelta <= historyCameraLimit;
+        cameraDelta <= historyCameraLimit &&
+        (!m_weatherOnly || input.weather.historyRevision ==
+                              m_froxelHistoryWeatherRevision);
     const uint32_t historyReadIndex = m_froxelHistoryIndex;
     const uint32_t historyWriteIndex = (historyReadIndex + 1u) % 2u;
 
@@ -2439,6 +2556,8 @@ bool War3VolumetricLightPass::drawVolumetricLight(
     m_froxelHistoryFrameSerial = input.frameSerial;
     m_froxelHistoryMapEpoch = input.mapEpoch;
     m_froxelHistoryDeviceEpoch = input.deviceEpoch;
+    m_froxelHistoryWeatherRevision = m_weatherOnly
+        ? input.weather.historyRevision : 0u;
     m_froxelHistoryNear = froxelNear;
     m_froxelHistoryFar = froxelFar;
     m_froxelHistoryViewProj = input.scene.worldCamera.viewProj;
@@ -2556,7 +2675,14 @@ bool War3VolumetricLightPass::compositeVolumetricLight(
   key.format = colorImage->info().format;
   key.samples = colorImage->info().sampleCount;
 
-  VkPipeline pipeline = getCompositePipeline(key);
+  VkPipeline pipeline = VK_NULL_HANDLE;
+  if (m_weatherOnly) {
+    const auto prepared = m_compositePipelines.find(key);
+    if (prepared != m_compositePipelines.end())
+      pipeline = prepared->second;
+  } else {
+    pipeline = getCompositePipeline(key);
+  }
   if (pipeline == VK_NULL_HANDLE)
     return false;
 
@@ -2655,20 +2781,146 @@ bool War3VolumetricLightPass::compositeVolumetricLight(
 
 void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
                                   const War3PipelineInput& input) {
-  VolumetricExecutionWitness witness;
+  if (m_weatherOnly || !input.settings)
+    return;
+  // Both invocations borrow the same immutable frame input. Do not duplicate
+  // scene/caster vectors, or modify any authored volumetric setting.
+  RunMedium(ctx, input, input.settings->postFx.volumetricLight);
+  const bool weatherMedium = input.weather.enabled && input.weather.id > 0 &&
+      input.mapEpoch != 0u && input.deviceEpoch != 0u &&
+      input.weather.frameSerial == input.frameSerial &&
+      input.weather.mapEpoch == input.mapEpoch &&
+      input.weather.deviceEpoch == input.deviceEpoch &&
+      (input.weather.params.haze > 0.0f || input.weather.params.lowSnow > 0.0f);
+  if (!weatherMedium && !m_weatherOwner)
+    return;
+  auto weatherCpu = war3::War3PerfMonitor::instance().cpuScope("WeatherVolume");
+  if (!m_weatherOwner && weatherMedium && ctx && input.colorView && input.depthView &&
+      input.scene.worldCamera.valid) {
+    const auto& color = input.colorView->image()->info();
+    const auto& depth = input.depthView->image()->info();
+    const war3::render::WeatherResourceRetry::Key resourceKey = {
+        input.mapEpoch, input.deviceEpoch, color.extent.width, color.extent.height,
+        uint32_t(color.format), uint32_t(depth.format)};
+    const auto noteCreationFailure = [&](const char* stage) {
+      VolumetricExecutionWitness witness(true);
+      witness.value.frameSerial = input.frameSerial;
+      witness.value.mapEpoch = input.mapEpoch;
+      witness.value.deviceEpoch = input.deviceEpoch;
+      witness.value.requestedBackend = uint32_t(War3VolumetricQuality::FroxelMedium);
+      witness.value.width = color.extent.width;
+      witness.value.height = color.extent.height;
+      witness.value.stage = stage;
+    };
+    if (!m_weatherResourceRetry.ready(resourceKey, input.frameSerial)) {
+      noteCreationFailure("weather-volume-owner-retry-wait");
+      return;
+    }
+    try {
+      m_weatherOwner = std::make_unique<War3VolumetricLightPass>(m_parent, true);
+      m_weatherResourceRetry.clear();
+    } catch (const DxvkError&) {
+      if (m_device->getDeviceStatus() == VK_ERROR_DEVICE_LOST)
+        throw;
+      m_weatherResourceRetry.failed(resourceKey, input.frameSerial);
+      noteCreationFailure("weather-volume-owner-allocation-failed");
+      return;
+    } catch (const std::bad_alloc&) {
+      if (m_device->getDeviceStatus() == VK_ERROR_DEVICE_LOST)
+        throw;
+      m_weatherResourceRetry.failed(resourceKey, input.frameSerial);
+      noteCreationFailure("weather-volume-owner-host-allocation-failed");
+      return;
+    }
+  }
+  if (!m_weatherOwner)
+    return;
+  War3VolumetricLightSettings weatherSettings = {};
+  weatherSettings.enabled = weatherMedium;
+  weatherSettings.quality = War3VolumetricQuality::FroxelMedium;
+  weatherSettings.intensity = 1.0f;
+  weatherSettings.weight = 1.0f;
+  weatherSettings.globalMediumEnabled = false;
+  weatherSettings.density = 0.0f;
+  weatherSettings.heightFogEnabled = false;
+  weatherSettings.includePointLights = false;
+  weatherSettings.maxPointLights = 0u;
+  weatherSettings.requireCsmSnapshot = false;
+  weatherSettings.volumeSunShadowEnabled = false;
+  weatherSettings.volumeSunShadowFallbackToCsm = false;
+  weatherSettings.extinctionStrength = 1.0f;
+  weatherSettings.unshadowedScattering = 0.0f;
+  weatherSettings.froxelTemporalEnabled = false;
+  weatherSettings.sampleCount = 16;
+  weatherSettings.adaptiveSampleCount = false;
+  weatherSettings.resolutionDivisor = 8u;
+  weatherSettings.sunDistance = 6000.0f;
+  m_weatherOwner->RunMedium(ctx, input, weatherSettings);
+}
+
+uint64_t War3VolumetricLightPass::resourceBytes() const {
+  uint64_t bytes = 0u;
+  const auto addImage = [&](const Rc<DxvkImage>& image) {
+    if (image)
+      bytes += image->getMemoryInfo().size;
+  };
+  addImage(m_colorCopy);
+  addImage(m_depthCopy);
+  addImage(m_effectImage);
+  addImage(m_directionalGuideBaseImage);
+  addImage(m_directionalGuideRefinedImage);
+  addImage(m_froxelCurrentImage);
+  for (const auto& image : m_froxelHistoryImages)
+    addImage(image);
+  addImage(m_pointShadowFallbackCube);
+  for (uint32_t i = 0u; i < kUboRingSlots; ++i) {
+    if (m_csmUniformBuffers[i])
+      bytes += m_csmUniformBuffers[i]->storage()->getMemoryInfo().size;
+    if (m_lightBuffers[i])
+      bytes += m_lightBuffers[i]->storage()->getMemoryInfo().size;
+    if (m_fogVolumeBuffers[i])
+      bytes += m_fogVolumeBuffers[i]->storage()->getMemoryInfo().size;
+  }
+  return bytes;
+}
+
+void War3VolumetricLightPass::RunMedium(const Rc<DxvkCommandList>& ctx,
+    const War3PipelineInput& input, const War3VolumetricLightSettings& settings) {
+  VolumetricExecutionWitness witness(m_weatherOnly);
   auto& execution = witness.value;
   execution.frameSerial = input.frameSerial;
   execution.mapEpoch = input.mapEpoch;
   execution.deviceEpoch = input.deviceEpoch;
+  if (m_weatherOnly)
+    execution.resourceBytes = resourceBytes();
   execution.stage = "missing-settings";
   // 关闭路径必须极早返回：不分配资源、不 copy color/depth、不影响 CSM。
   if (!input.settings)
     return;
   execution.requestedBackend = static_cast<uint32_t>(
-      input.settings->postFx.volumetricLight.quality);
+      settings.quality);
   execution.stage = "disabled";
-  if (!input.settings->postFx.volumetricLight.enabled)
+  const bool weatherMedium = m_weatherOnly && input.weather.enabled &&
+      input.weather.id > 0 && input.mapEpoch != 0u && input.deviceEpoch != 0u &&
+      input.weather.frameSerial == input.frameSerial &&
+      input.weather.mapEpoch == input.mapEpoch &&
+      input.weather.deviceEpoch == input.deviceEpoch &&
+      (input.weather.params.haze > 0.0f || input.weather.params.lowSnow > 0.0f);
+  const bool authoredMediumEnabled = !m_weatherOnly && settings.enabled;
+  if (!authoredMediumEnabled && !weatherMedium) {
+    if (m_weatherOnly)
+      invalidateFroxelHistory();
     return;
+  }
+  execution.stage = "missing-command-list";
+  if (!ctx)
+    return;
+  if (m_weatherOnly && m_weatherRecordedFrame == input.frameSerial &&
+      m_weatherRecordedMapEpoch == input.mapEpoch &&
+      m_weatherRecordedDeviceEpoch == input.deviceEpoch) {
+    execution.stage = "duplicate-weather-frame";
+    return;
+  }
   execution.stage = "missing-color-or-depth";
   if (!input.colorView || !input.depthView)
     return;
@@ -2676,11 +2928,9 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
   if (!input.scene.worldCamera.valid)
     return;
 
-  const auto& settings = input.settings->postFx.volumetricLight;
   const uint32_t activeBackend = static_cast<uint32_t>(settings.quality);
-  static int32_t s_lastLoggedBackend = -1;
-  if (s_lastLoggedBackend != static_cast<int32_t>(activeBackend)) {
-    s_lastLoggedBackend = static_cast<int32_t>(activeBackend);
+  if (m_lastLoggedBackend != static_cast<int32_t>(activeBackend)) {
+    m_lastLoggedBackend = static_cast<int32_t>(activeBackend);
     WAR3_RENDER_LOG(
         "DXVK War3Volumetric: requested backend=%u (%s)\n",
         activeBackend,
@@ -2696,13 +2946,13 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
   const bool hasConfiguredGlobalMedium =
       settings.globalMediumEnabled && safeDensity > 1e-6f;
   const bool localMediumRequested =
-      War3FogVolumeManager::Instance().HasActiveVolumes();
+      authoredMediumEnabled && War3FogVolumeManager::Instance().HasActiveVolumes();
   execution.stage = "no-medium-or-zero-intensity";
   // Global density zero now means clear air outside authored volumes, not an
   // unconditional pass kill. Keep the atomic manager probe before any image
   // allocation or snapshot lock.
   if (safeIntensity <= 1e-6f ||
-      (!hasConfiguredGlobalMedium && !localMediumRequested) ||
+      (!hasConfiguredGlobalMedium && !localMediumRequested && !weatherMedium) ||
       settings.sampleCount <= 0)
     return;
 
@@ -2718,6 +2968,10 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
   if (depthInfo.extent.width != extent.width ||
       depthInfo.extent.height != extent.height)
     return;
+  if (m_weatherOnly && (extent.width > 8192u || extent.height > 8192u)) {
+    execution.stage = "weather-volume-extent-limit";
+    return;
+  }
   // 当前 shader 使用 sampler2DArray，copy 目标也是单采样图像。直接 copy
   // 多采样源在 Vulkan 中非法，因此在实现显式 resolve 前安全跳过。
   if (colorInfo.sampleCount != VK_SAMPLE_COUNT_1_BIT ||
@@ -2737,17 +2991,17 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
        clampFinite(frameSunColor.z, 0.0f, 64.0f, 0.0f)});
   const float minSunIntensity =
       clampFinite(settings.minSunIntensity, 0.0f, 1.0f, 0.08f);
-  const bool pointFeatureRequested = settings.includePointLights &&
+  const bool pointFeatureRequested = !m_weatherOnly && settings.includePointLights &&
       settings.maxPointLights > 0u &&
       input.settings->shadows.pointLightsEnabled &&
       War3LightManager::Instance().HasActiveLights();
   const bool hasSunVolume = sunIntensity >= minSunIntensity &&
-                            sunIntensity * sunColorPeak > 1e-6f;
+                            sunIntensity * sunColorPeak > 1e-6f && !m_weatherOnly;
   execution.stage = "no-effective-light";
   // Keep the no-lock atomic gate before depth algebra. A true value is only a
   // request to inspect the canonical snapshot; it is not proof that any
   // finite, energetic or view-relevant point light exists.
-  if (!hasSunVolume && !pointFeatureRequested)
+  if (!hasSunVolume && !pointFeatureRequested && !weatherMedium)
     return;
 
   // Reuse the same projection-derived depth contract as the Hi-Z contact-ray
@@ -2789,7 +3043,7 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
   const bool hasLocalMedium = fogVolumes.hasAny && fogVolumes.count > 0u;
   execution.fogVolumes = fogVolumes.count;
   execution.stage = "no-visible-medium";
-  if (!hasConfiguredGlobalMedium && !hasLocalMedium)
+  if (!hasConfiguredGlobalMedium && !hasLocalMedium && !weatherMedium)
     return;
 
   War3PointLightFrameSnapshot pointLights = {};
@@ -2805,7 +3059,7 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
   // This is the exact pre-copy source gate. Zero-energy/invalid lights are
   // filtered by the canonical snapshot, while unreachable or provably
   // offscreen spheres are filtered locally without mutating shared order.
-  if (!hasSunVolume && !hasPointVolume)
+  if (!hasSunVolume && !hasPointVolume && !weatherMedium)
     return;
 
   // CSM 只约束太阳散射；缺失时 sun fail-soft，而独立点光体积仍可继续。
@@ -3113,7 +3367,9 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
   const auto workEstimate =
       war3::render::EvaluateWar3VolumetricShaderWork(workRequest);
   execution.stage = "shader-work-rejected";
-  PublishVolumetricShaderWorkDiagnostics(input.frameSerial, workEstimate);
+  execution.admittedShaderWork = workEstimate.totalWork;
+  if (!m_weatherOnly)
+    PublishVolumetricShaderWorkDiagnostics(input.frameSerial, workEstimate);
   if (!workEstimate.accepted) {
     static uint32_t s_workRejectLogs = 0u;
     const uint32_t rejectLog = s_workRejectLogs++;
@@ -3138,7 +3394,7 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
   }
 
   uint32_t directionalGuideDivisor = resolutionDivisor;
-  if (froxelAdmitted) {
+  if (froxelAdmitted && !m_weatherOnly) {
     const uint32_t guideDepth =
         settings.quality == War3VolumetricQuality::FroxelHigh
             ? kVolumetricFroxelHighDepth
@@ -3160,10 +3416,87 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
   }
 
   execution.stage = "resources-or-draw-failed";
-  ensureResources(extent, colorInfo.format, depthInfo.format,
-                  resolutionDivisor, froxelAdmitted,
-                  directionalGuideDivisor);
+  if (m_weatherOnly) {
+    // Nominal source-format bytes plus fixed Medium fields/UBOs. This gate
+    // precedes allocation; diagnostics below report actual current backing.
+    const auto* colorFormat = lookupFormatInfo(colorInfo.format);
+    const auto* depthFormat = lookupFormatInfo(depthInfo.format);
+    if (!colorFormat || !depthFormat || !colorFormat->elementSize ||
+        !depthFormat->elementSize) {
+      execution.stage = "weather-volume-resource-format";
+      return;
+    }
+    const uint64_t pixels = uint64_t(extent.width) * extent.height;
+    const uint64_t mediumCells = uint64_t((extent.width + 31u) / 32u) *
+        uint64_t((extent.height + 31u) / 32u) * 64u;
+    const uint64_t effectPixels = uint64_t(effectExtent.width) * effectExtent.height;
+    const uint64_t nominalBytes = pixels * (colorFormat->elementSize +
+        depthFormat->elementSize) + mediumCells * 8u * 3u +
+        effectPixels * 10u + kUboRingSlots *
+        (sizeof(VolumetricCsmUniform) + sizeof(VolumetricPointLightUniform) +
+         sizeof(VolumetricFogVolumeUniform));
+    if (nominalBytes > kWeatherVolumeResourceBudget) {
+      execution.stage = "weather-volume-resource-budget";
+      return;
+    }
+  }
+  if (m_weatherOnly) {
+    const war3::render::WeatherResourceRetry::Key resourceKey = {
+        input.mapEpoch, input.deviceEpoch, extent.width, extent.height,
+        uint32_t(colorInfo.format), uint32_t(depthInfo.format)};
+    if (!m_weatherResourceRetry.ready(resourceKey, input.frameSerial)) {
+      execution.stage = "weather-volume-resource-retry-wait";
+      return;
+    }
+    const auto noteResourceFailure = [&](const char* stage) {
+      m_weatherResourceRetry.failed(resourceKey, input.frameSerial);
+      invalidateFroxelHistory();
+      m_weatherFroxelPrepared = false;
+      execution.resourceBytes = resourceBytes();
+      execution.stage = stage;
+    };
+    // Catch only preparation: no world copy, UBO update, rendering scope or
+    // GPU dispatch has been recorded by the weather owner yet. Record-stage
+    // errors must still propagate; swallowing them could hide broken state.
+    try {
+      ensureResources(extent, colorInfo.format, depthInfo.format,
+                      resolutionDivisor, froxelAdmitted,
+                      directionalGuideDivisor);
+      m_weatherFroxelPrepared = froxelAdmitted &&
+          ensureFroxelResources(extent, settings.quality);
+      preparePointShadowFallbackResources();
+      const PipelineKey effectKey = {
+          m_effectView->image()->info().format, VK_SAMPLE_COUNT_1_BIT};
+      const PipelineKey compositeKey = {colorInfo.format, colorInfo.sampleCount};
+      if (getPipeline(effectKey) == VK_NULL_HANDLE ||
+          getCompositePipeline(compositeKey) == VK_NULL_HANDLE) {
+        noteResourceFailure("weather-volume-pipeline-unavailable");
+        return;
+      }
+      prepareWeatherDescriptors(input);
+      m_weatherResourceRetry.clear();
+    } catch (const DxvkError&) {
+      if (m_device->getDeviceStatus() == VK_ERROR_DEVICE_LOST)
+        throw;
+      noteResourceFailure("weather-volume-resource-allocation-failed");
+      return;
+    } catch (const std::bad_alloc&) {
+      if (m_device->getDeviceStatus() == VK_ERROR_DEVICE_LOST)
+        throw;
+      noteResourceFailure("weather-volume-resource-host-allocation-failed");
+      return;
+    }
+  } else {
+    ensureResources(extent, colorInfo.format, depthInfo.format,
+                    resolutionDivisor, froxelAdmitted,
+                    directionalGuideDivisor);
+  }
 
+  if (m_weatherOnly) {
+    m_weatherRecordedFrame = input.frameSerial;
+    m_weatherRecordedMapEpoch = input.mapEpoch;
+    m_weatherRecordedDeviceEpoch = input.deviceEpoch;
+  }
   copyColor(ctx, input.colorView);
   copyDepth(ctx, input.depthView);
   uint32_t pointShadowedLightCount = 0u;
@@ -3171,7 +3504,9 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
       ctx, input, pointLights, fogVolumes, pointSelection.sourceIndices,
       pointSelection.count, cameraPos, farClearRaw, rawDepthQuantum,
       farIsOne, effectScissor, effectiveSamples,
-      pointShadowedLightCount, execution.effectiveBackend);
+      pointShadowedLightCount, execution.effectiveBackend, settings);
+  if (m_weatherOnly)
+    execution.resourceBytes = resourceBytes();
   if (effectSubmitted)
     execution.stage = "composite-failed";
   if (effectSubmitted &&

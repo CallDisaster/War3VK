@@ -1,4 +1,7 @@
 #include "war3_japi_v1.h"
+#include "war3_managed_object_reset.h"
+#include "war3_module_loader.h"
+#include "../render/war3_weather_runtime.h"
 
 #if !defined(WARVK_JAPI_PROTOCOL_TEST)
 #include "../../d3d9_war3_light.h"
@@ -10,6 +13,7 @@
 #include "../math/war3_curve_runtime.h"
 #include "../render/war3_lightning_runtime.h"
 #include "../model/war3_native_light_bridge.h"
+#include "../game/war3_unit_animation_api.h"
 #include "../state/war3_render_state.h"
 #include "../war3.h"
 #endif
@@ -32,7 +36,7 @@ namespace {
 
 constexpr std::string_view kProtocolPrefix = "warvk:";
 constexpr std::string_view kCanonicalVersion = "v1";
-constexpr std::string_view kApiVersion = "WarVK JAPI 1.22.01";
+constexpr std::string_view kApiVersion = "WarVK JAPI 1.22.02";
 constexpr size_t kMaximumMessageBytes = 512u;
 constexpr size_t kMaximumArgumentCount = 16u;
 
@@ -48,11 +52,24 @@ constexpr uint32_t kFeatureStats = 0x00001000u;
 constexpr uint32_t kFeatureMathCurve = 0x00002000u;
 constexpr uint32_t kFeaturePolylineCurve = 0x00004000u;
 constexpr uint32_t kFeatureLocalFog = 0x00008000u;
+constexpr uint32_t kFeatureUnitAnimation = 0x00010000u;
+constexpr uint32_t kFeatureWeather = 0x00020000u;
 constexpr uint32_t kImplementedFeatureMask =
     kFeatureSun | kFeatureCsm | kFeaturePointLight | kFeatureVolumetric |
     kFeatureDayNight | kFeatureLightning | kFeatureManagedObject |
     kFeatureTime | kFeatureStats | kFeatureMathCurve |
-    kFeaturePolylineCurve | kFeatureLocalFog;
+    kFeaturePolylineCurve | kFeatureLocalFog | kFeatureUnitAnimation |
+    kFeatureWeather;
+
+uint32_t EffectiveFeatureMask() noexcept {
+#if defined(WARVK_JAPI_PROTOCOL_TEST)
+  return kImplementedFeatureMask & ~kFeatureUnitAnimation;
+#else
+  return game::IsUnitWalkHookAvailable()
+      ? kImplementedFeatureMask
+      : kImplementedFeatureMask & ~kFeatureUnitAnimation;
+#endif
+}
 
 enum class WireType : uint8_t {
   Bool,
@@ -88,6 +105,7 @@ enum class CommandId : uint16_t {
   ModelPointLightsSetEnabled,
   ModelPointLightsCount,
   ModelPointLightsRegistered,
+  UnitWalkLoopEnabled,
   VolumetricSetEnabled,
   VolumetricSetGlobalMediumEnabled,
   VolumetricSetDensity,
@@ -109,6 +127,18 @@ enum class CommandId : uint16_t {
   LocalFogSetBoxSize,
   LocalFogSetCylinderSize,
   LocalFogIsAlive,
+  WeatherCreateSnow,
+  WeatherDestroy,
+  WeatherIsAlive,
+  WeatherSetRegion,
+  WeatherSetEnabled,
+  WeatherSetSnowTarget,
+  WeatherClearKeyframes,
+  WeatherAddSnowKeyframe,
+  WeatherPlayTimeline,
+  WeatherSetPaused,
+  WeatherSetTime,
+  WeatherGetTime,
   OutlineSetEnabled,
   OutlineSetColor,
   OutlineSetParameters,
@@ -183,7 +213,7 @@ struct CommandSpec {
   bool backendRequired;
 };
 
-constexpr std::array<CommandSpec, 109> kCommands = {{
+constexpr std::array<CommandSpec, 122> kCommands = {{
     {CommandId::SystemVersion, "system.version", Carrier::LocalizedString, "", 0u, false},
     {CommandId::SystemProtocolVersion, "system.protocolVersion", Carrier::Hotkey, "", 0u, false},
     {CommandId::SystemLastErrorCode, "system.lastErrorCode", Carrier::Hotkey, "", 0u, false},
@@ -209,6 +239,7 @@ constexpr std::array<CommandSpec, 109> kCommands = {{
     {CommandId::ModelPointLightsSetEnabled, "modelPointLights.setEnabled", Carrier::Preloader, "sbb", kFeaturePointLight, false},
     {CommandId::ModelPointLightsCount, "modelPointLights.count", Carrier::Hotkey, "s", kFeaturePointLight, false},
     {CommandId::ModelPointLightsRegistered, "modelPointLights.registered", Carrier::Hotkey, "s", kFeaturePointLight, false},
+    {CommandId::UnitWalkLoopEnabled, "unit.walkLoopEnabled", Carrier::Preloader, "ib", kFeatureUnitAnimation, false},
     {CommandId::VolumetricSetEnabled, "volumetric.setEnabled", Carrier::Preloader, "b", kFeatureVolumetric, true},
     {CommandId::VolumetricSetGlobalMediumEnabled, "volumetric.setGlobalMediumEnabled", Carrier::Preloader, "b", kFeatureVolumetric, true},
     {CommandId::VolumetricSetDensity, "volumetric.setDensity", Carrier::Preloader, "r", kFeatureVolumetric, true},
@@ -230,6 +261,18 @@ constexpr std::array<CommandSpec, 109> kCommands = {{
     {CommandId::LocalFogSetBoxSize, "localFog.setBoxSize", Carrier::Preloader, "drrr", kFeatureLocalFog, true},
     {CommandId::LocalFogSetCylinderSize, "localFog.setCylinderSize", Carrier::Preloader, "drr", kFeatureLocalFog, true},
     {CommandId::LocalFogIsAlive, "localFog.isAlive", Carrier::Hotkey, "d", kFeatureLocalFog, true},
+    {CommandId::WeatherCreateSnow, "weather.createSnow", Carrier::Hotkey, "i", kFeatureWeather, false},
+    {CommandId::WeatherDestroy, "weather.destroy", Carrier::Preloader, "d", kFeatureWeather, false},
+    {CommandId::WeatherIsAlive, "weather.isAlive", Carrier::Hotkey, "d", kFeatureWeather, false},
+    {CommandId::WeatherSetRegion, "weather.setRegion", Carrier::Preloader, "drrrrrrr", kFeatureWeather, false},
+    {CommandId::WeatherSetEnabled, "weather.setEnabled", Carrier::Preloader, "db", kFeatureWeather, false},
+    {CommandId::WeatherSetSnowTarget, "weather.setSnowTarget", Carrier::Preloader, "drrrrrrr", kFeatureWeather, false},
+    {CommandId::WeatherClearKeyframes, "weather.clearKeyframes", Carrier::Preloader, "d", kFeatureWeather, false},
+    {CommandId::WeatherAddSnowKeyframe, "weather.addSnowKeyframe", Carrier::Preloader, "drrrrrrr", kFeatureWeather, false},
+    {CommandId::WeatherPlayTimeline, "weather.playTimeline", Carrier::Preloader, "dr", kFeatureWeather, false},
+    {CommandId::WeatherSetPaused, "weather.setPaused", Carrier::Preloader, "db", kFeatureWeather, false},
+    {CommandId::WeatherSetTime, "weather.setTime", Carrier::Preloader, "dr", kFeatureWeather, false},
+    {CommandId::WeatherGetTime, "weather.getTime", Carrier::LocalizedString, "d", kFeatureWeather, false},
     {CommandId::OutlineSetEnabled, "outline.setEnabled", Carrier::Preloader, "b", 0x00000010u, true},
     {CommandId::OutlineSetColor, "outline.setColor", Carrier::Preloader, "rrrr", 0x00000010u, true},
     {CommandId::OutlineSetParameters, "outline.setParameters", Carrier::Preloader, "rr", 0x00000010u, true},
@@ -285,9 +328,9 @@ constexpr std::array<CommandSpec, 109> kCommands = {{
     {CommandId::LightningTemplateSetFormulaCurve, "lightning.template.setFormulaCurve", Carrier::Preloader, "dd", kFeatureLightning | kFeatureMathCurve, false},
     {CommandId::LightningSetFormulaCurve, "lightning.setFormulaCurve", Carrier::Preloader, "dd", kFeatureLightning | kFeatureMathCurve, false},
     {CommandId::LightningSetPolylineCurve, "lightning.setPolylineCurve", Carrier::Preloader, "dd", kFeatureLightning | kFeaturePolylineCurve, false},
-    {CommandId::ManagedObjectCount, "managedObject.count", Carrier::Hotkey, "", kFeatureManagedObject, true},
-    {CommandId::ManagedObjectIsAlive, "managedObject.isAlive", Carrier::Hotkey, "d", kFeatureManagedObject, true},
-    {CommandId::ManagedObjectType, "managedObject.type", Carrier::Hotkey, "d", kFeatureManagedObject, true},
+    {CommandId::ManagedObjectCount, "managedObject.count", Carrier::Hotkey, "", kFeatureManagedObject, false},
+    {CommandId::ManagedObjectIsAlive, "managedObject.isAlive", Carrier::Hotkey, "d", kFeatureManagedObject, false},
+    {CommandId::ManagedObjectType, "managedObject.type", Carrier::Hotkey, "d", kFeatureManagedObject, false},
     {CommandId::TimeVisualSeconds, "time.visualSeconds", Carrier::LocalizedString, "", kFeatureTime, true},
     {CommandId::TimeFrameIndex, "time.frameIndex", Carrier::Hotkey, "", kFeatureTime, true},
     {CommandId::StatsFramesPerSecond, "stats.framesPerSecond", Carrier::LocalizedString, "", kFeatureStats, true},
@@ -364,11 +407,11 @@ bool g_typedRegisterASeen = false;
 std::unordered_map<int32_t, TypedTransaction> g_typedTransactions;
 constexpr size_t kMaximumTypedTransactions = 4u;
 
-#if !defined(WARVK_JAPI_PROTOCOL_TEST)
 enum class ManagedType : int32_t {
   PointLight = 1,
   Lightning = 2,
   LocalFog = 3,
+  Weather = 4,
 };
 
 struct ManagedObject {
@@ -378,8 +421,9 @@ struct ManagedObject {
 
 std::mutex g_objectMutex;
 std::unordered_map<int32_t, ManagedObject> g_objects;
-int32_t g_nextPublicId = 1;
-#endif
+// Public ids are never reused after a map reset. Delayed old commands must
+// not alias a newly created object, and exhaustion fails without wrapping.
+uint64_t g_nextPublicId = 1u;
 
 const CommandSpec* FindCommand(std::string_view name) {
   for (const CommandSpec& spec : kCommands) {
@@ -854,17 +898,24 @@ std::string NormalizeLightningTexturePath(std::string_view value) {
   return normalized;
 }
 
+#endif
+
 std::string FormatReal(float value) {
   char buffer[64] = {};
+  // Stock JASS S2R does not consume the exponent in scientific notation.
+  // General formatting can therefore turn a tiny positive time into e.g.
+  // "9.73e-05", which the VM reads as 9.73. Fixed without an explicit
+  // precision keeps the shortest round-trippable decimal, including small
+  // nonzero values, without an exponent. 64 bytes covers finite binary32.
   const auto converted = std::to_chars(
       buffer, buffer + sizeof(buffer) - 1u, value,
-      std::chars_format::general, std::numeric_limits<float>::max_digits10);
+      std::chars_format::fixed);
   if (converted.ec != std::errc{})
     return "0";
   return std::string(buffer, static_cast<size_t>(converted.ptr - buffer));
 }
 
-int32_t SaturateToInt32(uint64_t value) {
+[[maybe_unused]] int32_t SaturateToInt32(uint64_t value) {
   return value > static_cast<uint64_t>(std::numeric_limits<int32_t>::max())
       ? std::numeric_limits<int32_t>::max()
       : static_cast<int32_t>(value);
@@ -872,12 +923,21 @@ int32_t SaturateToInt32(uint64_t value) {
 
 bool IsBackendObjectAlive(const ManagedObject& object) {
   switch (object.type) {
+#if !defined(WARVK_JAPI_PROTOCOL_TEST)
     case ManagedType::PointLight:
       return War3LightManager::Instance().IsPointLightAlive(object.internalId);
     case ManagedType::Lightning:
       return render::War3LightningRuntime::instance().isAlive(object.internalId);
     case ManagedType::LocalFog:
       return war3shader::IsFogVolumeAlive(object.internalId);
+#else
+    case ManagedType::PointLight:
+    case ManagedType::Lightning:
+    case ManagedType::LocalFog:
+      return false;
+#endif
+    case ManagedType::Weather:
+      return render::WeatherRuntime::instance().isAlive(object.internalId);
   }
   return false;
 }
@@ -909,20 +969,12 @@ int32_t RegisterObject(ManagedType type, int32_t internalId) {
   if (internalId <= 0)
     return 0;
   std::lock_guard<std::mutex> lock(g_objectMutex);
-  if (g_objects.size() >=
-      static_cast<size_t>(std::numeric_limits<int32_t>::max() - 1))
+  if (g_nextPublicId >
+      static_cast<uint64_t>(std::numeric_limits<int32_t>::max()))
     return 0;
-  const size_t attempts = g_objects.size() + 1u;
-  for (size_t index = 0u; index < attempts; ++index) {
-    int32_t candidate = g_nextPublicId++;
-    if (g_nextPublicId <= 0)
-      g_nextPublicId = 1;
-    if (candidate <= 0)
-      continue;
-    if (g_objects.emplace(candidate, ManagedObject{type, internalId}).second)
-      return candidate;
-  }
-  return 0;
+  const int32_t candidate = static_cast<int32_t>(g_nextPublicId++);
+  return g_objects.emplace(candidate, ManagedObject{type, internalId}).second
+      ? candidate : 0;
 }
 
 void RemoveRegistryEntry(int32_t publicId, ManagedType expected,
@@ -975,6 +1027,116 @@ Reply BackendRejected() {
   return Failure(ErrorCode::BackendRejected);
 }
 
+Reply DispatchManagedQuery(const ParsedRequest& request) {
+  switch (request.spec->id) {
+    case CommandId::ManagedObjectCount:
+      return SuccessInteger(ManagedObjectCount());
+    case CommandId::ManagedObjectIsAlive:
+      return SuccessInteger(ManagedObjectAlive(request.arguments[0].integer) ? 1 : 0);
+    case CommandId::ManagedObjectType: {
+      ManagedType type = ManagedType::PointLight;
+      return SuccessInteger(ManagedObjectAlive(request.arguments[0].integer, &type)
+          ? static_cast<int32_t>(type) : 0);
+    }
+    default:
+      return {};
+  }
+}
+
+// This CPU control path is compiled unchanged into the shipping DLL and the
+// protocol test. No active device, mutable render settings or GPU operation is
+// required while a map initializes its weather.
+Reply DispatchWeather(const ParsedRequest& request) {
+  if (request.spec->id < CommandId::WeatherCreateSnow ||
+      request.spec->id > CommandId::WeatherGetTime)
+    return {};
+  const auto& a = request.arguments;
+  auto& runtime = render::WeatherRuntime::instance();
+  int32_t internalId = 0;
+  switch (request.spec->id) {
+    case CommandId::WeatherCreateSnow: {
+      const int32_t created = runtime.createSnow(
+          static_cast<uint32_t>(a[0].integer));
+      if (created <= 0)
+        return BackendRejected();
+      int32_t publicId = 0;
+      try {
+        publicId = RegisterObject(ManagedType::Weather, created);
+      } catch (...) {
+        static_cast<void>(runtime.destroy(created));
+        throw;
+      }
+      if (publicId <= 0) {
+        static_cast<void>(runtime.destroy(created));
+        return BackendRejected();
+      }
+      return SuccessInteger(publicId);
+    }
+    case CommandId::WeatherDestroy:
+      if (!ResolveObject(a[0].integer, ManagedType::Weather, internalId) ||
+          !runtime.destroy(internalId))
+        return BackendRejected();
+      RemoveRegistryEntry(a[0].integer, ManagedType::Weather, internalId);
+      return SuccessVoid();
+    case CommandId::WeatherIsAlive:
+      return SuccessInteger(
+          ResolveObject(a[0].integer, ManagedType::Weather, internalId) ? 1 : 0);
+    case CommandId::WeatherSetRegion: {
+      const render::WeatherRegion region = {
+          a[1].real, a[2].real, a[3].real, a[4].real,
+          a[5].real, a[6].real, a[7].real};
+      return ResolveObject(a[0].integer, ManagedType::Weather, internalId) &&
+             runtime.setRegion(internalId, region)
+          ? SuccessVoid() : BackendRejected();
+    }
+    case CommandId::WeatherSetEnabled:
+      return ResolveObject(a[0].integer, ManagedType::Weather, internalId) &&
+             runtime.setEnabled(internalId, a[1].boolean)
+          ? SuccessVoid() : BackendRejected();
+    case CommandId::WeatherSetSnowTarget: {
+      const render::SnowWeatherParams params = {
+          a[1].real, a[2].real, a[3].real,
+          a[4].real, a[5].real, a[6].real};
+      return ResolveObject(a[0].integer, ManagedType::Weather, internalId) &&
+             runtime.setTarget(internalId, params, a[7].real)
+          ? SuccessVoid() : BackendRejected();
+    }
+    case CommandId::WeatherClearKeyframes:
+      return ResolveObject(a[0].integer, ManagedType::Weather, internalId) &&
+             runtime.clearKeyframes(internalId)
+          ? SuccessVoid() : BackendRejected();
+    case CommandId::WeatherAddSnowKeyframe: {
+      const render::SnowWeatherParams params = {
+          a[2].real, a[3].real, a[4].real,
+          a[5].real, a[6].real, a[7].real};
+      return ResolveObject(a[0].integer, ManagedType::Weather, internalId) &&
+             runtime.addKeyframe(internalId, a[1].real, params)
+          ? SuccessVoid() : BackendRejected();
+    }
+    case CommandId::WeatherPlayTimeline:
+      return ResolveObject(a[0].integer, ManagedType::Weather, internalId) &&
+             runtime.playTimeline(internalId, a[1].real)
+          ? SuccessVoid() : BackendRejected();
+    case CommandId::WeatherSetPaused:
+      return ResolveObject(a[0].integer, ManagedType::Weather, internalId) &&
+             runtime.setPaused(internalId, a[1].boolean)
+          ? SuccessVoid() : BackendRejected();
+    case CommandId::WeatherSetTime:
+      return ResolveObject(a[0].integer, ManagedType::Weather, internalId) &&
+             runtime.setTime(internalId, a[1].real)
+          ? SuccessVoid() : BackendRejected();
+    case CommandId::WeatherGetTime: {
+      float seconds = 0.0f;
+      return ResolveObject(a[0].integer, ManagedType::Weather, internalId) &&
+             runtime.getTime(internalId, seconds)
+          ? SuccessReal(seconds) : BackendRejected();
+    }
+    default:
+      return {};
+  }
+}
+
+#if !defined(WARVK_JAPI_PROTOCOL_TEST)
 void AdvanceLightingClockRevision(War3DayNightSettings& settings) {
   if (++settings.clockRevision == 0u)
     settings.clockRevision = 1u;
@@ -1061,6 +1223,10 @@ bool CommandUsesDirectRenderSettings(CommandId command) noexcept {
 }
 
 Reply DispatchBackend(const ParsedRequest& request) {
+  if (Reply reply = DispatchWeather(request); reply.consumed)
+    return reply;
+  if (Reply reply = DispatchManagedQuery(request); reply.consumed)
+    return reply;
   const auto& a = request.arguments;
 
   // Acquire the settings mailbox only for cases that mutate it directly.
@@ -1075,6 +1241,10 @@ Reply DispatchBackend(const ParsedRequest& request) {
   }
 
   switch (request.spec->id) {
+    case CommandId::UnitWalkLoopEnabled:
+      return game::SetUnitWalkLoopEnabled(
+                 static_cast<uint32_t>(a[0].integer), a[1].boolean)
+          ? SuccessVoid() : BackendRejected();
     case CommandId::ModelPointLightsSetEnabled:
       return native_light::SetModelPath(a[0].text,a[1].boolean,a[2].boolean) ? SuccessVoid() : BackendRejected();
     case CommandId::ModelPointLightsCount: {
@@ -1798,16 +1968,6 @@ Reply DispatchBackend(const ParsedRequest& request) {
         return BackendRejected();
       return SuccessVoid();
     }
-    case CommandId::ManagedObjectCount:
-      return SuccessInteger(ManagedObjectCount());
-    case CommandId::ManagedObjectIsAlive:
-      return SuccessInteger(ManagedObjectAlive(a[0].integer) ? 1 : 0);
-    case CommandId::ManagedObjectType: {
-      ManagedType type = ManagedType::PointLight;
-      if (!ManagedObjectAlive(a[0].integer, &type))
-        return SuccessInteger(0);
-      return SuccessInteger(static_cast<int32_t>(type));
-    }
     case CommandId::TimeVisualSeconds:
       return SuccessReal(war3shader::GetGameTime());
     case CommandId::TimeFrameIndex:
@@ -1835,7 +1995,11 @@ Reply DispatchBackend(const ParsedRequest& request) {
   }
 }
 #else
-Reply DispatchBackend(const ParsedRequest&) {
+Reply DispatchBackend(const ParsedRequest& request) {
+  if (Reply reply = DispatchWeather(request); reply.consumed)
+    return reply;
+  if (Reply reply = DispatchManagedQuery(request); reply.consumed)
+    return reply;
   return Failure(ErrorCode::BackendUnavailable);
 }
 #endif
@@ -1912,7 +2076,7 @@ Reply DispatchTypedRequest(const ParsedRequest& request) {
   if (request.spec->backendRequired && !IsRuntimeReady())
     return Failure(ErrorCode::BackendUnavailable);
   if (request.spec->featureMask == 0u ||
-      (kImplementedFeatureMask & request.spec->featureMask) !=
+      (EffectiveFeatureMask() & request.spec->featureMask) !=
           request.spec->featureMask)
     return Failure(ErrorCode::UnsupportedFeature);
   return DispatchBackend(request);
@@ -1956,9 +2120,10 @@ const char* GetErrorText(ErrorCode code) noexcept {
 
 uint32_t GetFeatureFlags() noexcept {
 #if defined(WARVK_JAPI_PROTOCOL_TEST)
-  return 0u;
+  return kFeatureWeather | kFeatureManagedObject;
 #else
-  return IsRuntimeReady() ? kImplementedFeatureMask : 0u;
+  return IsRuntimeReady() ? EffectiveFeatureMask()
+      : kFeatureWeather | kFeatureManagedObject;
 #endif
 }
 
@@ -1975,6 +2140,15 @@ Reply Dispatch(Carrier carrier, std::string_view payload) noexcept {
     if (payload.size() < kProtocolPrefix.size() ||
         payload.substr(0u, kProtocolPrefix.size()) != kProtocolPrefix)
       return {};
+
+    // 内置模块：module.* 控制命令与已加载模块的 <模块名>.<函数名>。
+    // 模块层自行解析参数，不进入下面的静态命令表；失败仍走统一错误口径。
+    if (modules::IsModulePayload(payload)) {
+      Reply moduleReply = modules::Dispatch(carrier, payload);
+      if (!moduleReply.ok() && moduleReply.error != ErrorCode::None)
+        static_cast<void>(Failure(moduleReply.error));
+      return moduleReply;
+    }
 
     ParsedRequest request;
     const ErrorCode parseError = ParseRequest(payload, carrier, request);
@@ -2003,11 +2177,10 @@ Reply Dispatch(Carrier carrier, std::string_view payload) noexcept {
     if (request.spec->backendRequired && !IsRuntimeReady())
       return Failure(ErrorCode::BackendUnavailable);
     if (request.spec->featureMask == 0u ||
-        (kImplementedFeatureMask & request.spec->featureMask) !=
+        (EffectiveFeatureMask() & request.spec->featureMask) !=
             request.spec->featureMask)
       return Failure(ErrorCode::UnsupportedFeature);
     Reply reply = DispatchBackend(request);
-#if !defined(WARVK_JAPI_PROTOCOL_TEST)
     // The legacy string control plane keeps its v1 wire contract. The typed
     // data plane calls DispatchBackend directly and therefore retains the
     // native float without a format/parse round trip.
@@ -2016,7 +2189,6 @@ Reply Dispatch(Carrier carrier, std::string_view payload) noexcept {
       reply.kind = ResultKind::Text;
       reply.text = FormatReal(reply.real);
     }
-#endif
     return reply;
   } catch (...) {
     return Failure(ErrorCode::InternalError);
@@ -2243,24 +2415,40 @@ void ResetTypedTransport() noexcept {
   }
 }
 
+void ResetWeatherAuthorState() noexcept {
+  {
+    std::lock_guard<std::mutex> lock(g_objectMutex);
+    for (auto it = g_objects.begin(); it != g_objects.end();) {
+      if (it->second.type == ManagedType::Weather)
+        it = g_objects.erase(it);
+      else
+        ++it;
+    }
+  }
+  render::WeatherRuntime::instance().resetAuthorState();
+}
+
 void ResetAuthorState() noexcept {
   ResetTypedTransport();
 #if !defined(WARVK_JAPI_PROTOCOL_TEST)
-  std::vector<ManagedObject> objects;
-  {
-    std::lock_guard<std::mutex> lock(g_objectMutex);
-    objects.reserve(g_objects.size());
-    for (const auto& entry : g_objects)
-      objects.push_back(entry.second);
-    g_objects.clear();
-    g_nextPublicId = 1;
-  }
-  for (const ManagedObject& object : objects) {
+  game::ResetUnitWalkAuthorState();
+#endif
+  // Swap existing nodes out instead of allocating a duplicate vector while
+  // retiring an old map. This noexcept entry must remain usable when Win32
+  // address space is exhausted. Backends are called on this same lifecycle
+  // thread, after releasing the public registry lock.
+  DetachAndRetireManagedObjects(g_objects, g_objectMutex,
+      [](const ManagedObject& object) noexcept {
+#if !defined(WARVK_JAPI_PROTOCOL_TEST)
     if (object.type == ManagedType::PointLight)
       static_cast<void>(war3shader::RemovePointLight(object.internalId));
     else if (object.type == ManagedType::LocalFog)
       static_cast<void>(war3shader::RemoveFogVolume(object.internalId));
-  }
+#else
+    static_cast<void>(object);
+#endif
+  });
+#if !defined(WARVK_JAPI_PROTOCOL_TEST)
   // Records and templates are map-scoped author data. Texture cache ownership
   // remains with the renderer and is retired only by the Present transaction.
   render::War3LightningRuntime::instance().resetAuthorState();
@@ -2268,6 +2456,7 @@ void ResetAuthorState() noexcept {
   // records already own immutable snapshots, so reset order is intentional.
   math::CurveRuntime::instance().reset();
 #endif
+  render::WeatherRuntime::instance().resetAuthorState();
   g_lastError = ErrorCode::None;
 }
 

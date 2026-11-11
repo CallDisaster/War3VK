@@ -33,7 +33,7 @@ private:
 };
 enum class Stage { Setup, Connect, Header, Body, Write, SlotMutex, SlotCopy };
 enum class Fault { System, Timeout, PeerExited, PeerIdentity, HeaderInvalid, EndOfStream, Abandoned, SlotLease };
-enum class Channel { Echo0, Slots1 };
+enum class Channel { Echo0, Slots1, Gpu2, Present3, Buffers4, D3D9Dev5 };
 struct Failure : std::runtime_error {
   Failure(Fault f,Stage s,DWORD e=0,ipc::Error p=ipc::Error::None)
     :std::runtime_error("RH0 lab transport failure"),fault(f),stage(s),win32(e),protocol(p) {}
@@ -71,4 +71,10 @@ private:
 // does not select a protocol or authorize bytes as RH0/RH1 messages.
 void ReadExact(HANDLE pipe,HANDLE peer,uint8_t* bytes,size_t count,const ReadWindow& window,
                Stage stage,IoStats& stats);
+// Opt-in idle boundary for D3D9dev. Waits for one byte OR this exact verified
+// peer's exit; healthy idle has no framing deadline. On return the framing
+// owner starts one ReadWindow for the remaining header AND body. Pending I/O
+// is cancelled and ACTUALLY drained before any failure releases byte/event.
+// Existing ReadPacket/ReadExact callers retain their original 5 s semantics.
+void ReadFirstByteAfterIdle(HANDLE pipe,HANDLE peer,uint8_t* byte,IoStats& stats);
 } // namespace warvk::host::lab

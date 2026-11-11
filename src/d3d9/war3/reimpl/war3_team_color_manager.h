@@ -27,7 +27,7 @@ public:
   static War3TeamColorManager &Get();
 
   // 初始化 - 在D3D Device创建后调用
-  HRESULT Initialize(D3D9DeviceEx *device);
+  HRESULT Initialize(IDirect3DDevice9 *device);
 
   // 关闭 - 释放资源
   void Shutdown();
@@ -64,7 +64,8 @@ private:
   War3TeamColorManager(const War3TeamColorManager &) = delete;
   War3TeamColorManager &operator=(const War3TeamColorManager &) = delete;
 
-  D3D9DeviceEx *m_device = nullptr;
+  // 只经公开的 D3D9 接口调用，不链接到具体设备类（S2 切口）。
+  IDirect3DDevice9 *m_device = nullptr;
 
   // 原始TeamColor纹理 (弱引用，不AddRef)
   static constexpr uint32_t kMaxTeamColors = 24;

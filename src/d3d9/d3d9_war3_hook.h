@@ -158,6 +158,13 @@ public:
  */
 void ActivateWar3Runtime(uintptr_t gameBase, const char *source);
 
+// The native table can be initialized multiple times per map. These hooks
+// publish at most one shadow-session reset request after each completed
+// MainRunner; Present remains the only owner that applies GPU retirement.
+void ObserveWar3JassNativeTableRebuild();
+void ObserveWar3MainRunnerEnter();
+void ObserveWar3MainRunnerComplete();
+
 /**
  * @brief 在主循环入口前尝试前置安装早期阴影/内存域能力。
  * @param gameBase `Game.dll` 基址。

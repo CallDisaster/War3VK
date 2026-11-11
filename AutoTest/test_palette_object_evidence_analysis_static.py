@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import itertools
 import json
 import re
 import sys
@@ -67,7 +68,7 @@ def event(sequence, object_key, frame_domains, stage, source=0, terminal=0, reas
           hit_key=0, hit_count=0, first_reject_frame=0, delta_frames=0, saw_submit=False,
           saw_draw=False, selection_cleared=False, identity_weak=False, epoch_unknown=False,
           session=1, thread=7, parent=0, owner="0", chain_sequence=0,
-          window_segment=None, identity_proof=0, chain_type=None):
+          window_segment=None, identity_proof=0, chain_type=None, attempt_serial=None):
     data = [0] * 12
     bits = [0] * 48
     data[0] = object_key["renderablePart"]
@@ -82,6 +83,8 @@ def event(sequence, object_key, frame_domains, stage, source=0, terminal=0, reas
     # 夹具必须能写出非零值，才能证明旧版本**不会**悄悄接受它。
     if chain_type is not None:
         data[4] = chain_type
+    if attempt_serial is not None:
+        data[5] = attempt_serial
     bits[0] = reason
     bits[1] = object_key["jHandle"]
     bits[2] = object_key["rawcode"]
@@ -126,7 +129,7 @@ def event(sequence, object_key, frame_domains, stage, source=0, terminal=0, reas
 def envelope(events, enabled=True, evicted="0", watch_count=0, emitted=None,
              counter_overrides=None, session="1", accepted=None, reserved=None,
              producer_losses=None, trigger_sequence="0", reason=1, state=3,
-             post_remaining=0, capacity=4096, format_version=None, block_extra=None):
+             post_remaining=0, capacity=4096, format_version=5, block_extra=None):
     """A real schema-7 frame-evidence export root plus the paletteObject block.
 
     accepted == evicted + exported events and producerLosses >= reserved - accepted
@@ -210,12 +213,13 @@ def palette_block(watch_count, counters, format_version=None, block_extra=None):
 def segment_chain_events(part=1, segment=1, sequence_base=1, frame_base=500,
                          chain_sequence_base=1, lifecycle=0x4242, device_epoch=3000,
                          identity_proof=1, identity_weak=False, epoch_unknown=False,
-                         session=1):
+                         session=1, format_version=2):
     """版本 2 的一条完整链：分段标签 + 载明的身份证明 + 非零实例生命周期身份。"""
     rows = closed_chain_events(part=part, sequence_base=sequence_base, frame_base=frame_base,
                                chain_sequence_base=chain_sequence_base,
                                identity_weak=identity_weak, epoch_unknown=epoch_unknown,
-                               device_epoch=device_epoch, session=session)
+                               device_epoch=device_epoch, session=session,
+                               format_version=format_version)
     for row in rows:
         row["data"][2] = str(lifecycle)
         row["data"][3] = str(segment)
@@ -224,14 +228,16 @@ def segment_chain_events(part=1, segment=1, sequence_base=1, frame_base=500,
 
 
 def closed_chain_events(part=1, identity_weak=False, epoch_unknown=False, device_epoch=3000,
-                        sequence_base=1, frame_base=500, session=1, chain_sequence_base=1):
+                        sequence_base=1, frame_base=500, session=1, chain_sequence_base=1,
+                        format_version=5):
     """Rejected -> ServedCandidate -> Enqueued -> Drawn -> terminal Recovered.
 
     Frame offsets mirror the frozen recorder arithmetic: renderFrame == firstRejectFrame
     for the Reject, +3 for the served candidate, and deltaFrames == renderFrame -
     firstRejectFrame everywhere the reader checks it.
     """
-    object_key = key(part=part, device_epoch=device_epoch)
+    object_key = key(part=part, device_epoch=device_epoch,
+                     lifecycle=0x4242 if format_version>=2 else None)
 
     def domain(offset):
         return frames(render_frame=frame_base + offset, manifest=11, revision=22, record=33,
@@ -242,14 +248,19 @@ def closed_chain_events(part=1, identity_weak=False, epoch_unknown=False, device
                     first_reject_frame=frame_base, identity_weak=identity_weak,
                     epoch_unknown=epoch_unknown, session=session, **kwargs)
         row["words32"][23] = chain_sequence_base + step
+        if format_version>=2:
+            row["data"][3] = "1"
+            row["words32"][15] = 1
+        if format_version>=5:
+            row["data"][5] = "1"
         return row
 
     return [
         stage_event(0, 0, 1, reason=1),
         stage_event(1, 3, 2, source=2, hit_key=0xABCD, hit_count=1, delta_frames=3),
-        stage_event(2, 4, 3, source=2, hit_count=1, saw_submit=True),
-        stage_event(3, 5, 4, source=2, hit_count=1, saw_submit=True, saw_draw=True),
-        stage_event(4, 100, 4, source=2, hit_count=1, terminal=1, delta_frames=100,
+        stage_event(2, 4, 3, source=2, hit_key=0xABCD, hit_count=1, saw_submit=True),
+        stage_event(3, 5, 4, source=2, hit_key=0xABCD, hit_count=1, saw_submit=True, saw_draw=True),
+        stage_event(4, 100, 4, source=2, hit_key=0xABCD, hit_count=1, terminal=1, delta_frames=100,
                     saw_submit=True, saw_draw=True),
     ]
 
@@ -425,7 +436,7 @@ class LayoutContracts(unittest.TestCase):
         self.assertEqual(result["wireGaps"], [])
         self.assertEqual(result["proposedLifecycleIdentitySlot"], ["data", 2])
         chain = result["chains"][0]
-        self.assertEqual(chain["lifecycleIdentity"], "0")
+        self.assertEqual(chain["lifecycleIdentity"], str(0x4242))
         self.assertTrue(chain["lifecycleIdentityCarried"])
         self.assertEqual(len(chain["key"]), 8, "grouping key must stay the eight-tuple")
 
@@ -516,7 +527,7 @@ class ChainContracts(unittest.TestCase):
         self.assertEqual(len(result["recovered"]), 1)
 
     def test_palette_hit_alone_is_unclosed_not_recovered(self):
-        result = analyzer.analyze(envelope(hit_only_chain_events()))
+        result = analyzer.analyze(envelope(hit_only_chain_events(), format_version=1))
         chain = result["chains"][0]
         self.assertEqual(chain["terminal"], "Unclosed")
         self.assertEqual(chain["conclusion"], "Unclosed")
@@ -535,8 +546,9 @@ class ChainContracts(unittest.TestCase):
                                              event(2, key(part=9),
                                                    frames(render_frame=900), stage=4,
                                                    terminal=2, first_reject_frame=800,
-                                                   delta_frames=100)]))["chains"][0]
-        gone = analyzer.analyze(envelope(hit_only_chain_events(part=8, terminal=3)))["chains"][0]
+                                                   delta_frames=100)], format_version=1))["chains"][0]
+        gone = analyzer.analyze(envelope(hit_only_chain_events(part=8, terminal=3),
+                                         format_version=1))["chains"][0]
         self.assertEqual(expired["conclusion"], "WindowExpired")
         self.assertEqual(gone["conclusion"], "ObjectGone")
         self.assertNotEqual(expired["conclusion"], gone["conclusion"])
@@ -640,10 +652,11 @@ class ChainContracts(unittest.TestCase):
             # chainSequence counter restarts at 1 (lifecycleIdentity is the only field
             # the recorder could have used to keep the two entries apart, and it has no
             # wire slot).
-            rows[3] = event(4, key(part=1), frames(render_frame=505, manifest_unknown=False,
+            rows[3] = event(4, key(part=1, lifecycle=0x4242), frames(render_frame=505, manifest_unknown=False,
                                                    native_unknown=False),
                             stage=4, source=2, hit_count=1, first_reject_frame=500,
-                            saw_submit=True, saw_draw=True,
+                            saw_submit=True, saw_draw=True, hit_key=0xABCD,
+                            window_segment=1, identity_proof=1, attempt_serial=1,
                             chain_sequence=1 if reset_chain_sequence else 4)
             return rows
 
@@ -666,7 +679,9 @@ class ChainContracts(unittest.TestCase):
         with mock.patch.object(analyzer, "REQUIRE_WIRE_LIFECYCLE_IDENTITY", True), \
                 mock.patch.object(analyzer, "LIFECYCLE_IDENTITY_SLOT", None), \
                 mock.patch.object(analyzer, "RESERVED_DATA", (2, 3, 4, 5, 6, 7, 8)):
-            result = analyzer.analyze(envelope(closed_chain_events()))
+            rows = closed_chain_events()
+            for row in rows:row['data'][2] = '0'
+            result = analyzer.analyze(envelope(rows))
             chain = result["chains"][0]
             self.assertIn("lifecycleIdentityNotCarried", chain["certificationRefusals"])
             self.assertFalse(chain["sameObjectCertified"])
@@ -1246,7 +1261,8 @@ class FrozenLayoutDocumentationContracts(unittest.TestCase):
     def test_docstring_carrier_table_matches_the_implemented_layout(self):
         doc = analyzer.__doc__
         self.assertIn("data[2]  key.lifecycleIdentity", doc)
-        self.assertIn("data[3..8] reserved (0)", doc)
+        self.assertIn("data[5]  attemptSerial (v5+, U64_MAX unknown)", doc)
+        self.assertIn("data[6..8] reserved (0)", doc)
         for stale in ("NOT CARRIED by the frozen wire", "reserved (0): the A-chain-only",
                       "writes only", "is the 上级's call",
                       "The wire, however, has no slot for it"):
@@ -1277,7 +1293,10 @@ class FrozenLayoutDocumentationContracts(unittest.TestCase):
         self.assertNotIn(15, analyzer.reserved_bit_indices(2),
                          "版本 2 下 words32[15] 是身份证明载体")
         # 2026-09-18 阶段 C：v4 起 data[4] 是**链型**载体（登记槽），故写入集合法增加 4。
-        self.assertEqual(data_written, {0, 1, 2, 3, 4, 9, 10, 11})
+        self.assertEqual(data_written, {0, 1, 2, 3, 4, 5, 9, 10, 11})
+        self.assertIn('event.data[5] = record.frames.attemptSerial;', sink)
+        self.assertEqual(set(analyzer.reserved_data_indices(5)), {6, 7, 8})
+        self.assertEqual(data_written & set(analyzer.reserved_data_indices(5)), set())
         # 加强：data[4] 必须由**记录级 chainType** 写入（调用点不得给值），
         # 否则"登记了槽位"不等于"槽位语义被钉住"。
         assert 'event.data[4] = static_cast<uint32_t>(record.chainType);' in sink, \
@@ -1344,7 +1363,7 @@ class FormatVersionContracts(unittest.TestCase):
     """
 
     def test_generic_reader_accepts_the_registered_palette_extension(self):
-        payload = envelope(closed_chain_events())
+        payload = envelope(closed_chain_events(format_version=1), format_version=None)
         analysis = frame_evidence.analyze(payload)
         self.assertTrue(analysis["schemaValid"])
         self.assertEqual(analysis["schema"], 7)
@@ -1368,12 +1387,15 @@ class FormatVersionContracts(unittest.TestCase):
         self.assertEqual(result["windowSegments"], [1])
 
     def test_explicit_version_1_matches_the_legacy_contract(self):
-        legacy = analyzer.analyze(envelope(closed_chain_events()))
-        explicit = analyzer.analyze(envelope(closed_chain_events(), format_version=1))
+        legacy = analyzer.analyze(envelope(closed_chain_events(format_version=1),
+                                           format_version=None))
+        explicit = analyzer.analyze(envelope(closed_chain_events(format_version=1), format_version=1))
         self.assertEqual(legacy["formatVersion"], explicit["formatVersion"])
         self.assertEqual(legacy["recovered"], explicit["recovered"])
         self.assertEqual(legacy["chainComplete"], explicit["chainComplete"])
-        self.assertTrue(explicit["chainComplete"])
+        self.assertTrue(explicit["stageObservationComplete"])
+        self.assertFalse(explicit["chainComplete"])
+        self.assertIn('attemptSerialNotCarried', explicit['chains'][0]['certificationRefusals'])
         self.assertFalse(explicit["windowSegmentCarried"])
 
     def test_event_before_the_chain_head_must_block_completion(self):
@@ -1777,7 +1799,7 @@ class FormatVersionContracts(unittest.TestCase):
         # 2026-09-18 更正：3 已是**已登记**版本（v3 = 分段 + 正常观察链），故不在非法列表中。
         # 2026-09-18 阶段 C：4 也已成为**已登记**版本（v4 = 链型 + ObservationClosed），
         # 因此本用例改用**真正未知**的 5。**要求未变**：未知版本必须被两个读方整份拒绝。
-        for version in (0, 5, 7, 99, -1, "2", 2.0, True):
+        for version in (0, 6, 7, 99, -1, "2", 2.0, True):
             with self.subTest(version=version):
                 payload = envelope(closed_chain_events(), format_version=version)
                 with self.assertRaises(ValueError):
@@ -1800,14 +1822,14 @@ class FormatVersionContracts(unittest.TestCase):
 
     def test_unversioned_legacy_block_stays_readable_but_reserves_the_v2_slots(self):
         # 旧合同不放宽：没有 version 字段时 data[3]/words32[15] 仍是保留零。
-        events = closed_chain_events()
+        events = closed_chain_events(format_version=1)
         events[0]["data"][3] = "1"
         with self.assertRaises(ValueError):
-            analyzer.analyze(envelope(events))
-        events = closed_chain_events()
+            analyzer.analyze(envelope(events, format_version=None))
+        events = closed_chain_events(format_version=1)
         events[0]["words32"][15] = 1
         with self.assertRaises(ValueError):
-            analyzer.analyze(envelope(events))
+            analyzer.analyze(envelope(events, format_version=None))
         # 版本 2 声明的槽位集合只在版本 2 生效。
         self.assertIn(3, analyzer.reserved_data_indices(1))
         self.assertNotIn(3, analyzer.reserved_data_indices(2))
@@ -1846,14 +1868,14 @@ class WindowSegmentContracts(unittest.TestCase):
 
     def two_windows(self, first_segment, second_segment, **kwargs):
         first = segment_chain_events(part=1, segment=first_segment, sequence_base=1,
-                                     frame_base=500, chain_sequence_base=1, **kwargs)
+                                     frame_base=500, chain_sequence_base=1, format_version=5, **kwargs)
         second = segment_chain_events(part=1, segment=second_segment, sequence_base=6,
-                                      frame_base=700, chain_sequence_base=1, **kwargs)
-        return envelope(first + second, format_version=2)
+                                      frame_base=700, chain_sequence_base=1, format_version=5, **kwargs)
+        return envelope(first + second, format_version=5)
 
     def test_two_windows_with_the_same_key_split_into_two_chains(self):
         result = analyzer.analyze(self.two_windows(1, 2))
-        self.assertEqual(result["formatVersion"], 2)
+        self.assertEqual(result["formatVersion"], 5)
         self.assertEqual(result["objectCount"], 2,
                          "同键不同窗口的两条链不得被合成一条")
         self.assertEqual(result["windowSegments"], [1, 2])
@@ -1871,10 +1893,10 @@ class WindowSegmentContracts(unittest.TestCase):
             self.assertEqual(len(chain["key"]), 8, "分组键仍必须如实报告八元组")
 
     def test_version_1_same_key_two_windows_is_refused_not_guessed(self):
-        first = closed_chain_events(part=1, sequence_base=1, frame_base=500)
-        second = closed_chain_events(part=1, sequence_base=6, frame_base=700)
+        first = closed_chain_events(part=1, sequence_base=1, frame_base=500, format_version=1)
+        second = closed_chain_events(part=1, sequence_base=6, frame_base=700, format_version=1)
         with self.assertRaises(ValueError):
-            analyzer.analyze(envelope(first + second))
+            analyzer.analyze(envelope(first + second, format_version=1))
         # 同形状但不同键的对照组必须仍然认证（证明拒绝只来自"同键不分段"）。
         control = analyzer.analyze(envelope(closed_chain_events(part=1, sequence_base=1,
                                                                 frame_base=500)
@@ -1884,10 +1906,10 @@ class WindowSegmentContracts(unittest.TestCase):
         self.assertTrue(control["chainComplete"])
 
     def test_version_1_merged_windows_are_misjudged_as_one_corrupt_chain(self):
-        first = closed_chain_events(part=1, sequence_base=1, frame_base=500)
+        first = closed_chain_events(part=1, sequence_base=1, frame_base=500, format_version=1)
         first[-1]["words32"][18] = 0  # 窗口 1 未结算（Reset 清表），只有半条链
         result = analyzer.analyze(envelope(first + closed_chain_events(
-            part=1, sequence_base=6, frame_base=700)))
+            part=1, sequence_base=6, frame_base=700, format_version=1), format_version=1))
         self.assertEqual(result["objectCount"], 1,
                          "旧合同下这两个窗口**只能**被合并（没有分段量可依据）")
         self.assertFalse(result["chainComplete"])
@@ -1919,7 +1941,7 @@ class WindowSegmentContracts(unittest.TestCase):
         self.assertEqual(len(identity), 8)
         self.assertEqual(group[:8], identity)
         self.assertEqual(group[-1], 3)
-        legacy = analyzer.decode_event(closed_chain_events()[0])
+        legacy = analyzer.decode_event(closed_chain_events(format_version=1)[0])
         self.assertIsNone(analyzer.chain_group_identity(legacy)[-1])
 
     def test_segment_is_read_from_the_record_not_from_the_header(self):
@@ -1943,10 +1965,11 @@ class IdentityProofContracts(unittest.TestCase):
     """
 
     def test_version_1_reports_the_flag_claim_as_unproven(self):
-        result = analyzer.analyze(envelope(closed_chain_events()))
+        result = analyzer.analyze(envelope(closed_chain_events(format_version=1), format_version=1))
         chain = result["chains"][0]
-        self.assertTrue(chain["sameObjectCertified"],
-                        "旧合同的判定语义不变（版本 1 仍是 flags 合同）")
+        self.assertTrue(chain['stageObservationComplete'])
+        self.assertFalse(chain["sameObjectCertified"])
+        self.assertIn('attemptSerialNotCarried', chain['certificationRefusals'])
         self.assertEqual(chain["identityBasis"], "recorderFlagClaimOnly")
         self.assertFalse(chain["identityProven"],
                          "只有 identityWeak=0 时，报告必须明确写出身份**未**被证明")
@@ -1971,10 +1994,10 @@ class IdentityProofContracts(unittest.TestCase):
         self.assertFalse(chain["identityProven"])
         self.assertEqual(result["recovered"], [])
 
-    def test_version_2_with_a_carried_proof_is_certified(self):
+    def test_version_5_with_carried_identity_and_attempt_is_certified(self):
         result = analyzer.analyze(envelope(segment_chain_events(lifecycle=0x4242,
-                                                                identity_proof=1),
-                                           format_version=2))
+                                                                identity_proof=1, format_version=5),
+                                           format_version=5))
         chain = result["chains"][0]
         self.assertEqual(chain["certificationRefusals"], [])
         self.assertTrue(chain["identityProven"])
@@ -1998,13 +2021,15 @@ class IdentityProofContracts(unittest.TestCase):
 
     def test_version_2_cli_exit_code_follows_the_segmented_verdict(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            cases = (("segmented-certified.json",
-                      envelope(segment_chain_events(segment=1), format_version=2), 0),
+            cases = (("segmented-without-attempt.json",
+                      envelope(segment_chain_events(segment=1), format_version=2), 2),
+                     ("attempt-certified.json",
+                      envelope(segment_chain_events(segment=1, format_version=5), format_version=5), 0),
                      ("segmented-unproven.json",
                       envelope(segment_chain_events(segment=1, identity_proof=0),
                                format_version=2), 2),
                      ("legacy-unsegmented.json",
-                      envelope(closed_chain_events()), 0))
+                      envelope(closed_chain_events(format_version=1), format_version=None), 2))
             for name, payload, expected in cases:
                 with self.subTest(name=name):
                     path = Path(temp_dir) / name
@@ -2013,6 +2038,283 @@ class IdentityProofContracts(unittest.TestCase):
                                            ["analyze_palette_object_evidence.py", str(path)]):
                         with contextlib.redirect_stdout(io.StringIO()):
                             self.assertEqual(analyzer.main(), expected)
+
+class AttemptSerialContracts(unittest.TestCase):
+    """v5 must reconstruct live evidence for one contiguous known attempt."""
+
+    def rows(self, steps, terminal_attempt=None):
+        # Each tuple is (stage, attempt); the first rejection is intentionally
+        # allowed to precede a later retry. Cumulative flags/counts mirror wire v4.
+        rows=[]
+        served=0
+        submitted=drawn=False
+        object_key=key(lifecycle=0x4242)
+        for index,(stage,attempt) in enumerate(steps):
+            served+=int(stage==2)
+            submitted=submitted or stage==3
+            drawn=drawn or stage==4
+            rows.append(event(index+1,object_key,
+                              frames(render_frame=500+index,manifest_unknown=False,
+                                     native_unknown=False),stage,
+                              source=0 if stage==1 else 2,
+                              hit_key=0 if stage==1 else 0xABCD,hit_count=served,
+                              first_reject_frame=500,
+                              delta_frames=index if stage in (1,2) else 0,
+                              saw_submit=submitted,saw_draw=drawn,chain_sequence=index+1,
+                              window_segment=1,identity_proof=1,attempt_serial=attempt))
+        index=len(rows)
+        rows.append(event(index+1,object_key,
+                          frames(render_frame=500+index,manifest_unknown=False,native_unknown=False),
+                          stage=4,source=2,hit_key=0xABCD,hit_count=served,
+                          terminal=1,first_reject_frame=500,delta_frames=index,
+                          saw_submit=True,saw_draw=True,chain_sequence=index+1,
+                          window_segment=1,identity_proof=1,
+                          attempt_serial=steps[-1][1] if terminal_attempt is None else terminal_attempt))
+        return rows
+
+    def chain(self,rows):
+        return analyzer.analyze(envelope(rows,format_version=5))['chains'][0]
+
+    def assert_refused(self,rows,reason):
+        chain=self.chain(rows)
+        self.assertFalse(chain['sameObjectCertified'])
+        self.assertIn(reason,chain['certificationRefusals'])
+        return chain
+
+    def test_zero_and_large_known_attempts_certify(self):
+        for attempt in (0,1,2**64-2):
+            with self.subTest(attempt=attempt):
+                rows=self.rows([(1,0),(2,attempt),(3,attempt),(4,attempt)])
+                result=analyzer.analyze(envelope(rows,format_version=5))
+                self.assertTrue(result['chainComplete'])
+                self.assertEqual(result['attemptSerialSlot'],['data',5])
+                self.assertEqual(result['chains'][0]['attemptSerial'],str(attempt))
+                self.assertTrue(result['chains'][0]['sameAttemptComplete'])
+
+    def test_attempt_partition_matrix_never_stitches(self):
+        unknown=2**64-1
+        for s,e,d,t in itertools.product((0,9,unknown),repeat=4):
+            with self.subTest(served=s,enqueued=e,drawn=d,terminal=t):
+                chain=self.chain(self.rows([(1,0),(2,s),(3,e),(4,d)],t))
+                self.assertEqual(chain['sameObjectCertified'],s==e==d==t and s!=unknown)
+                self.assertTrue(chain['stageObservationComplete'])
+
+    def test_same_number_return_after_other_attempt_requires_new_chain(self):
+        # A S/E -> B S -> A D must not recover merely because A once had S/E.
+        self.assert_refused(self.rows([(1,0),(2,7),(3,7),(2,8),(4,7)]),
+                            'attemptServedCandidateMissing')
+        self.assertTrue(self.chain(self.rows(
+            [(1,0),(2,7),(3,7),(2,8),(2,7),(3,7),(4,7)]))['sameObjectCertified'])
+
+    def test_later_complete_retry_preserves_earlier_reject_fact(self):
+        rows=self.rows([(1,1),(2,1),(2,2),(3,2),(4,2)])
+        chain=self.chain(rows)
+        self.assertTrue(chain['sameObjectCertified'])
+        self.assertEqual(chain['servedCandidates'],2)
+        self.assertEqual(chain['attemptSerial'],'2')
+
+    def test_complete_retry_after_earlier_enqueue_without_serve_certifies(self):
+        rows=self.rows([(1,10),(3,10),(1,20),(2,20),(3,20),(4,20)])
+        result=analyzer.analyze(envelope(rows,format_version=5))
+        chain=result['chains'][0]
+        self.assertTrue(chain['sameAttemptComplete'])
+        self.assertTrue(chain['sameObjectCertified'])
+        self.assertTrue(chain['stageObservationComplete'])
+        self.assertTrue(chain['covered'])
+        self.assertTrue(result['chainComplete'])
+        self.assertEqual(chain['orderIssues'],[])
+        self.assertEqual(chain['certificationRefusals'],[])
+        self.assertEqual(chain['attemptSerial'],'20')
+
+    def test_complete_retry_after_earlier_draw_without_enqueue_certifies(self):
+        rows=self.rows([(1,10),(2,10),(4,10),(1,20),(2,20),(3,20),(4,20)])
+        self.assertFalse(rows[2]['words32'][28]&1,
+                         'the old failed draw must genuinely have no submit witness')
+        result=analyzer.analyze(envelope(rows,format_version=5))
+        chain=result['chains'][0]
+        self.assertTrue(chain['sameAttemptComplete'])
+        self.assertTrue(chain['sameObjectCertified'])
+        self.assertTrue(chain['stageObservationComplete'])
+        self.assertTrue(chain['covered'])
+        self.assertTrue(result['chainComplete'])
+        self.assertEqual(chain['orderIssues'],[])
+        self.assertEqual(chain['certificationRefusals'],[])
+
+    def test_earlier_failed_attempt_without_complete_retry_still_refuses(self):
+        for steps,reason in (
+                ([(1,10),(3,10),(1,20),(2,20),(4,20)], 'attemptEnqueuedMissing'),
+                ([(1,10),(2,10),(4,10),(1,20),(2,20),(3,20)], 'attemptDrawnMissing')):
+            with self.subTest(steps=steps):
+                chain=self.assert_refused(self.rows(steps),reason)
+                self.assertFalse(chain['sameAttemptComplete'])
+
+    def test_same_attempt_bad_prefix_cannot_be_washed_by_later_stages(self):
+        for steps in ([(1,10),(3,10),(2,10),(3,10),(4,10)],
+                      [(1,10),(2,10),(4,10),(2,10),(3,10),(4,10)]):
+            with self.subTest(steps=steps):
+                chain=self.assert_refused(self.rows(steps),'attemptStageOrderInvalid')
+                self.assertFalse(chain['sameAttemptComplete'])
+
+    def test_true_earlier_stage_regression_stays_sticky_after_complete_retry(self):
+        rows=self.rows([(1,10),(2,10),(3,10),(2,10),
+                        (1,20),(2,20),(3,20),(4,20)])
+        chain=self.assert_refused(rows,'attemptStageOrderInvalid')
+        self.assertFalse(chain['sameAttemptComplete'])
+        self.assertTrue(chain['covered'])
+        self.assertTrue(chain['stageObservationComplete'],
+                        'lifetime stage observation is separate from attempt certification')
+
+    def test_current_draw_without_submit_witness_remains_named_refusal(self):
+        rows=self.rows([(1,10),(3,10),(1,20),(2,20),(3,20),(4,20)])
+        rows[-2]['words32'][28]&=~1
+        chain=self.assert_refused(rows,'liveDrawnWithoutSubmit')
+        self.assertIn('attemptDrawWitnessMissing',chain['certificationRefusals'])
+
+    def test_complete_retry_does_not_bypass_loss_identity_source_or_terminal(self):
+        steps=[(1,10),(3,10),(1,20),(2,20),(3,20),(4,20)]
+        for field,index,value,reason in (
+                ('words32',14,1,'identityWeak'),
+                ('words32',16,1,'epochUnknown'),
+                ('data',10,'0','drawSourceMissing'),
+                ('data',11,'1','terminalHitKeyMismatch'),
+                ('words32',28,7,'selectionClearedAtDraw')):
+            with self.subTest(reason=reason):
+                rows=self.rows(steps)
+                rows[-1][field][index]=value
+                self.assert_refused(rows,reason)
+        result=analyzer.analyze(envelope(self.rows(steps),format_version=5,
+                                         counter_overrides={'droppedPayloadConflict':1}))
+        self.assertFalse(result['chains'][0]['sameObjectCertified'])
+        self.assertIn('chainNotCovered',result['chains'][0]['certificationRefusals'])
+
+    def test_legacy_versions_retain_first_stage_order_and_global_draw_witness_checks(self):
+        for version in (1,2,3,4):
+            for steps,issue in (
+                    ([(1,10),(3,10),(1,20),(2,20),(3,20),(4,20)],
+                     'enqueuedBeforeServedCandidate'),
+                    ([(1,10),(2,10),(4,10),(1,20),(2,20),(3,20),(4,20)],
+                     'drawnBeforeEnqueued')):
+                with self.subTest(version=version,issue=issue):
+                    rows=self.rows(steps)
+                    for row in rows:
+                        row['data'][5]='0'
+                        if version==1:
+                            row['data'][3]='0'
+                            row['words32'][15]=0
+                    chain=analyzer.analyze(envelope(rows,format_version=version))['chains'][0]
+                    self.assertFalse(chain['sameObjectCertified'])
+                    self.assertFalse(chain['stageObservationComplete'])
+                    self.assertIn(issue,chain['orderIssues'])
+                    self.assertIn('attemptSerialNotCarried',chain['certificationRefusals'])
+                    if issue=='drawnBeforeEnqueued':
+                        self.assertIn('liveDrawnWithoutSubmit',chain['certificationRefusals'])
+
+    def test_v5_observation_keeps_aggregate_stage_order_and_draw_witness_diagnostics(self):
+        for steps,issue in (
+                ([(1,10),(3,10),(2,20),(3,20),(4,20)], 'enqueuedBeforeServedCandidate'),
+                ([(1,10),(2,10),(4,10),(2,20),(3,20),(4,20)], 'drawnBeforeEnqueued')):
+            with self.subTest(issue=issue):
+                rows=self.rows(steps)
+                rows[0]['words32'][5]=5  # FirstSight, not a rejection.
+                rows[-1]['words32'][18]=7  # ObservationClosed, never Recovered.
+                for row in rows:
+                    row['data'][4]='1'
+                    row['words32'][0]=0xFE  # NotChecked: no reject fact.
+                chain=analyzer.analyze(envelope(rows,format_version=5,
+                    counter_overrides={'firstSightInserted':1,'firstSightEmitted':1}))['chains'][0]
+                self.assertTrue(chain['sameAttemptComplete'])
+                self.assertFalse(chain['sameObjectCertified'])
+                self.assertFalse(chain['stageObservationComplete'])
+                self.assertIn(issue,chain['orderIssues'])
+                if issue=='drawnBeforeEnqueued':
+                    self.assertIn('liveDrawnWithoutSubmit',chain['certificationRefusals'])
+
+    def test_unknown_attempt_interrupts_same_number(self):
+        self.assert_refused(self.rows([(1,0),(2,7),(3,2**64-1),(3,7),(4,7)]),
+                            'attemptServedCandidateMissing')
+
+    def test_incomplete_current_attempt_cannot_borrow_old_draw(self):
+        self.assert_refused(self.rows([(1,0),(2,7),(3,7),(4,7),(2,8),(3,8)]),
+                            'attemptDrawnMissing')
+
+    def test_terminal_cannot_relabel_an_older_complete_attempt_as_current(self):
+        self.assert_refused(self.rows([(1,0),(2,7),(3,7),(4,7),(2,8)],7),
+                            'terminalAttemptMismatch')
+
+    def test_terminal_flags_do_not_replace_live_draw(self):
+        self.assert_refused(self.rows([(1,0),(2,7),(3,7)]),'attemptDrawnMissing')
+
+    def test_live_sources_and_hit_keys_must_match(self):
+        for index in (1,2,3):
+            for slot,value,reason in ((10,'7','attemptStageSourceUnknown'),
+                                      (10,'0','attemptStageSourceUnknown'),
+                                      (10,'3','attemptSourceMismatch'),
+                                      (11,'0','attemptHitKeyMissing'),
+                                      (11,'123','attemptHitKeyMismatch')):
+                with self.subTest(index=index,slot=slot,value=value):
+                    rows=self.rows([(1,0),(2,7),(3,7),(4,7)])
+                    rows[index]['data'][slot]=value
+                    self.assert_refused(rows,reason)
+
+    def test_cleared_stage_or_terminal_cannot_certify(self):
+        for index in (1,2,3,4):
+            with self.subTest(index=index):
+                rows=self.rows([(1,0),(2,7),(3,7),(4,7)])
+                rows[index]['words32'][28]|=4
+                self.assert_refused(rows,'attemptSelectionCleared')
+
+    def test_terminal_source_and_hit_must_match_current_draw(self):
+        for slot,value,reason in ((10,'7','terminalSourceMismatch'),
+                                  (10,'3','terminalSourceMismatch'),
+                                  (11,'0','terminalHitKeyMismatch'),
+                                  (11,'123','terminalHitKeyMismatch')):
+            with self.subTest(slot=slot,value=value):
+                rows=self.rows([(1,0),(2,7),(3,7),(4,7)])
+                rows[-1]['data'][slot]=value
+                self.assert_refused(rows,reason)
+
+    def test_attempt_local_order_is_not_replaced_by_cumulative_flags(self):
+        # Earlier complete attempt sets cumulative sawSubmit/sawDraw, but current
+        # D precedes current E. The first-stage chain-wide order alone looks legal.
+        rows=self.rows([(1,0),(2,7),(3,7),(4,7),(2,8),(4,8),(3,8)])
+        self.assert_refused(rows,'attemptStageOrderInvalid')
+
+    def test_later_retry_does_not_erase_recorders_sticky_order_violation(self):
+        self.assert_refused(self.rows(
+            [(1,0),(2,7),(3,7),(4,7),(2,7),(2,8),(3,8),(4,8)]),
+            'attemptStageOrderInvalid')
+
+    def test_unknown_low_rank_event_preserves_lifetime_order_violation(self):
+        self.assert_refused(self.rows(
+            [(1,0),(2,7),(3,7),(4,7),(1,2**64-1),(2,8),(3,8),(4,8)]),
+            'attemptStageOrderInvalid')
+
+    def test_legacy_versions_remain_readable_but_cannot_certify_attempt(self):
+        for version in (None,1,2,3,4):
+            with self.subTest(version=version):
+                rows=closed_chain_events(format_version=version or 1)
+                result=analyzer.analyze(envelope(rows,format_version=version))
+                chain=result['chains'][0]
+                self.assertTrue(result['schemaValid'])
+                self.assertTrue(chain['stageObservationComplete'])
+                self.assertFalse(chain['sameObjectCertified'])
+                self.assertEqual(chain['conclusion'],'StageCompleteUncertified')
+                self.assertIn('attemptSerialNotCarried',chain['certificationRefusals'])
+                self.assertFalse(result['attemptSerialCarried'])
+                self.assertEqual(result['recovered'],[])
+
+    def test_attempt_carrier_is_reserved_until_v5_and_other_slots_stay_reserved(self):
+        for version in (1,2,3,4):
+            rows=closed_chain_events(format_version=version)
+            rows[1]['data'][5]='1'
+            with self.subTest(version=version),self.assertRaisesRegex(ValueError,r'data\[5\].*reserved'):
+                analyzer.analyze(envelope(rows,format_version=version))
+        for slot in (6,7,8):
+            rows=closed_chain_events()
+            rows[1]['data'][slot]='1'
+            with self.subTest(slot=slot),self.assertRaisesRegex(ValueError,'reserved'):
+                analyzer.analyze(envelope(rows))
+
 
 class LiveFoundEvidenceGapOrdering(unittest.TestCase):
     """2026-09-19 **实机发现**的锁定（evidence3 链 key=data[0]="857217852"）。

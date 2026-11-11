@@ -2,6 +2,11 @@
 
 #include "../../d3d9_util.h"
 #include "../../d3d9_war3_settings.h"
+#include "../../d3d9_buffer.h"
+#include "../../d3d9_shader.h"
+#include "../../d3d9_surface.h"
+#include "../../d3d9_texture.h"
+#include "../../d3d9_vertex_declaration.h"
 
 #include <array>
 #include <string>
@@ -17,7 +22,7 @@ namespace dxvk {
    */
   class War3PostProcess {
   public:
-    explicit War3PostProcess(IDirect3DDevice9* device);
+    explicit War3PostProcess(D3D9DeviceEx* device);
 
     void Init(uint32_t width, uint32_t height, D3DFORMAT format);
     void Shutdown();
@@ -53,20 +58,22 @@ namespace dxvk {
     uint32_t m_height = 0;
     D3DFORMAT m_format = D3DFMT_UNKNOWN;
 
-    Com<IDirect3DTexture9> m_sceneTexture;
-    Com<IDirect3DSurface9> m_sceneSurface;
+    // Device-owned resources retain their storage, not their parent device.
+    // Public API Get/Create references remain public until explicitly adopted.
+    Com<D3D9Texture2D, false> m_sceneTexture;
+    Com<D3D9Surface, false> m_sceneSurface;
 
-    std::array<Com<IDirect3DTexture9>, kBloomLevels> m_bloomTextures;
-    std::array<Com<IDirect3DSurface9>, kBloomLevels> m_bloomSurfaces;
+    std::array<Com<D3D9Texture2D, false>, kBloomLevels> m_bloomTextures;
+    std::array<Com<D3D9Surface, false>, kBloomLevels> m_bloomSurfaces;
     std::array<D3DVIEWPORT9, kBloomLevels> m_bloomViewports;
 
-    Com<IDirect3DVertexShader9> m_vsFullscreen;
-    Com<IDirect3DPixelShader9> m_psPrefilter;
-    Com<IDirect3DPixelShader9> m_psDownsample;
-    Com<IDirect3DPixelShader9> m_psUpsample;
-    Com<IDirect3DPixelShader9> m_psComposite;
-    Com<IDirect3DVertexDeclaration9> m_decl;
-    Com<IDirect3DVertexBuffer9> m_fullscreenVB;
+    Com<D3D9VertexShader, false> m_vsFullscreen;
+    Com<D3D9PixelShader, false> m_psPrefilter;
+    Com<D3D9PixelShader, false> m_psDownsample;
+    Com<D3D9PixelShader, false> m_psUpsample;
+    Com<D3D9PixelShader, false> m_psComposite;
+    Com<D3D9VertexDecl, false> m_decl;
+    Com<D3D9VertexBuffer, false> m_fullscreenVB;
   };
 
 } // namespace dxvk

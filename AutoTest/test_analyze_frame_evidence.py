@@ -170,12 +170,15 @@ class ExtensionVersionTests(unittest.TestCase):
     def test_explicit_version_two_is_accepted(self):
         self.assertEqual(analyze(self.with_palette(version=2))["extensions"],
                          {"paletteObject":2})
+    def test_explicit_version_five_is_accepted(self):
+        self.assertEqual(analyze(self.with_palette(version=5))["extensions"],
+                         {"paletteObject":5})
     def test_unknown_extension_version_is_rejected(self):
         # 2026-09-18 阶段 C 更正：这里原先把 **3** 列为"未知版本"，但 3 早已登记
         # （v3 = 分段 + 正常观察链）⇒ 本用例一直在**假失败**（它不在 259 个
         # `test_*_static.py` 门禁内，所以没被发现）。现在 3 与 4 都是已登记版本，
         # 本用例改用**真正未登记**的 5。**要求未变**：未登记版本必须整份拒绝。
-        for version in (0,5,7,99,-1,"1",2.0,True,None):
+        for version in (0,6,7,99,-1,"1",2.0,True,None):
             with self.subTest(version=version):
                 with self.assertRaises(ValueError):
                     analyze(self.with_palette(version=version))

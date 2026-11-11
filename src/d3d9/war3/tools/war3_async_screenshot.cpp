@@ -1,5 +1,6 @@
 #include "war3_async_screenshot.h"
 #include "war3_async_screenshot_core.h"
+#include "war3_async_screenshot_io.h"
 #include "war3_internal_test_api.h"
 #include "war3_frame_evidence.h"
 #include "war3_frame_history.h"
@@ -69,6 +70,8 @@ struct AsyncScreenshot::Impl {
   std::atomic<uint32_t> inFlight{0}, rejected{0}, cancelled{0};
   std::mutex wakeMutex;
   std::condition_variable wake;
+  screenshot::IoCancellationGate fileIo;
+  screenshot::Win32WorkerHandle workerHandle;
   std::thread worker;
   uint32_t width = 0, height = 0;
   bool sourceReady = false; // Validated dimensions/format, NOT allocated buffers.
@@ -77,7 +80,14 @@ struct AsyncScreenshot::Impl {
 
   explicit Impl(const Rc<DxvkDevice>& dev) : device(dev) {
     worker = std::thread([this] {
-      try { run(); }
+      screenshot::Win32WorkerHandle::ExitSignal exited(workerHandle);
+      const bool handleReady = workerHandle.publishCurrentThread();
+      try {
+        if (!handleReady)
+          Logger::warn(str::format("[AsyncScreenshot] worker handle duplication failed error=",
+              workerHandle.publicationError(), "; shutdown will use join without I/O cancellation"));
+        run();
+      }
       catch (...) {
         fault.store(true, std::memory_order_release);
         available.store(false, std::memory_order_release);
@@ -86,9 +96,26 @@ struct AsyncScreenshot::Impl {
     });
   }
   ~Impl() {
-    stop.store(true, std::memory_order_release);
-    wake.notify_one();
-    if (worker.joinable()) worker.join();
+    screenshot::ShutdownReport report;
+    if (worker.joinable()) {
+      report = screenshot::CancelAndJoin(stop, fileIo,
+          [&] { wake.notify_one(); },
+          [&] { return workerHandle.waitForCompletion(); },
+          [&] { return workerHandle.cancelPending(); },
+          [&] { workerHandle.joinAndClose([&] { worker.join(); }); });
+    }
+    screenshot::FailPendingHistoryAfterJoin(slots);
+    // Cancellation cannot target Logger: the worker has actually terminated.
+    // Reporting must not prevent pending history completion or throw at teardown.
+    if (report.cancelAttempts || report.completionPollFailed || workerHandle.publicationError()) {
+      try {
+        Logger::info(str::format("[AsyncScreenshot] shutdown joined; io-cancel-requested=",
+            report.cancelRequested, " not-found=", report.cancelNotFound,
+            " failed=", report.cancelFailed, " last-error=", report.lastCancelError,
+            " completion-poll-failed=", report.completionPollFailed,
+            " handle-error=", workerHandle.publicationError()));
+      } catch (...) { }
+    }
   }
 
   // Owner-only reclamation. Retired is published after GPU AND encoder finish,
@@ -143,6 +170,10 @@ struct AsyncScreenshot::Impl {
   }
 
   bool save(const Slot& slot) {
+    // The phase ends before Logger/evidence work. Its destructor also covers
+    // all early returns, after the file RAII object closes its owned handle.
+    auto filePhase = fileIo.enter(stop);
+    if (!filePhase) return false;
     std::wstring path;
     wchar_t name[160]{};
     if(slot.history) path=slot.history->path;
@@ -184,6 +215,7 @@ struct AsyncScreenshot::Impl {
         device->getDeviceStatus() != VK_SUCCESS) return false;
     // No REPLACE_EXISTING; failures preserve the owned .part for diagnostics.
     if (!MoveFileExW(partial.c_str(), path.c_str(), 0)) return false;
+    filePhase.finish();
     Logger::info(str::format("[AsyncScreenshot] saved id=", slot.serial,
         " size=", slot.width, "x", slot.height, " file=", name));
     if (slot.evidenceSession && !slot.history) {

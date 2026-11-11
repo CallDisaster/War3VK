@@ -25,13 +25,14 @@ meson 侧见 src/d3d9/meson.build 的 test('war3_palette_object_wire_roundtrip')
   G4  Control(freeze) 先 ClosePaletteObjectWindow() 再 ring.finish()（终态才进得了环），
       且发射器在 Record(...) == 0 时 NoteRingEviction(1)（环已冻结/未激活时 fail-visible）。
 
-因此本脚本现在的判定是：**四个场景的上级期望必须由真实生产路径全部满足**，否则非零退出。
+本脚本要求全部 A–O 场景的期望由真实生产路径满足，否则非零退出。
 仍然**硬断言全部可证事实**（不放宽任何一条，也不新增开关）：
 
   * 真导出文件的严格根校验（复用 analyze_frame_evidence.analyze 的非能力缺口检查）；
   * 逐事件逐位解码：data[2]=lifecycleIdentity、**版本 2 声明的**两个载体
     （data[3]=windowSegment、words32[15]=identityProofKind，取代旧的"保留位必须为 0"断言）、
-    其余保留位仍恒 0、thread 见证、lo/hi 拆分、chainSequence 单调递增、四阶段顺序；
+    v4 data[4]=chainType、v5 data[5]=attemptSerial，其余保留位仍恒 0、thread 见证、
+    lo/hi 拆分、chainSequence 单调递增、四阶段顺序；
   * A 的终态 Recovered 且 sameObjectCertified=true；
   * B 的 StageCompleteUncertified（弱身份拒绝同对象认证）；
   * C 的 objectLevelEvidenceDropped（环淘汰计数可读且进入 missing）；
@@ -82,6 +83,11 @@ meson 侧见 src/d3d9/meson.build 的 test('war3_palette_object_wire_roundtrip')
     导出里必须有 5 条 palette 事件且最后一条是 Recovered 终态、生产解析器必须判该链
     Recovered + sameObjectCertified —— 即预冻结钩子确实在状态仍为 Triggered 时结算了终态。
 
+v5 补充：H 跨 attempt、I unknown Drawn、J 来源不匹配必须真实导出为 Unclosed；
+K 完整重试、L 已知 attempt=0 必须仍可认证。未知是 U64_MAX，不是 0。
+M/N 的旧 attempt 分别缺 S/E，后续完整新 attempt 必须认证；O 的旧 attempt 真正 E→S
+降秩则必须保持拒绝，不能以换 attempt 洗掉记录器的历史 orderViolation。
+
 边界（不得外推）：这里证明的只是**CPU 侧阶段记录链**与 wire 往返；一次 Served 是 CPU caster
 候选入队，一次 Drawn 是**绘制命令已记录**，**不是** GPU 提交完成，更不是像素证明；本导出
 **不**建立任何"运行时唯一所有者"结论。
@@ -124,6 +130,8 @@ REJECT_FRAME, SERVED_FRAME, ENQUEUED_FRAME, DRAWN_FRAME = 500, 503, 504, 505
 # freeze 用记录器 currentFrame()（= 最后推进到的帧）结算终态，因此终态 renderFrame == 505。
 TERMINAL_FRAME = DRAWN_FRAME
 RECORD_SERIAL_BASE = 0x100000000
+TEST_ATTEMPT_SERIAL = 0xFEDCBA9876543210
+UNKNOWN_ATTEMPT_SERIAL = 2**64 - 1
 # 记录器写入的五个事件（A/B/C 同形；终态见 G4：现在它**确实**进得了导出）。
 #   stage, source, hitKey, hitCount, chainSequence, sawSubmit, sawDraw, deltaFrames,
 #   terminal, renderFrame, recordFrameSerial
@@ -136,11 +144,11 @@ EXPECTED_EVENTS = [
      REJECT_FRAME, RECORD_SERIAL_BASE + REJECT_FRAME),
     # 2026-09-17 审计卫生点：S 点（生产）只会给出 None/ArenaSlot/DrawTimeCaptured/
     # OwnedPartSnapshot/PoseKernel/Unknown，**给不出 ProducerSnapshot**，因此夹具的来源
-    # 组合改为生产可达的 Served=ArenaSlot / Enqueued=ArenaSlot / Drawn=DrawTimeCaptured。
-    ("ServedCandidate", "ArenaSlot", 0xA1, 1, 2, False, False,
+    # v5 完整链还必须让同次 S/E/D 来源与 hitKey 相等，均保留最终 DrawTimeCaptured/C3。
+    ("ServedCandidate", "DrawTimeCaptured", 0xC3, 1, 2, False, False,
      SERVED_FRAME - REJECT_FRAME, "NoTerminal", SERVED_FRAME,
      RECORD_SERIAL_BASE + SERVED_FRAME),
-    ("Enqueued", "ArenaSlot", 0xB2, 1, 3, True, False, 0, "NoTerminal",
+    ("Enqueued", "DrawTimeCaptured", 0xC3, 1, 3, True, False, 0, "NoTerminal",
      ENQUEUED_FRAME, RECORD_SERIAL_BASE + ENQUEUED_FRAME),
     ("Drawn", "DrawTimeCaptured", 0xC3, 1, 4, True, True, 0, "NoTerminal",
      DRAWN_FRAME, RECORD_SERIAL_BASE + DRAWN_FRAME),
@@ -203,8 +211,8 @@ FIXTURE_SOURCE_HINT = ("the fixture source is injected by "
                        "RecordCertifiedShape(); it must be a production-reachable value "
                        "(e.g. PaletteObjectSource::ArenaSlot) and the exe must be rebuilt")
 # 冻结 wire 的保留槽位（data[2] = lifecycleIdentity；2026-09-17 D2 之后 data[3] = windowSegment、
-# words32[15] = identityProofKind 是**版本 2 声明的语义**，不再出现在保留集合里）。
-RESERVED_DATA = (4, 5, 6, 7, 8)
+# words32[15] = identityProofKind；v4 data[4] = chainType，v5 data[5] = attemptSerial。
+RESERVED_DATA = (6, 7, 8)
 RESERVED_WORDS32 = (3, 4, 6, 7, 8, 9, 11, 13, 17, 19) + tuple(range(34, 48))
 # 2026-09-17 上级裁定 ⑦⑧（D2 生产写入侧）：版本 2 = 生产形状。
 # 生产链路的记录器在 arm（Reset）后开第 1 个窗口，因此 A..F 每个场景里每条记录的分段量都是 1。
@@ -324,7 +332,7 @@ def run_exe(exe: Path):
     return done.stdout
 
 
-SCENARIO_ORDER = ["A", "B", "C", "D", "E", "F", "G"]
+SCENARIO_ORDER = list("ABCDEFGHIJKLMNO")
 # 2026-09-18 独立复核（Astra）P0：终判必须要求**必需场景齐全**。
 # 原实现只统计 spec_results 里**现有**项，因此「把某个场景的调用删掉/注释掉」
 # 会让该场景从集合里消失，而门禁仍然显示通过 —— G 正是这样失踪的。
@@ -335,7 +343,7 @@ REQUIRED_SCENARIOS = frozenset(SCENARIO_ORDER)
 def parse_exports(stdout):
     exports, order = {}, []
     for line in stdout.splitlines():
-        found = re.fullmatch(r"SCENARIO=([A-G]) EXPORT=(.+)", line.strip())
+        found = re.fullmatch(r"SCENARIO=([A-O]) EXPORT=(.+)", line.strip())
         if found:
             exports[found.group(1)] = Path(found.group(2))
             order.append(found.group(1))
@@ -348,7 +356,8 @@ def parse_exports(stdout):
           "exe must print its own ROUNDTRIP checks summary")
     check("ENCODER checks=" in stdout, "pure encoder byte-mapping self-check must run")
     # 2026-09-17 D2：纯编码自检新增两条声明载体的默认值断言（windowSegment 默认 1、
-    # identityProofKind 默认 0），因此检查数从 71 变为 73。
+    # identityProofKind 默认 0），因此检查数从 71 变为 73；v5 用 chainType/attemptSerial
+    # 实值断言取代 data[4]/data[5] 的旧保留零断言，检查数仍为 73。
     check("ENCODER checks=73 failures=0 PASS" in stdout,
           "pure encoder byte-mapping self-check must pass (73 checks)")
     check(re.search(r"ROUNDTRIP checks=\d+ failures=0 PASS", stdout) is not None,
@@ -359,13 +368,8 @@ def parse_exports(stdout):
 
 
 def decode_events(raw):
-    """按**版本 2**（现行生产形状）解码真实导出里的事件。
-
-    2026-09-17 D2：analyze_palette_object_evidence.decode_event() 的默认参数是版本 1 合同
-    （data[3]/words32[15] 仍是必须为 0 的保留槽）。真实生产导出现在是版本 2，因此这里必须显式
-    传分段版本 —— 否则读方会把声明的分段载体 data[3] 判成"保留位非零"。
-    """
-    return [analyzer.decode_event(event, analyzer.PALETTE_OBJECT_CHAIN_TYPED_VERSION)
+    """按当前 v5 合同读取真实导出；旧版本的默认参数不适用于生产新写方。"""
+    return [analyzer.decode_event(event, PRODUCTION_VERSION)
             for event in raw]
 
 
@@ -392,7 +396,7 @@ def collect_tagged(stdout):
 def parse_counter_lines(stdout):
     per_scenario, current = {}, None
     for line in stdout.splitlines():
-        begin = re.fullmatch(r"SCENARIO_BEGIN ([A-F])", line.strip())
+        begin = re.fullmatch(r"SCENARIO_BEGIN ([A-O])", line.strip())
         if begin:
             current = begin.group(1)
             per_scenario[current] = {}
@@ -465,27 +469,13 @@ def check_root_envelope(name, data):
     return analysis
 
 
-# 2026-09-18 阶段 C：写方改为**恒定 v4**（链型 + 统一终态 ObservationClosed）。
-# 驱动的期望随之改为新版本 —— 这是**产品契约变更**（版本是契约的一部分），
-# 不是放宽判据：断言仍然要求「生产导出必须声明**当前**版本」，只是当前版本变了。
-PRODUCTION_VERSION=4
+# 当前写方恒定 v5，在 v4 链型基础上携带全宽 attemptSerial。
+PRODUCTION_VERSION = analyzer.PALETTE_OBJECT_ATTEMPT_VERSION
 
 def check_header_block(name, data, expected_version=PRODUCTION_VERSION):
-    """2026-09-18：`expected_version` 参数化。
-
-    本函数原先**硬编码**"生产导出必须是版本 2"（含字段集与版本号），写于 2026-09-17 ——
-    **v3 出现之前**。批次 3 引入正常观察链（FirstSight=5）后，生产导出在发出首见时
-    **必然是版本 3**，于是场景 G 一跑本函数就报
-    `the production export must declare extension version 2 (got 3)`。
-    **这不是产品缺陷，是测试没跟上版本**（审计第 7 项"测试同步"的具体一例）。
-    A–F 仍传默认 2（它们确实是版本 2 的形状），G 传 3。
-    """
-    """G1 翻转：paletteObject.watchCount 必须是 JSON 整数，counters 仍是规范十进制字符串。
-
-    2026-09-17 上级裁定 ⑦⑧（D2 已落地）：生产写入端现在**确实**写分段与身份证明种类，因此真实
-    导出的扩展版本必须是登记在案的**版本 2**（= 现行生产形状）。版本 1（含无 version 的旧实机产物）
-    仍按旧合同可读，但**不再**是本夹具导出所允许的形状。
-    """
+    """新生产导出必须声明 v5；旧版可读不等于允许新写方漏带 attempt。"""
+    check(expected_version == 5 and frame_evidence.PALETTE_OBJECT_ATTEMPT_VERSION == 5,
+          "%s: both production readers must register palette extension v5" % name)
     block = data["paletteObject"]
     check(set(block) == set(frame_evidence.PALETTE_OBJECT_BLOCK_FIELDS[expected_version]),
           "%s: the production block must be the registered version-%d shape (got %s)"
@@ -504,6 +494,20 @@ def check_header_block(name, data, expected_version=PRODUCTION_VERSION):
         check(isinstance(value, str) and value == str(int(value)) and int(value) >= 0,
               "%s: counter %s must be a canonical non-negative decimal string (got %r)"
               % (name, field, value))
+    # 所有场景都逐事件检查既有链型、全宽尝试号与剩余保留槽；包括观察链和并发链。
+    raw = [event for event in data["events"] if event.get("label") == analyzer.LABEL]
+    for event, decoded in zip(raw, decode_events(raw)):
+        words = [analyzer.u64(value) for value in event["data"]]
+        expected_chain_type = 1 if decoded["chainType"] == "Observation" else 0
+        check(words[4] == expected_chain_type,
+              "%s: data[4] must carry the decoded chainType" % name)
+        check(decoded["attemptSerial"] == str(words[5]),
+              "%s: data[5] must round-trip attemptSerial without truncation" % name)
+        if name in "ABCDEFG":
+            check(words[5] == TEST_ATTEMPT_SERIAL,
+                  "%s: existing scenarios must carry the explicit full-width test attempt" % name)
+        check(all(words[index] == 0 for index in RESERVED_DATA),
+              "%s: data[6..8] must remain reserved zero" % name)
 
 
 def check_decoded_events(name, data, identity_weak, lifecycle_identity, identity_proof):
@@ -529,7 +533,8 @@ def check_decoded_events(name, data, identity_weak, lifecycle_identity, identity
                 "hitCount": hit_count, "chainSequence": chain_sequence,
                 "sawSubmit": saw_submit, "sawDraw": saw_draw, "terminal": terminal,
                 "deltaFrames": str(delta), "firstRejectFrame": str(REJECT_FRAME),
-                "identityWeak": identity_weak, "epochUnknown": False}
+                "identityWeak": identity_weak, "epochUnknown": False,
+                "attemptSerial": str(TEST_ATTEMPT_SERIAL), "chainType": "RejectionRecovery"}
         got = {field: decoded_event[field] for field in want}
         detail = ""
         if got["source"] != want["source"] and got["source"] in WIRE_ONLY_SOURCES:
@@ -574,6 +579,9 @@ def check_decoded_events(name, data, identity_weak, lifecycle_identity, identity
         check(data_words[3] == WINDOW_SEGMENT and str(data_words[3]) == str(WINDOW_SEGMENT),
               "%s: data[3] must carry the record-level windowSegment (got %d, want %d)"
               % (name, data_words[3], WINDOW_SEGMENT))
+        check(data_words[4] == 0, "%s: data[4] must carry RejectionRecovery" % name)
+        check(data_words[5] == TEST_ATTEMPT_SERIAL,
+              "%s: data[5] must retain the explicit full-width known attempt" % name)
         for index in RESERVED_DATA:
             check(data_words[index] == 0,
                   "%s: data[%d] is reserved and must be zero (got %d)"
@@ -688,6 +696,10 @@ def check_chain(name, raw, result, lifecycle_identity, identity_proof):
     check(chain["terminal"] == "Recovered" and chain["sawSubmit"] and chain["sawDraw"],
           "%s: the recorder's own Recovered verdict + submit/draw flags must survive (got %s)"
           % (name, {key: chain[key] for key in ("terminal", "sawSubmit", "sawDraw")}))
+    check(chain["sameAttemptComplete"] is True and
+          chain["attemptSerial"] == str(TEST_ATTEMPT_SERIAL) and
+          result["attemptSerialCarried"] is True and result["attemptSerialSlot"] == ["data", 5],
+          "%s: the complete live attempt must be reconstructed from the v5 wire" % name)
     check(chain["servedCandidates"] == 1 and chain["hitCountMax"] == 1,
           "%s: hitCount must equal the ServedCandidate event count (got %s/%s)"
           % (name, chain["servedCandidates"], chain["hitCountMax"]))
@@ -879,6 +891,10 @@ def check_scenario_e(tagged, data):
               for rows in phase1_chains.values()),
           "E: every phase-1 chain must settle as Recovered with chainSequence 1..5 and the "
           "draw source carried by its terminal")
+    check(all({row["attemptSerial"] for row in rows} == {str(TEST_ATTEMPT_SERIAL)} and
+              len({(row["source"], row["hitKey"]) for row in rows[1:]}) == 1
+              for rows in phase1_chains.values()),
+          "E: every phase-1 chain must carry one known attempt and matching S/E/D/terminal")
     check(all(chain["covered"] for chain in result["chains"]) and
           result["coverageComplete"] is True and result["missing"] == [] and
           result["losses"] == {},
@@ -949,6 +965,120 @@ def check_scenario_g(data):
     return True
 
 
+def check_attempt_scenario(name, data):
+    """H–O 只接受生产可执行文件的真实导出，逐阶段检查尝试与来源。"""
+    before = len(FAILURES)
+    expected_attempts = {
+        "H": [TEST_ATTEMPT_SERIAL] * 2 + [TEST_ATTEMPT_SERIAL + 1] * 3,
+        "I": [TEST_ATTEMPT_SERIAL] * 3 + [UNKNOWN_ATTEMPT_SERIAL] * 2,
+        "J": [TEST_ATTEMPT_SERIAL] * 5,
+        "K": [TEST_ATTEMPT_SERIAL] * 4 + [TEST_ATTEMPT_SERIAL + 1] * 5,
+        "L": [0] * 5,
+        "M": [TEST_ATTEMPT_SERIAL] * 2 + [TEST_ATTEMPT_SERIAL + 1] * 5,
+        "N": [TEST_ATTEMPT_SERIAL] * 3 + [TEST_ATTEMPT_SERIAL + 1] * 5,
+        "O": [TEST_ATTEMPT_SERIAL] * 4 + [TEST_ATTEMPT_SERIAL + 1] * 5,
+    }[name]
+    positive = name in ("K", "L", "M", "N")
+    terminal_name = "Recovered" if positive else "Unclosed"
+    live_stages = ["Rejected", "ServedCandidate", "Enqueued", "Drawn"]
+    expected_stages = {
+        "K": live_stages * 2,
+        "M": ["Rejected", "Enqueued"] + live_stages,
+        "N": ["Rejected", "ServedCandidate", "Drawn"] + live_stages,
+        "O": ["Rejected", "ServedCandidate", "Enqueued", "ServedCandidate"] + live_stages,
+    }.get(name, live_stages) + ["Drawn"]
+    raw = [event for event in data["events"] if event.get("label") == analyzer.LABEL]
+    decoded = decode_events(raw)
+    check([row["stage"] for row in decoded] == expected_stages,
+          "%s: all planned live stages and exactly one settled terminal must be exported" % name)
+    if len(decoded) != len(expected_attempts):
+        check(False, "%s: unexpected event count for the real attempt fixture" % name)
+        return False
+    check([row["attemptSerial"] for row in decoded] == [str(x) for x in expected_attempts],
+          "%s: full-width live/terminal attempt values must match the actual calls" % name)
+    check([analyzer.u64(row["data"][5]) for row in raw] == expected_attempts,
+          "%s: raw data[5] must retain known, unknown and zero without reinterpretation" % name)
+    check([row["chainSequence"] for row in decoded] == list(range(1, len(decoded) + 1)),
+          "%s: repeated attempts must retain one continuous object-chain sequence" % name)
+    check([row["terminal"] for row in decoded] ==
+          ["NoTerminal"] * (len(decoded) - 1) + [terminal_name],
+          "%s: the recorder must itself settle the expected terminal" % name)
+    for index, row in enumerate(decoded):
+        # 首次 R 尚无来源；重试 R 按既有 MakeRecord 合同保留历史 lastSource/lastHitKey，
+        # 不可把这份历史载荷误当成新 attempt 的 ServedCandidate。
+        no_served_history = index == 0 or (name == "M" and index == 2)
+        expected_source = "NoSource" if no_served_history else "DrawTimeCaptured"
+        if name == "J" and row["stage"] == "Drawn":
+            expected_source = "OwnedPartSnapshot"
+        expected_hit = "0" if no_served_history else str(0xC3)
+        check((row["source"], row["hitKey"]) == (expected_source, expected_hit),
+              "%s: source/hit must preserve actual stage inputs and the retry rejection history" % name)
+        check(row["chainType"] == "RejectionRecovery" and
+              row["identityProofKind"] == IDENTITY_PROOF_CERTIFIED and
+              row["key"]["lifecycleIdentity"] == CERTIFIED_LIFECYCLE_IDENTITY and
+              row["identityWeak"] is False and row["epochUnknown"] is False and
+              row["selectionClearedByNativeOverride"] is False,
+              "%s: identity/selection prerequisites must not mask the target attempt condition" % name)
+    if name == "M":
+        check(decoded[1]["stage"] == "Enqueued" and decoded[1]["hitCount"] == 0 and
+              decoded[1]["sawSubmit"] is True,
+              "M: the actual old enqueue must precede any served candidate, not a rewritten JSON fixture")
+    if name == "N":
+        check(decoded[2]["stage"] == "Drawn" and decoded[2]["sawSubmit"] is False and
+              decoded[2]["sawDraw"] is True,
+              "N: the real old draw must preserve its missing submit witness")
+    if name in ("M", "N", "O"):
+        check(decoded[-1]["attemptSerial"] == str(TEST_ATTEMPT_SERIAL + 1) and
+              decoded[-1]["sawSubmit"] is True and decoded[-1]["sawDraw"] is True and
+              (decoded[-1]["source"], decoded[-1]["hitKey"]) == ("DrawTimeCaptured", str(0xC3)),
+              "%s: the current terminal must carry the complete retry's D payload and witnesses" % name)
+    counters = {field: int(value) for field, value in data["paletteObject"]["counters"].items()}
+    check(counters["emitted"] == len(decoded) and counters["terminalEmitted"] == 1 and
+          counters["closedRecovered"] == int(positive) and
+          counters["closedUnclosed"] == int(not positive),
+          "%s: recorder counters must agree with the real exported terminal" % name)
+    check(all(counters[field] == 0 for field in E_ZERO_COUNTERS),
+          "%s: no loss, conflict or duplicate may explain the result" % name)
+    result = analyzer.analyze(data)
+    check(result["formatVersion"] == 5 and result["attemptSerialCarried"] is True and
+          result["attemptSerialSlot"] == ["data", 5],
+          "%s: the production analyzer must consume the v5 attempt carrier" % name)
+    check(len(result["chains"]) == 1, "%s: exactly one strong-identity chain expected" % name)
+    if len(result["chains"]) != 1:
+        return False
+    chain = result["chains"][0]
+    check(result["coverageComplete"] is True and result["missing"] == [] and
+          result["losses"] == {} and chain["covered"] is True and
+          chain["identityProven"] is True and chain["stageObservationComplete"] is True,
+          "%s: the target must have full coverage, strong identity and all stage records" % name)
+    check(chain["terminal"] == terminal_name and chain["conclusion"] == terminal_name and
+          chain["sameAttemptComplete"] is positive and chain["sameObjectCertified"] is positive and
+          result["chainComplete"] is positive and chain["attemptSerial"] == str(expected_attempts[-1]),
+          "%s: writer and production reader must agree on the final attempt's recovery" % name)
+    if positive:
+        check(chain["certificationRefusals"] == [] and chain["orderIssues"] == [] and
+              result["recovered"] == [chain["key"]],
+              "%s: a complete retry/known-zero attempt must remain certified" % name)
+        check(chain["servedCandidates"] == (2 if name in ("K", "N") else 1),
+              "%s: all complete attempts must remain in the history" % name)
+    else:
+        refusal = {"H": "attemptServedCandidateMissing", "I": "attemptSerialUnknown",
+                   "J": "attemptSourceMismatch", "O": "attemptStageOrderInvalid"}[name]
+        check(refusal in chain["certificationRefusals"] and result["recovered"] == [],
+              "%s: reject certification for the named attempt defect %s" % (name, refusal))
+    if name == "O":
+        check(chain["servedCandidates"] == 3 and chain["hitCountMax"] == 3,
+              "O: both same-attempt served events and the complete retry must remain visible")
+    satisfied = len(FAILURES) == before
+    print("OBSERVED[%s]=%s" % (name, json.dumps({
+        "attemptSerial": chain["attemptSerial"], "terminal": chain["terminal"],
+        "sameAttemptComplete": chain["sameAttemptComplete"],
+        "sameObjectCertified": chain["sameObjectCertified"],
+        "certificationRefusals": chain["certificationRefusals"]}, sort_keys=True)))
+    print("SPEC_SATISFIED_PRODUCTION[%s]=%s" % (name, satisfied))
+    return satisfied
+
+
 def check_scenario_f_is_not_manual_freeze():
     """场景 F 必须走**自动**冻结：C++ 夹具的场景 F 函数体里不得出现 Control(freeze)。"""
     fixture = (ROOT / FIXTURE_CPP).read_text(encoding="utf-8")
@@ -1000,6 +1130,8 @@ def check_scenario_f(tagged, data):
           decoded[-1]["source"] == "DrawTimeCaptured",
           "F: the settled terminal must be Recovered and carry the draw source (got %s/%s)"
           % (decoded[-1]["terminal"], decoded[-1]["source"]))
+    check({event["attemptSerial"] for event in decoded} == {str(TEST_ATTEMPT_SERIAL)},
+          "F: automatic freeze must preserve the known full-width attempt on every event")
     check(decoded[-1]["deltaFrames"] == str(DRAWN_FRAME - REJECT_FRAME),
           "F: the terminal deltaFrames contract must hold (got %s)"
           % decoded[-1]["deltaFrames"])
@@ -1151,7 +1283,7 @@ def main():
     # 说明 v3 的 header 块存在 check_header_block 所不容的形状。
     # 未查明它是"G 真的违反不变量"还是"该检查未对 v3 参数化"，故**暂时移除**，
     # 以免留下一个我无法解释的失败门禁。查明后再决定是补检查还是修 G 夹具。
-    check_header_block("G", data)  # 阶段 C：恒定 v4 ⇒ 用默认（PRODUCTION_VERSION）
+    check_header_block("G", data)  # 正常观察链也必须使用当前恒定 v5。
     # 2026-09-18：补齐 A–F 都跑的其余三项。G 的身份参数**从夹具读出**（不猜）：
     # `war3_palette_object_wire_roundtrip_test.cpp:223`
     #     const PaletteObjectKey key = MakeKey(io.session, true, 0u);
@@ -1184,6 +1316,13 @@ def main():
         check_header_block(name, data)
         spec_results[name] = checker(tagged, data)
 
+    for name in "HIJKLMNO":
+        print("=== scenario %s ===" % name)
+        data = analyzer.load(exports[name])
+        check_root_envelope(name, data)
+        check_header_block(name, data)
+        spec_results[name] = check_attempt_scenario(name, data)
+
     # 2026-09-18 独立复核（Astra）P0：先强制"必需场景齐全"，再做 satisfied/unmet。
     # 缺场景时必须**具名**失败，而不是静默地从统计里消失。
     missing_scenarios = sorted(REQUIRED_SCENARIOS - set(spec_results))
@@ -1194,7 +1333,7 @@ def main():
     unmet = [name for name, ok in sorted(spec_results.items()) if not ok]
     print("CHECKS=%d FAILURES=%d" % (CHECKS, len(FAILURES)))
     print("SPEC_SATISFIED=%s SPEC_UNMET=%s" % (satisfied, unmet))
-    print("NOTE the six scenarios are read straight from the real production path (no projection, "
+    print("NOTE all fifteen scenarios are read straight from the real production path (no projection, "
           "no copied encoder/decoder): A certifies a same-object stage chain, B stays "
           "StageCompleteUncertified on weak identity, C stays Uncovered because the ring eviction "
           "is visible, D stays uncovered as an empty sample, E drives 4 writer threads plus a "
@@ -1202,7 +1341,11 @@ def main():
           "(the recorder's state access is serialized by its own lock; this says nothing about "
           "races having been eliminated elsewhere), F lets the ring freeze itself at the end of "
           "the post window and the settled terminal still reaches the export through the "
-          "pre-freeze hook. This proves CPU-boundary records and the frozen wire only: a served "
+          "pre-freeze hook; G preserves observation semantics; H/I/J reject cross-attempt, unknown "
+          "and source-mismatched recovery while K/L preserve complete retries and known zero; "
+          "M/N certify complete retries after missing-stage attempts, while O preserves sticky "
+          "refusal after a real earlier stage regression. "
+          "This proves CPU-boundary records and the frozen wire only: a served "
           "palette candidate is not a shadow recovery, a Drawn stage is a recorded draw command, "
           "not a GPU submission or a pixel, and the export establishes no runtime unique-owner "
           "claim.")
@@ -1228,7 +1371,9 @@ def main():
     print("ROUNDTRIP_VERDICT=CERTIFIED_SPEC_SATISFIED "
           "(A=Recovered+certified, B=StageCompleteUncertified, C=Uncovered/objectLevelEvidenceDropped, "
           "D=uncovered/noObjectEvidenceExported, E=concurrent-load/counts-identical, "
-          "F=auto-post-window-freeze+Recovered-terminal-in-export)")
+          "F=auto-post-window-freeze+Recovered-terminal-in-export, G=observation, "
+          "H/I/J=attempt-defect-refused, K=complete-retry, L=known-zero-attempt, "
+          "M/N=complete-retry-after-missing-stage, O=sticky-order-regression-refused)")
     return 0
 
 

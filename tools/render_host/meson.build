@@ -4,6 +4,9 @@ project('warvk-render-host-lab', 'cpp', version : '0.1.0',
 protocol_test = executable('warvk_host_protocol_test',
   ['protocol.cpp', '../../AutoTest/test_render_host_protocol.cpp'], install : false)
 test('rh0_codec_session', protocol_test, timeout : 30)
+gpu_wire_test = executable('warvk_host_gpu_wire_test',
+  ['protocol.cpp', 'gpu_wire.cpp', '../../AutoTest/test_render_host_gpu_wire.cpp'], install : false)
+test('rh2_gpu_ticket_core', gpu_wire_test, timeout : 30)
 slot_test = executable('warvk_host_slot_test',
   ['protocol.cpp', 'slot_ledger.cpp', '../../AutoTest/test_render_host_slot_ledger.cpp'], install : false)
 test('rh1_slot_core', slot_test, timeout : 30)
@@ -14,6 +17,17 @@ inbox_test = executable('warvk_host_producer_inbox_test',
   '../../AutoTest/test_render_host_producer_inbox.cpp',
   dependencies : dependency('threads'), install : false)
 test('producer_inbox_core', inbox_test, timeout : 30)
+
+# Render commands use non-consuming backpressure and explicit CPU acknowledgement;
+# the diagnostic inbox's permitted sample loss is not a rendering policy.
+render_command_queue_test = executable('warvk_render_command_queue_test',
+  '../../AutoTest/test_render_command_queue.cpp',
+  dependencies : dependency('threads'), install : false)
+test('render_command_queue_core', render_command_queue_test, timeout : 30)
+
+render_buffer_commands_test = executable('warvk_render_buffer_commands_test',
+  ['buffer_commands.cpp', '../../AutoTest/test_render_host_buffer_commands.cpp'], install : false)
+test('render_buffer_commands_core', render_buffer_commands_test, timeout : 30)
 envelope_test = executable('warvk_host_sample_envelope_test',
   ['protocol.cpp', 'slot_ledger.cpp', 'sample_envelope.cpp', '../../AutoTest/test_render_host_sample_envelope.cpp'],
   install : false)

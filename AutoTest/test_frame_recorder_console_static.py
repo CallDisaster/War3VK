@@ -141,7 +141,7 @@ class ConsoleWiringTargetState(ConsoleContractBase):
         self.assertIsNotNone(masked, "newFrame body not found")
         self.assertRegex(
             masked,
-            r"if\s*\(\s*!\s*m_initialized\s*\|\|\s*!\s*m_visible\s*\)\s*return\s*;",
+            r"if\s*\(\s*!\s*m_initialized\s*\|\|\s*m_retiring\s*\|\|\s*!\s*m_visible\s*\)\s*return\s*;",
             "newFrame must return for a hidden console (guard and return "
             "verified together)")
         self.assertNotRegex(
@@ -153,7 +153,7 @@ class ConsoleWiringTargetState(ConsoleContractBase):
         self.assertIsNotNone(masked, "render body not found")
         self.assertRegex(
             masked,
-            r"if\s*\(\s*!\s*m_initialized\s*\|\|\s*m_hasRendered\s*\|\|\s*"
+            r"if\s*\(\s*!\s*m_initialized\s*\|\|\s*m_retiring\s*\|\|\s*m_hasRendered\s*\|\|\s*"
             r"!\s*m_visible\s*\)\s*return\s*;",
             "render must return for a hidden console (guard and return "
             "verified together)")

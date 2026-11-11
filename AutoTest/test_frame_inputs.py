@@ -5,6 +5,7 @@ import unittest
 import numpy as np
 from analyze_frame_inputs import analyze_inputs, reconstruct, attribute
 from package_frame_input_research import parse_frames,select_evidence
+import native_render_input_contract as native_contract
 
 def fixture(skinned=False):
     points=struct.pack('<9f',0,0,0,1,0,0,0,1,0)
@@ -31,6 +32,31 @@ def fixture(skinned=False):
     data=['0']*12;data[0]='1';data[3:6]=['11','0',str(len(points))];data[6:9]=['12','0',str(len(indices))]
     event=dict(kind=18,owner='7',frame='10',mapEpoch='2',deviceEpoch='3',words32=pc,data=data)
     cpu=dict(session='1',processNonce='2',events=[event])
+    return root,binary,cpu
+
+def schema3_fixture(available=True,skinned=False):
+    root,binary,cpu=fixture(skinned)
+    root['schema']=3
+    batch=root['batches'][0];draw=batch['draws'][0]
+    for span in draw['spans']:span['sourceBytes']=span['bytes']
+    observation=dict(schema=1,available=available,frameDomain='ShadowProducerSerial',
+                     sourceFrame='3' if available else '0',
+                     mapEpoch=batch['mapEpoch'] if available else '0',
+                     deviceEpoch=batch['deviceEpoch'] if available else '0',
+                     part=draw['part'] if available else '0',
+                     layer=draw['words'][3] if available else 0,shaderMask=3 if available else 0)
+    for name,length in native_contract.NATIVE_ARRAY_LENGTHS:observation[name]=[0]*length
+    if available:
+        observation['materialBits'][:4]=[0x3F800000,0x3F000000,0,0]
+        for diagonal in (0,5,10,15):observation['textureTransform0Bits'][diagonal]=0x3F800000
+    draw['renderInputEvidence']=dict(
+        schema=1,captureStage='PreparedShadowReplay',
+        finalShadowMaterial=dict(alphaRefBits=0x3F000000,alphaTest=True,alphaBlend=False,
+                                 depthTest=True,depthWrite=True,additive=False,
+                                 uvBinding=1,uvStride=8,uvOffset=0,uvFormat=103,
+                                 textureView='11',sampler='12',samplerIndex=0),
+        nativeDrawMaterialObservation=observation,
+        requiredSharedFieldsMissing=list(native_contract.NATIVE_REQUIRED_SHARED_FIELDS_MISSING))
     return root,binary,cpu
 
 class Reconstruction(unittest.TestCase):
@@ -111,6 +137,174 @@ class Reconstruction(unittest.TestCase):
         for key,value in [('mapEpoch','4'),('deviceEpoch','4'),('frame','11')]:
             d,b,c=fixture();c['events'][0][key]=value
             self.assertEqual(analyze_inputs(d,b,c)['reconstructedDraws'],0)
+
+class NativeRenderInputs(unittest.TestCase):
+    def test_schema3_available_observation_and_reconstruction(self):
+        result=analyze_inputs(*schema3_fixture())
+        self.assertEqual(result['reconstructedDraws'],1)
+        self.assertIs(result['sharedRendererReady'],False)
+        row=result['draws'][0];summary=row['renderInputEvidence']
+        self.assertTrue(summary['nativeDrawStateAvailable'])
+        self.assertEqual(summary['sourceFrame'],'3')
+        self.assertEqual(summary['sourceFrameDomain'],'ShadowProducerSerial')
+        self.assertEqual(summary['materialDiffuseBits'],[0x3F800000,0x3F000000,0,0])
+        self.assertIs(summary['sharedRendererReady'],False)
+        self.assertEqual(summary['requiredSharedFieldsMissing'],list(native_contract.NATIVE_REQUIRED_SHARED_FIELDS_MISSING))
+        self.assertEqual(row['worldMin'],[10,20,30])
+
+    def test_schema3_unknown_observation_does_not_block_geometry(self):
+        result=analyze_inputs(*schema3_fixture(False))
+        summary=result['draws'][0]['renderInputEvidence']
+        self.assertEqual(result['reconstructedDraws'],1)
+        self.assertIs(summary['nativeDrawStateAvailable'],False)
+        self.assertIsNone(summary['materialDiffuseBits'])
+        self.assertEqual(summary['sourceFrame'],'0')
+        self.assertIs(summary['sharedRendererReady'],False)
+
+    def test_schema3_missing_block_rejected(self):
+        d,b,c=schema3_fixture();del d['batches'][0]['draws'][0]['renderInputEvidence']
+        with self.assertRaisesRegex(ValueError,'missing renderInputEvidence'):analyze_inputs(d,b,c)
+
+    def test_schema3_requires_block_for_every_draw(self):
+        d,b,c=schema3_fixture();batch=d['batches'][0]
+        second=copy.deepcopy(batch['draws'][0]);second['index']=2;del second['renderInputEvidence']
+        batch['draws'].append(second);batch['eligible']=2
+        with self.assertRaisesRegex(ValueError,'missing renderInputEvidence'):analyze_inputs(d,b,c)
+
+    def test_schema3_bad_native_epochs_reject_manifest(self):
+        for name in ('mapEpoch','deviceEpoch'):
+            with self.subTest(name=name):
+                d,b,c=schema3_fixture()
+                d['batches'][0]['draws'][0]['renderInputEvidence']['nativeDrawMaterialObservation'][name]='99'
+                with self.assertRaisesRegex(ValueError,'does not match'):analyze_inputs(d,b,c)
+
+    def test_schema3_validates_native_identity_against_batch_epochs(self):
+        for name in ('mapEpoch','deviceEpoch'):
+            with self.subTest(name=name):
+                d,b,c=schema3_fixture();d['batches'][0][name]='99'
+                c['events'][0][name]='99'
+                with self.assertRaisesRegex(ValueError,'does not match'):analyze_inputs(d,b,c)
+
+    def test_schema3_native_part_and_layer_must_match_draw(self):
+        for name,value in (('part','99'),('layer',1)):
+            with self.subTest(name=name):
+                d,b,c=schema3_fixture()
+                d['batches'][0]['draws'][0]['renderInputEvidence']['nativeDrawMaterialObservation'][name]=value
+                with self.assertRaisesRegex(ValueError,'does not match'):analyze_inputs(d,b,c)
+
+    def test_schema3_native_layer_uses_original_words(self):
+        d,b,c=schema3_fixture();draw=d['batches'][0]['draws'][0];draw['words'][3]=9
+        draw['renderInputEvidence']['nativeDrawMaterialObservation']['layer']=9
+        result=analyze_inputs(d,b,c)
+        self.assertEqual(result['draws'][0]['layer'],9)
+        self.assertEqual(draw['words'][3],9)
+
+    def test_schema3_nonfinite_float_bits_reject_manifest(self):
+        for name,index in (('materialBits',3),('textureTransform0Bits',15),('sampler0',7)):
+            with self.subTest(name=name):
+                d,b,c=schema3_fixture()
+                d['batches'][0]['draws'][0]['renderInputEvidence']['nativeDrawMaterialObservation'][name][index]=0x7FC00000
+                with self.assertRaisesRegex(ValueError,'finite'):analyze_inputs(d,b,c)
+        d,b,c=schema3_fixture()
+        d['batches'][0]['draws'][0]['renderInputEvidence']['finalShadowMaterial']['alphaRefBits']=0x7F800000
+        with self.assertRaisesRegex(ValueError,'finite'):analyze_inputs(d,b,c)
+
+    def test_schema3_native_and_final_shadow_states_may_differ(self):
+        d,b,c=schema3_fixture();draw=d['batches'][0]['draws'][0]
+        evidence=draw['renderInputEvidence'];native=evidence['nativeDrawMaterialObservation']
+        # Native alpha-test/blend state differs from the prepared shadow replay.
+        native['renderStates'][0]=0;native['renderStates'][3]=1
+        evidence['finalShadowMaterial']['alphaTest']=True
+        evidence['finalShadowMaterial']['alphaBlend']=False
+        original=copy.deepcopy((d,b,c));result=analyze_inputs(d,b,c)
+        self.assertEqual(result['reconstructedDraws'],1)
+        self.assertEqual((d,b,c),original)
+        self.assertTrue(result['draws'][0]['renderInputEvidence']['finalShadowMaterial']['alphaTest'])
+        self.assertFalse(result['draws'][0]['renderInputEvidence']['finalShadowMaterial']['alphaBlend'])
+        self.assertEqual(draw['words'][29:31],[0,0])
+        self.assertIs(result['sharedRendererReady'],False)
+
+    def test_schema3_preserves_old_native_source_frame(self):
+        d,b,c=schema3_fixture();batch=d['batches'][0]
+        native=batch['draws'][0]['renderInputEvidence']['nativeDrawMaterialObservation']
+        native['sourceFrame']='1';original=copy.deepcopy((d,b,c))
+        result=analyze_inputs(d,b,c)
+        self.assertEqual(result['draws'][0]['frame'],'10')
+        self.assertEqual(result['draws'][0]['renderInputEvidence']['sourceFrame'],'1')
+        self.assertEqual((d,b,c),original)
+
+    def test_schema3_native_frame_domain_never_replaces_cpu_frame_check(self):
+        d,b,c=schema3_fixture();c['events'][0]['frame']='11'
+        result=analyze_inputs(d,b,c)
+        self.assertEqual(result['reconstructedDraws'],0)
+        self.assertIn('draw identity mismatch',result['draws'][0]['unavailableReason'])
+        self.assertTrue(result['draws'][0]['renderInputEvidence']['nativeDrawStateAvailable'])
+
+    def test_schema3_keeps_actual_cpu_binding_check(self):
+        d,b,c=schema3_fixture();c['events'][0]['data'][3]='999'
+        result=analyze_inputs(d,b,c)
+        self.assertEqual(result['reconstructedDraws'],0)
+        self.assertIn('physical binding mismatch',result['draws'][0]['unavailableReason'])
+
+    def test_schema3_uses_source_bytes_and_not_gathered_span_bytes(self):
+        d,b,c=schema3_fixture();draw=d['batches'][0]['draws'][0]
+        gathered=b''.join(struct.pack('<4I',i,i,1,0)+b[i*12:i*12+12] for i in range(3))
+        rebuilt=b''
+        for role,span in enumerate(draw['spans']):
+            old=b[span['offset']:span['offset']+int(span['bytes'])]
+            span['encoding']=1 if role==0 else 0
+            value=gathered if role==0 else old
+            span['offset']=len(rebuilt);span['bytes']=str(len(value));rebuilt+=value
+        d['binaryBytes']=str(len(rebuilt));d['batches'][0]['bytes']=len(rebuilt)
+        result=analyze_inputs(d,rebuilt,c)
+        self.assertEqual(result['reconstructedDraws'],1)
+        self.assertEqual(result['draws'][0]['worldMin'],[10,20,30])
+        self.assertEqual(result['draws'][0]['renderInputEvidence']['sourceFrame'],'3')
+
+    def test_schema3_does_not_bypass_existing_record_layout(self):
+        for name in ('words','provenance','worldMatrixBits'):
+            with self.subTest(name=name):
+                d,b,c=schema3_fixture();d['batches'][0]['draws'][0][name].pop()
+                with self.assertRaisesRegex(ValueError,'record layout'):analyze_inputs(d,b,c)
+
+    def test_schema1_and_schema2_still_read_without_native_availability(self):
+        for schema in (1,2):
+            with self.subTest(schema=schema):
+                d,b,c=fixture();d['schema']=schema
+                if schema==2:
+                    for span in d['batches'][0]['draws'][0]['spans']:span['sourceBytes']=span['bytes']
+                result=analyze_inputs(d,b,c);row=result['draws'][0]
+                self.assertEqual(result['reconstructedDraws'],1)
+                self.assertNotIn('renderInputEvidence',row)
+                self.assertNotIn('nativeDrawStateAvailable',row)
+                self.assertIs(result['sharedRendererReady'],False)
+
+    def test_old_schema_does_not_synthesize_summary_from_extension(self):
+        for schema in (1,2):
+            with self.subTest(schema=schema):
+                d,b,c=schema3_fixture();d['schema']=schema
+                result=analyze_inputs(d,b,c)
+                self.assertEqual(result['reconstructedDraws'],1)
+                self.assertNotIn('renderInputEvidence',result['draws'][0])
+
+    def test_schema3_missing_list_tampering_rejects_manifest(self):
+        d,b,c=schema3_fixture()
+        d['batches'][0]['draws'][0]['renderInputEvidence']['requiredSharedFieldsMissing']=[]
+        with self.assertRaisesRegex(ValueError,'ordered fixed list'):analyze_inputs(d,b,c)
+
+    def test_schema3_unknown_is_not_backfilled_from_batch(self):
+        d,b,c=schema3_fixture(False)
+        native=d['batches'][0]['draws'][0]['renderInputEvidence']['nativeDrawMaterialObservation']
+        native['mapEpoch']='2'
+        with self.assertRaisesRegex(ValueError,'all-zero payload'):analyze_inputs(d,b,c)
+
+    def test_schema3_summary_is_available_without_cpu_draw_event(self):
+        d,b,c=schema3_fixture();c['events']=[]
+        result=analyze_inputs(d,b,c);row=result['draws'][0]
+        self.assertEqual(result['reconstructedDraws'],0)
+        self.assertTrue(row['renderInputEvidence']['nativeDrawStateAvailable'])
+        self.assertIn('no actual draw event',row['unavailableReason'])
+        self.assertIs(result['sharedRendererReady'],False)
 
 class SourceContract(unittest.TestCase):
     @classmethod

@@ -1,4 +1,5 @@
 #include "war3_storm_native_small_repair.h"
+#include "war3_storm_low_domain.h"
 
 #include "../../d3d9_war3_debug.h"
 
@@ -152,6 +153,7 @@ uint32_t RequiredTotalBytes(uint32_t requested, bool debug) noexcept {
 
 void *__fastcall HookedAllocPage(StormNativeArena *arena, uint32_t requested,
                                  uint32_t headerFlags) noexcept {
+  StormLowDomainScope lowAddressDomain(arena);
   InterlockedIncrement(&g_calls);
   if (!g_originalAllocPage)
     return nullptr;
@@ -279,7 +281,7 @@ bool StormNativeSmallRepair_Prepare(
     return false;
   }
   g_mode.store(requested, std::memory_order_release);
-  if (requested == StormNativeSmallRepairMode::Off)
+  if (requested == StormNativeSmallRepairMode::Off && !StormLowDomain_IsRequested())
     return true;
 
   const uintptr_t base = reinterpret_cast<uintptr_t>(stormModule);

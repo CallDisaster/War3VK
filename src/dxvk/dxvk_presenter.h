@@ -35,6 +35,9 @@ namespace dxvk {
    */
   struct PresenterDesc {
     bool deferSurfaceCreation = false;
+    // Opt-in diagnostic permission only. A surface without TRANSFER_SRC
+    // support is refused; ordinary presenters keep their existing usage.
+    bool diagnosticReadback = false;
   };
 
   /**
@@ -279,6 +282,7 @@ namespace dxvk {
     Rc<vk::DeviceFn>            m_vkd;
 
     PresenterSurfaceProc        m_surfaceProc;
+    const bool                  m_diagnosticReadback;
 
     dxvk::mutex                 m_surfaceMutex;
     dxvk::condition_variable    m_surfaceCond;

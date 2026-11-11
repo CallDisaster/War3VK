@@ -212,10 +212,7 @@ bool RenderQueue::FlushSortedItems_StdSort(D3D9DeviceEx *device,
     GetNativeFuncs() = fns;
     GetStateOptEnabled() = stateOptEnabled;
 
-    auto &instBufPtr = GetInstBufPtr();
-    if (!instBufPtr)
-      instBufPtr = dxvk::war3::reimpl::War3InstanceBuffer::Get(device);
-    instBuf = instBufPtr;
+    instBuf = dxvk::war3::reimpl::War3InstanceBuffer::Get(device);
 
     // Register Callback (Lazy Init)
     auto &cb = GetBatchFlushCallback();

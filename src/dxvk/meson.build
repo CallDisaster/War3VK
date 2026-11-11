@@ -98,6 +98,7 @@ dxvk_src = [
   'dxvk_image.cpp',
   'dxvk_implicit_resolve.cpp',
   'dxvk_instance.cpp',
+  'dxvk_startup_report.cpp',
   'dxvk_latency_builtin.cpp',
   'dxvk_latency_reflex.cpp',
   'dxvk_memory.cpp',

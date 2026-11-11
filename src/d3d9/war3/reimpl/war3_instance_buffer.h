@@ -58,6 +58,7 @@ public:
 
   static void SetActive(War3InstanceBuffer *buffer);
   static War3InstanceBuffer *GetActive();
+  static War3InstanceBuffer *GetActive(D3D9DeviceEx *device);
   static War3InstanceBuffer *Get(D3D9DeviceEx *device);
 
   // State-Aware Batching Hooks
@@ -92,19 +93,19 @@ private:
   } m_drawParams;
 
   static thread_local War3InstanceBuffer *s_activeBuffer;
-  static thread_local InstanceData *s_activeLockedPtr;
+  InstanceData *m_lockedPtr = nullptr;
   uint32_t m_capturedInstanceCount = 0;
   uint32_t m_maxBatchSize = 0;
 
   // Resets the buffer at the start of the frame (optional, mostly for tracking)
   void OnFrameStart();
 
-  IDirect3DVertexBuffer9 *GetBuffer() const { return m_buffer; }
+  IDirect3DVertexBuffer9 *GetBuffer() const { return m_buffer.ptr(); }
   uint32_t GetStride() const { return sizeof(InstanceData); }
 
 private:
   D3D9DeviceEx *m_device = nullptr;
-  IDirect3DVertexBuffer9 *m_buffer = nullptr;
+  Com<D3D9VertexBuffer, false> m_buffer;
 
   uint32_t m_maxInstances = 0;
   uint32_t m_currentOffset = 0;
@@ -122,9 +123,11 @@ private:
   // Vertex Declaration Cache
   IDirect3DVertexDeclaration9 *
   GetInstancedDeclaration(IDirect3DVertexDeclaration9 *originalDecl);
-  std::unordered_map<IDirect3DVertexDeclaration9 *,
-                     IDirect3DVertexDeclaration9 *>
-      m_declCache;
+  struct DeclarationEntry {
+    Com<D3D9VertexDecl, false> original;
+    Com<D3D9VertexDecl, false> instanced;
+  };
+  std::unordered_map<IDirect3DVertexDeclaration9 *, DeclarationEntry> m_declCache;
 };
 
 } // namespace reimpl

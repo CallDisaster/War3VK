@@ -1,10 +1,18 @@
-# WarVK 1.22.01
+# WarVK 1.22.02
 
 [English](README.md) · [更新日志](CHANGELOG.md) · [地图作者 API](WarVK/README.md) · [下载](https://github.com/CallDisaster/War3VK/releases/latest)
 
 WarVK 面向 **Warcraft III 1.27a（32位）**，使用 DXVK 派生的 D3D9→Vulkan 后端，提供太阳/点阴影、体积光、局部雾、后处理、诊断和有界 JASS API，不改变地图玩法。
 
-## 1.22.01 重点更新
+## 1.22.02 候选更新
+
+- **换图会话保护。** JASS Native 表重建时，在新地图阴影生产前请求会话 Reset；GPU 资源仍由 Present 安全点退休。同进程 `ChangeLevel` A→B→A 隔离用例通过，但菜单换图、设备 Reset 和长时高压仍是发布门禁。
+- **单位动画作者接口。** 增加 Walk 自动重选开关与移动动画 Override 组合助手。指定 `Hamg` 隔离用例已证明请求到达 DLL 且自动 Walk 被抑制；其他单位和完整画面行为仍待复核。
+- **生命周期加固。** 收紧常驻阴影几何发布、live/retired 内存账、取证归因与截图退出交接；不宣称新增 FPS 收益。
+- **32位入口与低地址维护候选。** CurrentDraw/材质大表改为按线程首次使用再分配，分配失败在 native hook 边界内可见且可重试；NetEvent 只在 JASS 前置条件建立后安装。隔离 Lost Temple 已真实截图并自然退出；这不是64位渲染迁移，也不是玩家 DLL 发布许可。见[2026-10-24证据](docs/research/2026-10-24-mdldata-low-address-repair.md)。
+- 单位模型附加点世界坐标 API 延至后续版本。Shader API 1.2.0、JASS wire `warvk:v1` 不变。
+
+### 此前的 1.22.01 内存维护更新
 
 - **动态内存预算与空闲回收。** 按实际显存堆预算、已分配后备和32位地址空间余量决定扩页；Arena在GPU退役后逐步缩减空闲尾页，不释放仍在使用的数据。
 - **页内空洞复用。** 同类快照不再只能等待整页全部过期；最后一个CPU/命令/GPU消费者释放后，可复用该切片区间。元数据或碎片极端情况仍有保守回退。
@@ -36,8 +44,8 @@ Froxel High、局部雾、方向阴影Guide、compare-first PCF已在1.21推出�
 - 仅支持已核验游戏签名，未知布局不会通过猜地址安装Hook。
 
 1. 完全退出游戏和编辑器，把已有 `d3d9.dll` 备份到独立目录。
-2. 解压 **WarVK-1.22.01-win32.zip**，将DLL放到 `war3.exe` 同级目录。
-3. 正常启动，确认 `d3d9.log` 出现 `DXVK: 1.22.01`。
+2. 解压 **WarVK-1.22.02-win32.zip**，将DLL放到 `war3.exe` 同级目录。
+3. 正常启动，确认 `d3d9.log` 出现 `DXVK: 1.22.02`。
 4. 按 **Ctrl+F1** 打开设置与Render Stats；正常优化无需开启性能录制。
 
 普通游玩不要继续使用旧实验启动脚本。环境变量是内部诊断面，可能覆盖默认值；玩家/作者入口为面板和文档中的JAPI。正式版**默认关闭重型帧取证**。不要叠放相互冲突的D3D9代理。
@@ -69,8 +77,8 @@ Froxel High、局部雾、方向阴影Guide、compare-first PCF已在1.21推出�
 
 ## 开发与许可
 
-产品/JAPI显示 **1.22.01**，后续修复继续使用1.22系列编号。Shader API保持 **1.2.0**，JASS线协议保持 **warvk:v1**，无需因产品版本升级迁移ABI。
+产品/JAPI显示 **1.22.02**，后续修复继续使用1.22系列编号。Shader API保持 **1.2.0**，JASS线协议保持 **warvk:v1**，无需因产品版本升级迁移ABI。
 
-代码位于 `src/d3d9/` 和 `src/d3d9/war3/`，shader在 `subprojects/war3fx/`，作者接口在 `WarVK/`，测试在 `AutoTest/`。正式构建使用固定依赖与显式发布选项，不复用未知诊断配置，见[发布范围](docs/RELEASE_1.22.01.md)。
+代码位于 `src/d3d9/` 和 `src/d3d9/war3/`，shader在 `subprojects/war3fx/`，作者接口在 `WarVK/`，测试在 `AutoTest/`。正式构建使用固定依赖与显式发布选项，不复用未知诊断配置，见[发布范围](docs/RELEASE_1.22.02.md)。
 
 项目层采用GPLv3，见 [LICENSE](LICENSE)、[COPYING](COPYING)、[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。第三方保留原许可。本项目基于DXVK、Dear ImGui、MinHook、Vulkan及魔兽社区研究，是非官方项目。

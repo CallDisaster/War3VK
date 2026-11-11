@@ -273,7 +273,7 @@ namespace dxvk::war3 {
         return true;
     }
 
-    void War3Material::apply(D3D9DeviceEx* device) {
+    void War3Material::apply(IDirect3DDevice9* device) {
         if (!m_compiled) return;
 
         if (m_vs != nullptr) device->SetVertexShader(m_vs.ptr());
@@ -288,7 +288,7 @@ namespace dxvk::war3 {
         applyConstantStore(device, m_psConstants, false);
     }
 
-    void War3Material::applyConstantStore(D3D9DeviceEx* device, const ShaderConstantStore& store, bool isVertex) const {
+    void War3Material::applyConstantStore(IDirect3DDevice9* device, const ShaderConstantStore& store, bool isVertex) const {
         if (!device || !store.hasAny())
             return;
         std::vector<ShaderConstantRange> ranges;
@@ -435,7 +435,8 @@ namespace dxvk::war3 {
             }
             try {
                 DxsoModuleInfo moduleInfo;
-                moduleInfo.options = DxsoOptions(device, *device->GetOptions());
+                moduleInfo.options = DxsoOptions(device->GetDXVKDevice(),
+                    *device->GetOptions(), device->GetVertexConstantLayout().floatSize());
                 DxsoReader reader(reinterpret_cast<const char*>(shaderData));
                 DxsoModule module(reader);
                 DxsoAnalysisInfo info = module.analyze();

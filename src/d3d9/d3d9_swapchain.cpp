@@ -134,7 +134,7 @@ static LRESULT CALLBACK War3WndProcHook(HWND hWnd, UINT msg, WPARAM wParam, LPAR
 
     // Forward to ImGui Manager
     using namespace dxvk::war3;
-    if (msg == WM_KEYDOWN && wParam == VK_F1 && (GetKeyState(VK_CONTROL) & 0x8000)) {
+    if (War3Imgui::get().ownsWindow(hWnd) && msg == WM_KEYDOWN && wParam == VK_F1 && (GetKeyState(VK_CONTROL) & 0x8000)) {
         if ((lParam & 0x40000000) == 0) {
             War3Imgui::get().toggleVisible();
         }
@@ -146,8 +146,9 @@ static LRESULT CALLBACK War3WndProcHook(HWND hWnd, UINT msg, WPARAM wParam, LPAR
         return ForwardWar3Proc(hWnd, msg, wParam, lParam);
 
     bool handled = War3Imgui::get().handleWndProc(hWnd, msg, wParam, lParam);
-    const bool wantMouse = War3Imgui::get().wantsCaptureMouse();
-    const bool wantKeyboard = War3Imgui::get().wantsCaptureKeyboard();
+    const bool ownsUi = War3Imgui::get().ownsWindow(hWnd);
+    const bool wantMouse = ownsUi && War3Imgui::get().wantsCaptureMouse();
+    const bool wantKeyboard = ownsUi && War3Imgui::get().wantsCaptureKeyboard();
 
     const bool isMouseMsg =
         msg == WM_MOUSEMOVE || msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP ||
@@ -243,12 +244,13 @@ namespace dxvk {
     if (m_presentParams.Windowed)
       HookWindowProc(m_window, this);
 
+    m_asyncScreenshot = war3::tools::AsyncScreenshot::Create(m_device);
+    m_frameHistory = war3::tools::FrameHistory::Create(m_device);
+    // Initialize the borrowed UI owner last, after fallible worker creation.
     if (!War3UseFpsUnlockOnlyMode() &&
         dxvk::war3::runtime::IsWar3RuntimeModuleEnabled(
             dxvk::war3::runtime::War3RuntimeModule::HookUi))
       war3::War3Imgui::get().initialize(m_window, pDevice);
-    m_asyncScreenshot = war3::tools::AsyncScreenshot::Create(m_device);
-    m_frameHistory = war3::tools::FrameHistory::Create(m_device);
   }
 
 
@@ -558,7 +560,7 @@ namespace dxvk {
       }
 
       // War3 ImGui Render
-      if (!War3UseFpsUnlockOnlyMode() &&
+      if (!War3UseFpsUnlockOnlyMode() && war3::War3Imgui::get().isOwner(m_parent) &&
           dxvk::war3::runtime::IsWar3RuntimeModuleEnabled(
               dxvk::war3::runtime::War3RuntimeModule::HookUi)) {
         war3::War3Imgui::get().newFrame();
@@ -600,7 +602,7 @@ namespace dxvk {
       TraceWar3Present(traceOrdinal, "exception", this,
                        D3DERR_DEVICEREMOVED);
       Logger::err(e.message());
-      if (!War3UseFpsUnlockOnlyMode() &&
+      if (!War3UseFpsUnlockOnlyMode() && war3::War3Imgui::get().isOwner(m_parent) &&
           dxvk::war3::runtime::IsWar3RuntimeModuleEnabled(
               dxvk::war3::runtime::War3RuntimeModule::HookUi))
         war3::War3Imgui::get().endFrame();

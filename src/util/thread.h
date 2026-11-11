@@ -312,37 +312,36 @@ namespace dxvk {
       auto now = Clock::now();
 
       return (now < time)
-        ? wait_for(lock, now - time)
+        ? wait_for(lock, time - now)
         : std::cv_status::timeout;
     }
 
     template<typename Clock, typename Duration, typename Predicate>
     bool wait_until(std::unique_lock<dxvk::mutex>& lock, const std::chrono::time_point<Clock, Duration>& time, Predicate pred) {
-      if (pred())
-        return true;
-
-      auto now = Clock::now();
-      return now < time && wait_for(lock, now - time, pred);
+      while (!pred()) {
+        if (wait_until(lock, time) == std::cv_status::timeout)
+          return pred();
+      }
+      return true;
     }
 
     template<typename Rep, typename Period>
     std::cv_status wait_for(std::unique_lock<dxvk::mutex>& lock, const std::chrono::duration<Rep, Period>& timeout) {
-      auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(timeout);
+      // Win32 takes whole milliseconds. Round positive sub-ms waits up, and
+      // never convert a negative/oversized duration into INFINITE or wraparound.
+      auto ms = std::chrono::ceil<std::chrono::milliseconds>(timeout);
+      const DWORD bounded = ms.count() <= 0 ? 0 :
+        ms.count() >= INFINITE ? INFINITE - 1 : DWORD(ms.count());
       auto srw = lock.mutex()->native_handle();
 
-      return SleepConditionVariableSRW(&m_cond, srw, ms.count(), 0)
+      return SleepConditionVariableSRW(&m_cond, srw, bounded, 0)
         ? std::cv_status::no_timeout
         : std::cv_status::timeout;
     }
 
     template<typename Rep, typename Period, typename Predicate>
     bool wait_for(std::unique_lock<dxvk::mutex>& lock, const std::chrono::duration<Rep, Period>& timeout, Predicate pred) {
-      bool result = pred();
-
-      if (!result && wait_for(lock, timeout) == std::cv_status::no_timeout)
-        result = pred();
-
-      return result;
+      return wait_until(lock, std::chrono::steady_clock::now() + timeout, pred);
     }
 
     native_handle_type native_handle() {

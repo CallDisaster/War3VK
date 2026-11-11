@@ -1,7 +1,9 @@
 dxso_src = files([
+  '../d3d9/d3d9_shader_helpers.cpp',
   'dxso_common.cpp',
   'dxso_options.cpp',
   'dxso_module.cpp',
+  'dxso_shader_module_cache.cpp',
   'dxso_reader.cpp',
   'dxso_header.cpp',
   'dxso_ctab.cpp',

@@ -96,6 +96,14 @@ namespace dxvk {
         m_cmd->cmdInsertDebugUtilsLabel(DxvkCmdBuffer::ExecBuffer, *reason);
     }
 
+    // endRecording also serves owners that submit the returned list directly.
+    // Publish even a partial descriptor-copy block and attach its CPU sync
+    // point before that list can reach the queue. This must not be exclusive
+    // to flushCommandList, or short descriptor-buffer draws read unwritten
+    // descriptors while clears and buffer-only submissions still succeed.
+    if (m_features.test(DxvkContextFeature::DescriptorBuffer))
+      m_cmd->setDescriptorSyncHandle(m_descriptorWorker.getSyncHandle());
+
     m_cmd->finalize();
     return std::exchange(m_cmd, nullptr);
   }
@@ -130,11 +138,6 @@ namespace dxvk {
   void DxvkContext::flushCommandList(
     const VkDebugUtilsLabelEXT*       reason,
           DxvkSubmitStatus*           status) {
-    // Flush pending descriptor updates and assign the sync
-    // point to the submission
-    if (m_features.test(DxvkContextFeature::DescriptorBuffer))
-      m_cmd->setDescriptorSyncHandle(m_descriptorWorker.getSyncHandle());
-
     // Need to call this before submitting so that the last GPU
     // submission does not happen before the render end signal.
     if (m_endLatencyTracking && m_latencyTracker)

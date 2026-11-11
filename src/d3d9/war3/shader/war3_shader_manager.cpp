@@ -551,7 +551,7 @@ namespace dxvk::war3 {
         m_globalPsConstants.setAlias(name, reg);
     }
 
-    void ShaderManager::applyGlobalUniforms(D3D9DeviceEx* device) const {
+    void ShaderManager::applyGlobalUniforms(IDirect3DDevice9* device) const {
         if (!device)
             return;
         auto applyStore = [device](const ShaderConstantStore& store, bool isVertex) {

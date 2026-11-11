@@ -5,6 +5,7 @@
 #include "dxvk_openvr.h"
 #include "dxvk_openxr.h"
 #include "dxvk_platform_exts.h"
+#include "dxvk_startup_report.h"
 
 #include "../wsi/wsi_platform.h"
 
@@ -23,6 +24,8 @@ namespace dxvk {
 
 
   DxvkInstance::DxvkInstance(const DxvkInstanceImportInfo& args, DxvkInstanceFlags flags) {
+    startup_report::beginInstance();
+
     Logger::info(str::format("Game: ", env::getExeName()));
     Logger::info(str::format("DXVK: ", DXVK_VERSION));
     Logger::info(str::format("Build: ", DXVK_TARGET, " ", DXVK_COMPILER, " ", DXVK_COMPILER_VERSION));
@@ -36,8 +39,10 @@ namespace dxvk {
     m_options = DxvkOptions(m_config);
 
     // Load Vulkan library
-    if (!initVulkanLoader(args))
+    if (!initVulkanLoader(args)) {
+      startup_report::setStage(DxvkStartupStage::LoaderMissing);
       throw DxvkError("Failed to load vulkan-1 library.");
+    }
 
     // Initialize extension providers
     m_extProviders.push_back(&DxvkPlatformExts::s_instance);
@@ -53,11 +58,17 @@ namespace dxvk {
       provider->initInstanceExtensions();
     }
 
-    if (!initVulkanInstance(args, flags))
+    if (!initVulkanInstance(args, flags)) {
+      startup_report::setStage(DxvkStartupStage::InstanceFailed);
       throw DxvkError("Failed to initialize DXVK.");
+    }
 
-    if (!initAdapters())
+    if (!initAdapters()) {
+      startup_report::setStage(DxvkStartupStage::NoAdapter);
       throw DxvkError("Failed to initialize DXVK.");
+    }
+
+    startup_report::setStage(DxvkStartupStage::Ready);
   }
   
   

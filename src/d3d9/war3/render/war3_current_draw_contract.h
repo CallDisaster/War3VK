@@ -206,6 +206,10 @@ struct CurrentDrawRangeValidator {
 };
 
 struct CurrentDrawContractDiagnosticsSummary {
+  // Process cumulative, including across map/reset and later successful retry.
+  // Refused before publishAttemptCount; not a geometry/canonical rejection or
+  // a successful draw. This field is an internal summary, not a new wire key.
+  uint64_t backingAllocationRefusedCount = 0u;
   uint64_t publishAttemptCount = 0u;
   uint64_t publishReadyCount = 0u;
   uint64_t publishMissNoRenderablePart = 0u;

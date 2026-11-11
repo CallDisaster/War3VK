@@ -234,7 +234,10 @@ struct FrameWorkloadSnapshot {
     uint64_t expiryAgeEvictions = 0;
     uint64_t expiryQueueSize = 0;
     uint64_t bytesCap = 0;
+    // Logical admission charge: bytesUsed = bytesLive + bytesRetired, not physical VRAM.
     uint64_t bytesUsed = 0;
+    uint64_t bytesLive = 0;
+    uint64_t bytesRetired = 0;
     uint64_t bytesEvicted = 0;
     uint64_t bytesEvictedDelta = 0;
     uint64_t liveGeometryCount = 0;
@@ -337,7 +340,11 @@ public:
         uint64_t expiryAgeEvictions = 0;
         uint64_t expiryQueueSize = 0;
         uint64_t bytesCap = 0;
+        // Same-Present logical admission charge, not physical VRAM:
+        // bytesUsed = bytesLive + bytesRetired (including GPU-pending sessions).
         uint64_t bytesUsed = 0;
+        uint64_t bytesLive = 0;
+        uint64_t bytesRetired = 0;
         uint64_t bytesEvicted = 0;
         uint64_t liveGeometryCount = 0;
         uint64_t s1EarlyEntryCount = 0;
@@ -1297,6 +1304,9 @@ private:
         uint64_t persistentCreateAttempts = 0;
         uint64_t persistentPoolBytesCapLast = 0;
         uint64_t persistentPoolBytesUsedLast = 0;
+        // Last same-Present logical admission charges, not physical VRAM usage.
+        uint64_t persistentPoolBytesLiveLast = 0;
+        uint64_t persistentPoolBytesRetiredLast = 0;
         uint64_t persistentPoolBytesUsedMax = 0;
         uint64_t persistentPoolBytesUsedGaugeSum = 0;
         uint64_t persistentPoolBytesNeededLast = 0;

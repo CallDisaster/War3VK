@@ -16,7 +16,8 @@
 //   data[4] chainType（2026-09-18 阶段 C：版本 4 声明的**记录级**链型载体；版本 ≤3 读方
 //             仍要求该槽为保留零 ⇒ 旧产物合同一位不放宽）
 //   data[3] windowSegment（2026-09-17 上级裁定 ⑧：版本 2 声明的**记录级**分段载体；版本 1 读方
-//   仍把该槽当保留零，所以只有头块 version=2 的导出才按分段合同解析）  data[4..8] 必须为 0
+//   仍把该槽当保留零；v2 起按分段合同解析）
+//   data[5] attemptSerial（v5，UINT64_MAX 为未知，0 有效）；data[6..8] 保留零。
 //   data[9] manifestFrameSerial  data[10] source  data[11] hitKey
 //   words32[0] rejectReason [1] jHandle [2] rawcode [3..4]=0 [5] stage [6..9]=0
 //   [10] sessionGeneration lo32 [11]=0 [12] 记录线程 [13]=0 [14]bit0 identityWeak
@@ -108,6 +109,9 @@ bool EncodePaletteObjectEvent(const PaletteObjectEventRecord& record,
   // （0 = RejectionRecovery，1 = Observation）；v1/v2/v3 的读方仍要求它为 0。
   // 本槽由 MakeRecord 从**条目建立时落定**的 chainType 盖章，调用点不得给值。
   event.data[4] = static_cast<uint32_t>(record.chainType);
+  // Extension v5: exact attempt token, UINT64_MAX means unknown. Legacy readers
+  // reject version 5 rather than certify a chain with its association erased.
+  event.data[5] = record.frames.attemptSerial;
   event.data[9] = record.frames.manifestFrameSerial;
   event.data[10] = static_cast<uint64_t>(record.source);
   event.data[11] = record.hitKey;

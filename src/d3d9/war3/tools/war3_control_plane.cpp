@@ -1,4 +1,5 @@
 #include "war3_control_plane.h"
+#include "../diagnostics/war3_startup_witness.h"
 
 #include "../../d3d9_war3_debug.h"
 #include "war3_frame_capture.h"
@@ -5122,11 +5123,15 @@ void HandlePipeClient(HANDLE pipe) {
 }
 
 void ServerLoop() {
+  using namespace dxvk::war3::diagnostics;
+  const auto serverToken = BeginStartupStage(StartupStage::ControlServerLoop);
+  bool witnessedPipe = false;
   const std::string pipeName = BuildPipeName();
   g_running.store(true, std::memory_order_relaxed);
   war3dbg::Print("DXVK War3Control: pipe=%s online\n", pipeName.c_str());
 
   while (!g_stopRequested.load(std::memory_order_relaxed)) {
+    const auto pipeToken = witnessedPipe ? 0u : BeginStartupStage(StartupStage::PipeCreate);
     HANDLE pipe = CreateNamedPipeA(
         pipeName.c_str(),
         PIPE_ACCESS_DUPLEX,
@@ -5137,10 +5142,15 @@ void ServerLoop() {
         0,
         nullptr);
     if (pipe == INVALID_HANDLE_VALUE) {
+      const DWORD pipeError = GetLastError();
+      EndStartupStage(StartupStage::PipeCreate, pipeToken, 0, pipeError);
+      if (witnessedPipe) NoteStartupStage(StartupStage::PipeCreate, 0, pipeError);
       war3dbg::Print("DXVK War3Control: CreateNamedPipe failed err=%lu\n",
                      GetLastError());
       break;
     }
+    EndStartupStage(StartupStage::PipeCreate, pipeToken, 1);
+    witnessedPipe = true;
 
     const BOOL connected =
         ConnectNamedPipe(pipe, nullptr)
@@ -5155,17 +5165,23 @@ void ServerLoop() {
   }
 
   g_running.store(false, std::memory_order_relaxed);
+  EndStartupStage(StartupStage::ControlServerLoop, serverToken);
   war3dbg::Print("DXVK War3Control: offline\n");
 }
 
 } // namespace
 
 void InitializeWar3ControlPlane() {
-  if (g_running.load(std::memory_order_relaxed) || g_serverThread->joinable())
+  using namespace dxvk::war3::diagnostics;
+  const auto startToken = BeginStartupStage(StartupStage::ControlServerStart);
+  if (g_running.load(std::memory_order_relaxed) || g_serverThread->joinable()) {
+    EndStartupStage(StartupStage::ControlServerStart, startToken, 0, g_serverThread->joinable()?1:0);
     return;
+  }
 
   g_stopRequested.store(false, std::memory_order_relaxed);
   *g_serverThread = std::thread(ServerLoop);
+  EndStartupStage(StartupStage::ControlServerStart, startToken, 1);
 }
 
 void ShutdownWar3ControlPlane() {

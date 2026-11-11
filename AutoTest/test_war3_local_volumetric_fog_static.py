@@ -48,7 +48,11 @@ class War3LocalVolumetricFogStaticTests(unittest.TestCase):
 
     def test_gpu_contract_uses_fixed_ring_ubo_and_matching_binding(self):
         self.assertIn("VolumetricFogVolumeUniform", PASS_CPP)
-        self.assertIn("sizeof(VolumetricFogVolumeUniform) == 528u", PASS_CPP)
+        self.assertIn("sizeof(VolumetricFogVolumeUniform) == 592u", PASS_CPP)
+        # Existing 8-volume payload remains the 528-byte prefix. Four
+        # weather vec4 fields append a separately owned medium, not replacement.
+        for offset in (528, 544, 560, 576):
+            self.assertIn(f"== {offset}u", PASS_CPP)
         self.assertIn(
             "std::array<Rc<DxvkBuffer>, kUboRingSlots> m_fogVolumeBuffers",
             PASS_H,
@@ -62,8 +66,9 @@ class War3LocalVolumetricFogStaticTests(unittest.TestCase):
         run = PASS_CPP[PASS_CPP.index("void War3VolumetricLightPass::Run"):]
         self.assertIn("localMediumRequested", run)
         self.assertIn("settings.globalMediumEnabled && safeDensity", run)
-        self.assertIn("(!hasConfiguredGlobalMedium && !localMediumRequested)", run)
-        self.assertIn("if (!hasConfiguredGlobalMedium && !hasLocalMedium)", run)
+        self.assertIn("(!hasConfiguredGlobalMedium && !localMediumRequested && !weatherMedium)", run)
+        self.assertIn("if (!hasConfiguredGlobalMedium && !hasLocalMedium && !weatherMedium)", run)
+        self.assertIn("const bool authoredMediumEnabled = !m_weatherOnly && settings.enabled", run)
         self.assertIn("SetVolumetricGlobalMediumEnabled", JAPI)
         self.assertIn("WarVKSetGlobalVolumetricMediumEnabled", JASS)
         self.assertIn("(density <= 1e-6 && !hasFogRayInterval)", SHADER)

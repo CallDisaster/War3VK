@@ -20,9 +20,12 @@ public:
   Rc<T> acquire(Args... constantArgs) {
     std::lock_guard lock(m_mutex);
 
-    if (!(m_useCount++))
+    // Count the use only after construction succeeded, so a failed
+    // attempt can be retried instead of returning a null object.
+    if (!m_useCount)
       m_object = new T(constantArgs...);
 
+    m_useCount++;
     return m_object;
   }
 

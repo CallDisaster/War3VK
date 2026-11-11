@@ -1,5 +1,6 @@
 #include "war3_current_draw_contract.h"
 #include "../tools/war3_data_collection_tree.h"
+#include "../memory/war3_lazy_thread_array.h"
 #include "war3_classified_counter.h"
 #include "war3_current_draw_group_slot_summary.h"
 #include "war3_current_draw_palette_hash.h"
@@ -122,7 +123,10 @@ struct CurrentDrawGeometryLedgerEntry {
   CurrentDrawContractRecord record = {};
 };
 
-thread_local std::array<CurrentDrawContractRecord, kContractCacheSize>
+// Keep the exact per-thread ownership/capacity and slot mapping. Large static
+// PE TLS arrays were copied for every game/driver worker, even workers that
+// never enter CurrentDraw. Only a thread using a table now owns its backing.
+thread_local memory::LazyThreadArray<CurrentDrawContractRecord, kContractCacheSize>
     g_currentDrawContractCache = {};
 // Direct-mapped cache slots are sparse in normal scenes. Snapshot used to walk
 // all 4096 large records every frame; retain an exact TLS occupancy bitmap so
@@ -130,7 +134,7 @@ thread_local std::array<CurrentDrawContractRecord, kContractCacheSize>
 // order (and therefore the historical dedupe/tie order).
 thread_local std::array<uint64_t, kContractCacheOccupancyWordCount>
     g_currentDrawContractCacheOccupancy = {};
-thread_local std::array<PaletteSnapshotEntry, kPaletteSnapshotCacheSize>
+thread_local memory::LazyThreadArray<PaletteSnapshotEntry, kPaletteSnapshotCacheSize>
     g_paletteSnapshotCache = {};
 thread_local std::array<CurrentDrawPreparedSliceRecord,
                         kPreparedSliceCacheSize>
@@ -145,7 +149,7 @@ thread_local std::array<CurrentDrawPreparedSliceRecord,
 thread_local std::array<CurrentDrawPreparedSliceInterest,
                         kPreparedSliceInterestCacheSize>
     g_preparedSliceInterestCache = {};
-thread_local std::array<CurrentDrawGeometryLedgerEntry,
+thread_local memory::LazyThreadArray<CurrentDrawGeometryLedgerEntry,
                         kGeometryContractLedgerSize>
     g_currentDrawGeometryLedger = {};
 thread_local CurrentDrawContractRecord g_globalFallbackRecord = {};
@@ -291,12 +295,13 @@ size_t CurrentDrawContractSetBase(void* renderablePart) {
 
 CurrentDrawContractRecord* FindLocalCurrentDrawContract(
     void* renderablePart) {
-  if (renderablePart == nullptr)
+  auto* cache = g_currentDrawContractCache.peek();
+  if (renderablePart == nullptr || !cache)
     return nullptr;
   const size_t base = CurrentDrawContractSetBase(renderablePart);
   CurrentDrawContractRecord* best = nullptr;
   for (size_t way = 0u; way < kContractCacheWays; ++way) {
-    auto& entry = g_currentDrawContractCache[base + way];
+    auto& entry = (*cache)[base + way];
     if (entry.renderablePart != renderablePart)
       continue;
     if (best == nullptr || entry.captureSerial > best->captureSerial)
@@ -332,12 +337,13 @@ size_t PaletteSnapshotSetBase(void* renderablePart) {
 }
 
 PaletteSnapshotEntry* FindLocalPaletteSnapshot(void* renderablePart) {
-  if (renderablePart == nullptr)
+  auto* cache = g_paletteSnapshotCache.peek();
+  if (renderablePart == nullptr || !cache)
     return nullptr;
   const size_t base = PaletteSnapshotSetBase(renderablePart);
   PaletteSnapshotEntry* best = nullptr;
   for (size_t way = 0u; way < kPaletteSnapshotCacheWays; ++way) {
-    auto& entry = g_paletteSnapshotCache[base + way];
+    auto& entry = (*cache)[base + way];
     if (entry.renderablePart != renderablePart)
       continue;
     if (best == nullptr || entry.captureSerial > best->captureSerial)
@@ -418,6 +424,9 @@ CurrentDrawContractRecord SnapshotRecordWithGrace(
 }
 
 std::atomic<uint64_t> g_publishAttemptCount{0u};
+// Process-cumulative storage preflight refusals. Deliberately not reset with
+// per-map diagnostics and never folded into geometry/canonical rejection.
+std::atomic<uint64_t> g_backingAllocationRefusedCount{0u};
 std::atomic<uint64_t> g_publishMissNoRenderablePart{0u};
 std::atomic<uint64_t> g_publishMissNoMeshPayload{0u};
 std::atomic<uint64_t> g_publishMissInvalidPaletteSlot{0u};
@@ -1101,8 +1110,9 @@ ContractLookupStatus LookupCurrentDrawContractRecord(
   if (localEntry == nullptr) {
     const size_t base = CurrentDrawContractSetBase(renderablePart);
     bool occupiedCollision = false;
+    if (auto* cache = g_currentDrawContractCache.peek())
     for (size_t way = 0u; way < kContractCacheWays; ++way) {
-      if (g_currentDrawContractCache[base + way].renderablePart != nullptr) {
+      if ((*cache)[base + way].renderablePart != nullptr) {
         occupiedCollision = true;
         break;
       }
@@ -1711,19 +1721,22 @@ int __fastcall Hook_RenderQueueUpdateItemWorldMatrix(int sceneNodePtr,
 }
 
 void ResetCurrentDrawContractCache() {
-  for (auto& entry : g_currentDrawContractCache)
-    entry = {};
+  if (auto* cache = g_currentDrawContractCache.peek())
+    for (auto& entry : *cache)
+      entry = {};
   g_currentDrawContractCacheOccupancy.fill(0u);
-  for (auto& snapshot : g_paletteSnapshotCache)
-    snapshot = {};
+  if (auto* cache = g_paletteSnapshotCache.peek())
+    for (auto& snapshot : *cache)
+      snapshot = {};
   for (auto& prepared : g_preparedSliceCache)
     prepared = {};
   for (auto& prepared : g_latestPreparedSliceByPart)
     prepared = {};
   for (auto& interest : g_preparedSliceInterestCache)
     interest = {};
-  for (auto& entry : g_currentDrawGeometryLedger)
-    entry = {};
+  if (auto* cache = g_currentDrawGeometryLedger.peek())
+    for (auto& entry : *cache)
+      entry = {};
   g_globalFallbackRecord = {};
   g_currentDrawDispatchContext = {};
   g_captureSerialCounter.store(0u, std::memory_order_relaxed);
@@ -1804,8 +1817,9 @@ CurrentDrawRetireResult RetireCurrentDrawContracts(
       retiredParts.insert(part);
   };
 
-  for (size_t slot = 0u; slot < g_currentDrawContractCache.size(); ++slot) {
-    auto& record = g_currentDrawContractCache[slot];
+  if (auto* cache = g_currentDrawContractCache.peek())
+  for (size_t slot = 0u; slot < cache->size(); ++slot) {
+    auto& record = (*cache)[slot];
     if (!CurrentDrawRecordMatchesTombstone(record, tombstone))
       continue;
     notePart(record.renderablePart);
@@ -1815,7 +1829,8 @@ CurrentDrawRetireResult RetireCurrentDrawContracts(
     result.localContractCount++;
   }
 
-  for (auto& entry : g_currentDrawGeometryLedger) {
+  if (auto* cache = g_currentDrawGeometryLedger.peek())
+  for (auto& entry : *cache) {
     if (!CurrentDrawRecordMatchesTombstone(entry.record, tombstone))
       continue;
     notePart(entry.renderablePart);
@@ -1823,7 +1838,8 @@ CurrentDrawRetireResult RetireCurrentDrawContracts(
     result.localContractCount++;
   }
 
-  for (auto& snapshot : g_paletteSnapshotCache) {
+  if (auto* cache = g_paletteSnapshotCache.peek())
+  for (auto& snapshot : *cache) {
     const bool directPartMatch =
         tombstone.identity.renderablePart != nullptr &&
         snapshot.renderablePart == tombstone.identity.renderablePart;
@@ -2098,6 +2114,22 @@ void PublishCurrentDrawContract(const CurrentDrawContractRecord& record,
   };
   if (!ShadowProducerPolicyAllows(
           ShadowProducerKind::CurrentDrawContract, producerContext)) {
+    return;
+  }
+
+  // Only Publish adds producer records to these three TLS tables; Reset and
+  // Retire clear existing values. Allocate all backing before changing any
+  // record, occupancy bit or geometry alias. A later allocation
+  // refusal may retain earlier empty backing, but publishes nothing and can
+  // retry next time. Do not catch the Game trampoline or any business work.
+  // Refusal is counted before publishAttemptCount, so derived publishReady
+  // cannot misclassify an unrecorded draw as successful. Null-part handling
+  // keeps its historical attempt/miss counters and does not warm the tables.
+  if (record.renderablePart != nullptr &&
+      !memory::TryPrepareThreadArrays(g_currentDrawContractCache,
+                                      g_paletteSnapshotCache,
+                                      g_currentDrawGeometryLedger)) {
+    g_backingAllocationRefusedCount.fetch_add(1u, std::memory_order_relaxed);
     return;
   }
 
@@ -2546,6 +2578,8 @@ void PublishCurrentDrawContract(const CurrentDrawContractRecord& record,
 CurrentDrawContractDiagnosticsSummary
 QueryCurrentDrawContractDiagnosticsSummary() {
   CurrentDrawContractDiagnosticsSummary summary = {};
+  summary.backingAllocationRefusedCount =
+      g_backingAllocationRefusedCount.load(std::memory_order_relaxed);
   summary.publishAttemptCount =
       g_publishAttemptCount.load(std::memory_order_relaxed);
   summary.publishMissNoRenderablePart =
@@ -2900,7 +2934,8 @@ bool QueryCurrentDrawGeometryContract(
     CurrentDrawContractRecord& out) {
   WARVK_DATA_SCOPE(CurrentDrawQuery);
   out = {};
-  if (renderablePart == nullptr)
+  const auto* ledger = g_currentDrawGeometryLedger.peek();
+  if (renderablePart == nullptr || !ledger)
     return false;
 
   const CurrentDrawContractRecord* best = nullptr;
@@ -2910,7 +2945,7 @@ bool QueryCurrentDrawGeometryContract(
     const size_t base = CurrentDrawGeometryLedgerSetBase(
         renderablePart, identityAlias);
     for (size_t way = 0u; way < kGeometryContractLedgerWays; ++way) {
-      const auto& entry = g_currentDrawGeometryLedger[base + way];
+      const auto& entry = (*ledger)[base + way];
       const auto& record = entry.record;
       if (entry.renderablePart != renderablePart ||
           entry.identityAlias != identityAlias || !record.known ||
@@ -3569,9 +3604,9 @@ void SnapshotPublishedCurrentDrawContracts(
         occupied &= occupied - 1u;
       }
     }
-  } else {
-    for (size_t slot = 0u; slot < g_currentDrawContractCache.size(); ++slot)
-      considerRecord(g_currentDrawContractCache[slot], slot);
+  } else if (auto* cache = g_currentDrawContractCache.peek()) {
+    for (size_t slot = 0u; slot < cache->size(); ++slot)
+      considerRecord((*cache)[slot], slot);
   }
   traceActiveSlotRecords = false;
 

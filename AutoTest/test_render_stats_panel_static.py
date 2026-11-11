@@ -44,7 +44,10 @@ class RenderStatsPanelContract(unittest.TestCase):
                       "g_stage11BudgetGrowthRejects.load(", "GlobalMemoryStatusEx("):
             self.assertEqual(self.panel.count(query), 1)
             self.assertIn(query, reads)
-        self.assertIn("m_renderStatsRefresh.reset();", body(self.ui, "void War3Imgui::shutdown()"))
+        shutdown = body(self.ui, "void War3Imgui::shutdown(D3D9DeviceEx* owner)")
+        self.assertIn("m_renderStatsRefresh.reset();", shutdown)
+        self.assertLess(shutdown.index("m_device != owner"),
+                        shutdown.index("m_renderStatsRefresh.reset();"))
 
     def test_atomic_memory_query_only(self):
         assignments = re.findall(r"result\.(\w+)\s*=\s*(g_\w+)\.load\(std::memory_order_relaxed\);", self.arena)

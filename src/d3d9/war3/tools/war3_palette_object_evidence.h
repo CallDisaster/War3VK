@@ -50,8 +50,7 @@ struct PaletteObjectFrames {
   bool nativeUnknown = true;
   // 2026-09-18 阶段 C（K3）：**一次明确关联的尝试**的序号（按值携带，裁定要求）。
   // 哨兵 `~0ull` = **未知**：本事件无法归属到某一次尝试。
-  // ⚠️ 默认未知 ⇒ MarkStage 保持**既有的终身单调判序** ⇒ 生产行为一位不变；
-  // 只有调用方**显式**给出已知尝试号时，判序才改为「尝试内单调」。
+  // 未知仍可记录阶段观察，但不能认证一次完整恢复尝试。
   // 为什么必须有未知哨兵：若无未知值，实现者只能用 0 冒充，而 0 会与
   // 「第一次尝试」混淆 ⇒ MarkStage 会据此**错误重置**。
   uint64_t attemptSerial = ~0ull;
@@ -151,6 +150,66 @@ struct PaletteObjectEventRecord {
   // DeriveIdentityProofKind() 按「非零实例生命周期身份 + !identityWeak + !epochUnknown」推导；
   // 三个生产采集点都载不明实例生命周期证明 ⇒ 生产恒为 NoIdentityProof(0)。
   uint32_t identityProofKind = 0u;
+};
+
+// One contiguous attempt, independent of lifetime observation counters. An
+// unknown/change discards the partial proof; A -> B -> A cannot reassemble A.
+// No allocation, query, lock or rendering policy lives in this value carrier.
+struct PaletteRecoveryAttempt {
+  uint64_t serial = ~0ull;
+  uint64_t hitKey = 0u;
+  uint64_t drawHitKey = 0u;
+  PaletteObjectSource source = PaletteObjectSource::None;
+  PaletteObjectSource drawSource = PaletteObjectSource::None;
+  PaletteObjectStage lastStage = PaletteObjectStage::Rejected;
+  bool served = false;
+  bool enqueued = false;
+  bool drawn = false;
+  bool invalid = false;
+  bool drawSelectionCleared = false;
+
+  void Observe(uint64_t attempt, PaletteObjectStage stage,
+               PaletteObjectSource selected = PaletteObjectSource::None,
+               uint64_t hit = 0u, bool cleared = false) noexcept {
+    if (attempt == ~0ull || serial != attempt) {
+      *this = {};
+      serial = attempt;
+    }
+    lastStage = stage;
+    // Unknown association prevents certification, not recording observed data.
+    if (stage == PaletteObjectStage::Drawn) {
+      drawSource = selected;
+      drawHitKey = hit;
+      drawSelectionCleared = cleared;
+    }
+    if (serial == ~0ull)
+      return;
+    if (stage == PaletteObjectStage::ServedCandidate ||
+        stage == PaletteObjectStage::Enqueued || stage == PaletteObjectStage::Drawn) {
+      invalid |= selected == PaletteObjectSource::None || selected == PaletteObjectSource::Unknown ||
+                 hit == 0u || cleared || (served && (selected != source || hit != hitKey));
+      invalid |= (stage == PaletteObjectStage::Enqueued && !served) ||
+                 (stage == PaletteObjectStage::Drawn && (!served || !enqueued));
+    }
+    if (stage == PaletteObjectStage::Rejected) {
+      served = enqueued = drawn = false;
+    } else if (stage == PaletteObjectStage::ServedCandidate) {
+      source = selected;
+      hitKey = hit;
+      served = hit != 0u && selected != PaletteObjectSource::None &&
+               selected != PaletteObjectSource::Unknown && !cleared;
+      enqueued = drawn = false;
+    } else if (stage == PaletteObjectStage::Enqueued) {
+      enqueued = served && selected == source && hit == hitKey && !cleared;
+      drawn = false;
+    } else if (stage == PaletteObjectStage::Drawn) {
+      drawn = enqueued && selected == source && hit == hitKey && !cleared;
+    }
+  }
+  bool complete() const noexcept { return serial != ~0ull && !invalid && served && enqueued && drawn; }
+  bool canCoalesce(uint64_t attempt, PaletteObjectStage stage) const noexcept {
+    return serial == attempt && lastStage == stage;
+  }
 };
 
 class PaletteObjectEvidence {
@@ -317,7 +376,7 @@ class PaletteObjectEvidence {
       // 真实拒绝原因，故它们的判定一位不变。
       const bool hasRejectFact =
           e.firstReason != PaletteObjectRejectReason::NotChecked;
-      const bool closedChain = hasRejectFact && e.sawServed && e.sawSubmit &&
+      const bool closedChain = hasRejectFact && e.recovery.complete() && e.sawServed && e.sawSubmit &&
                                e.sawDraw && !e.orderViolation &&
                                !e.drawSelectionCleared &&
                                e.drawSource != PaletteObjectSource::None;
@@ -346,12 +405,14 @@ class PaletteObjectEvidence {
                                      : PaletteObjectStage::Drawn;
       record.terminal = terminal;
       record.frames.renderFrame = frame;
+      record.frames.attemptSerial = e.recovery.serial;
       record.hitCount = e.hitCount;
       record.sawSubmit = e.sawSubmit;
       record.sawDraw = e.sawDraw;
-      record.source = e.drawSource;
-      record.hitKey = e.drawHitKey;
-      record.selectionClearedByNativeOverride = e.drawSelectionCleared;
+      // v5 terminal payload belongs to its current attempt, never an older draw.
+      record.source = e.recovery.drawSource;
+      record.hitKey = e.recovery.drawHitKey;
+      record.selectionClearedByNativeOverride = e.recovery.drawSelectionCleared;
       record.deltaFrames = frame >= e.firstRejectFrame ? frame - e.firstRejectFrame : 0u;
       if (!CanEmit(true)) {
         AccountDrop(true);
@@ -402,11 +463,14 @@ class PaletteObjectEvidence {
     // 的 Observation 分档，并由宿主机用例 27 / 28 / 35（两链独立、单链形状、双链路由）覆盖。
     // 上句的"必须同时落地"因此**已满足**；本条注释在被改写前曾长期写着"尚未参与查找"（已过期）。
     if (e != nullptr && e->lastRejectFrame == frames.renderFrame) {
-      // D6：同类拒绝原因才算「已证明等价的重复」；原因不同则计入可见冲突。
-      if (e->lastRejectReason == reason)
+      // Different attempts are not equivalent duplicates, even in one frame.
+      if (e->lastRejectReason == reason && e->lastRejectAttempt == frames.attemptSerial &&
+          e->recovery.canCoalesce(frames.attemptSerial, PaletteObjectStage::Rejected))
         m_counters.droppedDuplicatePerFrame++;
-      else
+      else {
         m_counters.droppedPayloadConflict++;
+        e->recovery.invalid = true;
+      }
       return;
     }
     if (e == nullptr && m_watchCount >= kWatchCapacity) {
@@ -456,7 +520,9 @@ class PaletteObjectEvidence {
     }
     e->lastRejectFrame = frames.renderFrame;
     e->lastRejectReason = reason;
+    e->lastRejectAttempt = frames.attemptSerial;
     MarkStage(e, frames.attemptSerial, PaletteObjectStage::Rejected);
+    e->recovery.Observe(frames.attemptSerial, PaletteObjectStage::Rejected);
     PaletteObjectEventRecord record = MakeRecord(*e);
     record.stage = PaletteObjectStage::Rejected;
     record.rejectReason = reason;
@@ -538,6 +604,7 @@ class PaletteObjectEvidence {
     e->sawFirstSight = true;
     PaletteObjectEventRecord record =
         PrepareStage(e, PaletteObjectStage::FirstSight, frames);
+    e->recovery.Observe(frames.attemptSerial, PaletteObjectStage::FirstSight);
     record.source = PaletteObjectSource::None;
     record.hitKey = 0u;
     record.hitCount = e->hitCount;
@@ -818,6 +885,7 @@ class PaletteObjectEvidence {
     uint64_t lastRejectFrame = kNoFrame;
     // D6：同帧去重必须比较**载荷**（拒绝原因），否则会把不同事实当成重复吞掉。
     PaletteObjectRejectReason lastRejectReason = PaletteObjectRejectReason::Unknown;
+    uint64_t lastRejectAttempt = ~0ull;
     // 2026-09-18：`lastFirstSightFrame` 已删除。它原先是首见链的**按帧去重标记**，
     // 但那个维度本身就是缺陷（跨帧不去重 ⇒ 每帧重发 ⇒ 烧光配额）。去重现按条目
     // （`sawFirstSight`）进行，该标记不再被读取；留着它会让读者以为去重仍按帧进行。
@@ -845,6 +913,10 @@ class PaletteObjectEvidence {
     bool drawSelectionCleared = false;
     bool used = false;
     bool tombstone = false; // 删除留下的空洞：Find 必须跨过它继续探测
+    PaletteRecoveryAttempt recovery{};
+    uint64_t lastServedAttempt = ~0ull;
+    uint64_t lastSubmitAttempt = ~0ull;
+    uint64_t lastDrawAttempt = ~0ull;
   };
 
 
@@ -856,10 +928,14 @@ class PaletteObjectEvidence {
       return;
     if (e->lastServedFrame == frames.renderFrame) {
       // D6：只有**载荷可证等价**（来源 + hitKey 相同）才允许压缩；否则计入可见冲突。
-      if (e->lastSource == source && e->lastHitKey == hitKey)
+      if (e->lastSource == source && e->lastHitKey == hitKey &&
+          e->lastServedAttempt == frames.attemptSerial &&
+          e->recovery.canCoalesce(frames.attemptSerial, PaletteObjectStage::ServedCandidate))
         m_counters.droppedDuplicatePerFrame++;
-      else
+      else {
         m_counters.droppedPayloadConflict++;
+        e->recovery.invalid = true;
+      }
       return;
     }
     if (!CanEmit(false)) {
@@ -867,6 +943,7 @@ class PaletteObjectEvidence {
       return;
     }
     e->lastServedFrame = frames.renderFrame;
+    e->lastServedAttempt = frames.attemptSerial;
     e->lastSource = source;
     e->lastHitKey = hitKey;
     PaletteObjectEventRecord record = PrepareStage(e, PaletteObjectStage::ServedCandidate,
@@ -875,6 +952,7 @@ class PaletteObjectEvidence {
     // 否则解析器会看到 hitCount 大于 Served 事件数而误判截断。
     e->hitCount++;
     e->sawServed = true;
+    e->recovery.Observe(frames.attemptSerial, PaletteObjectStage::ServedCandidate, source, hitKey);
     record.source = source;
     record.hitKey = hitKey;
     record.hitCount = e->hitCount;
@@ -899,10 +977,14 @@ class PaletteObjectEvidence {
     if (e->lastDrawFrame == frames.renderFrame) {
       // D6：**这正是上级给的反例** —— 同帧第二次 D 已清空语义 palette，载荷不等价 ⇒ 计冲突。
       if (e->drawSource == source && e->drawHitKey == hitKey &&
-          e->drawSelectionCleared == selectionClearedByNativeOverride)
+          e->drawSelectionCleared == selectionClearedByNativeOverride &&
+          e->lastDrawAttempt == frames.attemptSerial &&
+          e->recovery.canCoalesce(frames.attemptSerial, PaletteObjectStage::Drawn))
         m_counters.droppedDuplicatePerFrame++;
-      else
+      else {
         m_counters.droppedPayloadConflict++;
+        e->recovery.invalid = true;
+      }
       return;
     }
     if (!CanEmit(false)) {
@@ -910,12 +992,15 @@ class PaletteObjectEvidence {
       return;
     }
     e->lastDrawFrame = frames.renderFrame;
+    e->lastDrawAttempt = frames.attemptSerial;
     PaletteObjectEventRecord record = PrepareStage(e, PaletteObjectStage::Drawn,
                                                     frames);
     e->sawDraw = true;
     e->drawSource = source;
     e->drawHitKey = hitKey;
     e->drawSelectionCleared = selectionClearedByNativeOverride;
+    e->recovery.Observe(frames.attemptSerial, PaletteObjectStage::Drawn,
+                        source, hitKey, selectionClearedByNativeOverride);
     record.source = source;
     record.hitKey = hitKey;
     record.sawSubmit = e->sawSubmit;
@@ -938,10 +1023,14 @@ class PaletteObjectEvidence {
     if (e->lastSubmitFrame == frames.renderFrame) {
       // D6：来源 + hitKey + 清空标志全同才算等价重复。
       if (e->submitSource == source && e->submitHitKey == hitKey &&
-          e->submitSelectionCleared == selectionClearedByNativeOverride)
+          e->submitSelectionCleared == selectionClearedByNativeOverride &&
+          e->lastSubmitAttempt == frames.attemptSerial &&
+          e->recovery.canCoalesce(frames.attemptSerial, PaletteObjectStage::Enqueued))
         m_counters.droppedDuplicatePerFrame++;
-      else
+      else {
         m_counters.droppedPayloadConflict++;
+        e->recovery.invalid = true;
+      }
       return;
     }
     if (!CanEmit(false)) {
@@ -949,12 +1038,15 @@ class PaletteObjectEvidence {
       return;
     }
     e->lastSubmitFrame = frames.renderFrame;
+    e->lastSubmitAttempt = frames.attemptSerial;
     e->submitSource = source;
     e->submitHitKey = hitKey;
     PaletteObjectEventRecord record = PrepareStage(e, PaletteObjectStage::Enqueued,
                                                     frames);
     e->sawSubmit = true;
     e->submitSelectionCleared = selectionClearedByNativeOverride;
+    e->recovery.Observe(frames.attemptSerial, PaletteObjectStage::Enqueued,
+                        source, hitKey, selectionClearedByNativeOverride);
     record.source = source;
     record.hitKey = hitKey;
     record.sawSubmit = true;
@@ -982,14 +1074,16 @@ class PaletteObjectEvidence {
     record.stage = e->sawFirstSight ? StageOfRank(e->maxStage)
                                     : PaletteObjectStage::Rejected;
     record.terminal = PaletteObjectTerminal::ObjectGone;
+    record.frames.attemptSerial = e->recovery.serial;
     // 契约显式化：终态 delta 必须等于 renderFrame - firstRejectFrame（此处 renderFrame 仍取首帧 ⇒ 0）。
     record.deltaFrames = record.frames.renderFrame >= record.firstRejectFrame
                             ? record.frames.renderFrame - record.firstRejectFrame
                             : 0u;
     record.sawSubmit = e->sawSubmit;
     record.sawDraw = e->sawDraw;
-    record.source = e->drawSource;
-    record.hitKey = e->drawHitKey;
+    record.source = e->recovery.drawSource;
+    record.hitKey = e->recovery.drawHitKey;
+    record.selectionClearedByNativeOverride = e->recovery.drawSelectionCleared;
     if (!CanEmit(true)) {
       AccountDrop(true);
       e->used = false;

@@ -30,6 +30,8 @@ ROOT = Path(__file__).resolve().parents[1]
 DEVICE_H = ROOT / "src/d3d9/d3d9_device.h"
 DEVICE_CPP = ROOT / "src/d3d9/d3d9_device.cpp"
 DOMAIN_H = ROOT / "src/d3d9/war3/shadow/war3_shadow_geometry_domain.h"
+PUBLICATION_H = ROOT / "src/d3d9/war3/shadow/war3_shadow_geometry_publication.h"
+RETIREMENT_H = ROOT / "src/d3d9/war3/shadow/war3_shadow_session_retirement.h"
 HOST_TEST = ROOT / "src/d3d9/war3/render/tests/war3_shadow_geometry_domain_test.cpp"
 MESON = ROOT / "src/d3d9/meson.build"
 MODEL = ROOT / "AutoTest/test_registry_domain_model.py"
@@ -58,7 +60,18 @@ def strip_cpp_comments(source: str) -> str:
     return "".join(out)
 
 
-REQUIRED_FILES = (DEVICE_H, DEVICE_CPP, DOMAIN_H, HOST_TEST, MESON, MODEL)
+def code_only(source: str) -> str:
+    """Blank comments/literals so helper prose cannot satisfy an owner gate."""
+    tokens = re.compile(
+        r'//[^\n]*|/\*.*?\*/|R"(?P<delimiter>[^ ()\\\t\r\n]{0,16})'
+        r'\(.*?\)(?P=delimiter)"|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'',
+        re.DOTALL,
+    )
+    return tokens.sub(lambda match: re.sub(r"[^\n]", " ", match.group()), source)
+
+
+REQUIRED_FILES = (DEVICE_H, DEVICE_CPP, DOMAIN_H, PUBLICATION_H, RETIREMENT_H,
+                  HOST_TEST, MESON, MODEL)
 for path in REQUIRED_FILES:
     if not path.is_file():
         raise AssertionError(f"fail-closed: 缺少必需文件 {path}")
@@ -68,6 +81,8 @@ DEVICE_CPP_TEXT = DEVICE_CPP.read_text(encoding="utf-8", errors="replace")
 DEVICE_CPP_CODE = strip_cpp_comments(DEVICE_CPP_TEXT)
 DEVICE_H_CODE = strip_cpp_comments(DEVICE_H_TEXT)
 DOMAIN_H_TEXT = DOMAIN_H.read_text(encoding="utf-8", errors="replace")
+PUBLICATION_CODE = strip_cpp_comments(PUBLICATION_H.read_text(encoding="utf-8"))
+RETIREMENT_CODE = code_only(RETIREMENT_H.read_text(encoding="utf-8"))
 HOST_TEST_TEXT = HOST_TEST.read_text(encoding="utf-8", errors="replace")
 MESON_TEXT = MESON.read_text(encoding="utf-8", errors="replace")
 MODEL_TEXT = MODEL.read_text(encoding="utf-8", errors="replace")
@@ -84,11 +99,12 @@ FROZEN_ENTRY_SITES = {
     "War3CreateShadowPersistentGeometryAfterMiss": 4,
 }
 
-# m_war3ShadowGeometryRegistry 的触碰点计数（find / erase / operator[] / 整体清空）。
+# 发布已收敛到异常安全事务；禁止 device 重新直写 operator[]，事务入口只准一处。
 FROZEN_REGISTRY_TOUCHES = {
     "m_war3ShadowGeometryRegistry.find(": 3,
     "m_war3ShadowGeometryRegistry.erase(": 3,
-    "m_war3ShadowGeometryRegistry[key]": 1,
+    "m_war3ShadowGeometryRegistry[key]": 0,
+    "dxvk::war3::shadow::PublishPersistentGeometry(": 1,
     "m_war3ShadowGeometryRegistry = {}": 1,
 }
 
@@ -216,11 +232,29 @@ class RegistryDomainIsolationStaticTest(unittest.TestCase):
 
     def test_registry_container_touch_points_are_frozen(self) -> None:
         for token, expected in FROZEN_REGISTRY_TOUCHES.items():
-            found = DEVICE_CPP_TEXT.count(token)
+            found = DEVICE_CPP_CODE.count(token)
             self.assertEqual(
                 found, expected,
                 f"{token} 触碰点 {found} != 冻结值 {expected}（新增直连容器必须同步本门禁）",
             )
+        self.assertNotRegex(DEVICE_CPP_CODE, r"\bm_war3ShadowGeometryRegistry\s*\[")
+        body = braced_block(
+            DEVICE_CPP_CODE,
+            "bool D3D9DeviceEx::War3CreateShadowPersistentGeometryAfterMiss(",
+        )
+        publication = body.index("dxvk::war3::shadow::PublishPersistentGeometry(")
+        for assignment in ("entry.domain = domain;", "registryEntry.domain = domain;"):
+            self.assertLess(body.index(assignment), publication)
+        arguments = entry_call_sites(body, "PublishPersistentGeometry")
+        self.assertEqual(len(arguments), 1)
+        self.assertRegex(arguments[0], r"m_war3ShadowPersistentGeometries\s*,\s*m_war3ShadowGeometryRegistry\s*,")
+        self.assertRegex(arguments[0], r"std::move\(entry\)\s*,\s*registryEntry\s*,")
+        # The actual shared writer receives that complete domain-bearing slot;
+        # do not accept merely removing the old touch-point assertion.
+        self.assertEqual(PUBLICATION_CODE.count("registry.try_emplace(key)"), 1)
+        self.assertEqual(PUBLICATION_CODE.count("slot->second = publishedSlot;"), 1)
+        self.assertLess(PUBLICATION_CODE.index("expiry.push(token);"),
+                        PUBLICATION_CODE.index("slot->second = publishedSlot;"))
 
     def test_lookup_owner_check_rejects_without_touching_the_slot(self) -> None:
         body = braced_block(
@@ -272,15 +306,39 @@ class RegistryDomainIsolationStaticTest(unittest.TestCase):
 
     def test_reset_and_domain_scoped_clear_are_owner_checked(self) -> None:
         reset = braced_block(
-            DEVICE_CPP_TEXT, "void D3D9DeviceEx::War3ResetShadowSessionState(uint64_t retireSerial)"
+            code_only(DEVICE_CPP_TEXT), "void D3D9DeviceEx::War3ResetShadowSessionState("
         )
         self.assertIn("domainResetOwnerRejects++", reset)
         self.assertIn("ShadowGeometryOwnerAccepts(", reset)
-        # move 之前的归属校验必须早于容器 move。
+        # 归属校验仍须早于共享事务；真实 callback 将同一个 registry 搬入 retired。
         self.assertLess(
             reset.index("domainResetOwnerRejects++"),
-            reset.index("retired.geometryRegistry = std::move(m_war3ShadowGeometryRegistry);"),
+            reset.index("prepared.commit("),
         )
+        commit = braced_block(reset, "prepared.commit(")
+        self.assertRegex(
+            commit,
+            r"prepared\.commit\s*\(\s*m_war3ShadowPersistentCharges\s*,\s*"
+            r"m_war3GpuSkinMapEpoch\s*,\s*retireSerial\s*,\s*"
+            r"\[this\]\s*\(\s*War3RetiredShadowSession\s*&\s*target\s*\)\s*noexcept\s*\{",
+        )
+        self.assertRegex(
+            commit,
+            r"TransferShadowSessionOwner\s*\(\s*target\.geometryRegistry\s*,\s*"
+            r"m_war3ShadowGeometryRegistry\s*\)\s*;",
+        )
+        transfer = braced_block(RETIREMENT_CODE, "void TransferShadowSessionOwner(")
+        self.assertIsNotNone(re.fullmatch(
+            r"\s*static_assert\s*\(\s*std::is_nothrow_move_assignable_v<T>\s*,\s*\)\s*;"
+            r"\s*destination\s*=\s*std::move\s*\(\s*source\s*\)\s*;\s*",
+            transfer[transfer.index("{") + 1:-1],
+        ))
+        helper_commit = braced_block(RETIREMENT_CODE, "Session& commit(")
+        self.assertIn("static_assert(std::is_nothrow_invocable_v<Transfer, Session&>)", helper_commit)
+        self.assertRegex(helper_commit, r"auto\s*&\s*session\s*=\s*\*m_slot\s*;")
+        self.assertEqual(helper_commit.count("transfer(session);"), 1)
+        self.assertLess(helper_commit.index("transfer(session);"),
+                        helper_commit.index("m_committed = true;"))
         # Stage13 容器不得再用无条件 clear()；两处清理都必须是 domain 作用域。
         self.assertNotIn("m_war3Stage13RetainedCasters.clear()", DEVICE_CPP_TEXT)
         self.assertEqual(DEVICE_CPP_TEXT.count("domainResetPurgeRejects++"), 2)

@@ -45,11 +45,11 @@ assert "static PaletteObjectStage StageOfRank(uint32_t rank)" in EVIDENCE_H
 # 旧链（无首见）必须保持冻结形状
 assert ": PaletteObjectStage::Drawn;" in EVIDENCE_H
 
-# ---- 3. 写方：**恒定 v4**（2026-09-18 阶段 C）----
+# ---- 3. 写方：恒定 v5（v4 链型合同 + 当前 attempt 载体）----
 # 原断言要求「版本由 firstSightUsed() 决定」，那是**动态版本**：同一个二进制产生两种块形状，
-# 而版本本应是**契约**而不是内容摘要。现改为断言恒定 v4，并**显式禁止**动态选择回归。
-assert 'result["version"]=4;' in FRAME_EVIDENCE, (
-    "阶段 C：块版本必须**恒定 v4**（含未使用观察链的导出）")
+# 而版本本应是契约而不是内容摘要。新写方必须恒定 v5；旧 v4 仍按旧读方规则读取。
+assert 'result["version"]=5;' in FRAME_EVIDENCE, (
+    "块版本必须恒定 v5（包括未使用观察链的导出；不得漏报 attempt 载体）")
 assert 'firstSightUsed() ? 3 : 2' not in FRAME_EVIDENCE, (
     "阶段 C：按 firstSightUsed() 动态选择 2/3 必须已删除（版本是契约，不是内容摘要）")
 # 2026-09-18 Astra 六项裁定之一：**移除强制该函数存在的文本门禁**。
@@ -94,11 +94,25 @@ assert "recovery chain keeps the frozen stage=Drawn terminal shape" in HOST_TEST
 FRAME_READER = (ROOT / "AutoTest/analyze_frame_evidence.py").read_text(encoding="utf-8")
 
 # (a) C++ 写方能发出的版本必须与 Python 读方登记的版本一致。
-# 阶段 C：写方恒定 v4 ⇒ 读方必须**登记 v4**，否则整份导出会被拒。
-assert 'result["version"]=4;' in FRAME_EVIDENCE, \
+# 新写方恒定 v5 ⇒ 两个读方必须登记 v5；v4 的读方/保留位合同不随之放宽。
+assert 'result["version"]=5;' in FRAME_EVIDENCE, \
     "写方的版本表达式变了；本一致性检查需要同步"
 assert "PALETTE_OBJECT_CHAIN_TYPED_VERSION" in FRAME_READER, \
-    "读方必须登记 v4（链型 + ObservationClosed），否则写方发出的 v4 会被整份拒绝"
+    "读方必须继续登记旧 v4（链型 + ObservationClosed）"
+assert "PALETTE_OBJECT_ATTEMPT_VERSION=5" in FRAME_READER, \
+    "读方必须登记 v5（当前 attempt 载体）"
+import analyze_frame_evidence as frame_reader
+import analyze_palette_object_evidence as palette_reader
+
+assert frame_reader.PALETTE_OBJECT_CHAIN_TYPED_VERSION == 4
+assert frame_reader.PALETTE_OBJECT_ATTEMPT_VERSION == palette_reader.PALETTE_OBJECT_ATTEMPT_VERSION == 5
+assert frame_reader.PALETTE_OBJECT_BLOCK_FIELDS[4] == frame_reader.PALETTE_OBJECT_BLOCK_FIELDS[5], \
+    "v5 只使用事件保留槽承载 attempt，不能改动 v4 的头块字段集合"
+assert tuple(palette_reader.reserved_data_indices(4)) == (5, 6, 7, 8), \
+    "旧 v4 的 data[5] 仍必须保留零，不得偷用 v5 规则"
+assert tuple(palette_reader.reserved_data_indices(5)) == (6, 7, 8)
+assert palette_reader.attempt_recovery_evidence([], 4)["refusals"] == ["attemptSerialNotCarried"], \
+    "旧 v4 没有 attempt 载体，不得被升级为同次恢复认证"
 assert "PALETTE_OBJECT_FIRST_SIGHT_VERSION=3" in FRAME_READER, \
     "读方必须登记版本 3，否则写方发出的 v3 会被整份拒绝"
 assert "PALETTE_OBJECT_FIRST_SIGHT_VERSION:" in FRAME_READER, \

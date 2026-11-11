@@ -1,4 +1,5 @@
 #include "war3_hook_lifecycle.h"
+#include "../diagnostics/war3_startup_witness.h"
 #include "war3_native_capture.h"
 #include "war3_hook_address_book.h"
 #include "war3_hook_install_util.h"
@@ -1887,6 +1888,9 @@ MakeLifecycleCpuScope(const char *name) {
 }
 
 static int __fastcall Hook_MainRunner(void *thisPtr, void *edx) {
+  using namespace dxvk::war3::diagnostics;
+  const auto runToken = BeginStartupStage(StartupStage::MainRunner);
+  dxvk::ObserveWar3MainRunnerEnter();
   // 进入主循环时设置线程内标志，避免递归初始化/重入干扰。
   s_inMainRunner = true;
   MarkMainLoopThread();
@@ -1895,23 +1899,33 @@ static int __fastcall Hook_MainRunner(void *thisPtr, void *edx) {
   // 在首轮主循环执行前抢先安装 Shadow 域 Hook，避免首帧/首轮写入漏采样。
   const uintptr_t gameBase =
       reinterpret_cast<uintptr_t>(::GetModuleHandleA("Game.dll"));
+  const auto earlyToken = BeginStartupStage(StartupStage::MainRunnerEarlyHooks);
   TryInstallShadowHooksEarly(gameBase, "MainRunner_ENTER");
+  EndStartupStage(StartupStage::MainRunnerEarlyHooks, earlyToken);
 
   // 先执行原逻辑，保持游戏原始时序。
   int result = 0;
-  if (g_trampolineMainRunner)
+  if (g_trampolineMainRunner) {
+    const auto originalToken = BeginStartupStage(StartupStage::MainRunnerOriginal);
     result = g_trampolineMainRunner(thisPtr, edx);
+    EndStartupStage(StartupStage::MainRunnerOriginal, originalToken, uint32_t(result));
+  }
 
   // 在原逻辑返回后触发运行时激活，确保必要上下文已就绪。
   war3dbg::Print("DXVK War3Hook: Hook_MainRunner EXIT (Triggering Init)\n");
   s_inMainRunner = false;
 
   ActivateWar3Runtime(gameBase, "MainRunner");
+  dxvk::ObserveWar3MainRunnerComplete();
+  EndStartupStage(StartupStage::MainRunner, runToken, uint32_t(result));
 
   return result;
 }
 
 static int __fastcall Hook_MainRunner_Alt(void *thisPtr, void *edx) {
+  using namespace dxvk::war3::diagnostics;
+  const auto runToken = BeginStartupStage(StartupStage::MainRunnerAlt);
+  dxvk::ObserveWar3MainRunnerEnter();
   // 备用主循环入口，与主入口保持一致的激活策略。
   s_inMainRunner = true;
   MarkMainLoopThread();
@@ -1920,16 +1934,23 @@ static int __fastcall Hook_MainRunner_Alt(void *thisPtr, void *edx) {
   // 备用入口同样前置安装 Shadow Hook，保证任一路径都能捕获首轮写入。
   const uintptr_t gameBase =
       reinterpret_cast<uintptr_t>(::GetModuleHandleA("Game.dll"));
+  const auto earlyToken = BeginStartupStage(StartupStage::MainRunnerAltEarlyHooks);
   TryInstallShadowHooksEarly(gameBase, "MainRunner_Alt_ENTER");
+  EndStartupStage(StartupStage::MainRunnerAltEarlyHooks, earlyToken);
 
   int result = 0;
-  if (g_trampolineMainRunnerAlt)
+  if (g_trampolineMainRunnerAlt) {
+    const auto originalToken = BeginStartupStage(StartupStage::MainRunnerAltOriginal);
     result = g_trampolineMainRunnerAlt(thisPtr, edx);
+    EndStartupStage(StartupStage::MainRunnerAltOriginal, originalToken, uint32_t(result));
+  }
 
   war3dbg::Print("DXVK War3Hook: Hook_MainRunner_Alt EXIT (Triggering Init)\n");
   s_inMainRunner = false;
 
   ActivateWar3Runtime(gameBase, "MainRunner_Alt");
+  dxvk::ObserveWar3MainRunnerComplete();
+  EndStartupStage(StartupStage::MainRunnerAlt, runToken, uint32_t(result));
 
   return result;
 }

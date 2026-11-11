@@ -4192,7 +4192,12 @@ struct M25bSeed {
 };
 
 void M25bFill(dxvk::War3ShadowCaptureStats& st, const M25bSeed& seed) {
-  st = dxvk::War3ShadowCaptureStats{};
+  // This test compares every representation byte to detect unrelated writes.
+  // Aggregate assignment need not initialize padding; take both independent
+  // objects from one canonical representation instead. Keep all member
+  // defaults and the full-struct memcmp (not just the seven output fields).
+  static const dxvk::War3ShadowCaptureStats empty{};
+  std::memcpy(&st, &empty, sizeof(st));
   st.semanticSceneDirectLastSubmittedPaletteHash = seed.lastSubmitted;
   st.semanticSceneSubmittedSkinnedPaletteFirstSubmittedHash = seed.first;
   st.semanticSceneSubmittedSkinnedPaletteCombinedHash = seed.combined;

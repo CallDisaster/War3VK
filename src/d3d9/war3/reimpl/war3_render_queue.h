@@ -505,11 +505,6 @@ inline auto &GetNativeFuncs() {
   return f;
 }
 
-inline auto &GetInstBufPtr() {
-  static War3InstanceBuffer *p = nullptr;
-  return p;
-}
-
 inline auto &GetDispatchCommon() {
   static DispatchCommonFn f = nullptr;
   return f;
@@ -546,9 +541,7 @@ inline void FlushPendingBatches(D3D9DeviceEx *device) {
 
   auto &fns = GetNativeFuncs();
   auto dispatchCommon = GetDispatchCommon();
-  auto *instBuf = GetInstBufPtr();
-  if (!instBuf)
-    instBuf = War3InstanceBuffer::Get(device);
+  auto *instBuf = War3InstanceBuffer::Get(device);
 
   if (!fns.execBeginValue || !dispatchCommon)
     return;
@@ -899,10 +892,7 @@ public:
       GetNativeFuncs() = fns;
       GetStateOptEnabled() = stateOptEnabled;
 
-      auto &instBufPtr = GetInstBufPtr();
-      if (!instBufPtr)
-        instBufPtr = dxvk::war3::reimpl::War3InstanceBuffer::Get(device);
-      instBuf = instBufPtr;
+      instBuf = dxvk::war3::reimpl::War3InstanceBuffer::Get(device);
 
       // Register Callback (Lazy Init)
       auto &cb = GetBatchFlushCallback();

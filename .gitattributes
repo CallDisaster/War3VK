@@ -5,3 +5,6 @@
 /src/d3d9/war3/semantic/war3_palette_taxonomy_emission.h -text
 /src/d3d9/war3/semantic/war3_palette_submitted_aggregation.cpp -text
 /src/d3d9/war3/semantic/war3_palette_submitted_aggregation.h -text
+
+# Player scripts are GBK + CRLF for cmd.exe; keep their bytes exactly.
+/tools/player/*.cmd -text

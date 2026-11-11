@@ -27,7 +27,7 @@ assert "ShadowModelResourceCache::instance().mapEpoch()" in cache
 
 # The canonical resolver does not consume the draw-local layerState view.
 # A fallback signature does consume it, so it must retain exact matching.
-hash_end = cache.index("static thread_local std::array<CacheEntry, 16384>")
+hash_end = cache.index("static thread_local war3::memory::LazyThreadArray<CacheEntry, 16384>")
 hash_setup = cache[:hash_end]
 assert "fnv1a_iter(hash, reinterpret_cast<uintptr_t>(renderable.layerState))" not in hash_setup
 assert "entry.signature.layerContractResolved ||" in cache
@@ -35,6 +35,11 @@ assert "entry.layerState == renderable.layerState" in cache
 assert "entry.layerState = renderable.layerState" in cache
 assert "void* meshData = nullptr;" not in cache
 assert "entry.meshData" not in cache
+assert "auto* storage = s_cache.try_get();" in cache
+storage_failure = cache[cache.index("if (!storage)"):cache.index("auto& entry = (*storage)")]
+assert "return dxvk::war3::shadow::BuildShadowMaterialSignatureForRenderable(" in storage_failure
+assert "renderable);" in storage_failure
+assert "entry." not in storage_failure
 
 packet = function("bool War3TryBuildShadowPacketFromCurrentDrawRecord(")
 assert "War3BuildShadowMaterialSignatureCached(\n        renderable, resource.mapEpoch)" in packet

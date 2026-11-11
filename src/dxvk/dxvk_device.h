@@ -739,6 +739,17 @@ namespace dxvk {
      * \returns Result of the submission
      */
     VkResult waitForSubmission(DxvkSubmitStatus* status);
+    VkResult waitForSubmissionUntil(DxvkSubmitStatus* status,
+      std::chrono::steady_clock::time_point deadline);
+
+    // Owner-supplied CPU predicate over existing resource-use/terminal state;
+    // wakes from the original finish queue. It must not mutate resources or
+    // re-enter the queue while its lock is held. This is not a GPU fence.
+    template<typename Pred>
+    bool waitForResourceRetirementUntil(const Pred& pred,
+        std::chrono::steady_clock::time_point deadline) {
+      return m_submissionQueue.synchronizeUntil(pred, deadline);
+    }
 
     /**
      * \brief Waits for a fence to become signaled

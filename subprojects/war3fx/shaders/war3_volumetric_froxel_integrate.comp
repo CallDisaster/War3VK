@@ -59,7 +59,7 @@ bool finiteVec3(vec3 v) {
 }
 
 bool reconstructRayAndLimit(vec2 uvOut, out vec3 rayDir,
-                            out float distanceLimit) {
+                            out float distanceLimit, out vec2 volumeUv) {
   float nearDistance = max(pc.p_grid.z, 0.1);
   float farDistance = max(pc.p_grid.w, nearDistance + 1.0);
   distanceLimit = farDistance;
@@ -90,6 +90,10 @@ bool reconstructRayAndLimit(vec2 uvOut, out vec3 rayDir,
     ivec2(floor(fullPixelD3D + vec2(0.5))), viewportMinI, viewportMaxI);
   fullPixel = clamp(fullPixel, ivec2(0), fullSize - ivec2(1));
   vec2 uvLocal = (vec2(fullPixel) - viewportMin) / viewportSize;
+  // Injection and temporal reprojection store a viewport-local camera grid.
+  // Keep its lookup on the same ray as depth reconstruction; full-RT uvOut
+  // would sample a different froxel whenever the world viewport is inset.
+  volumeUv = uvLocal;
 
   float rawDepth = texelFetch(
     sampler2DArray(s_depth,
@@ -554,7 +558,8 @@ void main() {
   }
   vec3 rayDir;
   float distanceLimit;
-  if (!reconstructRayAndLimit(uv, rayDir, distanceLimit)) {
+  vec2 volumeUv;
+  if (!reconstructRayAndLimit(uv, rayDir, distanceLimit, volumeUv)) {
     imageStore(s_shadowGuideOutput, pixel, vec4(0.0, 0.0, 0.0, 1.0));
     if (!refineGuide)
       imageStore(s_effect, pixel, vec4(0.0, 0.0, 0.0, 1.0));
@@ -594,7 +599,7 @@ void main() {
       continue;
     vec4 cell = textureLod(
       sampler3D(s_volume, s_samplers[nonuniformEXT(pc.p_sampler)]),
-      vec3(uv, (float(z) + 0.5) / float(pc.p_gridDepth)), 0.0);
+      vec3(volumeUv, (float(z) + 0.5) / float(pc.p_gridDepth)), 0.0);
     if (!finiteVec4(cell))
       continue;
     float sigmaT = clamp(cell.a, 0.0, 0.01);

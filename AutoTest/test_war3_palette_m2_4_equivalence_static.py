@@ -86,7 +86,7 @@ TEST_CPP = (
 )
 DEVICE_CPP = ROOT / "src/d3d9/d3d9_device.cpp"
 MESON = ROOT / "src/d3d9/meson.build"
-TEST_EXE = ROOT / "build32/src/d3d9/war3_live_palette_selection_test.exe"
+TEST_EXE = Path(os.environ.get("WARVK_CPU_TEST_BUILD_DIR", str(ROOT / "build32"))) / "src/d3d9/war3_live_palette_selection_test.exe"
 RECORD_DOC = ROOT / "docs/plan/2026-09-18-m2-4-migration-equivalence-record.md"
 
 # 迁移前（M2-5 迁移已应用、M2-4 未应用）的**未提交工作树** device.cpp 身份

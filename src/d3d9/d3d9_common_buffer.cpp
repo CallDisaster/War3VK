@@ -103,6 +103,18 @@ namespace dxvk {
   }
 
 
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  void D3D9CommonBuffer::CensusLock(UINT OffsetToLock, UINT SizeToLock, DWORD Flags, const void* Caller) {
+    m_parent->BufferCensusLock(this, OffsetToLock, SizeToLock, Flags, Caller);
+  }
+
+
+  void D3D9CommonBuffer::CensusUnlock() {
+    m_parent->BufferCensusUnlock(this);
+  }
+#endif
+
+
   HRESULT D3D9CommonBuffer::ValidateBufferProperties(const D3D9_BUFFER_DESC* pDesc, const bool IsExtended) {
     if (unlikely(pDesc->Size == 0))
       return D3DERR_INVALIDCALL;

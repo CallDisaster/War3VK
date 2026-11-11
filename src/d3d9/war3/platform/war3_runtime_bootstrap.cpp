@@ -1,4 +1,5 @@
 #include "war3_runtime_bootstrap.h"
+#include "../diagnostics/war3_startup_witness.h"
 
 #include "../../d3d9_war3_debug.h"
 
@@ -52,29 +53,36 @@ void AdvanceSmallSemanticBuilds(
 } // namespace
 
 void InitializeRuntimeCore(uintptr_t gameBase) {
+  using namespace dxvk::war3::diagnostics;
+  const auto coreToken = BeginStartupStage(StartupStage::RuntimeCore);
+  const auto initToken = BeginStartupStage(StartupStage::War3Initialize);
   dxvk::war3dbg::Print(
       "DXVK War3Bootstrap: 运行时核心初始化开始 gameBase=%p\n",
       reinterpret_cast<void*>(gameBase));
   if (gameBase != 0) {
     dxvk::war3dbg::Print("DXVK War3Bootstrap: war3::Initialize 开始\n");
     dxvk::war3::Initialize(gameBase);
+    EndStartupStage(StartupStage::War3Initialize, initToken);
     dxvk::war3dbg::Print("DXVK War3Bootstrap: war3::Initialize 完成\n");
     dxvk::war3dbg::Print("DXVK War3Bootstrap: ShaderManager reload 开始\n");
+    const auto shaderToken = BeginStartupStage(StartupStage::ShaderReload);
     dxvk::war3::ShaderManager::get().reload();
+    EndStartupStage(StartupStage::ShaderReload, shaderToken);
     dxvk::war3dbg::Print("DXVK War3Bootstrap: ShaderManager reload 完成\n");
   } else {
     dxvk::war3dbg::Print("DXVK War3Bootstrap: war3::Initialize(auto) 开始\n");
     dxvk::war3::Initialize();
+    EndStartupStage(StartupStage::War3Initialize, initToken);
     dxvk::war3dbg::Print("DXVK War3Bootstrap: war3::Initialize(auto) 完成\n");
   }
 
-  dxvk::war3dbg::Print("DXVK War3Bootstrap: NetEventHook 初始化开始\n");
-  const bool netEventReady = dxvk::war3::NetEventHook::get().init();
-  dxvk::war3dbg::Print(
-      "DXVK War3Bootstrap: NetEventHook 初始化完成 ready=%d\n",
-      netEventReady ? 1 : 0);
+  // NetEvent installation depends on ::pGameDLL and JASS get_instance. The
+  // activation owner installs it after war3_preinit; neither is ready here on
+  // the first map. A premature one-shot attempt silently lost GAME_LEAVE.
   dxvk::war3dbg::Print("DXVK War3Bootstrap: 控制平面初始化开始\n");
+  const auto controlToken = BeginStartupStage(StartupStage::ControlPlaneInitialize);
   dxvk::war3::tools::InitializeWar3ControlPlane();
+  EndStartupStage(StartupStage::ControlPlaneInitialize, controlToken);
   dxvk::war3dbg::Print(
       "DXVK War3Bootstrap: 控制平面初始化返回 running=%d\n",
       dxvk::war3::tools::IsWar3ControlPlaneRunning() ? 1 : 0);
@@ -109,6 +117,7 @@ void InitializeRuntimeCore(uintptr_t gameBase) {
   // ShadowArena is VkDevice-owned. Its initialization is intentionally
   // deferred to the D3D9 render owner, which supplies the exact DxvkDevice;
   // this game-thread bootstrap must never bind process-global pages.
+  EndStartupStage(StartupStage::RuntimeCore, coreToken);
 }
 
 void ResetRuntimeCore() {

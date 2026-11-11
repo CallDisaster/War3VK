@@ -1,5 +1,24 @@
 # 更新日志
 
+## v1.22.02 - 2026-09-27（候选，尚未发布）
+
+### 2026-10-24 验证收口（仍为候选）
+
+- 修复 32 位低地址压力中的大 TLS 表放大：CurrentDraw/material 表冷启动，发布前成组预检，
+  异常不穿过 native hook，保留原语义并允许后续重试。最终候选 DLL 为
+  `24,469,504 B / AA4CF7F9499A325A5849C2AA463926908F209FE3A800889ACF997EE70830BCCD`。
+- 修复 NetEvent 一次性早装导致的退场事件缺链，并修复调查器在立即 `ERROR_MORE_DATA`
+  下丢失管道分片的工具缺陷。完整 restricted-Medium Meson `126` tests、CPU 专用门和真实
+  消息管道回归均通过。
+- 同一隔离实例已完成载图、1902×963 截图、退图清零、唯一窗口关闭与原句柄自然 exit code 0。
+  这仍不是 x64 renderer 接入、长时高压/跨地图/GPU 等价或玩家发布结论；详见
+  `docs/research/2026-10-24-mdldata-low-address-repair.md`。
+
+- 同进程换图：JASS Native 表重建触发一次性阴影会话 Reset 请求，旧资源继续由 Present 安全点退休。隔离 `ChangeLevel` A→B→A 的 epoch、请求/应用、收集和合法 caster 绘制已观察到；菜单换图、D3D9 Reset、高压长时与完整视觉尚未验收，不宣称跨地图全面修复。
+- 作者新增 `WarVKSetUnitWalkLoopEnabled`、移动动画 Override 与 Clear。修正 1.27a 单位 handle 可直接指向 CUnit 的实例；指定 `Hamg` 隔离用例已确认请求被接受并抑制自动 Walk，其他单位、移动途中已有动画及多人场景仍需验证。
+- 常驻阴影几何发布改为失败可回滚的事务；地图会话持有与 live/retired 账随 GPU 完成回收。帧取证按当前尝试归因，截图退出时可取消私有同步文件 I/O 并等待真实 worker 结束；这些改动不等于 GPU 完成前可释放资源，也不提供新的性能收益数字。
+- 单位模型附加点世界坐标 API 延后；未包含 64 位渲染器、Water、自动原版模型点光或未验收的剔除实验。Shader API 1.2.0 和 JASS wire v1 保持不变。
+
 ## v1.22.01 - 2026-09-20
 
 内存维护修复版。用户对相同源码候选完成一轮试玩并反馈未见问题；正式构建另更新产品/JAPI版本

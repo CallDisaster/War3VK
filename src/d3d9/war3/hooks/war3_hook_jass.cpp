@@ -5,7 +5,9 @@
 #include "war3_jass_command_bridge.h"
 #include "war3_jass_native_plan_cache.h"
 #include "../../d3d9_war3_debug.h"
+#include "../../d3d9_war3_hook.h"
 #include "../japi/war3_japi_v1.h"
+#include "../japi/war3_module_loader.h"
 
 #include "../core/war3_internal_test_config.h"
 #include "../tools/war3_perf_monitor.h"
@@ -341,6 +343,10 @@ static int __cdecl Hook_InitJassNatives() {
   // 阶段1：先执行原始初始化，保证游戏侧 Native 表先建立完成。
   war3dbg::Print("DXVK War3Hook: Hook_InitJassNatives ENTER\n");
 
+  // Close old-map producer admission before the rebuilt VM can publish any
+  // new-map semantic state. Repeated native initialization is coalesced.
+  dxvk::ObserveWar3JassNativeTableRebuild();
+
   int result = 0;
   if (g_trampolineInitJassNatives) {
     result = g_trampolineInitJassNatives();
@@ -349,6 +355,8 @@ static int __cdecl Hook_InitJassNatives() {
   // A rebuilt JASS VM starts a new map generation. Retire only objects owned
   // by the public WarVK JAPI before publishing the new carrier table.
   dxvk::war3::japi::ResetAuthorState();
+  // 内置模块按地图存活：换图/重建 JASS VM 时统一卸载，避免旧模块继续响应新地图。
+  dxvk::war3::japi::modules::ResetAuthorState();
   ResetJassCommandBridgeInstallState();
   TryInstallJassCommandBridge("InitJassNatives");
 

@@ -1,4 +1,5 @@
 #include "d3d9_util.h"
+#include "d3d9_fvf.h"
 
 #include "../util/util_win32_compat.h"
 
@@ -311,26 +312,7 @@ namespace dxvk {
 
 
   uint32_t GetDecltypeSize(D3DDECLTYPE Type) {
-    switch (Type) {
-      case D3DDECLTYPE_FLOAT1:    return 1 * sizeof(float);
-      case D3DDECLTYPE_FLOAT2:    return 2 * sizeof(float);
-      case D3DDECLTYPE_FLOAT3:    return 3 * sizeof(float);
-      case D3DDECLTYPE_FLOAT4:    return 4 * sizeof(float);
-      case D3DDECLTYPE_D3DCOLOR:  return 1 * sizeof(DWORD);
-      case D3DDECLTYPE_UBYTE4:    return 4 * sizeof(BYTE);
-      case D3DDECLTYPE_SHORT2:    return 2 * sizeof(short);
-      case D3DDECLTYPE_SHORT4:    return 4 * sizeof(short);
-      case D3DDECLTYPE_UBYTE4N:   return 4 * sizeof(BYTE);
-      case D3DDECLTYPE_SHORT2N:   return 2 * sizeof(short);
-      case D3DDECLTYPE_SHORT4N:   return 4 * sizeof(short);
-      case D3DDECLTYPE_USHORT2N:  return 2 * sizeof(short);
-      case D3DDECLTYPE_USHORT4N:  return 4 * sizeof(short);
-      case D3DDECLTYPE_UDEC3:     return 4;
-      case D3DDECLTYPE_DEC3N:     return 4;
-      case D3DDECLTYPE_FLOAT16_2: return 2 * 2;
-      case D3DDECLTYPE_FLOAT16_4: return 4 * 2;
-      default:                    return 0;
-    }
+    return DecltypeSize(Type);
   }
 
 

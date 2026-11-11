@@ -11,15 +11,26 @@ import zipfile
 from package_v122_release_candidate import identity, pe_tables, create_text
 from release_v122_package_audit import _pe_identity
 
+VERSION = '1.22.02'
 PLAYER = ('d3d9.dll', 'README.md', 'README_CN.md', 'CHANGELOG.md', 'LICENSE',
-          'COPYING', 'THIRD_PARTY_NOTICES.md', 'DEPENDENCY_LICENSES.txt')
+          'COPYING', 'THIRD_PARTY_NOTICES.md', 'DEPENDENCY_LICENSES.txt',
+          'WarVK_GPU_REQUIREMENTS.md', 'WarVK_LockD3D9.cmd', 'WarVK_UnlockD3D9.cmd')
+# Player package members that live elsewhere in the repository.
+PLAYER_SOURCES = {
+    'WarVK_GPU_REQUIREMENTS.md': 'docs/WarVK_GPU_REQUIREMENTS.md',
+    'WarVK_LockD3D9.cmd': 'tools/player/WarVK_LockD3D9.cmd',
+    'WarVK_UnlockD3D9.cmd': 'tools/player/WarVK_UnlockD3D9.cmd',
+}
 AUTHOR = ('WarVK/action.txt', 'WarVK/call.txt', 'WarVK/define.txt',
-          'WarVK/README.md', 'WarVK/MATH_CURVE_API.md',
+          'WarVK/README.md', 'WarVK/MATH_CURVE_API.md', 'WarVK/WEATHER_API.md',
           'WarVK/icons/atom.blp', 'WarVK/icons/atom.png',
           'WarVK/jass/warvk_api.j', 'WarVK/jass/warvk_bridge.j',
           'WarVK/jass/warvk_constant.j', 'WarVK/jass/warvk_init.j',
-          'WarVK/jass/warvk_smoke_test.j', 'LICENSE', 'COPYING', 'THIRD_PARTY_NOTICES.md')
-TESTED_CANDIDATE_SHA = '028565BCB33B6EB646E4915115B60CDA3C14C287A4225DAA50F8F6513F9E9BA3'
+          'WarVK/jass/warvk_smoke_test.j', 'WarVK/jass/warvk_weather_demo.j',
+          'LICENSE', 'COPYING', 'THIRD_PARTY_NOTICES.md')
+# The 2026-09-25 candidate the player kept running until this release. The
+# release DLL is newer: it was re-tested in isolated AutoTest runs only.
+PLAYER_RUNNING_PREDECESSOR_SHA = '1FFE0BD14C51C8E1D2A9EB94425A06260CD4B480A7CA735E13E946EA93EE35CF'
 DEPENDENCY_LICENSES = ('COPYING', 'LICENSE', 'src/minhook/LICENSE.txt',
     'subprojects/imgui/LICENSE.txt', 'subprojects/dxbc-spirv/LICENSE',
     'subprojects/libdisplay-info/LICENSE', 'smaa/LICENSE.txt',
@@ -69,7 +80,7 @@ def verify_archive(directory, archive, payload):
 def make_archive(directory, archive, payload, evidence):
     if set(members(directory)) != set(payload):
         raise ValueError('Unexpected payload')
-    manifest = dict(schema=1, kind='warvk-release', version='1.22.01',
+    manifest = dict(schema=1, kind='warvk-release', version=VERSION,
                     files=members(directory), evidence=evidence)
     create_text(directory / 'manifest.json', json.dumps(manifest, ensure_ascii=False, indent=2))
     with zipfile.ZipFile(archive, 'x', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
@@ -127,20 +138,22 @@ def package(root, build, out, manifest_name):
     # VersionInfo reads PE resources, not LoadLibrary/DllMain.
     version = json.loads(subprocess.check_output(['powershell', '-NoProfile', '-Command',
         f"$v=(Get-Item -LiteralPath '{dll}').VersionInfo; @{{v=$v.FileVersion;pre=$v.IsPreRelease;description=$v.FileDescription}}|ConvertTo-Json -Compress"], text=True))
-    if version != {'v': '1.22.01', 'pre': False, 'description': 'WarVK 1.22.01 Direct3D 9 Runtime'}:
+    if version != {'v': VERSION, 'pre': False, 'description': f'WarVK {VERSION} Direct3D 9 Runtime'}:
         raise ValueError('Not a final version resource')
     evidence = dict(sourceCommit=commit, buildInputManifest=identity(build / manifest_name),
         configurationAudit=identity(build / 'release-configuration-audit.json'),
         playerDll=identity(dll), unstrippedDll=original_id,
         mesonCpuTests=len(tests), assertionsEnabledInTests=True, staticScripts=len(results),
-        userReleaseAuthorized=True, playerAcceptedCandidateSha256=TESTED_CANDIDATE_SHA,
-        playerEvidence='One player test reported no observed problem; matching live DLL SHA independently checked',
-        deltaAfterPlayerTest='Product/JAPI version strings, matching runtime version probe and packaging/docs only; no allocation/caster/fence algorithm changes',
-        finalDllRuntimeRetested=False, universalGpuVisualOrApiAcceptance=False)
+        userReleaseAuthorized=True,
+        playerRunningPredecessorSha256=PLAYER_RUNNING_PREDECESSOR_SHA,
+        playerEvidence='The player ran the 2026-09-25 predecessor; this exact DLL has no player acceptance yet',
+        finalDllRuntimeRetested=True,
+        finalDllRuntimeScope='Isolated AutoTest smoke runs on one NVIDIA GPU (see release notes)',
+        universalGpuVisualOrApiAcceptance=False)
     player, author = out / 'player', out / 'author'
     player.mkdir(); author.mkdir()
     for name in PLAYER:
-        src = dll if name == 'd3d9.dll' else root / name
+        src = dll if name == 'd3d9.dll' else root / PLAYER_SOURCES.get(name, name)
         if name == 'DEPENDENCY_LICENSES.txt':
             notices = '\n\n'.join('===== ' + p + ' =====\n' +
                 (source / p).read_text(encoding='utf-8') for p in DEPENDENCY_LICENSES)
@@ -151,8 +164,8 @@ def package(root, build, out, manifest_name):
         dest = author / name
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(root / name, dest)
-    player_zip = out / 'WarVK-1.22.01-win32.zip'
-    author_zip = out / 'WarVK-1.22.01-author-kit.zip'
+    player_zip = out / f'WarVK-{VERSION}-win32.zip'
+    author_zip = out / f'WarVK-{VERSION}-author-kit.zip'
     make_archive(player, player_zip, PLAYER, evidence)
     make_archive(author, author_zip, AUTHOR, evidence)
     assets = {p.name: identity(p) for p in (dll, player_zip, author_zip)}

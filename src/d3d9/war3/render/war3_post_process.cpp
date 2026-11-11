@@ -1,4 +1,5 @@
 #include "war3_post_process.h"
+#include "../../d3d9_device.h"
 
 #include "../shader/war3_shader_manager.h"
 
@@ -226,11 +227,12 @@ float4 PS_Composite(VS_OUT input) : COLOR0 {
     }
   }
 
-  War3PostProcess::War3PostProcess(IDirect3DDevice9* device)
+  War3PostProcess::War3PostProcess(D3D9DeviceEx* device)
   : m_device(device) {
   }
 
   void War3PostProcess::Init(uint32_t width, uint32_t height, D3DFORMAT format) {
+    Shutdown();
     if (!m_device || width == 0 || height == 0)
       return;
 
@@ -238,14 +240,18 @@ float4 PS_Composite(VS_OUT input) : COLOR0 {
     m_height = height;
     m_format = format;
 
-    if (!compileShaders("shaders/war3_postfx.hlsl"))
-      return;
-
-    if (!createFullscreenResources())
-      return;
-
-    if (!createBloomResources(width, height, format))
-      return;
+    try {
+      if (!compileShaders("shaders/war3_postfx.hlsl") ||
+          !createFullscreenResources() ||
+          !createBloomResources(width, height, format)) {
+        // Do not keep a partially initialized resource set alive until a retry.
+        Shutdown();
+        return;
+      }
+    } catch (...) {
+      Shutdown();
+      throw;
+    }
 
     m_initialized = true;
   }
@@ -446,22 +452,26 @@ float4 PS_Composite(VS_OUT input) : COLOR0 {
       Logger::err("War3PostProcess: VS 编译失败: " + error);
       return false;
     }
-    if (FAILED(m_device->CreateVertexShader(reinterpret_cast<const DWORD*>(tokens.data()), &m_vsFullscreen))) {
+    Com<IDirect3DVertexShader9> vs;
+    if (FAILED(m_device->CreateVertexShader(reinterpret_cast<const DWORD*>(tokens.data()), &vs))) {
       Logger::err("War3PostProcess: VS 创建失败");
       return false;
     }
+    m_vsFullscreen = static_cast<D3D9VertexShader*>(vs.ptr());
 
-    auto compilePs = [&](const char* entry, Com<IDirect3DPixelShader9>& outPs) {
+    auto compilePs = [&](const char* entry, Com<D3D9PixelShader, false>& outPs) {
       tokens.clear();
       error.clear();
       if (!CompileDxso(source, path, entry, "ps_3_0", tokens, error)) {
         Logger::err(std::string("War3PostProcess: PS 编译失败: ") + error);
         return false;
       }
-      if (FAILED(m_device->CreatePixelShader(reinterpret_cast<const DWORD*>(tokens.data()), &outPs))) {
+      Com<IDirect3DPixelShader9> ps;
+      if (FAILED(m_device->CreatePixelShader(reinterpret_cast<const DWORD*>(tokens.data()), &ps))) {
         Logger::err("War3PostProcess: PS 创建失败");
         return false;
       }
+      outPs = static_cast<D3D9PixelShader*>(ps.ptr());
       return true;
     };
 
@@ -487,16 +497,20 @@ float4 PS_Composite(VS_OUT input) : COLOR0 {
       D3DDECL_END()
     };
 
-    if (FAILED(m_device->CreateVertexDeclaration(elements, &m_decl))) {
+    Com<IDirect3DVertexDeclaration9> decl;
+    if (FAILED(m_device->CreateVertexDeclaration(elements, &decl))) {
       Logger::err("War3PostProcess: 创建顶点声明失败");
       return false;
     }
+    m_decl = static_cast<D3D9VertexDecl*>(decl.ptr());
 
+    Com<IDirect3DVertexBuffer9> vb;
     if (FAILED(m_device->CreateVertexBuffer(sizeof(kFullscreenTri), D3DUSAGE_WRITEONLY, 0,
-                                             D3DPOOL_DEFAULT, &m_fullscreenVB, nullptr))) {
+                                             D3DPOOL_DEFAULT, &vb, nullptr))) {
       Logger::err("War3PostProcess: 创建全屏 VB 失败");
       return false;
     }
+    m_fullscreenVB = static_cast<D3D9VertexBuffer*>(vb.ptr());
 
     void* data = nullptr;
     if (FAILED(m_fullscreenVB->Lock(0, sizeof(kFullscreenTri), &data, 0))) {
@@ -512,28 +526,36 @@ float4 PS_Composite(VS_OUT input) : COLOR0 {
     if (!m_device)
       return false;
 
+    Com<IDirect3DTexture9> sceneTexture;
     if (FAILED(m_device->CreateTexture(width, height, 1, D3DUSAGE_RENDERTARGET,
-                                        format, D3DPOOL_DEFAULT, &m_sceneTexture, nullptr))) {
+                                        format, D3DPOOL_DEFAULT, &sceneTexture, nullptr))) {
       Logger::err("War3PostProcess: 创建场景纹理失败");
       return false;
     }
-    if (FAILED(m_sceneTexture->GetSurfaceLevel(0, &m_sceneSurface))) {
+    m_sceneTexture = static_cast<D3D9Texture2D*>(sceneTexture.ptr());
+    Com<IDirect3DSurface9> sceneSurface;
+    if (FAILED(m_sceneTexture->GetSurfaceLevel(0, &sceneSurface))) {
       Logger::err("War3PostProcess: 获取场景纹理 surface 失败");
       return false;
     }
+    m_sceneSurface = static_cast<D3D9Surface*>(sceneSurface.ptr());
 
     uint32_t w = std::max(1u, width);
     uint32_t h = std::max(1u, height);
     for (uint32_t i = 0; i < kBloomLevels; ++i) {
+      Com<IDirect3DTexture9> texture;
       if (FAILED(m_device->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET,
-                                          format, D3DPOOL_DEFAULT, &m_bloomTextures[i], nullptr))) {
+                                          format, D3DPOOL_DEFAULT, &texture, nullptr))) {
         Logger::err("War3PostProcess: 创建 Bloom 纹理失败");
         return false;
       }
-      if (FAILED(m_bloomTextures[i]->GetSurfaceLevel(0, &m_bloomSurfaces[i]))) {
+      m_bloomTextures[i] = static_cast<D3D9Texture2D*>(texture.ptr());
+      Com<IDirect3DSurface9> surface;
+      if (FAILED(m_bloomTextures[i]->GetSurfaceLevel(0, &surface))) {
         Logger::err("War3PostProcess: 获取 Bloom surface 失败");
         return false;
       }
+      m_bloomSurfaces[i] = static_cast<D3D9Surface*>(surface.ptr());
 
       m_bloomViewports[i] = { 0, 0, w, h, 0.0f, 1.0f };
       w = std::max(1u, w / 2);

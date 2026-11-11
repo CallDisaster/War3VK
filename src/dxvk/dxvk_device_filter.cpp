@@ -1,4 +1,6 @@
 #include "dxvk_device_filter.h"
+#include "dxvk_startup_report.h"
+#include <algorithm>
 #include <iomanip>
 #include <sstream>
 
@@ -48,36 +50,57 @@ namespace dxvk {
       properties.vk12.driverName, " ",
       properties.driverVersion.toString(), ")"));
 
-    std::string compatError;
+    // Keep what the player needs to hear about this device: the instance
+    // is never published when no adapter passes, so the log alone is lost.
+    DxvkStartupAdapterRecord record;
+    record.name             = properties.core.properties.deviceName;
+    record.vendorId         = properties.core.properties.vendorID;
+    record.deviceId         = properties.core.properties.deviceID;
+    record.deviceType       = uint32_t(properties.core.properties.deviceType);
+    record.apiVersion       = properties.core.properties.apiVersion;
+    record.driverVersionRaw = properties.core.properties.driverVersion;
+    record.driverId         = uint32_t(properties.vk12.driverID);
+    record.driverName       = properties.vk12.driverName;
+    record.driverInfo       = properties.vk12.driverInfo;
 
-    if (!adapter.isCompatible(compatError)) {
-      Logger::info(str::format("  Skipping: ", compatError));
-      return false;
+    const auto& memory = adapter.memoryProperties();
+
+    for (uint32_t i = 0; i < memory.memoryHeapCount && i < VK_MAX_MEMORY_HEAPS; i++) {
+      if (memory.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+        record.deviceLocalBytes = std::max<uint64_t>(record.deviceLocalBytes, memory.memoryHeaps[i].size);
     }
 
+    auto reject = [&record] (std::string reason) {
+      Logger::info(str::format("  Skipping: ", reason));
+      record.rejection = std::move(reason);
+      startup_report::addAdapter(std::move(record));
+      return false;
+    };
+
+    std::string compatError;
+
+    if (!adapter.isCompatible(compatError))
+      return reject(compatError);
+
     if (m_flags.test(DxvkDeviceFilterFlag::MatchDeviceName)) {
-      if (std::string(properties.core.properties.deviceName).find(m_matchDeviceName) == std::string::npos) {
-        Logger::info("  Skipping: Device filter");
-        return false;
-      }
+      if (std::string(properties.core.properties.deviceName).find(m_matchDeviceName) == std::string::npos)
+        return reject("Device filter");
     }
 
     if (m_flags.test(DxvkDeviceFilterFlag::MatchDeviceUUID)) {
       std::string uuidStr = convertUUID(properties.vk11.deviceUUID);
 
-      if (uuidStr.find(m_matchDeviceUUID) == std::string::npos) {
-        Logger::info("  Skipping: UUID filter");
-        return false;
-      }
+      if (uuidStr.find(m_matchDeviceUUID) == std::string::npos)
+        return reject("UUID filter");
     }
 
     if (m_flags.test(DxvkDeviceFilterFlag::SkipCpuDevices)) {
-      if (properties.core.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) {
-        Logger::info("  Skipping: Software driver");
-        return false;
-      }
+      if (properties.core.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU)
+        return reject("Software driver");
     }
 
+    record.accepted = true;
+    startup_report::addAdapter(std::move(record));
     return true;
   }
 

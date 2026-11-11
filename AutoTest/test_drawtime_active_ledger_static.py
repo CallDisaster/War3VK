@@ -82,11 +82,19 @@ class DrawTimeActiveLedgerStaticTest(unittest.TestCase):
         serial = DEVICE_CPP.index("m_war3ShadowPersistentFrameSerial++;")
         begin = DEVICE_CPP.index("m_war3DrawTimeActiveLedger.beginFrame(", serial)
         self.assertLess(serial, begin)
-        reset = DEVICE_CPP.index("m_war3DrawTimeActiveLedger.resetSession();")
-        move = DEVICE_CPP.index(
-            "retired.drawTimeVbCache = std::move(m_war3DrawTimeVBCache);"
+        session = DEVICE_CPP.split(
+            "void D3D9DeviceEx::War3ResetShadowSessionState(", 1
+        )[1].split("bool D3D9DeviceEx::War3DrainShadowCasterTombstones", 1)[0]
+        reset = session.index("m_war3DrawTimeActiveLedger.resetSession();")
+        commit = session.index("auto& retired = prepared.commit(")
+        move = session.index(
+            "TransferShadowSessionOwner(target.drawTimeVbCache, m_war3DrawTimeVBCache);"
         )
-        self.assertLess(move, reset)
+        # Ledger clear stays AFTER the successful no-throw owner transaction;
+        # moving to a shared helper must not release the cache before handoff.
+        self.assertLess(commit, move)
+        self.assertLess(move, session.index("});", move))
+        self.assertLess(session.index("});", move), reset)
         self.assertIn("m_records.clear();", LEDGER_H)
         reset_begin = LEDGER_H.index("void resetSession() noexcept")
         reset_end = LEDGER_H.index("\n  }", reset_begin)

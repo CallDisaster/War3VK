@@ -222,7 +222,7 @@ namespace dxvk::war3 {
         void* m_netData = nullptr;
         void* m_osbObj = nullptr;
         OriginalHandler_t m_originalFunc = nullptr;
-        bool m_runtimeReady = false;
+        std::atomic<bool> m_runtimeReady{false};
 
         static bool IsVerboseLogEnabled() {
             static int s_cached = -1;

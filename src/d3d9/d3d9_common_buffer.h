@@ -6,6 +6,9 @@
 #include "d3d9_device_child.h"
 #include "d3d9_format.h"
 #include "war3/tools/war3_resource_residency_census.h"
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+#include "d3d9_buffer_census.h"
+#endif
 
 #include <atomic>
 
@@ -219,6 +222,14 @@ namespace dxvk {
     inline void War3NoteResourceCensusUpload() const {
       war3::resource_census::NoteDeviceUpload(m_war3ResourceCensus, 0u);
     }
+
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+    // Caller-attributed buffer census, from the public Lock/Unlock entries.
+    // The cursor is read and written only inside the device's census cell.
+    void CensusLock(UINT OffsetToLock, UINT SizeToLock, DWORD Flags, const void* Caller);
+    void CensusUnlock();
+    d3d9::migration::BufferCursor m_bufferCensusCursor;
+#endif
 
     static HRESULT ValidateBufferProperties(const D3D9_BUFFER_DESC* pDesc, const bool IsExtended);
 

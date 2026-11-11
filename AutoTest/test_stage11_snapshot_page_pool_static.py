@@ -2,12 +2,16 @@
 """Structural contracts for the bounded Stage11 snapshot page pool."""
 
 from pathlib import Path
+import re
 import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
 HEADER = (ROOT / "src/d3d9/d3d9_device.h").read_text(encoding="utf-8")
 DEVICE = (ROOT / "src/d3d9/d3d9_device.cpp").read_text(encoding="utf-8")
+RETIREMENT = (
+    ROOT / "src/d3d9/war3/shadow/war3_shadow_session_retirement.h"
+).read_text(encoding="utf-8")
 POLICY = (ROOT / "src/d3d9/war3/render/war3_stage11_snapshot_page_policy.h").read_text(
     encoding="utf-8"
 )
@@ -26,19 +30,29 @@ PERF = (ROOT / "src/d3d9/war3/tools/war3_perf_monitor.cpp").read_text(
 )
 
 
+def code_only(source: str) -> str:
+    """Blank comments/literals before checking actual lifetime transfers."""
+    tokens = re.compile(
+        r'//[^\n]*|/\*.*?\*/|R"(?P<delimiter>[^ ()\\\t\r\n]{0,16})'
+        r'\(.*?\)(?P=delimiter)"|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'',
+        re.DOTALL,
+    )
+    return tokens.sub(lambda match: re.sub(r"[^\n]", " ", match.group()), source)
+
+
 class Stage11SnapshotPagePoolStaticTest(unittest.TestCase):
     @staticmethod
-    def body(signature: str) -> str:
-        start = DEVICE.index(signature)
-        opening = DEVICE.index("{", start)
+    def body(signature: str, source: str = DEVICE) -> str:
+        start = source.index(signature)
+        opening = source.index("{", start)
         depth = 0
-        for index in range(opening, len(DEVICE)):
-            if DEVICE[index] == "{":
+        for index in range(opening, len(source)):
+            if source[index] == "{":
                 depth += 1
-            elif DEVICE[index] == "}":
+            elif source[index] == "}":
                 depth -= 1
                 if depth == 0:
-                    return DEVICE[start : index + 1]
+                    return source[start : index + 1]
         raise AssertionError(signature)
 
     def test_policy_is_bounded_and_never_reuses_holes(self):
@@ -83,11 +97,35 @@ class Stage11SnapshotPagePoolStaticTest(unittest.TestCase):
         self.assertNotIn('debugName = "War3DrawTimeVBIdx"', DEVICE)
 
     def test_map_reset_never_reuses_old_epoch_pages(self):
-        reset = self.body("void D3D9DeviceEx::War3ResetShadowSessionState(")
-        move = reset.index("retired.drawTimeVbCache = std::move(m_war3DrawTimeVBCache)")
-        page_reset = reset.index("War3ResetStage11SnapshotPages()", move)
-        self.assertLess(move, page_reset)
-        page_body = self.body("void D3D9DeviceEx::War3ResetStage11SnapshotPages(")
+        reset = self.body("void D3D9DeviceEx::War3ResetShadowSessionState(", code_only(DEVICE))
+        commit = self.body("prepared.commit(", reset)
+        self.assertRegex(
+            commit,
+            r"prepared\.commit\s*\(\s*m_war3ShadowPersistentCharges\s*,\s*"
+            r"m_war3GpuSkinMapEpoch\s*,\s*retireSerial\s*,\s*"
+            r"\[this\]\s*\(\s*War3RetiredShadowSession\s*&\s*target\s*\)\s*noexcept\s*\{",
+        )
+        self.assertRegex(
+            commit,
+            r"TransferShadowSessionOwner\s*\(\s*target\.drawTimeVbCache\s*,\s*"
+            r"m_war3DrawTimeVBCache\s*\)\s*;",
+        )
+        commit_end = reset.index(commit) + len(commit)
+        self.assertRegex(reset[commit_end:], r"^\s*\)\s*;")
+        page_reset = reset.index("War3ResetStage11SnapshotPages()")
+        self.assertLess(commit_end, page_reset)
+        transfer = self.body("void TransferShadowSessionOwner(", code_only(RETIREMENT))
+        self.assertIsNotNone(re.fullmatch(
+            r"\s*static_assert\s*\(\s*std::is_nothrow_move_assignable_v<T>\s*,\s*\)\s*;"
+            r"\s*destination\s*=\s*std::move\s*\(\s*source\s*\)\s*;\s*",
+            transfer[transfer.index("{") + 1:-1],
+        ))
+        helper_commit = self.body("Session& commit(", code_only(RETIREMENT))
+        self.assertRegex(helper_commit, r"auto\s*&\s*session\s*=\s*\*m_slot\s*;")
+        self.assertEqual(helper_commit.count("transfer(session);"), 1)
+        self.assertLess(helper_commit.index("transfer(session);"),
+                        helper_commit.index("m_committed = true;"))
+        page_body = self.body("void D3D9DeviceEx::War3ResetStage11SnapshotPages(", code_only(DEVICE))
         self.assertIn("m_war3Stage11SnapshotPages.clear()", page_body)
         self.assertNotIn("page->used = 0", page_body)
 

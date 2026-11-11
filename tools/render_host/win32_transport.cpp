@@ -13,10 +13,7 @@ DWORD Remaining(ULONGLONG deadline) {
 // An OVERLAPPED never outlives its event or caller-owned buffer. Cancellation
 // is a request, not a release permission. External lab watchdog bounds a stuck
 // kernel drain by terminating the entire owned test process, never by UAF.
-DWORD Complete(HANDLE pipe,HANDLE peer,OVERLAPPED& ov,ULONGLONG deadline,
-               Stage stage,IoStats& stats) {
-  HANDLE waits[]={ov.hEvent,peer};
-  DWORD result=WaitForMultipleObjects(2,waits,FALSE,Remaining(deadline));
+DWORD FinishPending(HANDLE pipe,OVERLAPPED& ov,DWORD result,Stage stage,IoStats& stats) {
   DWORD transferred=0;
   if(result==WAIT_OBJECT_0){
     if(!GetOverlappedResult(pipe,&ov,&transferred,FALSE))System(stage);
@@ -35,6 +32,12 @@ DWORD Complete(HANDLE pipe,HANDLE peer,OVERLAPPED& ov,ULONGLONG deadline,
   if(result==WAIT_TIMEOUT)throw Failure(Fault::Timeout,stage,WAIT_TIMEOUT);
   if(result==WAIT_OBJECT_0+1)throw Failure(Fault::PeerExited,stage);
   throw Failure(Fault::System,stage,error);
+}
+DWORD Complete(HANDLE pipe,HANDLE peer,OVERLAPPED& ov,ULONGLONG deadline,
+               Stage stage,IoStats& stats) {
+  HANDLE waits[]={ov.hEvent,peer};
+  const DWORD result=WaitForMultipleObjects(2,waits,FALSE,Remaining(deadline));
+  return FinishPending(pipe,ov,result,stage,stats);
 }
 void Transfer(HANDLE pipe,HANDLE peer,uint8_t* bytes,size_t count,bool writing,
               ULONGLONG deadline,Stage stage,IoStats& stats,size_t fragment) {
@@ -98,6 +101,10 @@ ipc::Nonce ParseNonce(const std::wstring& text) {
 std::wstring PipeName(ipc::Nonce n, Channel channel) {
   if (channel == Channel::Echo0) return L"\\\\.\\pipe\\warvk-rh0-" + NonceText(n);
   if (channel == Channel::Slots1) return L"\\\\.\\pipe\\warvk-rh1-" + NonceText(n);
+  if (channel == Channel::Gpu2) return L"\\\\.\\pipe\\warvk-rh2-" + NonceText(n);
+  if (channel == Channel::Present3) return L"\\\\.\\pipe\\warvk-rh3-" + NonceText(n);
+  if (channel == Channel::Buffers4) return L"\\\\.\\pipe\\warvk-rh4-" + NonceText(n);
+  if (channel == Channel::D3D9Dev5) return L"\\\\.\\pipe\\warvk-d9dev-" + NonceText(n);
   throw Failure(Fault::System, Stage::Setup, ERROR_INVALID_PARAMETER);
 }
 Handle CreateServer(ipc::Nonce nonce, Channel channel) {
@@ -158,6 +165,22 @@ void ReadExact(HANDLE pipe,HANDLE peer,uint8_t* bytes,size_t count,const ReadWin
   if (!bytes || count > ipc::MaxMessageBytes || (stage != Stage::Header && stage != Stage::Body))
     throw Failure(Fault::System, stage, ERROR_INVALID_PARAMETER);
   Transfer(pipe, peer, bytes, count, false, window.m_until, stage, stats, ipc::MaxMessageBytes);
+}
+void ReadFirstByteAfterIdle(HANDLE pipe,HANDLE peer,uint8_t* byte,IoStats& stats) {
+  if(!byte)throw Failure(Fault::System,Stage::Header,ERROR_INVALID_PARAMETER);
+  Handle event(CreateEventW(nullptr,TRUE,FALSE,nullptr));if(!event)System(Stage::Header);
+  OVERLAPPED ov{};ov.hEvent=event.get();DWORD transferred=0;
+  ++stats.reads;
+  if(!ReadFile(pipe,byte,1,&transferred,&ov)){
+    if(GetLastError()!=ERROR_IO_PENDING)System(Stage::Header);
+    HANDLE waits[]={ov.hEvent,peer};
+    DWORD result;
+    // Short waits preserve the exact same pending read and buffer. A healthy
+    // idle tick neither cancels I/O nor creates a fresh framing deadline.
+    do { result=WaitForMultipleObjects(2,waits,FALSE,1000); } while(result==WAIT_TIMEOUT);
+    transferred=FinishPending(pipe,ov,result,Stage::Header,stats);
+  }
+  if(transferred!=1)throw Failure(Fault::EndOfStream,Stage::Header);
 }
 const char* StageName(Stage s) noexcept {
   switch(s){case Stage::Setup:return "setup";case Stage::Connect:return "connect";

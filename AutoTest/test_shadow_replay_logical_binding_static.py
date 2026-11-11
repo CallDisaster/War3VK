@@ -72,12 +72,19 @@ class ShadowReplayLogicalBindingStaticTest(unittest.TestCase):
         )
         last_create = persistent.rindex("War3CreateShadowPersistentBuffer")
         capture = persistent.index("stored.positionReplayBinding.capture", last_create)
-        insert = persistent.index("m_war3ShadowPersistentGeometries.emplace", capture)
+        ownership = persistent.index("entry.geometry = std::move(stored);", capture)
+        insert = persistent.index("dxvk::war3::shadow::PublishPersistentGeometry(", ownership)
         self.assertLess(last_create, capture)
-        self.assertLess(capture, insert)
+        self.assertLess(capture, ownership)
+        self.assertLess(ownership, insert)
+        self.assertEqual(persistent.count("PublishPersistentGeometry("), 1)
+        self.assertNotIn("m_war3ShadowPersistentGeometries.emplace", persistent)
+        self.assertIn("bytesNeeded, geometryId, key, std::move(entry), registryEntry,", persistent[insert:])
         self.assertEqual(DEVICE.count("War3CopyPersistentReplayBindings("), 3)
         for name in ("position", "index", "blend", "uv"):
             self.assertIn(f"{name}ReplayBinding", SCENE)
+            self.assertLess(last_create, persistent.index(f"stored.{name}ReplayBinding.capture("))
+            self.assertLess(persistent.index(f"stored.{name}ReplayBinding.capture("), ownership)
 
     def test_resolved_snapshot_precedes_hash_worker_validation_and_draw(self):
         run = function_body(SHADOW, "void War3ShadowReceiverPass::Run(")

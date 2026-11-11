@@ -5,6 +5,26 @@ comment = "无参数；清除最近一次错误状态。"
 category = "TC_WarVKDiagnostics"
 script = "WarVKClearError"
 
+[WarVKSetUnitWalkLoopEnabled]
+title = "设置单位自动行走动画"
+description = "设置单位 ${whichUnit} 的移动自动 Walk 动画开关 ${enabled}。"
+comment = "false 暂停游戏移动回调自动切回 Walk，true 恢复；不会停止单位移动，也不会强制当前动画立即切换。仅支持已验证的 Warcraft III 1.27a Game.dll。"
+category = "TC_WarVKUnitAnimation"
+script = "WarVKSetUnitWalkLoopEnabled"
+[[.args]]
+type = unit
+[[.args]]
+type = boolean
+
+[WarVKClearUnitMovementAnimationOverride]
+title = "恢复单位自动行走动画"
+description = "恢复单位 ${whichUnit} 移动时自动选择 Walk。"
+comment = "与动画覆盖助手配对；允许游戏在后续移动状态更新时自然选回 Walk，不会立即强制播放。"
+category = "TC_WarVKUnitAnimation"
+script = "WarVKClearUnitMovementAnimationOverride"
+[[.args]]
+type = unit
+
 [WarVKSetSunEnabled]
 title = "启用太阳光"
 description = "设置太阳光开关 ${enabled}。"
@@ -737,3 +757,134 @@ script = "WarVKSetPolylineLightningCurve"
 type = integer
 [[.args]]
 type = integer
+
+[WarVKDestroyWeather]
+title = "销毁天气"
+description = "销毁天气实例 ${weatherId}。"
+comment = "使用创建返回的正整数；销毁后句柄失效，GPU资源由渲染所有者安全退役。"
+category = "TC_WarVKWeather"
+script = "WarVKDestroyWeather"
+[[.args]]
+type = integer
+
+[WarVKSetWeatherRegion]
+title = "设置天气作用区域"
+description = "天气 ${weatherId}：XY区域 ${minX}、${minY} 到 ${maxX}、${maxY}，Z高度 ${bottomZ} 到 ${topZ}，边缘过渡 ${edgeFeather}。"
+comment = "世界坐标绝对值不超过10000000，三个最大值须大于最小值；边缘过渡0..0.5。首版用于室外，不保证屋檐避雪或复杂地形贴合。"
+category = "TC_WarVKWeather"
+script = "WarVKSetWeatherRegion"
+[[.args]]
+type = integer
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+
+[WarVKSetWeatherEnabled]
+title = "启用天气"
+description = "设置天气 ${weatherId} 的开关 ${enabled}。"
+comment = "关闭冻结演出时间并保留配置；重新开启从保留时刻继续。新创建的天气默认关闭。"
+category = "TC_WarVKWeather"
+script = "WarVKSetWeatherEnabled"
+[[.args]]
+type = integer
+[[.args]]
+type = boolean
+
+[WarVKSetSnowWeatherTarget]
+title = "设置暴风雪目标"
+description = "天气 ${weatherId}：雪量 ${snowfall}、风向 ${windAngle}、风速 ${windSpeed}、阵风 ${gust}、雪雾 ${haze}、低空吹雪 ${lowSnow}，过渡 ${transitionSeconds} 秒。"
+comment = "雪量/阵风/雪雾/低空吹雪为0..1；风向为角度（0沿+X，90沿+Y），风速0..2048世界单位/秒，过渡0..3600秒。停止原时间线并从当前状态切入手动控制；不会自动开启已关闭实例。"
+category = "TC_WarVKWeather"
+script = "WarVKSetSnowWeatherTarget"
+[[.args]]
+type = integer
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+
+[WarVKClearWeatherKeyframes]
+title = "清除天气关键帧"
+description = "清除天气 ${weatherId} 的关键帧配置。"
+comment = "时间线播放期间禁止编辑；先设置目标天气切回手动控制，再清除或追加。"
+category = "TC_WarVKWeather"
+script = "WarVKClearWeatherKeyframes"
+[[.args]]
+type = integer
+
+[WarVKAddSnowWeatherKeyframe]
+title = "添加暴风雪关键帧"
+description = "天气 ${weatherId} 在 ${timeSeconds} 秒：雪量 ${snowfall}、风向 ${windAngle}、风速 ${windSpeed}、阵风 ${gust}、雪雾 ${haze}、低空吹雪 ${lowSnow}。"
+comment = "最多64帧；第一帧必须0秒，后续时间严格递增，范围0..86400秒。四个强度0..1，风速0..2048；风向按最短方向插值。播放期间不能编辑。"
+category = "TC_WarVKWeather"
+script = "WarVKAddSnowWeatherKeyframe"
+[[.args]]
+type = integer
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+
+[WarVKPlayWeatherTimeline]
+title = "播放天气时间线"
+description = "播放天气 ${weatherId} 的时间线，从 ${startSeconds} 秒开始。"
+comment = "起始秒数0..86400；自动开启天气，最后关键帧保持。音乐由原版声音函数播放，在同一触发流程中协调。"
+category = "TC_WarVKWeather"
+script = "WarVKPlayWeatherTimeline"
+[[.args]]
+type = integer
+[[.args]]
+type = real
+
+[WarVKSetWeatherPaused]
+title = "暂停天气演出"
+description = "设置天气 ${weatherId} 的暂停状态 ${paused}。"
+comment = "暂停保持当前天气与时间；恢复继续，不补算暂停期间的墙钟时间。音乐暂停由作者另行协调。"
+category = "TC_WarVKWeather"
+script = "WarVKSetWeatherPaused"
+[[.args]]
+type = integer
+[[.args]]
+type = boolean
+
+[WarVKSetWeatherTime]
+title = "设置天气演出时间"
+description = "将天气 ${weatherId} 跳转到 ${seconds} 秒。"
+comment = "范围0..86400；受控重建天气历史，不逐帧补算过去过程。不会自动取消暂停或开启关闭实例。"
+category = "TC_WarVKWeather"
+script = "WarVKSetWeatherTime"
+[[.args]]
+type = integer
+[[.args]]
+type = real

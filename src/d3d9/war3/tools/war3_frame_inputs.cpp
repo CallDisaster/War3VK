@@ -3,6 +3,7 @@
 #include "war3_frame_recorder_memory.h"
 #include "war3_frame_recorder_profile.h"
 #include "war3_frame_evidence_control.h"
+#include "war3_native_render_input_export.h"
 #include "../render/war3_tracked_vk_pipeline.h"
 #include <war3_frame_input_gather.h>
 #include <windows.h>
@@ -39,6 +40,8 @@ struct Draw {
   std::array<uint32_t,40> words{};
   std::array<uint64_t,16> provenance{};
   war3::render::skin::Selection skinSelection{};
+  war3::render::native_input::NativeDrawMaterialFacts nativeMaterial;
+  FinalShadowMaterialFacts finalMaterial;
   uint64_t part=0,metadata=0,geometry=0,alphaFrame=0,boundsGeneration=0;
   std::array<Span,7> spans{}; // position,index,blend,uv,matrices,direct source,direct palette
   std::array<uint32_t,16> world{};
@@ -59,6 +62,7 @@ struct InputCapture::Impl {
     uint64_t fenceValue=0,session=0,id=0,qpc=0,renderSerial=0,sceneKey=0,upload=0;
     Key key{};bool volume=false,finalized=false;
     uint32_t used=0,eligible=0,omitted=0,focusCount=0,objectBase=0;
+    uint32_t nativeMaterialIdentityRejected=0;
     std::vector<Draw> draws;
   };
   Rc<DxvkDevice> device;
@@ -126,6 +130,7 @@ uint64_t InputCapture::capture(const Rc<DxvkCommandList>& ctx,Key key,bool volum
     if(!s.buffer||!s.fence||!s.buffer->mapPtr(0)||s.fenceValue==UINT64_MAX){++m->drops;return 0;}
     s.id=++m->serial;s.session=session;s.key=key;s.volume=volume;s.renderSerial=renderSerial;
     s.sceneKey=sceneKey;s.upload=upload;s.objectBase=objectBase;s.used=s.eligible=s.omitted=s.focusCount=0;s.draws.clear();
+    s.nativeMaterialIdentityRejected=0;
     LARGE_INTEGER tick{};QueryPerformanceCounter(&tick);s.qpc=uint64_t(tick.QuadPart);
     const auto dst=s.buffer->getSliceInfo();
     s.finalized=false;
@@ -235,6 +240,28 @@ uint64_t InputCapture::capture(const Rc<DxvkCommandList>& ctx,Key key,bool volum
       r.metadata=d.shadowMetadataKeyHash;r.geometry=d.shadowExactGeometryKeyHash;r.alphaFrame=d.alphaMetadataFrameSerial;r.boundsGeneration=d.boundsSourceGeneration;
       r.provenance=d.inputEvidenceProvenance;
       r.skinSelection=d.inputSkinSelection;
+      // Availability is an observation, not proof of freshness. Retained
+      // geometry keeps its original ShadowProducerSerial; no frame restamp.
+      if (d.nativeDrawMaterial.available) {
+        if (d.mapEpoch==s.key.mapEpoch && d.deviceEpoch==s.key.deviceEpoch &&
+            war3::render::native_input::MaterialFactsSameDrawIdentity(
+            d.nativeDrawMaterial, d.mapEpoch, d.deviceEpoch,
+            r.part, d.shadowLayerIndex))
+          r.nativeMaterial=d.nativeDrawMaterial;
+        else ++s.nativeMaterialIdentityRejected;
+      }
+      auto& material=r.finalMaterial;
+      material.alphaRefBits=war3::render::native_input::FloatBits(d.alphaRef);
+      material.alphaTest=d.alphaTestEnabled;material.alphaBlend=d.alphaBlendEnabled;
+      material.depthTest=d.depthTestEnabled;material.depthWrite=d.depthWriteEnabled;
+      material.additive=d.additiveBlend;
+      material.uvBinding=d.uvBinding;material.uvStride=d.uvStride;
+      material.uvOffset=d.uvOffset;material.uvFormat=uint32_t(d.uvFormat);
+      if(const auto* descriptor=d.CurrentTextureDescriptor())
+        material.textureView=uint64_t(descriptor->legacy.image.imageView);
+      if(d.diffuseSampler!=nullptr)
+        material.sampler=uint64_t(d.diffuseSampler->getDescriptor().samplerObject);
+      material.samplerIndex=d.diffuseSamplerIndex;
       r.words={uint32_t(d.stage),d.jHandle,d.rawcode,d.shadowLayerIndex,d.positionStride,d.positionOffset,uint32_t(d.positionFormat),
         uint32_t(d.indexType),d.indexCount,d.firstIndex,uint32_t(d.vertexOffset),d.vertexCount,d.firstVertex,d.minVertexIndex,d.numVertices,
         uint32_t(d.vertexBlendEnabled),uint32_t(d.vertexBlendIndexed),d.vertexBlendCount,d.paletteIndex,
@@ -290,7 +317,7 @@ uint64_t InputCapture::capture(const Rc<DxvkCommandList>& ctx,Key key,bool volum
 json InputCapture::exportNew(uint64_t session,const std::wstring& prefix,const std::atomic<bool>* stopping){
   std::lock_guard<std::mutex> lock(m->mutex);
   if(ActiveSession())return {{"ok",false},{"error","freeze before input export"}};
-  json result={{"schema",2},{"session",std::to_string(session)},{"processNonce",std::to_string(ProcessNonce())},
+  json result={{"schema",3},{"session",std::to_string(session)},{"processNonce",std::to_string(ProcessNonce())},
     {"slots",m->slotCount},{"maxSlots",Slots},{"bytesPerSlot",BytesPerSlot},{"drawsPerSlot",DrawsPerSlot},{"captureDrops",std::to_string(m->drops.load())},
     {"rootCauseReady",false},{"pixelDrawId",false},{"alphaTextureBytes",false},{"intermediateAttachments",false},
     {"selection","Stage11; observed 52/105 and 614/1587 signatures first; bounded remaining Stage11"},
@@ -310,6 +337,7 @@ json InputCapture::exportNew(uint64_t session,const std::wstring& prefix,const s
       {"qpc",std::to_string(s.qpc)},{"volume",s.volume},{"renderSerial",std::to_string(s.renderSerial)},
       {"sceneKey",std::to_string(s.sceneKey)},{"uploadSerial",std::to_string(s.upload)},{"objectBase",s.objectBase},
       {"eligible",s.eligible},{"omitted",s.omitted},{"focusCount",s.focusCount},
+      {"nativeMaterialIdentityRejected",s.nativeMaterialIdentityRejected},
       {"gpuComplete",ready},{"fenceValue",std::to_string(s.fenceValue)},{"observedValue",std::to_string(observed)},
       {"fileOffset",std::to_string(offset)},{"bytes",ready?s.used:0},{"draws",json::array()}};
     if(ready&&s.used){if(!binary.write(s.buffer->mapPtr(0),s.used))return {{"ok",false},{"error","input binary write failed; partial retained"}};offset+=s.used;}
@@ -325,6 +353,7 @@ json InputCapture::exportNew(uint64_t session,const std::wstring& prefix,const s
         {"slot",p.slot},{"actualGroupCount",p.actualGroupCount},{"frameTag",p.frameTag}};
       batch["draws"].push_back({{"index",r.index},{"words",r.words},{"worldMatrixBits",r.world},{"provenance",provenance},
         {"skinPaletteSelection",selection},
+        {"renderInputEvidence",EncodeNativeRenderInputEvidence(r.nativeMaterial,r.finalMaterial)},
         {"part",std::to_string(r.part)},{"metadata",std::to_string(r.metadata)},{"geometry",std::to_string(r.geometry)},
         {"alphaFrame",std::to_string(r.alphaFrame)},{"boundsGeneration",std::to_string(r.boundsGeneration)},{"spans",spans}});
     }

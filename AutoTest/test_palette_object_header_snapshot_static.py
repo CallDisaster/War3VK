@@ -4,7 +4,8 @@
 #
 # 缺陷原本的形态 = **动态版本**（`firstSightUsed() ? 3 : 2`）：那是一次**独立的查询**，
 # 其结果可以与计数快照不一致（版本说 3、计数按 2 的形状写）。
-# round 10 已把版本改成字面常量 4，本锁**防止它退回动态形态**。
+# round 10 将版本改为字面常量；当前新写方为 v5，本锁防止它退回动态形态。
+# 旧 v4 仍注册且 data[5] 保留零，不能用新写方升级放宽旧产物。
 #
 # 载荷断言是「快照查询恰好一次」：再出现第二次 QueryPaletteObjectEvidenceHeader，
 # 就意味着又有了第二个快照 —— 这正是 D3 要防的东西。
@@ -36,11 +37,22 @@ check(_snapshots == 1,
       "(found %d calls to QueryPaletteObjectEvidenceHeader); a second call is a second "
       "snapshot, which is the very defect D3 forbids" % _snapshots)
 
-check(re.search(r'result\["version"\]\s*=\s*4\s*;', BODY) is not None,
-      "D3: the block version must be the literal 4 (a computed/dynamic version is a "
+check(re.search(r'result\["version"\]\s*=\s*5\s*;', BODY) is not None,
+      "D3: the new block version must be the literal 5 (a computed/dynamic version is a "
       "second query whose result can disagree with the counters snapshot)")
 check("?" not in re.search(r'result\["version"\][^;]*;', BODY).group(0),
       "D3: the version assignment must not contain a conditional")
+
+import analyze_frame_evidence as frame_reader
+import analyze_palette_object_evidence as palette_reader
+
+check(frame_reader.PALETTE_OBJECT_ATTEMPT_VERSION == palette_reader.PALETTE_OBJECT_ATTEMPT_VERSION == 5,
+      "D3: both readers must register the new writer's v5 attempt contract")
+check(frame_reader.PALETTE_OBJECT_BLOCK_FIELDS[4] == frame_reader.PALETTE_OBJECT_BLOCK_FIELDS[5],
+      "D3: v5 must retain the exact v4 header shape")
+check(tuple(palette_reader.reserved_data_indices(4)) == (5, 6, 7, 8) and
+      tuple(palette_reader.reserved_data_indices(5)) == (6, 7, 8),
+      "D3: data[5] remains reserved-zero under v4; only v5 carries attemptSerial")
 
 check(re.search(r"const auto& c\s*=\s*header\.counters;", BODY) is not None,
       "D3: counters must be taken from the same header snapshot")

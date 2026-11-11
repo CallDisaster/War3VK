@@ -1,0 +1,9 @@
+# Warcraft III 1.27a movement-animation read-only locator
+
+Scope: read-only preliminary reverse engineering for the WarVK main tree at `E:/Mycode/Source/Repos/War3MapReforge/Core/Base/Graphics/dxvk`. Use the connected IDA MCP at `http://127.0.0.1:13337/mcp` if available. Do not modify source files, the IDA database, the game installation, or a running process. Do not build or deploy. This is a locator report, not authority to choose or implement a hook.
+
+Find the native path that selects or restarts the Walk animation while a unit is moving, and the state that carries the currently playing animation/sequence index. Cross-reference the stock `SetUnitAnimation`, `SetUnitAnimationByIndex`, `QueueUnitAnimation`, and `AddUnitAnimationProperties` natives so that a WarVK API does not duplicate an existing capability. Distinguish animation selection from animation time advancement and rendering-side sequence observation.
+
+For each candidate function, report the loaded module's exact identity, image base and RVA, cross-references/call chain from movement state, relevant predicates and field offsets, small pseudocode or instruction excerpts, and at least one disconfirming test. Mark hypotheses and confidence separately; do not infer a stable address from one run. In particular, test whether a manual animation is overwritten by movement and whether suppressing automatic Walk selection can leave the existing animation running without changing gameplay movement.
+
+The requested API semantics are two independent opt-in controls: a boolean that disables/re-enables automatic Walk looping while the unit moves, and a temporary animation override. Preserve Warcraft's native animation APIs and restore native behavior on clear, unit death/destruction, map transition, and device/session reset. Return only evidence and candidate hook sites to the primary agent for independent review.

@@ -105,7 +105,7 @@ namespace dxvk
     if(tools::HandleFrameHistoryShortcut(message,uint64_t(wparam),
         (GetKeyState(VK_CONTROL)&0x8000)!=0,(GetKeyState(VK_SHIFT)&0x8000)!=0,
         (lparam&0x40000000)!=0))return true;
-    if (message == WM_KEYDOWN && wparam == VK_F1 &&
+    if (War3Imgui::get().ownsWindow(window) && message == WM_KEYDOWN && wparam == VK_F1 &&
         (GetKeyState(VK_CONTROL) & 0x8000)) {
       if ((lparam & 0x40000000) == 0)
         War3Imgui::get().toggleVisible();
@@ -119,8 +119,9 @@ namespace dxvk
     }
 
     const bool handled = War3Imgui::get().handleWndProc(window, message, wparam, lparam);
-    const bool wantMouse = War3Imgui::get().wantsCaptureMouse();
-    const bool wantKeyboard = War3Imgui::get().wantsCaptureKeyboard();
+    const bool ownsUi = War3Imgui::get().ownsWindow(window);
+    const bool wantMouse = ownsUi && War3Imgui::get().wantsCaptureMouse();
+    const bool wantKeyboard = ownsUi && War3Imgui::get().wantsCaptureKeyboard();
 
     const bool isMouseMsg =
         message == WM_MOUSEMOVE || message == WM_LBUTTONDOWN ||

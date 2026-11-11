@@ -2,12 +2,14 @@
 
 TC_WarVK=[WarVK] 基础与版本,ui\\WarVK\\icons\\atom.blp
 TC_WarVKDiagnostics=[WarVK] 诊断与统计,ui\\WarVK\\icons\\atom.blp
+TC_WarVKUnitAnimation=[WarVK] 单位动画,ui\\WarVK\\icons\\atom.blp
 TC_WarVKSunShadow=[WarVK] 太阳光与 CSM,ui\\WarVK\\icons\\atom.blp
 TC_WarVKLightingClock=[WarVK] 光照时钟与昼夜,ui\\WarVK\\icons\\atom.blp
 TC_WarVKPointLight=[WarVK] 点光源,ui\\WarVK\\icons\\atom.blp
 TC_WarVKVolumetricLight=[WarVK] 体积光,ui\\WarVK\\icons\\atom.blp
 TC_WarVKVolumetricFog=[WarVK] 体积雾,ui\\WarVK\\icons\\atom.blp
 TC_WarVKLocalFog=[WarVK] 局部体积雾,ui\\WarVK\\icons\\atom.blp
+TC_WarVKWeather=[WarVK] 天气与暴风雪,ui\\WarVK\\icons\\atom.blp
 TC_WarVKLightning=[WarVK] 闪电效果,ui\\WarVK\\icons\\atom.blp
 TC_WarVKLightningTemplate=[WarVK] 闪电模板,ui\\WarVK\\icons\\atom.blp
 TC_WarVKMath=[WarVK] 数学计算,ui\\WarVK\\icons\\atom.blp

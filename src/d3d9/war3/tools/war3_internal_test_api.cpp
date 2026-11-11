@@ -8,9 +8,11 @@
 #include "../../d3d9_war3_debug.h"
 #include "../../d3d9_war3_settings.h"
 #include "../../d3d9_war3_volumetric_light.h"
+#include "../../d3d9_war3_weather.h"
 
 #include "../gpu_skin/war3_gpu_skin_native_bridge.h"
 #include "../core/war3_internal_test_config.h"
+#include "../game/war3_unit_animation_api.h"
 #include "../hooks/war3_jass_command_bridge.h"
 #include "../render/war3_render_state.h"
 #include "../shader/war3_shader_manager.h"
@@ -288,7 +290,76 @@ bool ProcessPendingInternalTestRequest(uint64_t frameIndex,
   }
 
   json response = json::object();
-  if (state->request.command == "runtime.log_marker") {
+  if (state->request.command == "weather-status" ||
+      state->request.command == "weather.status") {
+    const auto draw = QueryWar3WeatherDiagnostics();
+    const auto weather = render::WeatherRuntime::instance().snapshot(
+        frameIndex, draw.mapEpoch, draw.deviceEpoch);
+    response["runtime"] = {{"id", weather.id}, {"enabled", weather.enabled},
+        {"observationKind", "owner-control-live-state-not-render-input"},
+        {"paused", weather.paused}, {"timeSeconds", weather.timeSeconds},
+        {"revision", weather.revision}, {"historyRevision", weather.historyRevision},
+        {"frameSerial", weather.frameSerial}, {"mapEpoch", weather.mapEpoch},
+        {"deviceEpoch", weather.deviceEpoch},
+        {"params", {{"snowfall", weather.params.snowfall},
+                    {"windAngle", weather.params.windAngle},
+                    {"windSpeed", weather.params.windSpeed},
+                    {"gust", weather.params.gust},
+                    {"haze", weather.params.haze}, {"lowSnow", weather.params.lowSnow}}}};
+    response["render"] = {{"commandsRecorded", draw.submitted},
+        {"id", draw.id}, {"timeSeconds", draw.timeSeconds},
+        {"mapEpoch", draw.mapEpoch}, {"deviceEpoch", draw.deviceEpoch},
+        {"particleCount", draw.activeParticles}, {"capacity", draw.capacity},
+        {"resourceBytes", draw.resourceBytes}, {"frameSerial", draw.frameSerial},
+        {"stage", War3WeatherDrawStageName(draw.stage)}};
+    const auto& frozen = draw.frozenInput;
+    response["consumedCameraDomain"] = {
+        {"observationKind", "render-consumed-camera-domain"},
+        {"frameSerial", draw.frameSerial}, {"mapEpoch", draw.mapEpoch},
+        {"deviceEpoch", draw.deviceEpoch}, {"cameraFrameMatches", draw.cameraFrameMatches},
+        {"viewport", {{"x", draw.worldViewport.X}, {"y", draw.worldViewport.Y},
+                      {"width", draw.worldViewport.Width}, {"height", draw.worldViewport.Height},
+                      {"minZ", draw.worldViewport.MinZ}, {"maxZ", draw.worldViewport.MaxZ}}},
+        {"depthWidth", draw.depthWidth}, {"depthHeight", draw.depthHeight}};
+    response["frozenInput"] = {{"observationKind", "render-consumed-value-snapshot"},
+        {"id", frozen.id}, {"enabled", frozen.enabled}, {"paused", frozen.paused},
+        {"timeSeconds", frozen.timeSeconds}, {"frameSerial", frozen.frameSerial},
+        {"mapEpoch", frozen.mapEpoch}, {"deviceEpoch", frozen.deviceEpoch},
+        {"revision", frozen.revision}, {"historyRevision", frozen.historyRevision},
+        {"params", {{"snowfall", frozen.params.snowfall},
+                    {"windAngle", frozen.params.windAngle},
+                    {"windSpeed", frozen.params.windSpeed},
+                    {"gust", frozen.params.gust},
+                    {"haze", frozen.params.haze}, {"lowSnow", frozen.params.lowSnow}}}};
+    const auto volume = QueryWar3WeatherVolumeDiagnostics();
+    response["volumetric"] = {{"compositeSubmitted", volume.compositeSubmitted},
+        {"stage", volume.stage}, {"frameSerial", volume.frameSerial},
+        {"mapEpoch", volume.mapEpoch}, {"deviceEpoch", volume.deviceEpoch},
+        {"resourceBytes", volume.resourceBytes},
+        {"width", volume.width}, {"height", volume.height},
+        {"admittedShaderWork", volume.admittedShaderWork}};
+    const auto ordinary = QueryWar3VolumetricExecutionDiagnostics();
+    response["ordinaryVolumetric"] = {
+        {"frameSerial", ordinary.frameSerial}, {"mapEpoch", ordinary.mapEpoch},
+        {"deviceEpoch", ordinary.deviceEpoch}, {"compositeSubmitted", ordinary.compositeSubmitted},
+        {"stage", ordinary.stage}, {"width", ordinary.width}, {"height", ordinary.height},
+        {"requestedBackend", ordinary.requestedBackend}, {"effectiveBackend", ordinary.effectiveBackend},
+        // The old owner does not publish current byte accounting. Unknown
+        // must not become a plausible-looking measured zero.
+        {"resourceBytes", nullptr}, {"currentResourceAccountingCovered", false}};
+    War3RenderSettings author;
+    if (dxvk::war3::GetSettingsSnapshot(author)) {
+      const auto& ordinarySettings = author.postFx.volumetricLight;
+      response["authorSettings"] = {
+          {"observationKind", "owner-settings-live-state-not-render-input"},
+          {"sunEnabled", author.sun.enabled},
+          {"ordinaryVolumetricEnabled", ordinarySettings.enabled},
+          {"globalMediumEnabled", ordinarySettings.globalMediumEnabled},
+          {"volumetricDensity", ordinarySettings.density},
+          {"volumetricBackend", static_cast<uint32_t>(ordinarySettings.quality)}};
+    }
+    result.ok = true;
+  } else if (state->request.command == "runtime.log_marker") {
     const std::string marker = payload.value("marker", std::string());
     war3dbg::Print("DXVK War3Test: marker=%s frame=%llu\n", marker.c_str(),
                    static_cast<unsigned long long>(frameIndex));
@@ -790,6 +861,35 @@ bool ProcessPendingInternalTestRequest(uint64_t frameIndex,
         static_cast<unsigned long long>(frameIndex));
     if (!applied)
       result.error = "GPU skin outline test mode actuation failed";
+  } else if (state->request.command == "unit.walk.snapshot") {
+    const auto diag = game::QueryUnitWalkDiagnostics();
+    response["evidenceKind"] = "bounded-cpu-hook-counters-not-animation-visual-proof";
+    response["installStatus"] = diag.installStatus;
+    response["setterCalls"] = diag.setterCalls;
+    response["setterAccepted"] = diag.setterAccepted;
+    response["setterRejected"] = diag.setterRejected;
+    response["lastSetterHandle"] = diag.lastSetterHandle;
+    response["lastSetterFailure"] = diag.lastSetterFailure;
+    response["lastSetterObservedType"] = diag.lastSetterObservedType;
+    response["lastSetterDirectRawcode"] = diag.lastSetterDirectRawcode;
+    response["lastSetterDirectMethodRva"] = diag.lastSetterDirectMethodRva;
+    response["lastSetterCurrentProperty"] = diag.lastSetterCurrentProperty;
+    response["lastSetterCurrentPropertyKnown"] =
+        diag.lastSetterCurrentPropertyKnown;
+    response["hookCalls"] = diag.hookCalls;
+    response["autoCallerSeen"] = diag.autoCallerSeen;
+    response["autoRequestMatched"] = diag.autoRequestMatched;
+    response["autoRequestSuppressed"] = diag.autoRequestSuppressed;
+    response["lastSuppressedCurrentProperty"] =
+        diag.lastSuppressedCurrentProperty;
+    response["lastSuppressedCurrentPropertyKnown"] =
+        diag.lastSuppressedCurrentPropertyKnown;
+    response["autoWithoutDisabledEntry"] = diag.autoWithoutDisabledEntry;
+    response["autoIdentityRejected"] = diag.autoIdentityRejected;
+    response["otherWalkRequests"] = diag.otherWalkRequests;
+    response["lastOtherWalkCallerRva"] = diag.lastOtherWalkCallerRva;
+    response["disabledUnitCount"] = diag.disabledUnitCount;
+    result.ok = true;
   } else if (state->request.command == "jass.public_api") {
     const auto test = dxvk::war3::hooks::InvokeJassPublicApiForTest(
         payload.value("carrier", std::string()),

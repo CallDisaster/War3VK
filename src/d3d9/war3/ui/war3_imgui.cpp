@@ -4,9 +4,11 @@
 #include "../../d3d9_device.h"
 #include "../../d3d9_war3_light.h"
 #include "../../d3d9_war3_shadow.h"
+#include "../../d3d9_war3_weather.h"
+#include "../../d3d9_war3_volumetric_light.h"
 #include "../../war3_shader_api.h"
 #include "../../war3_shaderpack.h"
-#include "imgui_impl_dx9.h"
+#include "war3_imgui_dx9.h"
 #include "imgui_impl_win32.h"
 
 #include "../core/war3_internal_test_config.h"
@@ -37,19 +39,43 @@ namespace dxvk::war3 {
 std::atomic<bool> War3Imgui::s_fpsUnlocked{true};
 
 War3Imgui &War3Imgui::get() {
-  static War3Imgui instance;
-  return instance;
+  // Process-lifetime registry, not a CRT GPU owner. Normal device shutdown
+  // explicitly releases every device resource after its GPU drain. At DLL
+  // detach do not run Com destructors under loader lock/after parent teardown.
+  static War3Imgui* instance = new War3Imgui;
+  return *instance;
 }
 
 void War3Imgui::initialize(HWND hwnd, D3D9DeviceEx *device) {
-  if (m_initialized)
+  if (m_initialized || !hwnd || !device)
     return;
 
   m_hwnd = hwnd;
   m_device = device;
+  m_retiring = false;
 
+  ImGuiContext* previous = ImGui::GetCurrentContext();
+  // No borrowed device/context may survive a failed swapchain constructor.
+  // Backend data is published by each backend before its remaining setup.
+  const auto abandonInitialization = [&] {
+    if (m_context) {
+      ImGui::SetCurrentContext(m_context);
+      if (ImGui::GetIO().BackendRendererUserData)
+        War3ImGui_ImplDX9_Shutdown();
+      if (ImGui::GetIO().BackendPlatformUserData)
+        ImGui_ImplWin32_Shutdown();
+      ImGui::DestroyContext(m_context);
+    }
+    ImGui::SetCurrentContext(previous);
+    m_context = nullptr;
+    m_device = nullptr;
+    m_hwnd = nullptr;
+    m_initialized = false;
+  };
+  try {
   IMGUI_CHECKVERSION();
-  ImGui::CreateContext();
+  m_context = ImGui::CreateContext();
+  ImGui::SetCurrentContext(m_context);
   ImGuiIO &io = ImGui::GetIO();
   io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
   // io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
@@ -70,28 +96,75 @@ void War3Imgui::initialize(HWND hwnd, D3D9DeviceEx *device) {
                                io.Fonts->GetGlyphRangesChineseFull());
 
   // Platform/Renderer backends
-  ImGui_ImplWin32_Init(hwnd);
-  ImGui_ImplDX9_Init(device);
+  if (!ImGui_ImplWin32_Init(hwnd)) {
+    abandonInitialization();
+    return;
+  }
+  if (!War3ImGui_ImplDX9_Init(device)) {
+    abandonInitialization();
+    return;
+  }
 
   m_initialized = true;
   Logger::info("War3Imgui initialized.");
+  } catch (...) {
+    abandonInitialization();
+    throw;
+  }
 }
 
-void War3Imgui::shutdown() {
-  m_renderStatsRefresh.reset();
-  if (!m_initialized)
+void War3Imgui::beginDeviceTeardown(D3D9DeviceEx* owner) {
+  if (!m_initialized || m_device != owner)
     return;
+  m_retiring = true;
+  war3shader::internal::EndUiFrame();
+  war3shader::internal::SetImGuiContext(nullptr);
+}
 
-  ImGui_ImplDX9_Shutdown();
+void War3Imgui::shutdown(D3D9DeviceEx* owner) {
+  if (!m_initialized || m_device != owner)
+    return;
+  beginDeviceTeardown(owner);
+  m_renderStatsRefresh.reset();
+  ImGuiContext* previous = ImGui::GetCurrentContext();
+  ImGui::SetCurrentContext(m_context);
+  War3ImGui_ImplDX9_Shutdown();
+  m_cursorTexture = nullptr;
   ImGui_ImplWin32_Shutdown();
-  ImGui::DestroyContext();
-
+  ImGui::DestroyContext(m_context);
+  ImGui::SetCurrentContext(previous == m_context ? nullptr : previous);
+  m_context = nullptr;
+  m_device = nullptr;
+  m_hwnd = nullptr;
+  m_frameStarted = false;
+  m_hasRendered = false;
+  m_visible = false;
+  m_retiring = false;
+  m_cursorWidth = m_cursorHeight = m_cursorHotX = m_cursorHotY = 0;
   m_initialized = false;
+}
+
+void War3Imgui::invalidateDeviceObjects(D3D9DeviceEx* owner) {
+  if (!isOwner(owner))
+    return;
+  ImGuiContext* previous = ImGui::GetCurrentContext();
+  ImGui::SetCurrentContext(m_context);
+  War3ImGui_ImplDX9_InvalidateDeviceObjects();
+  ImGui::SetCurrentContext(previous);
+}
+
+void War3Imgui::restoreDeviceObjects(D3D9DeviceEx* owner) {
+  if (!isOwner(owner))
+    return;
+  ImGuiContext* previous = ImGui::GetCurrentContext();
+  ImGui::SetCurrentContext(m_context);
+  War3ImGui_ImplDX9_CreateDeviceObjects();
+  ImGui::SetCurrentContext(previous);
 }
 
 bool War3Imgui::handleWndProc(HWND hWnd, UINT msg, WPARAM wParam,
                               LPARAM lParam) {
-  if (m_initialized && m_visible) {
+  if (ownsWindow(hWnd) && m_visible) {
     if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
       return true;
   }
@@ -101,19 +174,19 @@ bool War3Imgui::handleWndProc(HWND hWnd, UINT msg, WPARAM wParam,
 void War3Imgui::toggleVisible() { m_visible = !m_visible; }
 
 bool War3Imgui::wantsCaptureMouse() const {
-  if (!m_initialized || !m_visible)
+  if (!m_initialized || m_retiring || !m_visible)
     return false;
   return ImGui::GetIO().WantCaptureMouse;
 }
 
 bool War3Imgui::wantsCaptureKeyboard() const {
-  if (!m_initialized || !m_visible)
+  if (!m_initialized || m_retiring || !m_visible)
     return false;
   return ImGui::GetIO().WantCaptureKeyboard;
 }
 
 void War3Imgui::newFrame() {
-  if (!m_initialized || !m_visible)
+  if (!m_initialized || m_retiring || !m_visible)
     return;
   if (m_frameStarted)
     return;
@@ -121,7 +194,7 @@ void War3Imgui::newFrame() {
   m_frameStarted = true;
   m_hasRendered = false; // Reset frame flag
 
-  ImGui_ImplDX9_NewFrame();
+  War3ImGui_ImplDX9_NewFrame();
   ImGui_ImplWin32_NewFrame();
   ImGui::NewFrame();
 
@@ -137,7 +210,7 @@ void War3Imgui::endFrame() {
 }
 
 void War3Imgui::render(bool inScene) {
-  if (!m_initialized || m_hasRendered || !m_visible)
+  if (!m_initialized || m_retiring || m_hasRendered || !m_visible)
     return;
   // Keep console pixels outside the recorder's final-color history capture.
   if (inScene && tools::evidence::Enabled())
@@ -167,7 +240,7 @@ void War3Imgui::render(bool inScene) {
   if (m_device) {
     if (!inScene)
       m_device->BeginScene();
-    ImGui_ImplDX9_RenderDrawData(ImGui::GetDrawData());
+    War3ImGui_ImplDX9_RenderDrawData(ImGui::GetDrawData());
     if (!inScene)
       m_device->EndScene();
   }
@@ -1228,6 +1301,8 @@ void War3Imgui::drawRenderStatsPanel() {
     ShadowReplayDiagnostics replay;
     render::ShadowDisplayStats receiver;
     CsmResolutionDiagnostics csm;
+    War3WeatherDiagnostics weather;
+    War3VolumetricExecutionDiagnostics weatherVolume;
     MEMORYSTATUSEX processMemory{};
     bool processMemoryValid = false;
     uint64_t snapshotCap = 0, sliceReusedBytes = 0, budgetGrowthRejects = 0;
@@ -1239,6 +1314,8 @@ void War3Imgui::drawRenderStatsPanel() {
     samples.replay = QueryShadowReplayDiagnostics();
     samples.receiver = render::QueryShadowDisplayStats();
     samples.csm = QueryCsmResolutionDiagnostics();
+    samples.weather = QueryWar3WeatherDiagnostics();
+    samples.weatherVolume = QueryWar3WeatherVolumeDiagnostics();
     samples.snapshotCap = render::g_stage11AdaptiveTarget.load(std::memory_order_relaxed);
     samples.sliceReusedBytes = render::g_stage11SliceReusedBytes.load(std::memory_order_relaxed);
     samples.budgetGrowthRejects = render::g_stage11BudgetGrowthRejects.load(std::memory_order_relaxed);
@@ -1252,6 +1329,15 @@ void War3Imgui::drawRenderStatsPanel() {
   const auto mib = [](uint64_t value) { return ui::BytesToMiB(value); };
   const auto u64 = [](uint64_t value) { return static_cast<unsigned long long>(value); };
   ImGui::TextDisabled("4 Hz 刷新；不需要开启性能录制或帧取证");
+  const auto& weather = samples.weather;
+  ImGui::Text("天气: %s / 演出 %.2f 秒 / 活动雪片估算 %u / %u",
+      War3WeatherDrawStageName(weather.stage), weather.timeSeconds,
+      weather.activeParticles, weather.capacity);
+  ImGui::Text("雪片命令记录: %s / 深度副本 %.2f MiB（体积天气另计）",
+      weather.submitted ? "是" : "否", mib(weather.resourceBytes));
+  ImGui::Text("雪雾: %s / 合成命令 %s / 当前资源 %.2f MiB",
+      samples.weatherVolume.stage, samples.weatherVolume.compositeSubmitted ? "已记录" : "未记录",
+      mib(samples.weatherVolume.resourceBytes));
   ImGui::Text("已退休切片累计复用 %.1f MiB / 动态预算增长拒绝 %llu",
       mib(samples.sliceReusedBytes), u64(samples.budgetGrowthRejects));
   ImGui::TextWrapped("各来源独立采样，可能相差数帧；数值用于诊断，不代表像素验收。单位 MiB。");
@@ -1336,27 +1422,28 @@ void War3Imgui::drawRenderStatsPanel() {
 
 void War3Imgui::setCursorBitmap(int width, int height, const void *bgraData,
                                 int hotX, int hotY) {
-  if (!m_device || width <= 0 || height <= 0 || !bgraData)
+  if (!m_device || m_retiring || width <= 0 || height <= 0 || !bgraData)
     return;
 
   // Release old texture if size changed (or just release to assume simplicity)
   // Optimization: Keep if size matches.
-  if (m_cursorTexture) {
+  if (m_cursorTexture != nullptr) {
     D3DSURFACE_DESC desc;
     m_cursorTexture->GetLevelDesc(0, &desc);
     if (desc.Width != (UINT)width || desc.Height != (UINT)height) {
-      m_cursorTexture->Release();
       m_cursorTexture = nullptr;
     }
   }
 
-  if (!m_cursorTexture) {
+  if (m_cursorTexture == nullptr) {
+    Com<IDirect3DTexture9> texture;
     if (FAILED(m_device->CreateTexture(width, height, 1, 0, D3DFMT_A8R8G8B8,
-                                       D3DPOOL_MANAGED, &m_cursorTexture,
+                                       D3DPOOL_MANAGED, &texture,
                                        NULL))) {
       Logger::err("War3Imgui: Failed to create cursor texture");
       return;
     }
+    m_cursorTexture = static_cast<D3D9Texture2D*>(texture.ptr());
   }
 
   D3DLOCKED_RECT locked;
@@ -1389,11 +1476,11 @@ void War3Imgui::drawCursorOverlay() {
                                       // everything
   ImVec2 mousePos = ImGui::GetMousePos();
 
-  if (m_cursorTexture) {
+  if (m_cursorTexture != nullptr) {
     // Draw custom cursor
     ImVec2 tl = ImVec2(mousePos.x - m_cursorHotX, mousePos.y - m_cursorHotY);
     ImVec2 br = ImVec2(tl.x + m_cursorWidth, tl.y + m_cursorHeight);
-    drawList->AddImage((ImTextureID)m_cursorTexture, tl, br);
+    drawList->AddImage((ImTextureID)m_cursorTexture.ptr(), tl, br);
   } else {
     // Fallback: Draw a simple arrow (White with Black border)
     ImVec2 p = mousePos;

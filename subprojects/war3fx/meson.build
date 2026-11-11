@@ -28,6 +28,8 @@ war3fx_shaders = files([
   'shaders/war3_unit_outline_vert.vert',
   'shaders/war3_outline_expand_vert.vert',
   'shaders/war3_ssao.frag',
+  'shaders/war3_weather_snow_vert.vert',
+  'shaders/war3_weather_snow_frag.frag',
 ])
 
 set_variable('war3fx_shaders', war3fx_shaders)

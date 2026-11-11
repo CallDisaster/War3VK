@@ -1,9 +1,203 @@
-# WarVK Render Host Laboratory (RH0 / RH1)
+# WarVK Render Host Laboratory (CPU, cross-bitness GPU, and x64 core)
 
-Not a rendering replacement and **not linked into the shipping DLL**. There is
-currently no Game.dll reader, D3D9 proxy, GPU import, swapchain,
-automatic game integration or deployment in this directory. The CPU test client
-explicitly creates its own isolated helper and no other application.
+Not a rendering replacement and **not linked into the shipping DLL**. The newer
+RH2/RH3 labs below perform actual Vulkan work and cross-process presentation;
+RH0/RH1 remain CPU-only. There is still no Game.dll reader, product D3D9 proxy,
+automatic game integration or deployment. Test clients explicitly create only
+their own isolated helpers/windows, never a player game instance.
+
+After the author's 2026-10-29 review, compatibility expansion is paused for
+T1 memory ownership and T2 transport feasibility measurements. The development
+host's opt-in `WARVK_D3D9_WAIT_PROFILE=1` records up to 128 EVENT intervals of
+flight-reuse CPU submission, Vulkan wait-call and resource-retirement wall time.
+Nested times must not be added to their containing total. It changes no wire,
+resource retirement or admission rule; disabled mode performs no clock reads.
+See [current evidence and remaining gates](../../docs/research/2026-10-29-x64-review-t1-t2-baseline.md).
+The shared command-ring/delta prototype and real per-frame Lock/Unlock workload
+coverage are still outstanding; no migration saving or performance parity claim.
+
+The 2026-10-29 checkpoint adds actual pre-device adapter queries, partial
+viewport/rectangle clears, shared production FVF/key/transform preparation and
+bounded fixed-function draws (including mixed FF/SM3 stages). The existing
+DXVK fixed-function shaders execute in x64. BGRA8 multi-mip/NPOT, bounded upload
+transactions, partial locks and LOD pass actual local/remote GPU comparison in
+both default and forced optimized pipeline modes. A sustained-draw test found
+and repaired the missing optimized FF specialization values using the original
+production packer. The fresh shared x86 product passes its configured 119 tests.
+Sixteen texture formats/surface ownership and sampler address/filter/LOD/sRGB
+now pass separately: E7EFBD5E host default/optimized gates compare 225 complete
+images per arm, with 48 rejected transactions and subsequent recovery. Shared
+x86 26B411E9 passes its current 119 tests; 96 resource-lifetime rounds pass.
+Alpha/fog/scissor/separate alpha blend subsequently passed on host 5BCCD41A:
+`x64-effects-gpu-20261029-r3/r4` compare 269 complete images per arm and 60
+real IPC refusals/recoveries; the 96-round lifetime gate also passed. Clear
+now intersects scissor as well as viewport and caller rectangles. Eight texture
+stages and independent samplers subsequently passed on host C68506CF:
+`x64-multitexture-gpu-20261029-r3/r4`, 286 complete images per arm, 72 actual
+IPC refusals/recoveries, VVL365 clean, and the 96-round lifetime gate. This
+includes eight SM3 samplers, public-zero private bindings, and stale-generation
+rejection after texture destruction/reuse. The exact build/test failures remain
+in the evidence record; no incomplete run was promoted by a later result.
+StateBlock recording/capture/apply and private resource retention subsequently
+passed on host 80287B63 (`x64-stateblock-gpu-20261029-r5/r6`): 297 whole images
+per arm in default and optimized modes, including 11 added images and 246/247
+native/remote state checks. The same gate found and repaired the old requirement
+for a stage-0 texture in programmable draws; canonical null textures now use
+the original DXSO null-sampler semantics, while malformed/stale identities still
+fail. Wire tests exhaust optional-resource subsets on both widths. Native null
+stream offsets and recaptured-short-buffer rejection are also covered. See
+[`StateBlock evidence`](../../docs/research/2026-10-29-x64-stateblock-integration.md).
+The same frozen candidate passes `x64-stateblock-lifetime-20261029-r1`: 96 COM
+rounds, 576 resources, 256 queries, and the existing raw fault/recovery gate,
+with final host resource zero and natural exit. This is not a game memory result.
+It is still a bounded 64x64 development profile: RT/reset,
+complete game and WarVK pass coverage remain pending. Fixed-function draws still
+use ordered synchronous transactions. The isolated gate performs no process-memory measurement.
+See [the exact evidence and retained failures](../../docs/research/2026-10-29-x64-fixed-function-integration.md).
+
+The [2026-10-11 migration plan](../../docs/plan/2026-10-11-x64-render-migration.md)
+starts x64 development following the author's new decision. Lab success does not
+mean the game's renderer has moved or its 32-bit memory footprint has decreased.
+
+## Actual public D3D9 / C2 development slice (2026-10-22/23)
+
+`d3d9_proxy.cpp` now exports a real x86 `Direct3DCreate9` COM factory. A restricted
+caller sends original shader tokens, owned geometry/texture uploads,
+draw states and query/readback commands to `dxvk_core/d3d9_backend.cpp`, which
+uses this tree's **same DXSO and DXVK libraries**. This is not the RH2 hand-built
+Vulkan renderer, but it is also **not a complete or shipping D3D9 proxy**.
+
+The profile remains 64x64 with D32F depth. Clear has bounded asynchronous local
+admission. The explicit `WARVK_D3D9_BATCH_DRAWS=1` development profile also
+copies up to 32 draws into a fixed batch; EndScene flushes its tail, and other
+RPCs flush that prefix before their ordered synchronous barrier. Absent this
+profile, Draw retains its old synchronous behavior. The new DrawBatch opcode
+does not change existing header layouts; old peers reject the new operation.
+`WARVK_D3D9_ASYNC_BATCH=1` additionally admits owned batches to the existing four
+queue slots. `WARVK_D3D9_GPU_FLIGHTS=4` gives the host four distinct constant
+backings, each reused only after the original CPU submission, GPU timeline and
+DXVK resource-use witnesses. Both profiles remain explicit and default off.
+`WARVK_D3D9_ASYNC_EVENTS=1` requires asynchronous batches and replaces repeated
+EVENT Poll RPCs with at most one outstanding WaitEvent command. GetData observes
+a connection-scoped GPU watermark locally; a live Query's successful Issue still
+supplies its exact serial/revision. The worker waits for the original Vulkan
+timeline, never for a future command or a fabricated CPU-complete fence. Query
+completion does not grant resource retirement. Old peers reject WaitEvent.
+Read-only diagnostics refuse locally staged draws instead of flushing them.
+`WARVK_D3D9_GPU_GROUP=4` (requires four flights) records up to four incoming
+packets on one original DXVK command list, without increasing constant backing.
+EndScene explicitly sends FlushDraws; ordered resource/query/readback operations
+also flush a partial group. Diagnostics reject an unsubmitted host group.
+The new nonindexed triangle-list path uses a canonical empty IB reference;
+other resource identities, initialized ranges and atomic preflight remain required.
+`WARVK_D3D9_BATCH_STATE=1` is a default-off within-batch state experiment. Its
+correctness tests passed, but timing did not show a consistent benefit. Do not
+enable it as a validated performance improvement. Every batch starts with full
+state restoration; no cross-frame cache is introduced.
+The older batching fixture explicitly restores the full viewport before Clear.
+The 2026-10-29 gate separately covers viewport/rectangle-limited Clear through
+the original DXVK context; the older timing figures do not measure that work.
+See the [submission grouping and coverage report](../../docs/research/2026-10-28-x64-submit-groups-and-nonindexed.md)
+for matched timings, CPU-cycle scope, failed fixture receipts and remaining gates.
+Offscreen Present is unsupported; two explicitly negotiated isolated Presenter
+profiles now use the original `Presenter`, `DxvkSwapchainBlitter` and
+`DxvkDevice::presentImage`. The diagnostic profile checks the actual acquired
+swapchain image before queuePresent; it does not prove compositor/scanout pixels.
+These Presenter/lifetime GPU gates use a genuinely separate non-input Win32 Desktop with
+independent native thread/desktop witnesses, no global input or desktop switch.
+
+`D9C2` / `D9R2` deliberately reject old wire versions. The shared resource
+registry tracks 64 reusable logical slots with exact ID, generation and type;
+all six Draw references are checked before mapping backend slots. Reuse follows
+confirmed remote destruction and never substitutes for DXVK GPU retirement.
+EVENT Query has its own resource identity and Issue revision, checked together
+with the GPU serial. Repeated Issue without new GPU work may keep the same serial
+while advancing the revision; it no longer consumes a new slot per Issue.
+This does not enlarge the typed capacities or remove x86 resource backing.
+
+### Current evidence and the remaining ownership gates
+
+The source of truth is each dated receipt, not a combination of passing fragments:
+
+- [X1b notification waits](../../docs/research/2026-10-23-x64-notification-waits.md)
+  replaces three Connection Sleep polling sites with two connection-owned event
+  hints, preserving the queue and deadlines. Dual-architecture CPU and five real
+  IPC fault cases pass. Two fresh x86 builds of the same source each pass the
+  complete six-case offscreen GPU development slice with VVL365: 96 COM rounds,
+  2244 settled commands and 256 Query issues complete in 3.719/1.844 seconds,
+  under the original 45-second watchdog. Older failures remain failures. This
+  is not a full Presenter/C2 gate, product asynchronous ownership, game coverage,
+  memory-saving or FPS result.
+- [Host-owned window lifetime](../../docs/research/2026-10-23-x64-host-window-lifetime.md)
+  now uses the same CPU-tested adapter in the formal development host, not a
+  copied diagnostic backend. A fresh x64 build and two fresh x86 runs each pass
+  six actual non-input Desktop GPU cases: top-level/child targets, eight-frame
+  drawing, 256-Present clear soak, and quiescent parent-window destruction.
+  Independent VVL365 reports zero warnings/errors; primary exits take 93–265 ms
+  under the unchanged five-second limit, with empty Jobs and closed Desktops.
+  Child destruction by Windows is recorded as external pre-retirement loss,
+  never normal target preservation. Each case creates only one surface, so this
+  does not prove actual surface recreation, in-flight target loss, full C2, or
+  compositor/player pixels. Static handoff tests pass 21/21 with 73 rejected
+  in-memory mutants; the GPU reader passes 22/22 pure tests.
+- The old [first-draw checkpoint](../../docs/research/2026-10-11-x64-d3d9-first-draw.md)
+  retains its failed 15-reference single-process teardown. The later
+  [device-owned COM checkpoint](../../docs/research/2026-10-22-device-owned-com-lifetime.md)
+  closes that specific reference gate with actual remote/reference runs and
+  production-object lifecycle probes; it does not erase the old failure.
+- [Presenter r7](../../AutoTest/artifacts/x64-presenter-20261022-r7/receipt.json)
+  passed 37 cases. The later C2
+  [r8](../../AutoTest/artifacts/x64-presenter-20261022-r8/receipt.json) and
+  [r9](../../AutoTest/artifacts/x64-presenter-20261022-r9/receipt.json) both remain
+  **failed**: r8's 256-frame clear-soak checked 1,048,576 pixels without error,
+  but its primary 5,000 ms host-exit wait timed out; secondary drain saw exit 0
+  another 1,328 ms later. In r9 the clear-soak and diagnostic-off WSI passed,
+  but diagnostic-on WSI again missed the primary exit deadline and exited 0
+  156 ms into secondary drain. Host `normalTeardown=true`, correct pixels and a
+  later exit do not satisfy that original deadline. The earlier r7 pass cannot
+  certify the newer C2 combination. See the
+  [Presenter investigation](../../docs/research/2026-10-22-x64-d3d9-presenter-isolation.md).
+- The [R1/Q1 resource and Query checkpoint](../../docs/research/2026-10-22-x64-resource-generation-and-query.md)
+  retains [r1](../../AutoTest/artifacts/x64-resource-lifetime-20261022-r1/receipt.json)
+  as failed after the 45-second COM-case watchdog. Its
+  [r2](../../AutoTest/artifacts/x64-resource-lifetime-20261022-r2/receipt.json)
+  passes COM and raw-protocol runs, including resource reuse, legal drawing after
+  rejection and Query revisions. Progress/exit markers added for r2 do not prove
+  the earlier intermittent stall's cause has been repaired.
+- The shared production changes have a
+  [fresh full x86 build](../../AutoTest/artifacts/device-owned-presenter-build-20261022/receipt.json)
+  and [116/116 configured Meson regressions](../../AutoTest/artifacts/device-owned-presenter-regressions-20261022/receipt.json),
+  with no-work and protected DLL identities preserved. This offline result does
+  not close the later x64 process-exit failures or imply all Python/game/GPU gates passed.
+
+The [2026-10-28 batching/cost checkpoint](../../docs/research/2026-10-28-x64-draw-batching-and-cost.md)
+adds actual original-DXVK batched execution and notification-based submit/retire
+waits. Fresh receipts now cover four-flight ownership, asynchronous batches and
+single EVENT completion: 97/1,025-draw paired GPU gates, stale-query and whole-batch
+refusal/recovery, VVL365, both-width CPU checks and five real pipe faults. The final
+FE6ECB host and each independently rebuilt x86 proxy have separate identities in
+that report. Timings are microbenchmarks, not game FPS; the remote path remains
+slower than local and the full performance acceptance gate is open. A post-run
+sample also observed another game's CPU load, not a clean exclusive machine.
+
+Remaining ownership gates include idle target-fault notification and exact host-exit observation,
+including owner-thread cancellation/drain without fabricated requests or ACKs.
+Only the existing proven-quiescent predicate may authorize GPU cleanup; unknown
+or in-flight ownership remains fail-stop. Then validate real surface recreation,
+in-flight failures, and the complete Presenter/C2 combination. These current
+subsets do not retroactively pass the older exit failures or establish game
+performance/memory savings. Calls other than Clear and the explicit draw-batch /
+EVENT-completion profiles still block on laboratory RPC; product asynchronous ownership and nonblocking cancellation remain
+unfinished. Game.dll processes are refused, and no WarVK game pass is migrated.
+Never rename this development DLL into a player installation.
+
+Runners are `AutoTest/run_render_host_d3d9_gate.py`,
+`AutoTest/run_render_host_presenter_gate.py` and
+`AutoTest/run_render_host_resource_lifetime_gate.py`, with explicit toolchain,
+isolated build, preserved reference DLL and a fresh output directory. Use one
+build/GPU owner and freeze inputs before running. The separate
+`AutoTest/run_d3d9_shared_shipping_compile.py` remains a per-TU compile check;
+it is not the full product build cited above.
 
 Read the [protocol and architecture contract](../../docs/plan/2026-09-16-render-host-ipc-v0-contract.md)
 before changing the wire format or implementing a transport. This CPU foundation
@@ -231,6 +425,127 @@ must return to that exact baseline. Earlier failures and self-handle diagnostics
 are preserved in the [P3b2 audit](../../docs/research/2026-09-16-render-host-worker-lifetime-audit.md).
 No arbitrary handle allowance, sleep-until-count-matches or silent retry is used.
 
-Limits: synthetic CPU bytes only; worker remains an AutoTest fixture, not a
+Limits of this RH1 worker: synthetic CPU bytes only; worker remains an AutoTest fixture, not a
 production asynchronous service. No Vulkan device, cross-process GPU ownership,
 render graph, swapchain, game integration, memory saving, FPS or crash-fix claim.
+
+## RH2: actual cross-bitness GPU image ownership
+
+`gpu_wire.*`, `gpu_render_backend.*` and `gpu_host_main.cpp` form an independent
+WVG2 protocol, not a widening of RH0's echo/recorder capabilities. The x64 owner
+creates geometry and an indexed graphics pipeline, draws to an exported image,
+and exchanges ready/consumed GPU semaphores with the exact x86 client. Adapter
+and driver UUIDs, generation, map/device epoch, sequence, resource and frame are
+all checked. CPU ACK does not authorize GPU retirement.
+
+```powershell
+python AutoTest/run_render_host_gpu_gate.py --compiler32 <i686-clang++.exe> --compiler64 <x86_64-clang++.exe> --vulkan-sdk <SDK-directory> --output AutoTest/artifacts/<new-directory>
+python -B AutoTest/test_render_host_gpu_gate.py
+```
+
+The client performs GPU readback **only as an independent full-image test
+oracle**. No CPU image crosses IPC; a game must not use this readback as its
+presentation path. Normal, stale-generation, repeated-frame, bad-nonce and
+wrong-adapter cases have separate exact verdicts. Native errors cannot stand
+in for the intended negative result. A selected subset is not a complete gate.
+
+`--validation` requires a working Khronos layer in both architectures;
+`--host-validation` requires it only in x64 and does not claim x86 layer coverage.
+Set layer paths only on the test process. Layer failures remain failed evidence.
+All GPU objects stay owned until actual fence/consumer completion; uncertain
+completion is quarantined to the isolated lab process. An outer watchdog is
+mandatory and its intervention is always failure, not successful recovery.
+
+## RH3: x86 window, x64 presentation
+
+```powershell
+python AutoTest/run_render_host_wsi_gate.py --compiler32 <i686-clang++.exe> --compiler64 <x86_64-clang++.exe> --vulkan-sdk <SDK-directory> --output AutoTest/artifacts/<new-directory>
+```
+
+The x86 parent owns a hidden non-activating HWND and keeps pumping messages; the
+x64 child owns the Vulkan surface/swapchain and presents into that exact window.
+The test requires x86 to have no `vulkan-1.dll` loaded, resizes/recreates the
+swapchain and distinguishes render completion from present-completion fences.
+No global input or player-window control is used. Hidden Present success is not
+foreground visual/FPS acceptance, game integration, or full WSI fault coverage.
+
+## Existing DXVK core in x64
+
+Unlike RH2's small interoperability backend, [dxvk_core](dxvk_core/README.md)
+links the repository's actual `dxvk_lib`: instance/device, allocator, context,
+command submission and resource retirement. It requires a fresh independent
+Windows x64 root build with `warvk_render_host_core_dev=true` and
+`enable_d3d9=false`; root shipping defaults remain unchanged. No game hooks or
+StormBreaker are linked into this host.
+
+```powershell
+python AutoTest/run_render_host_core_gate.py --build <new-build-directory> --output AutoTest/artifacts/<new-directory>
+```
+
+The bootstrap executable is deliberately limited to GPU fill/copy/readback with
+distinct CPU submission, GPU timeline and resource-retirement witnesses. The
+restricted D3D9 host above is a separate target built on that same core; bootstrap
+success alone is not D3D9, WarVK-pass or full-frame evidence. The future product
+must reuse this real core, not promote RH2's test renderer into a second independent
+graphics engine. Blocking lab transports/destructors still must not be linked
+onto the game/render thread.
+
+## X1 / WRC1: bounded x86 commands into actual DXVK x64 buffers
+
+`render_command_queue.h` is a process-private SPSC component, not a shared-memory
+ABI: four <=64 KiB batches, no allocation/I/O/internal retries in its calls.
+Full is non-consuming backpressure, never permission to lose a render command.
+CPU ack, remote acceptance and GPU resource retirement are distinct milestones.
+
+`buffer_commands.*` defines a separate bounded WRC1 resource subset with strict
+scope/sequence, four resource IDs, generation tombstones, and private commit
+only after the backend succeeds. `dxvk_core/buffer_backend.*` is its actual
+DXVK integration: fixed host upload/readback buffers, device-local resources,
+unaligned partial copies, GPU timeline and production usage retirement.
+
+```powershell
+python AutoTest/run_render_command_queue_gate.py --compiler32 <i686-clang++.exe> --compiler64 <x86_64-clang++.exe> --output AutoTest/artifacts/<new-directory>
+python AutoTest/run_render_host_buffer_gate.py --compiler32 <i686-clang++.exe> --compiler64 <x86_64-clang++.exe> --build <existing-isolated-x64-core-build> --output AutoTest/artifacts/<new-directory>
+```
+
+The latter gate builds the `warvk-dxvk-buffer-host` target, proves a real x86
+producer -> private queue -> dedicated I/O worker -> x64 DXVK chain, and checks
+independent full-buffer hashes plus exact bad-generation/map/range rejections.
+It does **not** call D3D9 COM APIs or a game. The lab-only transport/process owner
+still requires an external watchdog; neither its blocking final drain nor the
+fixture's explicit retry policy is a production D3D9 backpressure contract.
+The 1 MiB logical resource cap excludes staging, readback, allocator backing and
+process overhead. No game memory saving or full renderer migration is claimed.
+
+## X1a: bounded Clear admission in the D3D9 development proxy
+
+Only `Device::Clear` now returns on bounded local admission. Initialize, Draw,
+resource operations, Readback, Query, Present and Finish remain ordered synchronous
+barriers. The real Connection reuses the four-slot queue plus one worker-private
+batch; Full neither consumes a sequence nor drops work. Remote Clear errors latch
+terminal before reply progress. An enqueue/CPU ACK is never a GPU retirement proof.
+
+```powershell
+python AutoTest/run_d3d9_connection_async_cpu.py --output AutoTest/artifacts/<new-directory>
+python AutoTest/test_d3d9_connection_async_cpu_reader.py
+python AutoTest/run_d3d9_connection_fault_ipc.py --output AutoTest/artifacts/<another-new-directory>
+python AutoTest/test_d3d9_connection_fault_ipc_reader.py
+```
+
+The CPU runner builds and executes both architectures on real restricted-Medium
+non-input Win32 Desktops. It exercises the actual Connection/queue with synthetic
+replies, not COM/IPC/GPU. r2 passed 263 checks per architecture; the first missing-
+protocol-link failure is retained. Actual proxy-worker pressure/fault validation
+is a separate gate, not inferred from these tests. Admission is bounded at 5s;
+call uses a single original 30s deadline, preserving baseline done-first semantics.
+The final join/transport cancellation still belong to a blocking laboratory owner;
+Game.dll remains prohibited. No shipping asynchronous service or game memory saving
+is established. See `docs/research/2026-10-23-x64-bounded-clear-async.md`.
+
+The separate fault runner uses the real x86 Connection, worker, OwnedChild and
+authenticated pipe with an x64 CPU adversary. Its fixed five-case r1 passed:
+unexpected Clear status/payload, wrong nonce, peer exit and partial-header timeout
+while Readback is waiting. The live guarded result remains untouched and later
+admission fails. Secondary fault cleanup is not reclassified as primary normal
+exit. This gate neither creates a GPU nor calls the public D3D9 COM proxy; actual
+GPU success/retirement and product-owner cancellation remain separate gates.

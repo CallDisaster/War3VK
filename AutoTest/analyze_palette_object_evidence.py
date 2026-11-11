@@ -105,12 +105,17 @@ analyze_frame_evidence.extension_version(), which owns the root format registry)
     structurally inconsistent version is refused with ValueError -- never ignored.
   * Identity is explicit instead of implied: carrying a field is NOT a proof. Every chain
     reports identityBasis + identityProven. Under version 1 the basis is
-    'recorderFlagClaimOnly' and identityProven is False: sameObjectCertified keeps the
-    legacy flag-based meaning, and the report never claims the instance was proven. Under
-    version 2 a chain may only certify when a registered identityProofKind is carried
+    'recorderFlagClaimOnly' and identityProven is False. Versions 1-4 remain readable
+    but cannot certify recovery because they do not carry attemptSerial. Since
+    version 2 identity is proven only when a registered identityProofKind is carried
     AND the carried identity value is non-zero AND identityWeak/epochUnknown are false;
     otherwise it is refused with 'identityNotProven' / 'identityValueMissing'. So the 0 of
     identityWeak alone can never certify a same-object recovery in the versioned format.
+  * Version 5 keeps v4 chain types, counters and layout except data[5], which carries
+    attemptSerial (U64_MAX is unknown; zero is known). Certification rebuilds live S/E/D
+    in one contiguous known attempt with the same non-None/non-Unknown source and
+    nonzero hitKey, no cleared selection, and a matching terminal. Earlier rejection
+    facts remain valid; partial attempts can never be combined, even if an ID reappears.
 
 Window / Reset segmentation (2026-09-17 上级裁定 ⑧):
 
@@ -144,7 +149,10 @@ from that function and requires it to be exactly {documented slots} | RESERVED_D
   event.frame            -> frames.renderFrame      event.mapEpoch -> key.mapEpoch
   event.deviceEpoch      -> key.deviceEpoch         event.thread   == words32[12]
   data[0]  key.renderablePart         data[1]  key.runtimeModelPtr
-  data[2]  key.lifecycleIdentity      data[3..8] reserved (0)
+  data[2]  key.lifecycleIdentity
+  data[3]  windowSegment (v2+)       data[4] chainType (v4+)
+  data[5]  attemptSerial (v5+, U64_MAX unknown)   data[6..8] reserved (0)
+  Earlier versions require zero in slots not yet introduced by that version.
   data[9]  frames.manifestFrameSerial data[10] source (hitKind)   data[11] hitKey
   words32[0] rejectReason   [1] key.jHandle   [2] key.rawcode   [3..4] reserved (0)
   words32[5] stage   [6..9] reserved (0)   [10] sessionGeneration lo32
@@ -294,7 +302,7 @@ CHAIN_IDENTITY_FIELDS=('renderablePart','runtimeModelPtr','jHandle','rawcode',
 # ---- 2026-09-17 上级 03:58 要求"必须贯通"后落地 --------------------------------------
 # 发射器（war3_palette_object_evidence_sink.cpp）现在写 data[2] = key.lifecycleIdentity；
 # 因此读方声明该槽位（原先的 None 只适用于"C++ 尚未补槽位"的过渡状态）。
-# data[3..8] 仍是必须为 0 的保留位（RESERVED_DATA）。
+# RESERVED_DATA describes v1; reserved_data_indices applies later version carriers.
 LIFECYCLE_IDENTITY_SLOT=('data',2)
 PROPOSED_LIFECYCLE_IDENTITY_SLOT=('data',2)
 ALTERNATE_LIFECYCLE_IDENTITY_SLOT=('words32',34,35)
@@ -325,8 +333,11 @@ TERMINALS={0:'NoTerminal',1:'Recovered',2:'WindowExpired',3:'ObjectGone',4:'Tabl
 # 不表示身份已证明、不表示 palette 已消费、更不表示画面已恢复。
 TERMINALS_OBSERVATION_CLOSED=7
 TERMINALS_V4=dict(TERMINALS);TERMINALS_V4[TERMINALS_OBSERVATION_CLOSED]='ObservationClosed'
-TERMINALS_BY_VERSION={1:TERMINALS,2:TERMINALS,3:TERMINALS,4:TERMINALS_V4}
+TERMINALS_BY_VERSION={1:TERMINALS,2:TERMINALS,3:TERMINALS,4:TERMINALS_V4,5:TERMINALS_V4}
 PALETTE_OBJECT_CHAIN_TYPED_VERSION=4
+PALETTE_OBJECT_ATTEMPT_VERSION=frame_evidence.PALETTE_OBJECT_ATTEMPT_VERSION
+ATTEMPT_SERIAL_SLOT=('data',5)
+UNKNOWN_ATTEMPT_SERIAL=str(2**64-1)
 REASONS={0:'R0',1:'R1',2:'R2',3:'R3',0xFE:'NotChecked',0xFF:'Unknown'}
 
 def lookup(table,value,what):
@@ -367,6 +378,8 @@ def reserved_data_indices(version=PALETTE_OBJECT_LEGACY_VERSION):
     if version>=PALETTE_OBJECT_CHAIN_TYPED_VERSION:
         # 阶段 C：v4 的 data[4] 是**链型**载体，不再是保留零。
         indices=tuple(index for index in indices if index!=CHAIN_TYPE_SLOT[1])
+    if version>=PALETTE_OBJECT_ATTEMPT_VERSION:
+        indices=tuple(index for index in indices if index!=ATTEMPT_SERIAL_SLOT[1])
     return indices
 
 def reserved_bit_indices(version=PALETTE_OBJECT_LEGACY_VERSION):
@@ -452,6 +465,8 @@ def decode_event(e,version=PALETTE_OBJECT_LEGACY_VERSION):
             STAGES if version>=PALETTE_OBJECT_FIRST_SIGHT_VERSION else LEGACY_STAGES,
             bits[5],'palette stage'),
         'source':lookup(SOURCES,data[10],'palette source'),
+        'attemptSerial':(str(data[ATTEMPT_SERIAL_SLOT[1]])
+                         if version>=PALETTE_OBJECT_ATTEMPT_VERSION else None),
         # 阶段 C：链型。v4 从 data[4] 解码（未知值 ⇒ 整份拒绝）；
         # v1/v2/v3 **没有**链型载体 —— 那些版本里只存在一类链（拒绝恢复），这不是猜测而是
         # 它们的合同：data[4] 在那三个版本上被校验为保留零（见 reserved_data_indices）。
@@ -510,6 +525,100 @@ def stage_index(events,stage,live_only=False):
         if live_only and event['terminal']!='NoTerminal':continue
         return index
     return None
+
+def attempt_recovery_evidence(events,version):
+    """Rebuild one contiguous attempt from live records, never from terminal flags.
+
+    Rejection history belongs to the object chain. S/E/D proof belongs only to the
+    current known attempt: switching A -> B -> A resets it twice. Unknown attempts
+    reset on every event, because the sentinel is not an identity or a wildcard.
+    A complete later retry may therefore follow an earlier rejection/partial attempt.
+    The caller retains all existing chain-wide loss, identity and ordering checks.
+    """
+    if version<PALETTE_OBJECT_ATTEMPT_VERSION:
+        return {'attemptSerial':None,'complete':False,
+                'refusals':['attemptSerialNotCarried']}
+    current=None
+    served=enqueued=drawn=None
+    refusals=[]
+    # Preserve the recorder's sticky MarkStage ordering rule across retries.
+    # An unknown attempt compares against the lifetime maximum; known attempts
+    # compare against the most recent known attempt's maximum.
+    order_refusals=[]
+    lifetime_rank=known_rank=0
+    known_order_attempt=None
+    terminal=None
+    for index,event in enumerate(events):
+        if event['terminal']!='NoTerminal':
+            terminal=event
+            if index!=len(events)-1:
+                refusals.append('terminalNotLastInChain')
+            break
+        attempt=event['attemptSerial']
+        rank={'Rejected':1,'FirstSight':1,'ServedCandidate':2,'Enqueued':3,'Drawn':4}[event['stage']]
+        lifetime_rank=max(lifetime_rank,rank)
+        if attempt==UNKNOWN_ATTEMPT_SERIAL:
+            if rank<lifetime_rank:order_refusals.append('attemptStageOrderInvalid')
+        elif attempt!=known_order_attempt:
+            known_order_attempt=attempt
+            known_rank=rank
+        else:
+            if rank<known_rank:order_refusals.append('attemptStageOrderInvalid')
+            known_rank=max(known_rank,rank)
+        if attempt==UNKNOWN_ATTEMPT_SERIAL or attempt!=current:
+            current=attempt
+            served=enqueued=drawn=None
+            refusals=[]
+        if attempt==UNKNOWN_ATTEMPT_SERIAL:
+            refusals.append('attemptSerialUnknown')
+            continue
+        stage=event['stage']
+        if stage not in ('ServedCandidate','Enqueued','Drawn'):
+            continue
+        source_key=(event['source'],event['hitKey'])
+        if event['source'] in ('NoSource','Unknown'):
+            refusals.append('attemptStageSourceUnknown')
+        if event['hitKey']=='0':
+            refusals.append('attemptHitKeyMissing')
+        if event['selectionClearedByNativeOverride']:
+            refusals.append('attemptSelectionCleared')
+        if served is not None:
+            if source_key[0]!=served[0]:refusals.append('attemptSourceMismatch')
+            if source_key[1]!=served[1]:refusals.append('attemptHitKeyMismatch')
+        if stage=='ServedCandidate':
+            if served is None:served=source_key
+        elif stage=='Enqueued':
+            if served is None:refusals.append('attemptStageOrderInvalid')
+            if not event['sawSubmit']:refusals.append('attemptSubmitWitnessMissing')
+            enqueued=source_key
+        else:
+            if served is None or enqueued is None:
+                refusals.append('attemptStageOrderInvalid')
+            if not event['sawSubmit']:
+                refusals.append('liveDrawnWithoutSubmit')
+            if not event['sawSubmit'] or not event['sawDraw']:
+                refusals.append('attemptDrawWitnessMissing')
+            drawn=source_key
+    if terminal is None:
+        refusals.append('attemptTerminalMissing')
+    else:
+        if terminal['attemptSerial']==UNKNOWN_ATTEMPT_SERIAL:
+            refusals.append('attemptSerialUnknown')
+        if terminal['attemptSerial']!=current:
+            refusals.append('terminalAttemptMismatch')
+        if drawn is not None:
+            if terminal['source']!=drawn[0]:refusals.append('terminalSourceMismatch')
+            if terminal['hitKey']!=drawn[1]:refusals.append('terminalHitKeyMismatch')
+        if terminal['selectionClearedByNativeOverride']:
+            refusals.append('attemptSelectionCleared')
+        if not terminal['sawSubmit'] or not terminal['sawDraw']:
+            refusals.append('attemptTerminalWitnessMissing')
+    if served is None:refusals.append('attemptServedCandidateMissing')
+    if enqueued is None:refusals.append('attemptEnqueuedMissing')
+    if drawn is None:refusals.append('attemptDrawnMissing')
+    refusals=sorted(set(refusals+order_refusals))
+    return {'attemptSerial':current,'complete':not refusals,'refusals':refusals}
+
 
 def judge_chain(key,events,lossy,lifecycle_carried,
                 version=PALETTE_OBJECT_LEGACY_VERSION):
@@ -600,12 +709,18 @@ def judge_chain(key,events,lossy,lifecycle_carried,
         issues.append('servedCandidateBeforeFirstSight')
     if i_reject is not None and i_served is not None and not i_reject<i_served:
         issues.append('servedCandidateBeforeRejected')
-    # 正常链 = FirstSight -> Enqueued（**无** ServedCandidate）；拒绝恢复链才需要
-    # ServedCandidate 在前。故此处只约束"若两者都在则必须有序"，不要求 Served 必须存在。
-    if i_served is not None and i_enqueued is not None and not i_served<i_enqueued:
-        issues.append('enqueuedBeforeServedCandidate')
-    if i_enqueued is not None and i_drawn is not None and not i_enqueued<i_drawn:
-        issues.append('drawnBeforeEnqueued')
+    # v5 recovery ordering belongs to the current contiguous attempt. A failed
+    # earlier attempt may have E without S or D without E before a complete retry;
+    # first-ever stage indices would falsely reject that later complete attempt.
+    # Keep the frozen aggregate rules for v1-v4 and for Observation chains, whose
+    # stage-observation shape does not require the recovery proof's S/E/D sequence.
+    attempt_ordered_recovery=(version>=PALETTE_OBJECT_ATTEMPT_VERSION
+                              and events[0]['chainType']=='RejectionRecovery')
+    if not attempt_ordered_recovery:
+        if i_served is not None and i_enqueued is not None and not i_served<i_enqueued:
+            issues.append('enqueuedBeforeServedCandidate')
+        if i_enqueued is not None and i_drawn is not None and not i_enqueued<i_drawn:
+            issues.append('drawnBeforeEnqueued')
     saw_submit=any(event['sawSubmit'] for event in events)
     saw_draw=any(event['sawDraw'] for event in events)
     # 2026-09-17 只读对抗审计 D4：认证谓词不得弱于记录器自身的 Recovered 语义
@@ -619,7 +734,10 @@ def judge_chain(key,events,lossy,lifecycle_carried,
                          and terminal_event['source']=='NoSource')
     selection_cleared_at_draw=(terminal=='Recovered' and terminal_event is not None
                                and terminal_event['selectionClearedByNativeOverride'])
-    live_drawn_without_submit=any(not event['sawSubmit'] for event in live_draws)
+    # Current-attempt D witnesses are checked by attempt_recovery_evidence for v5
+    # recovery; an earlier failed D must not invalidate a complete later attempt.
+    live_drawn_without_submit=(not attempt_ordered_recovery
+                               and any(not event['sawSubmit'] for event in live_draws))
     unknown_frame_domains=sorted({domain for event in events
                                   for domain in unknown_frame_domain_conflicts(event)})
     if saw_draw and i_drawn is None:truncation.append('drawnFlagWithoutDrawnEvent')
@@ -698,7 +816,8 @@ def judge_chain(key,events,lossy,lifecycle_carried,
                                and required_stages<=_stages
                                and _stages<=legal_stages
                                and saw_submit and saw_draw and terminal!='NoTerminal')
-    refusals=[]
+    attempt_proof=attempt_recovery_evidence(events,version)
+    refusals=list(attempt_proof['refusals'])
     if identity_weak:refusals.append('identityWeak')
     if epoch_unknown:refusals.append('epochUnknown')
     # 2026-09-17 上级裁定 ⑦：**字段存在 ≠ 身份已证明**。版本 2 要求这条链**载明**登记在案的
@@ -721,7 +840,8 @@ def judge_chain(key,events,lossy,lifecycle_carried,
         refusals.append('lifecycleIdentityNotCarried')
     if draw_source_missing:refusals.append('drawSourceMissing')
     if selection_cleared_at_draw:refusals.append('selectionClearedAtDraw')
-    if live_drawn_without_submit:refusals.append('liveDrawnWithoutSubmit')
+    if live_drawn_without_submit and 'liveDrawnWithoutSubmit' not in refusals:
+        refusals.append('liveDrawnWithoutSubmit')
     if unknown_frame_domains:refusals.append('unknownFrameDomainWithValue')
     # 2026-09-18 P0-6（复审 1266d8db 的独立发现）：**读方的 Recovered 谓词弱于写方**。
     # 写方（war3_palette_object_evidence.h:309-311）的 closedChain 要求：
@@ -739,7 +859,6 @@ def judge_chain(key,events,lossy,lifecycle_carried,
     # 链首事件由建立该链的那次 NoteReject 发出 ⇒ 它的 rejectReason 就是 firstReason，正是写方谓词的镜像；
     # 同时仍能拦住伪造链（链首 NotChecked + 终态塞 R1 —— 写方不可能产生该形状）。
     if terminal=='Recovered' and events and events[0]['rejectReason']=='NotChecked':
-        refusals.append('recoveredWithoutRejectFact')
         refusals.append('recoveredWithoutRejectFact')
     if not covered:refusals.append('chainNotCovered')
     if truncation:refusals.append('stageStreamTruncated')
@@ -767,6 +886,8 @@ def judge_chain(key,events,lossy,lifecycle_carried,
             'sequenceSpan':[order[0],order[-1]],'eventCount':len(events),
             'stages':stages,'stageOrder':[event['stage'] for event in events],
             'terminal':terminal,'servedCandidates':served_count,'hitCountMax':hit_max,
+            'attemptSerial':attempt_proof['attemptSerial'],
+            'sameAttemptComplete':attempt_proof['complete'],
             'sawSubmit':saw_submit,'sawDraw':saw_draw,
             'terminalSource':None if terminal_event is None else terminal_event['source'],
             'drawSources':[event['source'] for event in draw_events],
@@ -943,6 +1064,9 @@ def analyze(d):
                                 and all(chain['stageObservationComplete'] for chain in chains))
     return {'schemaValid':True,'label':LABEL,'kind':KIND,
             'formatVersion':version,
+            'attemptSerialCarried':version>=PALETTE_OBJECT_ATTEMPT_VERSION,
+            'attemptSerialSlot':(list(ATTEMPT_SERIAL_SLOT)
+                                 if version>=PALETTE_OBJECT_ATTEMPT_VERSION else None),
             'extensions':frame_analysis['extensions'],
             'schema':frame_analysis.get('schema'),
             'windowSegmentCarried':version>=PALETTE_OBJECT_SEGMENTED_VERSION,
@@ -980,6 +1104,9 @@ def analyze(d):
                    'submission, GPU execution or pixel evidence. A chain is only '
                    'certified when the export is fully covered AND the identity is '
                    'strong (identityWeak/epochUnknown refuse same-object certification). '
+                   'Version 5 also requires a contiguous known attempt with live S/E/D '
+                   'records carrying the same known source and nonzero hit key; older '
+                   'versions remain readable but cannot certify same-object recovery. '
                    'identityProven is true only when the versioned wire carries a '
                    'registered identity proof: carrying a field (or writing '
                    'identityWeak = 0) is NOT a proof. windowSegment identifies which '

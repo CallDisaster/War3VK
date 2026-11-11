@@ -1,10 +1,18 @@
-# WarVK 1.22.01
+# WarVK 1.22.02
 
 [简体中文](README_CN.md) · [Changelog](CHANGELOG.md) · [Map-author API](WarVK/README.md) · [Downloads](https://github.com/CallDisaster/War3VK/releases/latest)
 
 WarVK enhances **Warcraft III 1.27a (32-bit)** using a DXVK-derived D3D9-to-Vulkan backend. It adds directional/point shadows, volumetric lighting, local fog, post-processing, diagnostics and a bounded JASS API, without changing map gameplay.
 
-## Highlights in 1.22.01
+## Changes in 1.22.02 (release candidate)
+
+- A rebuilt JASS native table now requests a shadow-session reset before new-map producers run; GPU retirement remains on the Present owner. The isolated same-process `ChangeLevel` A→B→A path passed, but menu transitions, D3D9 Reset and prolonged pressure remain release gates.
+- Map authors gain a unit Walk-loop switch and movement-animation Override helpers. The isolated `Hamg` test confirmed requests reached the DLL and automatic Walk reselection was suppressed; other units and full visual behavior remain under review.
+- Persistent shadow geometry publication, live/retired accounting, frame-evidence attribution and screenshot shutdown ownership are hardened. These correctness changes do not imply an FPS gain.
+- **32-bit entry and low-address maintenance candidate.** Large per-thread CurrentDraw/material tables are cold-started, allocation failure is fail-visible and retryable, and the native event hook is installed only after its JASS prerequisites. A restricted isolated Lost Temple run reached a real screenshot and natural exit; this is not x64 renderer migration or player-DLL release approval. See [the 2026-10-24 evidence](docs/research/2026-10-24-mdldata-low-address-repair.md).
+- The unit-model attachment-point world-coordinate API is deferred. Shader API 1.2.0 and JASS wire `warvk:v1` are unchanged.
+
+### Earlier 1.22.01 maintenance update
 
 - **Adaptive memory budgets and idle retirement.** Pool growth checks the actual heap budget, physical backing commitment and 32-bit address-space headroom. Completed Arena generations can gradually release idle tail pages; live resources are not revoked.
 - **Snapshot hole reuse.** Retired intervals can be reused after their final CPU/command/GPU consumer releases them, without waiting for every slice in a page to expire. Metadata exhaustion and fragmentation retain conservative fallbacks.
@@ -36,8 +44,8 @@ A historical same-DLL, matched isolated 2560×1440 A-B-B-A experiment measured m
 - Only verified executable/Game.dll signatures are supported; unknown layouts are not guessed.
 
 1. Fully exit Warcraft III and the editor; back up any existing `d3d9.dll` separately.
-2. Extract **WarVK-1.22.01-win32.zip** and put its DLL beside `war3.exe`.
-3. Start normally; `d3d9.log` should report `DXVK: 1.22.01`.
+2. Extract **WarVK-1.22.02-win32.zip** and put its DLL beside `war3.exe`.
+3. Start normally; `d3d9.log` should report `DXVK: 1.22.02`.
 4. Press **Ctrl+F1** for settings and Render Stats. Normal optimizations do not require recording.
 
 Do not use old experimental launch scripts for normal play. Environment variables are an internal diagnostic surface and can override defaults; supported player/author entry points are the panel and documented JAPI. Heavy frame evidence is **off by default**. Do not install conflicting D3D9 proxy DLLs.
@@ -69,8 +77,8 @@ Fully exit before restoring the backed-up DLL. To uninstall, remove WarVK's DLL;
 
 ## Development / licensing
 
-Product/JAPI display: **1.22.01**; subsequent fixes retain the 1.22 numbering series. External Shader API remains **1.2.0**, JASS wire remains **warvk:v1**; existing scripts do not need an ABI migration.
+Product/JAPI display: **1.22.02**; subsequent fixes retain the 1.22 numbering series. External Shader API remains **1.2.0**, JASS wire remains **warvk:v1**; existing scripts do not need an ABI migration.
 
-Runtime code: `src/d3d9/`; Warcraft integration: `src/d3d9/war3/`; shaders: `subprojects/war3fx/`; author integration: `WarVK/`; tests: `AutoTest/`. Use pinned dependencies and explicit release options, not an old diagnostic build directory. See [release scope](docs/RELEASE_1.22.01.md).
+Runtime code: `src/d3d9/`; Warcraft integration: `src/d3d9/war3/`; shaders: `subprojects/war3fx/`; author integration: `WarVK/`; tests: `AutoTest/`. Use pinned dependencies and explicit release options, not an old diagnostic build directory. See [release scope](docs/RELEASE_1.22.02.md).
 
 WarVK is GPLv3 at project level: [LICENSE](LICENSE), [COPYING](COPYING), [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Dependencies retain their original notices. This is an unofficial project built on DXVK, Dear ImGui, MinHook, Vulkan and Warcraft community research.

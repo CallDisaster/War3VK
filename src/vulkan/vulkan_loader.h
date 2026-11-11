@@ -162,6 +162,10 @@ namespace dxvk::vk {
     VULKAN_FN(vkSubmitDebugUtilsMessageEXT);
     #endif
 
+    #ifdef VK_EXT_sample_locations
+    VULKAN_FN(vkGetPhysicalDeviceMultisamplePropertiesEXT);
+    #endif
+
     #ifdef VK_EXT_full_screen_exclusive
     VULKAN_FN(vkGetPhysicalDeviceSurfacePresentModes2EXT);
     #endif
@@ -470,7 +474,6 @@ namespace dxvk::vk {
 
     #ifdef VK_EXT_sample_locations
     VULKAN_FN(vkCmdSetSampleLocationsEXT);
-    VULKAN_FN(vkGetPhysicalDeviceMultisamplePropertiesEXT);
     #endif
 
     #ifdef VK_EXT_shader_module_identifier

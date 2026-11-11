@@ -1,4 +1,6 @@
 #include "d3d9_war3_hook.h"
+#include "war3/diagnostics/war3_startup_witness.h"
+#include "war3/memory/war3_storm_low_domain.h"
 
 #include "d3d9_device.h"
 #include "d3d9_war3_branding.h"
@@ -21,7 +23,10 @@
 #include "war3/core/war3_events.h"
 #include "war3/core/war3_internal_test_config.h"
 #include "war3/core/war3_memory.h"
+#include "war3/core/war3_map_transition_gate.h"
 #include "war3/core/war3_net_event_hook.h"
+#include "war3/game/war3_unit_animation_api.h"
+#include "war3/japi/war3_japi_v1.h"
 #include "war3/hooks/war3_hook_jass.h"
 #include "war3/hooks/war3_hook_address_book.h"
 #include "war3/hooks/war3_hook_lifecycle.h"
@@ -30,6 +35,9 @@
 #include "war3/hooks/war3_hook_widget_identity.h"
 #include "war3/hooks/war3_hook_ui.h"
 #include "war3/memory/war3_storm_hook.h"
+#if defined(WARVK_MDLDATA_TRACE_DEV)
+#include "war3/memory/war3_mdl_trace.h"
+#endif
 #include "war3/memory/war3_tlsf_pool.h"
 #include "war3/model/war3_model_hook.h"
 #include "war3/model/war3_native_light_bridge.h"
@@ -77,6 +85,7 @@ std::atomic<bool> g_war3_runtime_activated{false};
 namespace {
 
 std::atomic<bool> s_nativeTakeoverInstallAttempted{false};
+war3::War3MapTransitionGate s_mapTransitionGate;
 
 using dxvk::war3::IsExecutableRange;
 using dxvk::war3::IsReadableRange;
@@ -232,7 +241,11 @@ void TryInstallStormBreakerEarly(const char *source) {
   }
 
   if (!dxvk::war3::memory::TlsfPool_IsInitialized()) {
-    if (dxvk::war3::memory::TlsfPool_Init()) {
+    using namespace war3::diagnostics;
+    const auto token = BeginStartupStage(StartupStage::StormRuntimeInitialize, 1);
+    const bool initialized = dxvk::war3::memory::TlsfPool_Init();
+    EndStartupStage(StartupStage::StormRuntimeInitialize, token, 1, initialized ? 1u : 0u);
+    if (initialized) {
       war3dbg::Print(
           "DXVK War3[StormHook]: 早期初始化 TLSF 完成 source=%s\n", source);
     } else {
@@ -243,7 +256,16 @@ void TryInstallStormBreakerEarly(const char *source) {
   }
 
   if (!dxvk::war3::memory::StormHook_IsInstalled()) {
-    if (dxvk::war3::memory::StormHook_Install()) {
+    using namespace war3::diagnostics;
+    const auto token = BeginStartupStage(StartupStage::StormRuntimeInitialize, 2);
+    const bool installed = dxvk::war3::memory::StormHook_Install();
+    EndStartupStage(StartupStage::StormRuntimeInitialize, token, 2, installed ? 1u : 0u);
+    const auto low = dxvk::war3::memory::StormLowDomain_GetStats();
+    NoteStartupStage(StartupStage::StormRuntimeInitialize, 3, low.enabled);
+    NoteStartupStage(StartupStage::StormRuntimeInitialize, 4, low.preexistingArenas);
+    NoteStartupStage(StartupStage::StormRuntimeInitialize, 5, low.preexistingHigh);
+    NoteStartupStage(StartupStage::StormRuntimeInitialize, 6, low.preexistingExternalUnproven);
+    if (installed) {
       war3dbg::Print("DXVK War3[StormHook]: 早期安装完成 source=%s\n", source);
     } else {
       war3dbg::Print("DXVK War3[StormHook]: 早期安装失败 source=%s\n", source);
@@ -366,6 +388,7 @@ void ResetWar3RuntimeState() {
   // admission first, then publish a request that Present will coalesce and
   // apply after the final BeforeUi boundary. GPU-owned caches and Arena
   // generations must never be rewound from this callback.
+  s_mapTransitionGate.onGameExit();
   g_war3_runtime_activated.store(false, std::memory_order_release);
   // Keep active-device lookup, request publication, destructor revocation and
   // the no-owner CPU fallback in one publication transaction. This prevents
@@ -428,6 +451,28 @@ bool ValidateGameModule(uintptr_t gameBase, ModuleInfo &gameInfo,
 
 } // namespace
 
+void ObserveWar3JassNativeTableRebuild() {
+  if (!s_mapTransitionGate.onNativeTableRebuild())
+    return;
+  war3dbg::Print("DXVK War3Hook: JASS native-table rebuild requests shadow map reset\n");
+  war3::RequestActiveDeviceShadowMapResetOrCpuFallback();
+}
+
+void ObserveWar3MainRunnerEnter() {
+  if (!s_mapTransitionGate.onMainRunnerEnter())
+    return;
+  // The native-table hook normally retires authored weather. This fallback
+  // closes the same old-map lifetime before the original runner can execute
+  // new JASS; a late Present reset must not erase new-map authoring instead.
+  war3::japi::ResetWeatherAuthorState();
+  war3dbg::Print("DXVK War3Hook: MainRunner entry requests shadow map reset (no native-table signal)\n");
+  war3::RequestActiveDeviceShadowMapResetOrCpuFallback();
+}
+
+void ObserveWar3MainRunnerComplete() {
+  s_mapTransitionGate.onMainRunnerComplete();
+}
+
 /**
  * @brief 运行时激活入口。
  *
@@ -435,8 +480,11 @@ bool ValidateGameModule(uintptr_t gameBase, ModuleInfo &gameInfo,
  * 统一完成 War3 运行时初始化与完整 Hook 安装。
  */
 void ActivateWar3Runtime(uintptr_t gameBase, const char *source) {
+  using namespace war3::diagnostics;
+  const auto activationToken = BeginStartupStage(StartupStage::RuntimeActivation);
   bool expected = false;
   if (!g_war3_runtime_activated.compare_exchange_strong(expected, true)) {
+    EndStartupStage(StartupStage::RuntimeActivation, activationToken, 0);
     return;
   }
 
@@ -447,7 +495,9 @@ void ActivateWar3Runtime(uintptr_t gameBase, const char *source) {
   dxvk::war3::platform::InitializeRuntimeCore(gameBase);
   auto tInit = std::chrono::high_resolution_clock::now();
 
+  const auto preinitToken = BeginStartupStage(StartupStage::War3PreInit);
   ::war3_preinit();
+  EndStartupStage(StartupStage::War3PreInit, preinitToken);
   auto tPre = std::chrono::high_resolution_clock::now();
 
   void *rootObj = jass::get_instance(0xD);
@@ -461,10 +511,23 @@ void ActivateWar3Runtime(uintptr_t gameBase, const char *source) {
   }
   auto tJass = std::chrono::high_resolution_clock::now();
 
+  // war3_preinit publishes ::pGameDLL and the JASS instance accessors.
+  // Install exactly once here, on the same activation owner, not before those
+  // prerequisites in InitializeRuntimeCore and not by a background retry.
+  const auto netToken = BeginStartupStage(StartupStage::NetEventInitialize);
+  const bool netEventReady = dxvk::war3::NetEventHook::get().init();
+  EndStartupStage(StartupStage::NetEventInitialize, netToken,
+                  netEventReady ? 1u : 0u);
+  war3dbg::Print("DXVK War3Hook: NetEventHook initialized after preinit ready=%d\n",
+                 netEventReady ? 1 : 0);
   auto tNet = std::chrono::high_resolution_clock::now();
 
+  const auto initToken = BeginStartupStage(StartupStage::War3Init);
   ::war3_init();
+  EndStartupStage(StartupStage::War3Init, initToken);
+  const auto readyToken = BeginStartupStage(StartupStage::JassReadyCallbacks);
   dxvk::war3::War3Events::get().fireOnJassReady();
+  EndStartupStage(StartupStage::JassReadyCallbacks, readyToken);
   war3dbg::Print("DXVK War3Hook: War3 runtime fully initialized\n");
   war3dbg::Print("DXVK War3Hook: JASS runtime fully initialized\n");
   auto tFull = std::chrono::high_resolution_clock::now();
@@ -473,9 +536,15 @@ void ActivateWar3Runtime(uintptr_t gameBase, const char *source) {
       []() { ResetWar3RuntimeState(); });
 
   // 提前初始化模块系统，避免首帧事件分发时触发额外抖动。
+  const auto modulesToken = BeginStartupStage(StartupStage::ModulesInitialize);
   war3module::InitializeModules();
+  EndStartupStage(StartupStage::ModulesInitialize, modulesToken);
 
+  const auto hooksToken = BeginStartupStage(StartupStage::GameHooksInstall);
   War3Hook::InstallGameHooks(gameBase);
+  EndStartupStage(StartupStage::GameHooksInstall, hooksToken);
+  EndStartupStage(StartupStage::RuntimeActivation, activationToken, 1);
+  NoteStartupStage(StartupStage::RuntimeReady);
   auto tHook = std::chrono::high_resolution_clock::now();
 
   // 输出运行时总览（只记录一次）。
@@ -777,17 +846,26 @@ void War3Hook::InstallGameHooks(uintptr_t gameBase) {
     war3dbg::Print("DXVK War3Hook: Native renderer hook takeover disabled\n");
   }
 
+  // Public animation API: install only when the exact 1.27a instruction and
+  // caller contract matches; unsupported Game.dll builds keep native behavior.
+  static_cast<void>(dxvk::war3::game::InstallUnitWalkHook(gameInfo.base));
   War3Hook::MarkHooksInstalled();
 }
 
 void War3Hook::InstallHooks(IDirect3DDevice9 *device) {
+  using namespace war3::diagnostics;
+  InitializeStartupWitness();
+  const auto bootstrapToken = BeginStartupStage(StartupStage::Bootstrap);
   s_device = device;
   dxvk::war3::platform::BindNativeShadowDevice(device);
 
-  if (g_bootstrapInstalled.load(std::memory_order_acquire))
+  if (g_bootstrapInstalled.load(std::memory_order_acquire)) {
+    EndStartupStage(StartupStage::Bootstrap, bootstrapToken, 2);
     return;
+  }
 
   if (!GetEnvBool("DXVK_WAR3_ENABLE_HOOKS", true)) {
+    EndStartupStage(StartupStage::Bootstrap, bootstrapToken, 3);
     war3dbg::Print("DXVK War3Hook: 已通过 DXVK_WAR3_ENABLE_HOOKS 禁用 Hook\n");
     g_bootstrapInstalled.store(true, std::memory_order_release);
     return;
@@ -796,11 +874,13 @@ void War3Hook::InstallHooks(IDirect3DDevice9 *device) {
   ModuleInfo gameInfo = {};
   bool forceHooks = false;
   if (!ValidateGameModule(GetGameDllBase(), gameInfo, forceHooks)) {
+    EndStartupStage(StartupStage::Bootstrap, bootstrapToken, 4);
     g_bootstrapInstalled.store(true, std::memory_order_release);
     return;
   }
 
   if (!EnsureMinHookInitialized()) {
+    EndStartupStage(StartupStage::Bootstrap, bootstrapToken, 5);
     const MH_STATUS st = g_minhookInitStatus.load(std::memory_order_relaxed);
     war3dbg::Print("DXVK War3Hook: MinHook 初始化失败, 错误码=%d\n", int(st));
     g_bootstrapInstalled.store(true, std::memory_order_release);
@@ -812,6 +892,7 @@ void War3Hook::InstallHooks(IDirect3DDevice9 *device) {
   const bool bootstrapNoGameHooks =
       GetEnvBool("DXVK_WAR3_BOOTSTRAP_NO_GAME_HOOKS", false);
   if (bootstrapNoGameHooks) {
+    EndStartupStage(StartupStage::Bootstrap, bootstrapToken, 6);
     war3dbg::Print(
         "DXVK War3Hook: 启动无 Game hook 二分，仅保留 D3D9 图形路径\n");
     g_bootstrapInstalled.store(true, std::memory_order_release);
@@ -822,18 +903,30 @@ void War3Hook::InstallHooks(IDirect3DDevice9 *device) {
   // Storm、Shadow producer 与 model provenance 的启动期侵入。
   const bool bootstrapMinimal =
       GetEnvBool("DXVK_WAR3_BOOTSTRAP_MINIMAL", false);
+#if defined(WARVK_MDLDATA_TRACE_DEV)
+  // Independent observation before optional Storm/Shadow installation. Honor
+  // both existing no-Game/minimal controls; never advance allocator policy.
+  if (!bootstrapMinimal)
+    dxvk::war3::memory::InstallMdlAllocationTrace(gameInfo.base);
+#endif
   if (!bootstrapMinimal) {
     // Shadow producer/StormBreaker 越早装越好：优先在首个 D3D9 bootstrap
     // 尝试安装，若此时依赖尚未就绪，再由 MainRunner_ENTER 补一次兜底。
+    const auto earlyToken = BeginStartupStage(StartupStage::EarlyHooks);
     TryInstallShadowHooksEarly(gameInfo.base, "Bootstrap");
+    EndStartupStage(StartupStage::EarlyHooks, earlyToken);
   } else {
     war3dbg::Print(
         "DXVK War3Hook: 启动最小化二分，跳过 Storm/Shadow early hooks\n");
   }
 
   // Bootstrap 只做“最早期可安全安装”的生命周期/JASS 入口。
+  const auto jassToken = BeginStartupStage(StartupStage::JassHookInstallation);
   dxvk::war3::hooks::War3HookJass::Install(gameInfo.base);
+  EndStartupStage(StartupStage::JassHookInstallation, jassToken);
+  const auto lifeToken = BeginStartupStage(StartupStage::LifecycleHookInstallation);
   dxvk::war3::hooks::War3HookLifecycle::Install(gameInfo.base);
+  EndStartupStage(StartupStage::LifecycleHookInstallation, lifeToken);
   if (!bootstrapMinimal)
     war3::native_light::Install(gameInfo.base);
   if constexpr (dxvk::war3::internal::kWar3ModelHookEnabled &&
@@ -847,6 +940,7 @@ void War3Hook::InstallHooks(IDirect3DDevice9 *device) {
   }
 
   g_bootstrapInstalled.store(true, std::memory_order_release);
+  EndStartupStage(StartupStage::Bootstrap, bootstrapToken, 1);
 }
 
 void War3Hook::MaybeInstallNativeRendererTakeover(const char *reason) {

@@ -9,7 +9,7 @@ import re
 import sys
 from pathlib import Path
 
-DEFAULT_VERSION = "1.22.01"
+DEFAULT_VERSION = "1.22.02"
 OPTION_RE = re.compile(
     r"option\s*\(\s*'(?P<name>[^']+)'\s*,\s*type\s*:\s*'(?P<type>[^']+)'\s*,\s*"
     r"value\s*:\s*(?P<raw>true|false|'(?:[^']*)')",
@@ -26,6 +26,10 @@ DIAGNOSTIC_OPTIONS = (
     "warvk_coherent_real_index_trim_dev",
     "warvk_coherent_real_perf_candidate_dev",
     "warvk_device_address_binding_report_dev",
+    "warvk_render_host_core_dev",
+    "warvk_d3d9_migration_census_dev",
+    "warvk_mdl_allocation_trace_dev",
+    "warvk_startup_witness_dev",
 )
 PRODUCT_OPTIONS = {
     "warvk_data_collection_tree_dev": False,
@@ -38,6 +42,10 @@ PRODUCT_OPTIONS = {
     "warvk_coherent_real_index_trim_dev": False,
     "warvk_coherent_real_perf_candidate_dev": False,
     "warvk_device_address_binding_report_dev": False,
+    "warvk_render_host_core_dev": False,
+    "warvk_d3d9_migration_census_dev": False,
+    "warvk_mdl_allocation_trace_dev": False,
+    "warvk_startup_witness_dev": False,
 }
 DIAGNOSTIC_PROFILE_OPTIONS = dict(PRODUCT_OPTIONS)
 DIAGNOSTIC_PROFILE_OPTIONS["warvk_internal_frame_recorder"] = True
@@ -118,6 +126,10 @@ PLAYER_RECIPE = (
     "-Dwarvk_coherent_real_index_trim_dev=false",
     "-Dwarvk_coherent_real_perf_candidate_dev=false",
     "-Dwarvk_device_address_binding_report_dev=false",
+    "-Dwarvk_render_host_core_dev=false",
+    "-Dwarvk_d3d9_migration_census_dev=false",
+    "-Dwarvk_mdl_allocation_trace_dev=false",
+    "-Dwarvk_startup_witness_dev=false",
 )
 def read(root: Path, rel: str) -> str:
     return (root / rel).read_text(encoding="utf-8")

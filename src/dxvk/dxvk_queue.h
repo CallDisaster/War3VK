@@ -148,6 +148,10 @@ namespace dxvk {
      */
     void synchronizeSubmission(
             DxvkSubmitStatus*   status);
+    // A timeout only stops this observer. The status must remain owned until
+    // the submit worker has settled (or the whole uncertain owner is retained).
+    bool synchronizeSubmissionUntil(DxvkSubmitStatus* status,
+            std::chrono::steady_clock::time_point deadline);
     
     /**
      * \brief Synchronizes with queue submissions
@@ -167,6 +171,12 @@ namespace dxvk {
     void synchronizeUntil(const Pred& pred) {
       std::unique_lock<dxvk::mutex> lock(m_mutex);
       m_finishCond.wait(lock, pred);
+    }
+
+    template<typename Pred>
+    bool synchronizeUntil(const Pred& pred, std::chrono::steady_clock::time_point deadline) {
+      std::unique_lock<dxvk::mutex> lock(m_mutex);
+      return m_finishCond.wait_until(lock, deadline, pred);
     }
 
     /**

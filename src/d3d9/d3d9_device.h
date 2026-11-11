@@ -27,6 +27,13 @@
 
 
 #include "d3d9_fixed_function.h"
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+#include "d3d9_migration_census.h"
+#include "d3d9_caller_census.h"
+#include "d3d9_buffer_census.h"
+// Evaluated in the public entry itself: that entry's return address.
+#define WARVK_MIGRATION_CALLER __builtin_return_address(0)
+#endif
 #include "d3d9_swvp_emu.h"
 
 #include "d3d9_interop.h"
@@ -49,6 +56,7 @@
 #include "war3/shadow/war3_shadow_backend_dxvk.h"
 // 2026-09-18 T7 批次 4（U5）：registry domain 的显式类型与 owner-check 判定内核。
 #include "war3/shadow/war3_shadow_geometry_domain.h"
+#include "war3/shadow/war3_shadow_session_retirement.h"
 #include "war3/render/war3_shadow_generation_backed_stream.h"
 #include "war3/render/war3_drawtime_active_ledger.h"
 #include "war3/render/war3_stage11_snapshot_page_policy.h"
@@ -104,6 +112,7 @@ namespace dxvk {
 
 class War3RenderPipeline;
 class War3PostProcess;
+namespace war3::reimpl { class War3InstanceBuffer; }
 
 // Draw-time vertex snapshots belong to one object instance and one logical
 // draw slice. Model parts can be shared by many units, and one part/layer can
@@ -962,6 +971,14 @@ public:
   HRESULT UnlockBuffer(D3D9CommonBuffer *pResource,
                        uintptr_t OwnerIdentity);
 
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  // Buffer census entries for the public buffer Lock/Unlock; attempts, before
+  // the call. Caller is the public entry's return address.
+  void BufferCensusLock(D3D9CommonBuffer *pResource, UINT OffsetToLock,
+                        UINT SizeToLock, DWORD Flags, const void *Caller);
+  void BufferCensusUnlock(D3D9CommonBuffer *pResource);
+#endif
+
   /**
    * @brief Uploads data from D3DPOOL_SYSMEM + D3DUSAGE_DYNAMIC buffers and
    * binds the temporary buffers.
@@ -1413,7 +1430,11 @@ private:
   // boundary. Returns true when the current Arena generation was sealed and
   // its dedicated completion signal was emitted by this call.
   bool War3ApplyShadowMapEpochResetAtPresent(uint64_t retireSerial);
-  void War3ResetShadowSessionState(uint64_t retireSerial);
+  struct War3RetiredShadowSession;
+  using War3PreparedShadowRetirement =
+      war3::shadow::PreparedShadowSessionRetirement<War3RetiredShadowSession>;
+  void War3ResetShadowSessionState(uint64_t retireSerial,
+                                  War3PreparedShadowRetirement& prepared);
   void War3CollectRetiredShadowSessions(uint64_t completedSerial);
   void War3RefreshRetiredShadowSessionDiagnostics();
 
@@ -2118,6 +2139,33 @@ private:
   bool m_war3UiDrawSeenThisFrame = false;
 
   D3D9FFShaderModuleSet m_ffModules;
+#if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
+  // Argument/local-key POD only. The recorder has its own bounded try-cell;
+  // it must never enable the device mutex or read extra live device state.
+  // The ordinal is fixed before the constructed device can be published.
+  d3d9::migration::ConcurrentCensus m_migrationCensus;
+  static uint64_t MigrationAllocateDeviceOrdinal();
+  const uint64_t m_migrationDeviceOrdinal = MigrationAllocateDeviceOrdinal();
+  void MigrationNoteApi(d3d9::migration::Api api);
+  void MigrationNoteTexture(const d3d9::migration::TextureFacts& facts);
+  void MigrationNoteDraw(d3d9::migration::DrawKind kind,
+      D3DPRIMITIVETYPE primitiveType, UINT primitiveCount,
+      UINT explicitStride, bool hasExplicitStride,
+      UINT vertexCount, bool vertexCountKnown,
+      D3DFORMAT indexFormat, bool indexFormatKnown);
+  void MigrationNoteVsKey(const D3D9FFShaderKeyVSData& key);
+  void MigrationNoteFsKey(const D3D9FFShaderKeyFS& key);
+  void MigrationPresent();
+  void MigrationLog(const char* reason);
+  // Caller-module split, its own try-cell; the v2 snapshot is unchanged.
+  d3d9::migration::ConcurrentCallerCensus m_callerCensus;
+  static d3d9::migration::CallerRanges CallerCensusRanges();
+  const bool m_callerCensusRanged = (m_callerCensus.setRanges(CallerCensusRanges()), true);
+  void CallerCensusLog(const char* reason);
+  // Buffer classes and Lock patterns by caller, its own try-cell.
+  d3d9::migration::ConcurrentBufferCensus m_bufferCensus;
+  const bool m_bufferCensusRanged = (m_bufferCensus.setRanges(CallerCensusRanges()), true);
+#endif
   D3D9SWVPEmulator m_swvpEmulator;
 
   Com<D3D9StateBlock, false> m_recorder;
@@ -2493,7 +2541,7 @@ private:
   };
   struct War3ShadowPersistentExpiryCompare {
     bool operator()(const War3ShadowPersistentExpiryEntry& a,
-                    const War3ShadowPersistentExpiryEntry& b) const {
+                    const War3ShadowPersistentExpiryEntry& b) const noexcept {
       return a.lastSeenFrame > b.lastSeenFrame;
     }
   };
@@ -2779,6 +2827,7 @@ private:
     // consume 时直接用这个矩阵作为 draw.worldMatrix，避免误把本地空间顶点
     // 当世界空间，让静态建筑阴影跑到世界中心。
     Matrix4 capturedWorldMatrix = {};
+    war3::render::native_input::NativeDrawMaterialFacts nativeDrawMaterial;
     // UV buffer（用于 alpha-test shadow）。
     // 注意：可能与 positionBuffer 不在同一个 stream。capture 时如果 UV stream
     // 与 position stream 相同，复用 positionBuffer；否则单独 GPU copy 一份。
@@ -2958,6 +3007,9 @@ private:
   struct War3RetiredShadowSession {
     uint64_t mapEpoch = 0u;
     uint64_t retireSerial = 0u;
+    // Exclusive persistent admission charge; never use the alias-inclusive
+    // census below to return capacity to the live map.
+    uint64_t persistentChargeBytes = 0u;
     // Census fields are computed once when the live containers move into this
     // fence-owned record. GPU logical bytes can contain aliases and are not a
     // unique residency measurement; allocator bytes are reported separately.
@@ -2982,7 +3034,7 @@ private:
     std::vector<War3ShadowCasterDraw> s1TerrainCasterStash;
     War3S1TerrainEarlyCache s1TerrainEarlyCache;
   };
-  std::vector<War3RetiredShadowSession> m_war3RetiredShadowSessions;
+  std::list<War3RetiredShadowSession> m_war3RetiredShadowSessions;
   War3S1TerrainEarlyCache m_war3S1TerrainEarlyCache;
   struct War3S1GenerationProofObservationEntry {
     dxvk::war3::render::War3ShadowGenerationStabilityState state = {};
@@ -3036,11 +3088,14 @@ private:
   std::unique_ptr<War3SemanticDirectPartPacketLeaseState>
       m_war3SemanticDirectPartPacketLeaseState;
   uint64_t m_war3ShadowTombstoneSerialSeen = 0u;
+  // Owner-thread latch: an overflow reset must finish before ANY producer can
+  // reopen, not merely before the next semantic Populate retries the drain.
+  bool m_war3ShadowTombstoneResetPending = false;
   War3SemanticDirectCasterContractMap m_war3SemanticDirectCasterContracts;
   bool m_war3SemanticSceneLastReusableUnitsOnly = true;
   bool m_war3SemanticSceneLastReusableNativeValidation = false;
   bool m_war3SemanticSceneLastSuccessfulSubmitComplete = false;
-  uint64_t m_war3ShadowPersistentBytesUsed = 0;
+  war3::shadow::PersistentGeometryCharges m_war3ShadowPersistentCharges;
   uint64_t m_war3ShadowPersistentBytesEvicted = 0;
   War3ShadowPersistentDiagnosticsFrame
       m_war3ShadowPersistentDiagnosticsFrame = {};
@@ -3123,6 +3178,9 @@ private:
                                   bool DynamicSysmemIBO,
                                   const war3::gpu_skin::GpuSkinResolvedDraw*
                                       gpuSkinResolved);
+  war3::render::native_input::NativeDrawMaterialFacts
+  War3CaptureNativeDrawMaterialFacts(void* renderablePart,
+      uint32_t layerIndex) const;
   bool War3CaptureShadowDrawMetadata(
       D3DPRIMITIVETYPE primitiveType, INT baseVertexIndex,
       UINT minVertexIndex, UINT numVertices, UINT startVal, UINT countVal,
@@ -3232,6 +3290,7 @@ private:
   War3SsaoPass *m_ssaoPass = nullptr;
   War3AAPass *m_aaPass = nullptr;
   War3PostProcess *m_war3PostProcess = nullptr;
+  std::unique_ptr<war3::reimpl::War3InstanceBuffer> m_war3InstanceBuffer;
   dxvk::war3::shadow::DxvkValidationBackend m_war3SemanticDxvkBackend;
   Com<IDirect3DVertexShader9> m_shadowFakeVS;
   Com<IDirect3DPixelShader9> m_shadowFakePS;
@@ -3243,6 +3302,7 @@ private:
 
 public:
   DWORD GetPureGameAmbient() const { return m_pureGameAmbient; }
+  war3::reimpl::War3InstanceBuffer* GetWar3InstanceBuffer();
   War3ShadowReceiverPass* GetWar3ShadowReceiverPass() const {
     return m_shadowReceiverPass;
   }

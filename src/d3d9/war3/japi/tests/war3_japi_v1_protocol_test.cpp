@@ -35,7 +35,7 @@ void TestSystemAndForwarding() {
   const auto version =
       Dispatch(Carrier::LocalizedString, "warvk:v1;system.version");
   Check(version.ok(), "system.version must succeed without a backend");
-  Check(version.text == "WarVK JAPI 1.22.01",
+  Check(version.text == "WarVK JAPI 1.22.02",
         "system.version must identify the integrated runtime");
 
   const auto protocol =
@@ -51,6 +51,15 @@ void TestSystemAndForwarding() {
 }
 
 void TestStrictScalars() {
+  CheckError(Carrier::Preloader, "warvk:v1;unit.walkLoopEnabled;i:1048577;b:0",
+             ErrorCode::UnsupportedFeature,
+             "experimental Walk API must remain unavailable in protocol-only builds");
+  CheckError(Carrier::Preloader, "warvk:v1;unit.walkLoopEnabled;i:1048577;b:true",
+             ErrorCode::InvalidBoolean,
+             "Walk switch must require the strict boolean wire form");
+  CheckError(Carrier::Hotkey, "warvk:v1;unit.walkLoopEnabled;i:1048577;b:0",
+             ErrorCode::CarrierMismatch,
+             "Walk switch must not accept a query carrier");
   CheckError(Carrier::Preloader, "warvk:v1;csm.setLayout;i:+1;r:4000",
              ErrorCode::InvalidInteger, "leading plus must be rejected");
   CheckError(Carrier::Preloader, "warvk:v1;csm.setLayout;i:01;r:4000",

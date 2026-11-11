@@ -28,6 +28,7 @@
 #include "../../../dxvk/dxvk_descriptor.h"
 #include "../../../dxvk/dxvk_image.h"
 #include "../../../dxvk/dxvk_sampler.h"
+#include "../render/war3_native_draw_material_facts.h"
 
 #include <array>
 #include <atomic>
@@ -51,6 +52,7 @@ namespace shadow {
 ///       scene build 时已经 invalidate。
 /// @note `Rc<...>` 保活 image view / sampler，避免上层纹理切换后出现悬空。
 struct War3ShadowAlphaTestPayload {
+  render::native_input::NativeDrawMaterialFacts nativeDrawMaterial;
   /// 是否启用 alpha-test（==1 时 shader p_flags bit2 会亮）。
   bool alphaTestEnabled = false;
   /// 从 D3DRS_ALPHAREF 取整后换算的 [0,1] 阈值；不再用硬编码 0.5。

@@ -8,6 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 TOOLS = ROOT / 'src/d3d9/war3/tools'
 CPP = (TOOLS / 'war3_async_screenshot.cpp').read_text(encoding='utf-8')
 CORE = (TOOLS / 'war3_async_screenshot_core.h').read_text(encoding='utf-8')
+IO = (TOOLS / 'war3_async_screenshot_io.h').read_text(encoding='utf-8')
 SWAP = (ROOT / 'src/d3d9/d3d9_swapchain.cpp').read_text(encoding='utf-8')
 HOOK = (ROOT / 'src/d3d9/war3/hooks/war3_native_capture.cpp').read_text(encoding='utf-8')
 
@@ -115,6 +116,30 @@ class AsyncScreenshotTests(unittest.TestCase):
         self.assertIn('if (r.owner == this) r.owner = nullptr',CPP)
         self.assertIn('m_asyncScreenshot.release();',SWAP)
         self.assertIn('worker.join()',CPP)
+
+    def test_shutdown_uses_shared_cancel_and_completion_control(self):
+        shutdown = CPP.split('~Impl()', 1)[1].split('void releaseRetiredSlots()', 1)[0]
+        self.assertIn('screenshot::CancelAndJoin(stop, fileIo,', shutdown)
+        self.assertIn('workerHandle.waitForCompletion()', shutdown)
+        self.assertIn('workerHandle.cancelPending()', shutdown)
+        self.assertIn('workerHandle.joinAndClose(', shutdown)
+        self.assertNotIn('worker.native_handle()', CPP)
+        self.assertIn('DuplicateHandle(GetCurrentProcess(), GetCurrentThread()', IO)
+        self.assertIn('SYNCHRONIZE | THREAD_TERMINATE', IO)
+        self.assertIn('CancelSynchronousIo(handle)', IO)
+        self.assertIn('ERROR_NOT_FOUND', IO)
+        self.assertLess(shutdown.index('worker.join()'),
+                        shutdown.index('screenshot::FailPendingHistoryAfterJoin(slots)'))
+        for forbidden in ('detach(', 'TerminateThread(', 'State::Retired', 'buffer = nullptr'):
+            self.assertNotIn(forbidden, shutdown)
+        self.assertIn('join();', IO)
+
+    def test_file_cancellation_phase_excludes_notifications(self):
+        save = CPP.split('bool save(const Slot& slot)', 1)[1].split('void run()', 1)[0]
+        self.assertLess(save.index('fileIo.enter(stop)'), save.index('File file;'))
+        self.assertLess(save.index('MoveFileExW('), save.index('filePhase.finish()'))
+        self.assertLess(save.index('filePhase.finish()'), save.index('Logger::info('))
+        self.assertLess(save.index('filePhase.finish()'), save.index('evidence::Record('))
 
     def test_no_fake_save_or_overwrite(self):
         save = CPP.split('bool save(const Slot& slot)',1)[1].split('void run()',1)[0]

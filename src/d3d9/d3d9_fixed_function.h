@@ -15,7 +15,7 @@
 
 namespace dxvk {
 
-  class D3D9DeviceEx;
+  class DxvkDevice;
   class SpirvModule;
 
   struct D3D9Options;
@@ -128,25 +128,37 @@ namespace dxvk {
     bool operator () (const D3D9FFShaderKeyFS& a, const D3D9FFShaderKeyFS& b) const;
   };
 
+  // CPU/SPIR-V compilation only. Uses the same key naming and compiler as the
+  // shipping renderer; registration and resource submission remain the caller's
+  // responsibility. Options must be valid for the duration of the call.
+  Rc<DxvkShader> CompileD3D9FixedFunctionShader(
+    const D3D9FFShaderKeyVS&    Key,
+    const D3D9Options*          options);
+
+  Rc<DxvkShader> CompileD3D9FixedFunctionShader(
+    const D3D9FFShaderKeyFS&    Key,
+    const D3D9Options*          options);
+
   class D3D9FFShader {
 
   public:
 
     D3D9FFShader(
-            D3D9DeviceEx*         pDevice,
+      const Rc<DxvkDevice>&      device,
+      const D3D9Options*          options,
       const D3D9FFShaderKeyVS&    Key);
 
     D3D9FFShader(
-            D3D9DeviceEx*         pDevice,
+      const Rc<DxvkDevice>&      device,
+      const D3D9Options*          options,
       const D3D9FFShaderKeyFS&    Key);
 
     D3D9FFShader(
-            D3D9DeviceEx*         pDevice,
+      const Rc<DxvkDevice>&      device,
             DxsoProgramType       ProgramType,
             bool                  War3GpuSkinVariant = false);
 
-    template <typename T>
-    void Dump(D3D9DeviceEx* pDevice, const T& Key, const std::string& Name);
+    void Dump(const D3D9Options* options);
 
     Rc<DxvkShader> GetShader() const {
       return m_shader;
@@ -165,14 +177,16 @@ namespace dxvk {
 
     D3D9FFShaderModuleSet() = delete;
 
-    explicit D3D9FFShaderModuleSet(D3D9DeviceEx* pDevice);
+    explicit D3D9FFShaderModuleSet(const Rc<DxvkDevice>& device);
 
     D3D9FFShader GetShaderModule(
-            D3D9DeviceEx*         pDevice,
+      const Rc<DxvkDevice>&      device,
+      const D3D9Options*          options,
       const D3D9FFShaderKeyVS&    ShaderKey);
 
     D3D9FFShader GetShaderModule(
-            D3D9DeviceEx*         pDevice,
+      const Rc<DxvkDevice>&      device,
+      const D3D9Options*          options,
       const D3D9FFShaderKeyFS&    ShaderKey);
 
     const D3D9FFShader& GetVSUbershaderModule() const {

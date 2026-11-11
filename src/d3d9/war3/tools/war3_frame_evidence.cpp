@@ -64,7 +64,7 @@ json PaletteObjectHeaderJson() {
   // 当时首见计数器**只在版本 3** 出现，因为版本 2 的 counters 是注册集合，
   // 追加字段会让生产解析器以 "paletteObject counter fields mismatch" 拒绝整份导出
   // （实测 A/B/C/D 四场景全败），且未使用首见链的块仍是版本 2。
-  // ⇒ 现在写方**恒定 v4**：v4 的 counters **始终**含这两个键（不再有"缺席"的情形）。
+  // ⇒ v4 起 counters 始终含这两个键（不再有"缺席"的情形）。
   // 2026-09-18 阶段 C：**恒定 v4**。原实现按 `firstSightUsed()` 决定是否写入这两个计数器、
   // 并把块版本在 2/3 之间**动态**选择 —— 同一个二进制会产生两种块形状，读方必须同时接受，
   // 而"版本"本应是**契约**而不是**内容摘要**。裁定要求：新写方一律输出 v4。
@@ -74,7 +74,7 @@ json PaletteObjectHeaderJson() {
   json result=json::object();
   // 【历史 × 3 代】下面这段（D2）→ 批次 3 → 阶段 C 是**同一处的三代叙述**，它们互相矛盾是**正常的历史**：
   //   第 1 代说"因此头块版本必须是 2"；第 2 代说"抬到 3"；第 3 代说"恒定 4"。
-  //   **现行事实只有一条：本函数恒定写 `version=4`（见下方 result["version"]=4）。**
+  //   以上均为历史版本；当前恒定 v5，新增 data[5] 的完整 attemptSerial。
   // 2026-09-17 上级裁定 D2（⑧分段 + ⑦身份证明种类）：生产写入侧现在**确实**写分段（记录级
   // data[3]=windowSegment，Reset 开第 1 个窗口、ResetForSessionTransition 递增）与载明的身份证明
   // 种类（words32[15]=identityProofKind），因此头块版本必须是 **2**（版本 2 = 现行生产形状）。
@@ -86,7 +86,7 @@ json PaletteObjectHeaderJson() {
   // 2026-09-18 阶段 C：**恒定 v4**（链型 + 统一终态 ObservationClosed）。
   // 不再按 `firstSightUsed()` 在 2/3 之间动态选择；v1/v2/v3 仍按各自契约被读方解析，
   // 但**新写方不再产生它们**。旧产物（无 version 的冻结形状）仍按 v1 读取，一位不放宽。
-  result["version"]=4;
+  result["version"]=5;
   // 2026-09-17 往返测试暴露的 G1：读方要求这里是 JSON **整数**（counters 仍是规范十进制字符串）。
   result["watchCount"]=header.watchCount;
   result["counters"]=counters;

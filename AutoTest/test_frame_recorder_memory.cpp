@@ -51,8 +51,8 @@ int main(){try{
   CHECK(RecorderMemoryAdmission(m,4097,4097)==R::Contiguous);
   m.contiguousKnown=false;CHECK(RecorderMemoryAdmission(m,4096,4096)==R::Contiguous);
   CHECK(RecorderMemoryAdmission(m,4096,0)==R::None);
-  CHECK(inputs::HostPayloadBudget==231211008ull); // 220.5 MiB, including metadata
-  CHECK(inputs::HostPayloadBudgetForSlots(224)==89915392ull); // 85.75 MiB internal profile
+  CHECK(inputs::HostPayloadBudget==259522560ull); // 247.5 MiB, including owned material metadata
+  CHECK(inputs::HostPayloadBudgetForSlots(224)==100925440ull); // 96.25 MiB internal profile
   CHECK(Ring::storageBytes(262144)>=100ull*1024*1024);
   CHECK(Ring::storageBytes(256)==Ring::storageBytes(1)*256);
   // A small ring must not allocate the maximum; ownership survives reject and

@@ -29,6 +29,8 @@
 #include "../render/war3_shadow_producer_policy.h"
 #include "../render/war3_shadow_runtime_bridge.h"
 #include "../shadow/war3_shadow_alpha_test_payload.h"
+#include "../../d3d9_war3_weather.h"
+#include "../../d3d9_war3_volumetric_light.h"
 #include "../../util/util_env.h"
 namespace dxvk::war3 {
 
@@ -2522,6 +2524,8 @@ void War3PerfMonitor::notePersistentGeometryFrame(
   m_currentFrameWorkload.expiryQueueSize = stats.expiryQueueSize;
   m_currentFrameWorkload.bytesCap = stats.bytesCap;
   m_currentFrameWorkload.bytesUsed = stats.bytesUsed;
+  m_currentFrameWorkload.bytesLive = stats.bytesLive;
+  m_currentFrameWorkload.bytesRetired = stats.bytesRetired;
   m_currentFrameWorkload.bytesEvicted = stats.bytesEvicted;
   m_currentFrameWorkload.bytesEvictedDelta =
       m_shadowBudgetAggregate.persistentDiagnosticsFramesObserved != 0u &&
@@ -2590,6 +2594,8 @@ void War3PerfMonitor::notePersistentGeometryFrame(
 
   agg.persistentPoolBytesCapLast = stats.bytesCap;
   agg.persistentPoolBytesUsedLast = stats.bytesUsed;
+  agg.persistentPoolBytesLiveLast = stats.bytesLive;
+  agg.persistentPoolBytesRetiredLast = stats.bytesRetired;
   agg.persistentPoolBytesUsedMax =
       (std::max)(agg.persistentPoolBytesUsedMax, stats.bytesUsed);
   agg.persistentPoolBytesUsedGaugeSum += stats.bytesUsed;
@@ -4983,6 +4989,30 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
   }
   json << "    ]\n";
   json << "  },\n";
+
+  // Export-time diagnostics, not members of the sampled workload series.
+  // Distinct frame tags remain visible; command recording is not GPU completion.
+  const auto weatherDraw = QueryWar3WeatherDiagnostics();
+  const auto weatherVolume = QueryWar3WeatherVolumeDiagnostics();
+  json << "  \"weatherObservation\": {"
+       << "\"sampleKind\":\"independent-live-diagnostics-at-export\","
+       << "\"gpuCompletionCertified\":false,"
+       << "\"driverAndRetiredResourcesIncluded\":false,"
+       << "\"snow\":{\"stage\":\"" << War3WeatherDrawStageName(weatherDraw.stage)
+       << "\",\"frameSerial\":" << weatherDraw.frameSerial
+       << ",\"mapEpoch\":" << weatherDraw.mapEpoch
+       << ",\"deviceEpoch\":" << weatherDraw.deviceEpoch
+       << ",\"commandsRecorded\":" << boolJson(weatherDraw.submitted)
+       << ",\"estimatedActiveParticles\":" << weatherDraw.activeParticles
+       << ",\"capacity\":" << weatherDraw.capacity
+       << ",\"currentResourceBytes\":" << weatherDraw.resourceBytes << "},"
+       << "\"volume\":{\"stage\":\"" << weatherVolume.stage
+       << "\",\"frameSerial\":" << weatherVolume.frameSerial
+       << ",\"mapEpoch\":" << weatherVolume.mapEpoch
+       << ",\"deviceEpoch\":" << weatherVolume.deviceEpoch
+       << ",\"compositeRecorded\":" << boolJson(weatherVolume.compositeSubmitted)
+       << ",\"currentResourceBytes\":" << weatherVolume.resourceBytes
+       << ",\"admittedShaderWork\":" << weatherVolume.admittedShaderWork << "}},\n";
 
   const auto& residency = snapshot.resourceResidency;
   json << "  \"resourceResidencyCensus\": {\n";
@@ -7621,6 +7651,10 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg.persistentPoolBytesCapLast << ",\n";
   json << "    \"persistentPoolBytesUsed\": "
        << shadowAgg.persistentPoolBytesUsedLast << ",\n";
+  json << "    \"persistentPoolBytesLiveLast\": "
+       << shadowAgg.persistentPoolBytesLiveLast << ",\n";
+  json << "    \"persistentPoolBytesRetiredLast\": "
+       << shadowAgg.persistentPoolBytesRetiredLast << ",\n";
   json << "    \"persistentPoolBytesUsedMax\": "
        << shadowAgg.persistentPoolBytesUsedMax << ",\n";
   json << "    \"persistentPoolBytesUsedAverage\": "
@@ -9150,6 +9184,10 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg.persistentPoolBytesCapLast << ",\n";
   json << "    \"persistentPoolBytesUsed\": "
        << shadowAgg.persistentPoolBytesUsedLast << ",\n";
+  json << "    \"persistentPoolBytesLiveLast\": "
+       << shadowAgg.persistentPoolBytesLiveLast << ",\n";
+  json << "    \"persistentPoolBytesRetiredLast\": "
+       << shadowAgg.persistentPoolBytesRetiredLast << ",\n";
   json << "    \"persistentPoolBytesUsedMax\": "
        << shadowAgg.persistentPoolBytesUsedMax << ",\n";
   json << "    \"persistentPoolBytesUsedAverage\": "
@@ -9901,7 +9939,8 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
           "\"s1EarlyReplayInstanceCount\", "
           "\"s1EarlyReplayFallbackCount\", "
           "\"s1EarlySourceMismatchEvictCount\", "
-          "\"s1EarlyReplayClosureMismatch\"],\n";
+          "\"s1EarlyReplayClosureMismatch\", \"poolBytesLive\", "
+          "\"poolBytesRetired\"],\n";
   json << "  \"workloadSeries\": [\n";
   first = true;
   for (const auto* f : frames) {
@@ -10024,7 +10063,8 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
          << w.s1EarlyReplayInstanceCount << ", "
          << w.s1EarlyReplayFallbackCount << ", "
          << w.s1EarlySourceMismatchEvictCount << ", "
-         << (w.s1EarlyReplayClosureMismatch ? 1 : 0) << "]";
+         << (w.s1EarlyReplayClosureMismatch ? 1 : 0) << ", "
+         << w.bytesLive << ", " << w.bytesRetired << "]";
   }
   json << "\n  ],\n";
 

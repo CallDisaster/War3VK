@@ -5,10 +5,12 @@
 #include "d3d9_war3_pipeline.h"
 #include "war3/render/war3_owned_image_layout.h"
 #include "war3/render/war3_volumetric_shader_work_admission.h"
+#include "war3/render/war3_weather_resource_retry.h"
 #include "../dxvk/dxvk_hash.h"
 #include "../dxvk/dxvk_buffer.h"
 
 #include <array>
+#include <memory>
 #include <unordered_map>
 
 namespace dxvk {
@@ -27,9 +29,14 @@ namespace dxvk {
         uint32_t width = 0u;
         uint32_t height = 0u;
         bool compositeSubmitted = false;
+        // Current image/buffer backing, excluding pipeline/sampler driver
+        // allocations and older replaced resources retained by queued work.
+        uint64_t resourceBytes = 0u;
+        uint64_t admittedShaderWork = 0u;
     };
 
     War3VolumetricExecutionDiagnostics QueryWar3VolumetricExecutionDiagnostics();
+    War3VolumetricExecutionDiagnostics QueryWar3WeatherVolumeDiagnostics();
 
     struct War3VolumetricShaderWorkRuntimeDiagnostics {
         uint64_t frameSerial = 0u;
@@ -50,13 +57,19 @@ namespace dxvk {
      */
     class War3VolumetricLightPass final : public War3RenderPass {
     public:
-        explicit War3VolumetricLightPass(D3D9DeviceEx* device);
+        explicit War3VolumetricLightPass(D3D9DeviceEx* device,
+                                         bool weatherOnly = false);
         ~War3VolumetricLightPass();
 
         War3InsertionPoint Point() const override { return War3InsertionPoint::BeforeUi; }
         void Run(const Rc<DxvkCommandList>& ctx, const War3PipelineInput& input) override;
 
     private:
+        void RunMedium(const Rc<DxvkCommandList>& ctx,
+                       const War3PipelineInput& input,
+                       const War3VolumetricLightSettings& settings);
+        uint64_t resourceBytes() const;
+        void releasePipelines() noexcept;
         struct PipelineKey {
             VkFormat format = VK_FORMAT_UNDEFINED;
             VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
@@ -88,6 +101,8 @@ namespace dxvk {
                              uint32_t directionalGuideDivisor);
         bool ensureFroxelResources(VkExtent3D fullExtent,
                                    War3VolumetricQuality quality);
+        void preparePointShadowFallbackResources();
+        void prepareWeatherDescriptors(const War3PipelineInput& input);
         void invalidateFroxelHistory();
         void ensurePointShadowFallbackResources(
             const Rc<DxvkCommandList>& ctx);
@@ -107,13 +122,24 @@ namespace dxvk {
                                   const VkRect2D& effectScissor,
                                   int effectiveSamples,
                                   uint32_t& outPointShadowedLightCount,
-                                  int32_t& outEffectiveBackend);
+                                  int32_t& outEffectiveBackend,
+                                  const War3VolumetricLightSettings& settings);
         bool compositeVolumetricLight(const Rc<DxvkCommandList>& ctx,
                                       const War3PipelineInput& input,
                                       const VkRect2D& compositeScissor);
 
         D3D9DeviceEx* m_parent = nullptr;
         Rc<DxvkDevice> m_device;
+        const bool m_weatherOnly;
+        // Separate resources keep authored High and weather Medium from
+        // alternating image allocation sizes or aliasing the same UBO slot.
+        std::unique_ptr<War3VolumetricLightPass> m_weatherOwner;
+        war3::render::WeatherResourceRetry m_weatherResourceRetry;
+        bool m_weatherFroxelPrepared = false;
+        uint64_t m_weatherRecordedFrame = 0u;
+        uint64_t m_weatherRecordedMapEpoch = 0u;
+        uint64_t m_weatherRecordedDeviceEpoch = 0u;
+        int32_t m_lastLoggedBackend = -1;
 
         Rc<DxvkSampler> m_linearSampler;
         const DxvkPipelineLayout* m_layout = nullptr;
@@ -184,6 +210,7 @@ namespace dxvk {
         uint64_t m_froxelHistoryFrameSerial = 0u;
         uint64_t m_froxelHistoryMapEpoch = 0u;
         uint64_t m_froxelHistoryDeviceEpoch = 0u;
+        uint64_t m_froxelHistoryWeatherRevision = 0u;
         float m_froxelHistoryNear = 0.0f;
         float m_froxelHistoryFar = 0.0f;
         Matrix4 m_froxelHistoryViewProj = {};

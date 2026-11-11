@@ -1,6 +1,7 @@
 """Production collector -> real JSON emitter -> strict reader, plus wiring guards."""
 import copy
 import json
+import os
 from pathlib import Path
 import subprocess
 import unittest
@@ -8,7 +9,7 @@ import unittest
 from analyze_stage11_budget_census import REASONS, TAG_DIMENSIONS, unique_pairs, validate
 
 ROOT = Path(__file__).resolve().parents[1]
-EXE = ROOT / "build32/src/d3d9/war3_stage11_budget_census_test.exe"
+EXE = Path(os.environ.get("WARVK_CPU_TEST_BUILD_DIR", str(ROOT / "build32"))) / "src/d3d9/war3_stage11_budget_census_test.exe"
 
 
 def _v2_sample():

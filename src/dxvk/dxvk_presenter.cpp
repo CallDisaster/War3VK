@@ -22,7 +22,8 @@ namespace dxvk {
   : m_device(device), m_signal(signal),
     m_vki(device->instance()->vki()),
     m_vkd(device->vkd()),
-    m_surfaceProc(std::move(proc)) {
+    m_surfaceProc(std::move(proc)),
+    m_diagnosticReadback(desc.diagnosticReadback) {
     // Only enable FSE if the user explicitly opts in. On Windows, FSE
     // is required to support VRR or HDR, but blocks alt-tabbing or
     // overlapping windows, which breaks a number of games.
@@ -671,6 +672,11 @@ namespace dxvk {
       return status;
     }
 
+    // Diagnostic copies must be supported by the generic surface and every
+    // selected/compatible present mode whose capabilities we query below.
+    // Reuse those production queries rather than inventing a fallback image.
+    VkImageUsageFlags diagnosticSupportedUsage = caps.surfaceCapabilities.supportedUsageFlags;
+
     // Select image extent based on current surface capabilities, and return
     // immediately if we cannot create an actual swap chain.
     VkExtent2D imageExtent = pickImageExtent(caps.surfaceCapabilities, m_preferredExtent);
@@ -729,6 +735,8 @@ namespace dxvk {
         return status;
       }
 
+      diagnosticSupportedUsage &= caps.surfaceCapabilities.supportedUsageFlags;
+
       compatibleModes.resize(compatibleModeInfo.presentModeCount);
       compatibleModeInfo.pPresentModes = compatibleModes.data();
 
@@ -737,6 +745,8 @@ namespace dxvk {
         Logger::err(str::format("Presenter: Failed to get surface capabilities: ", status));
         return status;
       }
+
+      diagnosticSupportedUsage &= caps.surfaceCapabilities.supportedUsageFlags;
 
       // Remove modes we don't need for the purpose of finding the minimum
       // image count, as well as for swap chain creation later.
@@ -756,6 +766,8 @@ namespace dxvk {
           Logger::err(str::format("Presenter: Failed to get surface capabilities: ", status));
           return status;
         }
+
+        diagnosticSupportedUsage &= caps.surfaceCapabilities.supportedUsageFlags;
 
         minImageCount = std::max(minImageCount, caps.surfaceCapabilities.minImageCount);
 
@@ -809,6 +821,15 @@ namespace dxvk {
     swapInfo.compositeAlpha         = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     swapInfo.presentMode            = m_presentMode;
     swapInfo.clipped                = VK_TRUE;
+
+    if (m_diagnosticReadback) {
+      if (!(diagnosticSupportedUsage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
+        Logger::err("Presenter: Diagnostic swapchain readback requires surface TRANSFER_SRC support");
+        return VK_ERROR_FORMAT_NOT_SUPPORTED;
+      }
+
+      swapInfo.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    }
 
     if (m_device->features().khrSwapchainMutableFormat && formatList.viewFormatCount) {
       swapInfo.flags |= VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR;

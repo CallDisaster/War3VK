@@ -2,6 +2,8 @@
 
 #extension GL_EXT_nonuniform_qualifier : require
 #extension GL_EXT_scalar_block_layout : require
+#extension GL_GOOGLE_include_directive : require
+#include "war3_weather_density.glsl"
 
 layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
 
@@ -53,6 +55,10 @@ uniform FogVolumeBlock {
   uint u_pad1;
   uint u_pad2;
   FogVolume u_volumes[8];
+  vec4 u_weatherMin;
+  vec4 u_weatherMax;
+  vec4 u_weatherControls;
+  vec4 u_weatherMotion;
 } fogVolumes;
 
 layout(push_constant, scalar)
@@ -198,7 +204,10 @@ vec4 evaluateMedium(vec3 worldPos, vec3 cameraRay) {
     sigmaT += densityToSigmaT(max(volume.params.y, 0.0)) * weight;
   }
 
-  sigmaT = clamp(sigmaT, 0.0, 0.01);
+  float weatherSigma = war3WeatherSigma(worldPos, fogVolumes.u_weatherMin,
+      fogVolumes.u_weatherMax, fogVolumes.u_weatherControls,
+      fogVolumes.u_weatherMotion);
+  sigmaT = clamp(sigmaT + weatherSigma, 0.0, 0.01);
   if (!finiteFloat(sigmaT) || sigmaT <= 1.0e-8)
     return vec4(0.0);
 
@@ -229,6 +238,8 @@ vec4 evaluateMedium(vec3 worldPos, vec3 cameraRay) {
   source *= sigmaS * intensity;
   if (!finiteVec3(source))
     source = vec3(0.0);
+  // Independent, bounded ambient snow scattering survives absent sun/CSM.
+  source += weatherSigma * vec3(0.30, 0.34, 0.40);
   return vec4(max(source, vec3(0.0)), sigmaT);
 }
 

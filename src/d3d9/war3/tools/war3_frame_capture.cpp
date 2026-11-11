@@ -300,7 +300,7 @@ bool WriteBmp24(const std::filesystem::path& outputPath, const uint8_t* pixels,
   return true;
 }
 
-bool CaptureSurfaceToBmp(D3D9DeviceEx* device, D3D9Surface* sourceSurface,
+bool CaptureSurfaceToBmp(IDirect3DDevice9* device, D3D9Surface* sourceSurface,
                          const std::filesystem::path& outputPath,
                          uint32_t* outWidth, uint32_t* outHeight,
                          std::string* outError) {
@@ -479,7 +479,7 @@ bool HasPendingFrameCaptureRequest() {
   return GetFileAttributesA(requestPath.c_str()) != INVALID_FILE_ATTRIBUTES;
 }
 
-bool ProcessPendingFrameCapture(D3D9DeviceEx* device, D3D9Surface* sourceSurface,
+bool ProcessPendingFrameCapture(IDirect3DDevice9* device, D3D9Surface* sourceSurface,
                                 War3FrameCaptureResult* outResult) {
   timeline::Scope capturePollTimeline("FrameCapture/Poll");
   War3FrameCaptureResult result = {};

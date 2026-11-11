@@ -667,6 +667,14 @@ namespace dxvk {
     m_statCounters.addCtr(DxvkStatCounter::GpuSyncTicks, us.count());
   }
 
+  VkResult DxvkDevice::waitForSubmissionUntil(DxvkSubmitStatus* status,
+      std::chrono::steady_clock::time_point deadline) {
+    if (status->result.load(std::memory_order_acquire) == VK_NOT_READY
+        && !m_submissionQueue.synchronizeSubmissionUntil(status, deadline))
+      return VK_TIMEOUT;
+    return status->result.load(std::memory_order_acquire);
+  }
+
 
   void DxvkDevice::waitForResource(const DxvkPagedResource& resource, DxvkAccess access) {
     if (resource.isInUse(access)) {

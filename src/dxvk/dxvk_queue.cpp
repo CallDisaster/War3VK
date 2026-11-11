@@ -96,6 +96,14 @@ namespace dxvk {
     });
   }
 
+  bool DxvkSubmissionQueue::synchronizeSubmissionUntil(DxvkSubmitStatus* status,
+      std::chrono::steady_clock::time_point deadline) {
+    std::unique_lock<dxvk::mutex> lock(m_mutex);
+    return m_submitCond.wait_until(lock, deadline, [status] {
+      return status->result.load(std::memory_order_acquire) != VK_NOT_READY;
+    });
+  }
+
 
   void DxvkSubmissionQueue::waitForIdle() {
     std::unique_lock<dxvk::mutex> lock(m_mutex);

@@ -4,6 +4,7 @@
 #include <d3d9.h>
 #include "imgui.h"
 #include "war3_render_stats_view.h"
+#include "../../d3d9_texture.h"
 #include <atomic>
 
 namespace dxvk {
@@ -17,7 +18,16 @@ namespace dxvk::war3 {
         static War3Imgui& get();
 
         void initialize(HWND hwnd, D3D9DeviceEx* device);
-        void shutdown();
+        void beginDeviceTeardown(D3D9DeviceEx* owner);
+        void shutdown(D3D9DeviceEx* owner);
+        void invalidateDeviceObjects(D3D9DeviceEx* owner);
+        void restoreDeviceObjects(D3D9DeviceEx* owner);
+        bool isOwner(const D3D9DeviceEx* owner) const {
+            return m_initialized && !m_retiring && m_device == owner;
+        }
+        bool ownsWindow(HWND hwnd) const {
+            return m_initialized && !m_retiring && m_hwnd == hwnd;
+        }
         
         void newFrame();
         void endFrame();
@@ -49,6 +59,8 @@ namespace dxvk::war3 {
         void drawCursorOverlay();
 
         bool m_initialized = false;
+        bool m_retiring = false;
+        ImGuiContext* m_context = nullptr;
         HWND m_hwnd = nullptr;
         bool m_hasRendered = false;
         bool m_frameStarted = false;
@@ -57,7 +69,7 @@ namespace dxvk::war3 {
         ui::RenderStatsRefresh m_renderStatsRefresh;
 
         // Custom Cursor
-        IDirect3DTexture9* m_cursorTexture = nullptr;
+        Com<D3D9Texture2D, false> m_cursorTexture;
         int m_cursorWidth = 0;
         int m_cursorHeight = 0;
         int m_cursorHotX = 0;

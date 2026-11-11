@@ -71,7 +71,7 @@ TEST_CPP = (
     "war3_live_palette_selection_test.cpp"
 )
 MESON = ROOT / "src/d3d9/meson.build"
-TEST_EXE = ROOT / "build32/src/d3d9/war3_live_palette_selection_test.exe"
+TEST_EXE = Path(os.environ.get("WARVK_CPU_TEST_BUILD_DIR", str(ROOT / "build32"))) / "src/d3d9/war3_live_palette_selection_test.exe"
 RECORD_DOC = ROOT / "docs/plan/2026-09-18-m2-3-migration-equivalence-record.md"
 
 # 迁移前（M2-2 迁移已应用、M2-3 未应用）的**未提交工作树**
