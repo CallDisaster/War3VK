@@ -6,6 +6,9 @@ ROOT = Path(__file__).resolve().parents[1]
 def source(p): return (ROOT/p).read_text(encoding='utf-8')
 DEVICE = source('src/d3d9/d3d9_native_light.cpp')
 MAIN = source('src/d3d9/d3d9_device.cpp')
+# Fixed-function key construction moved into this header (x86/x64 shared
+# refactor); the device passes m_nativeLightSplit into both builders.
+KEYS = source('src/d3d9/d3d9_fixed_function_keys.h')
 FF = source('src/d3d9/d3d9_fixed_function.cpp')
 BRIDGE = source('src/d3d9/war3/model/war3_native_light_bridge.cpp')
 SHADOW = source('src/d3d9/d3d9_war3_shadow.cpp')
@@ -61,8 +64,10 @@ class TransactionalNativeLight(unittest.TestCase):
     def test_shader_pair_not_ubershader(self):
         self.assertIn('m_d3d9Options.ffUbershaderVS && !m_nativeLightSplit', MAIN)
         self.assertIn('m_d3d9Options.ffUbershaderFS && !m_nativeLightSplit', MAIN)
-        self.assertIn('key.Data.Contents.NativeLightSplit = m_nativeLightSplit', MAIN)
-        self.assertIn('stage0.NativeLightSplit = m_nativeLightSplit', MAIN)
+        self.assertIn('BuildFixedFunctionVSKey(m_state, m_nativeLightSplit,', MAIN)
+        self.assertIn('BuildFixedFunctionFSKey(m_state, m_nativeLightSplit)', MAIN)
+        self.assertIn('key.Data.Contents.NativeLightSplit = m_nativeLightSplit', KEYS)
+        self.assertIn('stage0.NativeLightSplit = m_nativeLightSplit', KEYS)
     def test_attachment_blend_and_fenced_ownership(self):
         self.assertIn('attachments.color[i+1].view = m_nativeColor.alternate[i]', MAIN)
         self.assertIn('(writeMasks & 0xfu) << (4*i)', MAIN)
