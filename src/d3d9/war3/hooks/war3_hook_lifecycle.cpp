@@ -1890,7 +1890,7 @@ MakeLifecycleCpuScope(const char *name) {
 static int __fastcall Hook_MainRunner(void *thisPtr, void *edx) {
   using namespace dxvk::war3::diagnostics;
   const auto runToken = BeginStartupStage(StartupStage::MainRunner);
-  dxvk::ObserveWar3MainRunnerEnter();
+  dxvk::ObserveWar3MainRunnerEnter("main-runner");
   // 进入主循环时设置线程内标志，避免递归初始化/重入干扰。
   s_inMainRunner = true;
   MarkMainLoopThread();
@@ -1925,7 +1925,7 @@ static int __fastcall Hook_MainRunner(void *thisPtr, void *edx) {
 static int __fastcall Hook_MainRunner_Alt(void *thisPtr, void *edx) {
   using namespace dxvk::war3::diagnostics;
   const auto runToken = BeginStartupStage(StartupStage::MainRunnerAlt);
-  dxvk::ObserveWar3MainRunnerEnter();
+  dxvk::ObserveWar3MainRunnerEnter("main-runner-alt");
   // 备用主循环入口，与主入口保持一致的激活策略。
   s_inMainRunner = true;
   MarkMainLoopThread();

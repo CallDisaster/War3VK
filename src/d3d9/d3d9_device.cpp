@@ -16059,25 +16059,200 @@ D3D9DeviceEx::SetMaterial(const D3DMATERIAL9 *pMaterial) {
   if (unlikely(ShouldRecord()))
     return m_recorder->SetMaterial(pMaterial);
 
-  D3DMATERIAL9 finalMat = *pMaterial;
+  // Keep the game's own material: the ambient rewrite below applies to the
+  // main world only and is undone at the world RenderScene boundary.
+  m_war3PureMaterial = *pMaterial;
+  m_war3PureMaterialValid = true;
+
+  m_state.material =
+      War3EffectiveMaterial(*pMaterial, War3WorldLightingActive());
+  m_dirty.set(D3D9DeviceDirtyFlag::FFVertexData);
+
+  return D3D_OK;
+}
+
+D3DMATERIAL9 D3D9DeviceEx::War3EffectiveMaterial(const D3DMATERIAL9 &pure,
+                                                 bool worldLighting) const {
+  D3DMATERIAL9 finalMat = pure;
 
   // [War3 Shadow] Fix Ambient Lighting
   // Force materials to accept ambient light. War3 often sets this to black,
   // which causes D3DRS_AMBIENT to be ignored.
   // By setting this to white, we allow D3DRS_AMBIENT to control the scene
   // darkness. We only apply this if we have a pipeline (to avoid breaking other
-  // things potentially)
-  if (m_war3Pipeline) {
+  // things potentially), and only for the main world: a UI-owned model such
+  // as the unit portrait keeps the material the game gave it.
+  if (m_war3Pipeline && worldLighting) {
     finalMat.Ambient.r = 1.0f;
     finalMat.Ambient.g = 1.0f;
     finalMat.Ambient.b = 1.0f;
     finalMat.Ambient.a = 1.0f;
   }
 
-  m_state.material = finalMat;
-  m_dirty.set(D3D9DeviceDirtyFlag::FFVertexData);
+  return finalMat;
+}
 
-  return D3D_OK;
+D3DLIGHT9 D3D9DeviceEx::War3EffectiveLight0(const D3DLIGHT9 &pure,
+                                            bool worldLighting) const {
+  D3DLIGHT9 finalLight = pure;
+
+  // [War3 Enhanced] Inject Dynamic Day-Night Cycle Lighting
+  // Only for the main world's light 0 (Main Directional) and if pipeline
+  // settings are valid/initialized. Outside the world RenderScene (portrait,
+  // cursor, menu scenes) the game's own light is used unchanged.
+  if (!m_war3Pipeline || !worldLighting)
+    return finalLight;
+
+  const auto &sun = m_war3Pipeline->GetSettings().sun;
+  if (!sun.enabled) {
+    // Public sun.setEnabled(false) disables direct sunlight. Keeping the
+    // original diffuse/specular here merely restored Warcraft's sun and
+    // made the author-facing switch appear ineffective. Preserve ambient
+    // and never suppress a point/spot light occupying the native slot.
+    if (finalLight.Type == D3DLIGHT_DIRECTIONAL)
+      war3::render::ApplyWar3DisabledSun(finalLight);
+    return finalLight;
+  }
+  // Check if settings are initialized (direction not zero)
+  if (sun.direction.x != 0.0f || sun.direction.y != 0.0f ||
+      sun.direction.z != 0.0f) {
+    // Force Type to Directional
+    finalLight.Type = D3DLIGHT_DIRECTIONAL;
+
+    // Override Direction (D3D9 expects direction vector)
+    finalLight.Direction = {sun.direction.x, sun.direction.y,
+                            sun.direction.z};
+
+    // Override Colors (Apply Intensity)
+    float r = sun.color.x * sun.intensity;
+    float g = sun.color.y * sun.intensity;
+    float b = sun.color.z * sun.intensity;
+
+    finalLight.Diffuse = {r, g, b, 1.0f};
+    finalLight.Specular = {r, g, b, 1.0f};
+
+    // [War3 Shadow] Ambient Injection
+    // Since D3DRS_AMBIENT is ignored by the game engine/shaders,
+    // we MUST inject our calculated ambient into the Light's Ambient term.
+    // This effectively achieves the "Separation" the user wants:
+    // - Diffuse/Specular = Controlled by Sun Logic (Direct Light)
+    // - Ambient = Controlled by our Ambient Logic (Fill Light)
+    // They just travel in the same D3DLIGHT9 struct.
+
+    // Start with a base ambient (e.g. 20% of diffuse) to emulate skylight
+    Vector4 ambColor = {r * 0.2f, g * 0.2f, b * 0.2f, 1.0f};
+
+    // Apply our Override Ambient (calculated from Night/Transition logic)
+    const auto &ambSettings = m_war3Pipeline->GetSettings().ambient;
+    if (ambSettings.overrideEnabled) {
+      // We use MAX blending to ensure we don't darken the scene below our
+      // floor
+      ambColor.x = std::max(ambColor.x, ambSettings.color.x);
+      ambColor.y = std::max(ambColor.y, ambSettings.color.y);
+      ambColor.z = std::max(ambColor.z, ambSettings.color.z);
+    }
+
+    finalLight.Ambient = {ambColor.x, ambColor.y, ambColor.z, 1.0f};
+
+    // Ensure Range is sufficient
+    if (finalLight.Range < 1000.0f)
+      finalLight.Range = 10000.0f;
+  }
+
+  return finalLight;
+}
+
+bool D3D9DeviceEx::War3EffectiveAmbient(DWORD &value,
+                                        bool worldLighting) const {
+  if (!m_war3Pipeline || !worldLighting ||
+      !m_war3Pipeline->GetSettings().ambient.overrideEnabled)
+    return false;
+  const auto &c = m_war3Pipeline->GetSettings().ambient.color;
+  value = D3DCOLOR_ARGB(
+      0xFF,
+      static_cast<int>(std::max(0.0f, std::min(1.0f, c.x)) * 255.0f),
+      static_cast<int>(std::max(0.0f, std::min(1.0f, c.y)) * 255.0f),
+      static_cast<int>(std::max(0.0f, std::min(1.0f, c.z)) * 255.0f));
+  return true;
+}
+
+void D3D9DeviceEx::War3ApplyAmbientSourceForWorldLighting(bool overrideActive) {
+  auto &source = m_state.renderStates[D3DRS_AMBIENTMATERIALSOURCE];
+  if (overrideActive) {
+    // [Fix] Force Ambient Material Source to MATERIAL (ignore Vertex Color)
+    // If we override Ambient, we must ensure the material actually USES it.
+    // War3 Terrain often uses Vertex Color for ambient which might be black.
+    // We force it to use the Material's Ambient (which we forced to White in
+    // SetMaterial).
+    if (source != D3DMCS_MATERIAL) {
+      source = D3DMCS_MATERIAL;
+      m_war3AmbientSourceForced = true;
+      m_dirty.set(D3D9DeviceDirtyFlag::FFVertexShader);
+    }
+    m_dirty.set(D3D9DeviceDirtyFlag::FFVertexData); // Trigger update
+  } else if (m_war3AmbientSourceForced) {
+    // Leaving the world (or the override was switched off): give the game's
+    // own ambient source back.
+    m_war3AmbientSourceForced = false;
+    if (source != m_war3PureAmbientSource) {
+      source = m_war3PureAmbientSource;
+      m_dirty.set(D3D9DeviceDirtyFlag::FFVertexShader);
+      m_dirty.set(D3D9DeviceDirtyFlag::FFVertexData);
+    }
+  }
+}
+
+void D3D9DeviceEx::War3ReapplyWorldLighting() {
+  const bool worldLighting = War3WorldLightingActive();
+
+  if (m_war3PureMaterialValid) {
+    m_state.material = War3EffectiveMaterial(m_war3PureMaterial, worldLighting);
+    m_dirty.set(D3D9DeviceDirtyFlag::FFVertexData);
+  }
+
+  if (m_war3PureLight0Valid && !m_state.lights.empty()) {
+    m_state.lights[0] = War3EffectiveLight0(m_war3PureLight0, worldLighting);
+    if (m_state.IsLightEnabled(0))
+      m_dirty.set(D3D9DeviceDirtyFlag::FFVertexData);
+  }
+
+  if (m_war3PureAmbientValid) {
+    DWORD ambient = m_pureGameAmbient;
+    const bool overrideActive = War3EffectiveAmbient(ambient, worldLighting);
+    if (m_state.renderStates[D3DRS_AMBIENT] != ambient) {
+      m_state.renderStates[D3DRS_AMBIENT] = ambient;
+      m_dirty.set(D3D9DeviceDirtyFlag::FFVertexData);
+    }
+    War3ApplyAmbientSourceForWorldLighting(overrideActive);
+  } else {
+    War3ApplyAmbientSourceForWorldLighting(false);
+  }
+}
+
+void D3D9DeviceEx::War3SetWorldLightingScope(bool inWorld) {
+  D3D9DeviceLock lock = LockDevice();
+
+  const auto previous = m_war3LightingScope;
+  const auto next = war3::render::War3WorldLightingScopeFor(inWorld);
+  if (previous == next)
+    return;
+  m_war3LightingScope = next;
+  ++m_war3LightingScopeSwitches;
+
+  // One-shot evidence that the boundary is live and that the game really
+  // sets light 0 on both sides of it (the portrait side only counts while a
+  // unit is selected).
+  if (m_war3LightingScopeSwitches == 1u || m_war3LightingScopeSwitches == 2400u) {
+    Logger::info(str::format(
+        "WarVK world lighting scope: switches=", m_war3LightingScopeSwitches,
+        " light0 sets world=", m_war3Light0SetsInWorld,
+        " outside=", m_war3Light0SetsOutside));
+  }
+
+  if (!m_war3Pipeline ||
+      !war3::render::War3WorldLightingScopeNeedsReapply(previous, next))
+    return;
+  War3ReapplyWorldLighting();
 }
 
 HRESULT STDMETHODCALLTYPE D3D9DeviceEx::GetMaterial(D3DMATERIAL9 *pMaterial) {
@@ -16112,68 +16287,18 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::SetLight(DWORD Index,
 
   D3DLIGHT9 finalLight = *pLight;
 
-  // [War3 Enhanced] Inject Dynamic Day-Night Cycle Lighting
-  // Only apply to Light 0 (Main Directional) and if pipeline settings are
-  // valid/initialized
+  // The day-night sun rewrite (War3EffectiveLight0) applies to the main
+  // world's light 0 only. Keep the game's own light so the effective one can
+  // be recomputed at the world RenderScene boundary.
   if (Index == 0 && m_war3Pipeline) {
-    const auto &sun = m_war3Pipeline->GetSettings().sun;
-    if (!sun.enabled) {
-      // Public sun.setEnabled(false) disables direct sunlight. Keeping the
-      // original diffuse/specular here merely restored Warcraft's sun and
-      // made the author-facing switch appear ineffective. Preserve ambient
-      // and never suppress a point/spot light occupying the native slot.
-      if (finalLight.Type == D3DLIGHT_DIRECTIONAL)
-        war3::render::ApplyWar3DisabledSun(finalLight);
-      m_state.lights[Index] = finalLight;
-      if (m_state.IsLightEnabled(Index))
-        m_dirty.set(D3D9DeviceDirtyFlag::FFVertexData);
-      return D3D_OK;
-    }
-    // Check if settings are initialized (direction not zero)
-    if (sun.direction.x != 0.0f || sun.direction.y != 0.0f ||
-        sun.direction.z != 0.0f) {
-      // Force Type to Directional
-      finalLight.Type = D3DLIGHT_DIRECTIONAL;
-
-      // Override Direction (D3D9 expects direction vector)
-      finalLight.Direction = {sun.direction.x, sun.direction.y,
-                              sun.direction.z};
-
-      // Override Colors (Apply Intensity)
-      float r = sun.color.x * sun.intensity;
-      float g = sun.color.y * sun.intensity;
-      float b = sun.color.z * sun.intensity;
-
-      finalLight.Diffuse = {r, g, b, 1.0f};
-      finalLight.Specular = {r, g, b, 1.0f};
-
-      // [War3 Shadow] Ambient Injection
-      // Since D3DRS_AMBIENT is ignored by the game engine/shaders,
-      // we MUST inject our calculated ambient into the Light's Ambient term.
-      // This effectively achieves the "Separation" the user wants:
-      // - Diffuse/Specular = Controlled by Sun Logic (Direct Light)
-      // - Ambient = Controlled by our Ambient Logic (Fill Light)
-      // They just travel in the same D3DLIGHT9 struct.
-
-      // Start with a base ambient (e.g. 20% of diffuse) to emulate skylight
-      Vector4 ambColor = {r * 0.2f, g * 0.2f, b * 0.2f, 1.0f};
-
-      // Apply our Override Ambient (calculated from Night/Transition logic)
-      const auto &ambSettings = m_war3Pipeline->GetSettings().ambient;
-      if (ambSettings.overrideEnabled) {
-        // We use MAX blending to ensure we don't darken the scene below our
-        // floor
-        ambColor.x = std::max(ambColor.x, ambSettings.color.x);
-        ambColor.y = std::max(ambColor.y, ambSettings.color.y);
-        ambColor.z = std::max(ambColor.z, ambSettings.color.z);
-      }
-
-      finalLight.Ambient = {ambColor.x, ambColor.y, ambColor.z, 1.0f};
-
-      // Ensure Range is sufficient
-      if (finalLight.Range < 1000.0f)
-        finalLight.Range = 10000.0f;
-    }
+    m_war3PureLight0 = *pLight;
+    m_war3PureLight0Valid = true;
+    const bool worldLighting = War3WorldLightingActive();
+    if (m_war3LightingScope == war3::render::War3WorldLightingScope::World)
+      ++m_war3Light0SetsInWorld;
+    else if (m_war3LightingScope == war3::render::War3WorldLightingScope::Outside)
+      ++m_war3Light0SetsOutside;
+    finalLight = War3EffectiveLight0(*pLight, worldLighting);
   }
 
   m_state.lights[Index] = finalLight;
@@ -16339,52 +16464,41 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::SetRenderState(D3DRENDERSTATETYPE State,
     return m_recorder->SetRenderState(State, Value);
 
   auto &states = m_state.renderStates;
+
+  // [War3 Shadow] Ambient Override
+  // The game's own value is always remembered; the override replaces it only
+  // while world lighting is in scope (see War3SetWorldLightingScope). Doing
+  // this before the redundancy check keeps that check effective-vs-effective,
+  // so a re-sent game value is handled the same in and out of the world.
+  if (unlikely(State == D3DRS_AMBIENT)) {
+    m_pureGameAmbient = Value;
+    m_war3PureAmbientValid = true;
+    const bool overrideActive =
+        War3EffectiveAmbient(Value, War3WorldLightingActive());
+
+    // Debug Log (Limited frequency)
+    static int s_ambLogTimer = 0;
+    if (war3dbg::RenderLogEnabled() &&
+        s_ambLogTimer++ > 300) { // Every ~5 seconds
+      s_ambLogTimer = 0;
+      WAR3_RENDER_LOG("D3D9 SetRenderState(AMBIENT): Game=0x%08X Override=%d "
+                      "Final=0x%08X\n",
+                      m_pureGameAmbient, overrideActive, Value);
+    }
+
+    War3ApplyAmbientSourceForWorldLighting(overrideActive);
+  } else if (unlikely(State == D3DRS_AMBIENTMATERIALSOURCE)) {
+    // An explicit game value replaces a forced one, as before.
+    m_war3PureAmbientSource = Value;
+    m_war3AmbientSourceForced = false;
+  }
+
   const DWORD oldValue = states[State];
 
   if (likely(Value != oldValue)) {
     constexpr uint32_t nvidiaVendorId = uint32_t(DxvkGpuVendor::Nvidia);
     constexpr uint32_t amdVendorId = uint32_t(DxvkGpuVendor::Amd);
     constexpr uint32_t intelVendorId = uint32_t(DxvkGpuVendor::Intel);
-
-    // [War3 Shadow] Ambient Override
-    if (unlikely(State == D3DRS_AMBIENT)) {
-      m_pureGameAmbient = Value;
-      bool overrideActive = false;
-      DWORD finalValue = Value;
-
-      if (m_war3Pipeline &&
-          m_war3Pipeline->GetSettings().ambient.overrideEnabled) {
-        const auto &c = m_war3Pipeline->GetSettings().ambient.color;
-        finalValue = D3DCOLOR_ARGB(
-            0xFF,
-            static_cast<int>(std::max(0.0f, std::min(1.0f, c.x)) * 255.0f),
-            static_cast<int>(std::max(0.0f, std::min(1.0f, c.y)) * 255.0f),
-            static_cast<int>(std::max(0.0f, std::min(1.0f, c.z)) * 255.0f));
-        overrideActive = true;
-      }
-
-      Value = finalValue;
-
-      // Debug Log (Limited frequency)
-      static int s_ambLogTimer = 0;
-      if (war3dbg::RenderLogEnabled() &&
-          s_ambLogTimer++ > 300) { // Every ~5 seconds
-        s_ambLogTimer = 0;
-        WAR3_RENDER_LOG("D3D9 SetRenderState(AMBIENT): Game=0x%08X Override=%d "
-                        "Final=0x%08X\n",
-                        m_pureGameAmbient, overrideActive, Value);
-      }
-
-      // [Fix] Force Ambient Material Source to MATERIAL (ignore Vertex Color)
-      // If we override Ambient, we must ensure the material actually USES it.
-      // War3 Terrain often uses Vertex Color for ambient which might be black.
-      // We force it to use the Material's Ambient (which we forced to White in
-      // SetMaterial).
-      if (overrideActive) {
-        m_state.renderStates[D3DRS_AMBIENTMATERIALSOURCE] = D3DMCS_MATERIAL;
-        m_dirty.set(D3D9DeviceDirtyFlag::FFVertexData); // Trigger update
-      }
-    }
 
     states[State] = Value;
 
@@ -17234,12 +17348,67 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::DrawPrimitive(
   return D3D_OK;
 }
 
+void D3D9DeviceEx::War3FinishBeforeUiFrameTrace() {
+  if (!m_war3Pipeline)
+    return;
+  // One line whenever the shape of the frame changes: which boundary tier
+  // committed the BeforeUi passes and how much UI had already been drawn.
+  const auto bucket = [](uint32_t n) -> uint32_t {
+    return n == 0u ? 0u : (n < 4u ? 1u : (n < 32u ? 2u : 3u));
+  };
+  const bool wants = m_war3Pipeline->WantsBeforeUiInsertion();
+  const bool inWorld = War3RenderState::HasWorldStageThisFrame();
+  const uint32_t signature =
+      (m_war3BeforeUiTraceTier & 0xFu) |
+      (m_war3BeforeUiTraceFrameEnd ? 0x10u : 0u) |
+      (bucket(m_war3BeforeUiTraceUiDraws) << 5u) |
+      (bucket(m_war3BeforeUiTraceUiLikeDraws) << 7u) |
+      (wants ? 0x200u : 0u) | (inWorld ? 0x400u : 0u) |
+      (m_war3BeforeUiTraceReady ? 0x800u : 0u) |
+      (bucket(m_war3BeforeUiTraceWorldDraws) << 12u) |
+      (bucket(m_war3BeforeUiTraceCalls) << 14u) |
+      (m_war3BeforeUiTraceGateRejects != 0u ? 0x10000u : 0u) |
+      (m_war3BeforeUiTraceNotWanted != 0u ? 0x20000u : 0u);
+  ++m_war3BeforeUiTraceFrames;
+  if (signature != m_war3BeforeUiTraceLastSignature) {
+    m_war3BeforeUiTraceLastSignature = signature;
+    const uint32_t n = ++m_war3BeforeUiTraceLogs;
+    if (n <= 12u || (n % 4096u) == 0u) {
+      Logger::info(str::format(
+          "WarVK BeforeUi trace: frame=", m_war3BeforeUiTraceFrames,
+          " tier=", m_war3BeforeUiTraceTier,
+          " frameEnd=", m_war3BeforeUiTraceFrameEnd ? 1 : 0,
+          " uiDrawsBefore=", m_war3BeforeUiTraceUiDraws,
+          " uiLikeBefore=", m_war3BeforeUiTraceUiLikeDraws,
+          " worldBefore=", m_war3BeforeUiTraceWorldDraws,
+          " calls=", m_war3BeforeUiTraceCalls,
+          " gateRejects=", m_war3BeforeUiTraceGateRejects,
+          " notWanted=", m_war3BeforeUiTraceNotWanted,
+          " ready=", m_war3BeforeUiTraceReady ? 1 : 0,
+          " inWorld=", inWorld ? 1 : 0, " wants=", wants ? 1 : 0,
+          " maxStage=", War3RenderState::GetStage(), " n=", n));
+    }
+  }
+  m_war3BeforeUiTraceUiDraws = 0u;
+  m_war3BeforeUiTraceUiLikeDraws = 0u;
+  m_war3BeforeUiTraceWorldDraws = 0u;
+  m_war3BeforeUiTraceCalls = 0u;
+  m_war3BeforeUiTraceGateRejects = 0u;
+  m_war3BeforeUiTraceNotWanted = 0u;
+  m_war3BeforeUiTraceTier = 0u;
+  m_war3BeforeUiTraceFrameEnd = false;
+  m_war3BeforeUiTraceReady = false;
+}
+
 void D3D9DeviceEx::War3MaybeInsertBeforeUi(bool forceFrameEnd) {
   if (CheckVulkanDeviceLostFailStop("War3.BeforeUi"))
     return;
 
   if (!m_war3Pipeline)
     return;
+
+  if (!forceFrameEnd)
+    ++m_war3BeforeUiTraceCalls;
 
   // A map-unload request closes the producer before any render-owned state is
   // changed. Present will apply the coalesced reset and acquire a completed
@@ -17252,14 +17421,19 @@ void D3D9DeviceEx::War3MaybeInsertBeforeUi(bool forceFrameEnd) {
       m_war3ShadowDeviceRebindPending.load(std::memory_order_acquire)) {
     m_war3ShadowDiagPendingProducerRejectCount.fetch_add(
         1u, std::memory_order_relaxed);
+    if (!forceFrameEnd)
+      ++m_war3BeforeUiTraceGateRejects;
     return;
   }
 
   // [性能] 若本帧不需要插入 BeforeUi，则跳过所有分界检测与外部渲染插入。
   // 目的：在“光影/后处理/ShaderPack 全部关闭”时，避免每帧
   // beginExternalRendering 导致的巨大 CPU/GPU 开销，尽可能贴近原生渲染性能。
-  if (!m_war3Pipeline->WantsBeforeUiInsertion())
+  if (!m_war3Pipeline->WantsBeforeUiInsertion()) {
+    if (!forceFrameEnd)
+      ++m_war3BeforeUiTraceNotWanted;
     return;
+  }
 
   // 默认在 Present 阶段绘制 ImGui，确保 UI 不被后处理影响。
   // 仅在显式启用开关时，才在 UI 渲染前插入 ImGui。
@@ -17589,6 +17763,32 @@ void D3D9DeviceEx::War3MaybeInsertBeforeUi(bool forceFrameEnd) {
   const bool depthTestEffectivelyOff = (!uiZTestEnabled) || uiZFuncAlways;
   const bool uiMatrixOrViewportHint =
       uiHasPositionT || uiViewportDiffersFromWorld || !uiProjIsPerspective;
+  // The hooked main-world RenderScene has returned: the world is complete,
+  // in a running and in a paused frame alike (war3_before_ui_boundary.h).
+  const bool worldSceneCompleted =
+      War3RenderState::HasCompletedWorldRenderSceneThisFrame();
+  const bool worldSceneEndBoundary =
+      !forceFrameEnd &&
+      war3::render::War3IsWorldSceneEndBoundary(
+          {worldSceneCompleted, War3RenderState::IsWorldRenderSceneActive(),
+           inWorldThisFrame, haveWorldInput,
+           m_war3Pipeline->HasInsertedBeforeUi()});
+  if (!forceFrameEnd && !m_war3Pipeline->HasInsertedBeforeUi()) {
+    // Diagnostics: what reached the device before this frame's BeforeUi
+    // commit. A menu or HUD batch counted here was drawn under the effects.
+    m_war3BeforeUiTraceReady = m_war3BeforeUiTraceReady || readyForUiBoundary;
+    if (inUiLayer || cat == War3RenderState::StageCategory::UI) {
+      ++m_war3BeforeUiTraceUiDraws;
+      War3RenderState::NoteFrameEvent(War3RenderState::FrameEventUiLayerDraw);
+    } else if (uiHasPositionT || !uiProjIsPerspective) {
+      // Every run of UI-like draws becomes one token, wherever it sits
+      // between the world stages (minimap, portrait, menu...).
+      ++m_war3BeforeUiTraceUiLikeDraws;
+      War3RenderState::NoteFrameEvent(War3RenderState::FrameEventUiLikeDraw);
+    } else {
+      ++m_war3BeforeUiTraceWorldDraws;
+    }
+  }
   // 允许用环境变量回退到“严格 UI
   // 特征触发”，便于对比排查插入时机导致的抽搐问题。
   // - DXVK_WAR3_BEFOREUI_TIER1=0：禁用 Tier1 兜底（仅当满足 Tier2/3/4
@@ -17765,6 +17965,13 @@ void D3D9DeviceEx::War3MaybeInsertBeforeUi(bool forceFrameEnd) {
     }
   }
 
+  // Tier10: the first draw after the world scene. It outranks the heuristic
+  // tiers above and commits at once instead of arming: a paused frame has no
+  // stage 15/18/21 for them to see, and a running frame no longer lets one
+  // HUD/portrait draw slip in under the passes.
+  if (worldSceneEndBoundary)
+    uiBoundaryTier = war3::render::kWar3BeforeUiWorldSceneEndTier;
+
   bool semanticSceneTailBoundary = false;
   if constexpr (dxvk::war3::internal::
                     kShadowSemanticCoreSceneTailBoundaryFallbackEnabled) {
@@ -17900,12 +18107,63 @@ void D3D9DeviceEx::War3MaybeInsertBeforeUi(bool forceFrameEnd) {
     }
   }
 
+  // Frame-end fallback (called from Present): no draw committed the boundary
+  // this frame. Running the passes now is correct only while the cached world
+  // RT still holds the world alone, e.g. a cinematic with the interface
+  // hidden. Once anything was drawn after the world scene, the shadow
+  // receiver / volumetric light / SSAO / bloom would be composited on top of
+  // it; that frame keeps the game's own image instead.
+  if (forceFrameEnd && isUiBoundaryDraw) {
+    static const bool s_allowFrameEndAfterUi =
+        env::getEnvVar("DXVK_WAR3_BEFOREUI_FRAME_END_AFTER_UI") == "1";
+    const bool refuse = !war3::render::War3FrameEndFallbackAllowed(
+        worldSceneCompleted, m_war3DrawsAfterWorldSceneThisFrame,
+        s_allowFrameEndAfterUi);
+    const uint64_t occurrence =
+        refuse ? ++m_war3BeforeUiFrameEndRefusedCount
+               : ++m_war3BeforeUiFrameEndCommitCount;
+    if (occurrence <= 4u || occurrence % 3600u == 0u) {
+      Logger::info(str::format(
+          "WarVK BeforeUi frame-end fallback: ",
+          refuse ? "skipped (drawn after world)" : "ran",
+          " n=", occurrence,
+          " sceneDone=", worldSceneCompleted ? 1 : 0,
+          " drawsAfterWorld=", m_war3DrawsAfterWorldSceneThisFrame,
+          " uiDraw=", m_war3UiDrawSeenThisFrame ? 1 : 0,
+          " uiDispatch=", uiDispatchSeen ? 1 : 0,
+          " uiBatch=", uiBatchSeenThisFrame ? 1 : 0,
+          " ready=", readyForUiBoundary ? 1 : 0,
+          " done21Main=", completedMainWorld21 ? 1 : 0,
+          " done21=", completedStage21 ? 1 : 0,
+          " reached15=", reachedStage15 ? 1 : 0));
+    }
+    if (refuse) {
+      War3RenderState::NoteFrameEvent(
+          War3RenderState::FrameEventFrameEndRefused);
+      return;
+    }
+  }
+
   const bool shouldInsertBeforeUi =
       forceFrameEnd
           ? (isUiBoundaryDraw && m_war3Pipeline->ForceBeforeUiInsertion())
-          : m_war3Pipeline->NotifyDraw(layer, cat, tag, isUiBoundaryDraw);
-  if (!shouldInsertBeforeUi)
+          : (worldSceneEndBoundary
+                 ? m_war3Pipeline->ForceBeforeUiInsertion()
+                 : m_war3Pipeline->NotifyDraw(layer, cat, tag,
+                                              isUiBoundaryDraw));
+  if (!shouldInsertBeforeUi) {
+    // A draw after the world scene that could not commit (no world draw was
+    // tracked): the frame-end fallback must not run over it.
+    if (!forceFrameEnd && worldSceneCompleted &&
+        !War3RenderState::IsWorldRenderSceneActive() &&
+        !m_war3Pipeline->HasInsertedBeforeUi())
+      ++m_war3DrawsAfterWorldSceneThisFrame;
     return;
+  }
+  m_war3BeforeUiTraceTier = uiBoundaryTier;
+  m_war3BeforeUiTraceFrameEnd = forceFrameEnd;
+  War3RenderState::NoteFrameEvent(static_cast<uint16_t>(
+      War3RenderState::FrameEventBeforeUiCommit + (uiBoundaryTier & 0xFu)));
   if (stage13WorldBoundaryCandidate)
     m_war3Scene.shadowStats.beforeUiStage13BoundaryCommitCount++;
   if (uiBoundaryTier == 8u)
@@ -34072,6 +34330,7 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
     auto phaseScope =
         War3PresentFrameTransitionScope("BeforeUiFinalize");
     War3MaybeInsertBeforeUi(true);
+    War3FinishBeforeUiFrameTrace();
     war3FrameSceneAlreadyRotated =
         m_war3Pipeline != nullptr && m_war3Pipeline->HasInsertedBeforeUi();
   }
@@ -34608,6 +34867,7 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
   m_war3BestWorldCameraTier = 0u;
   m_war3DebugOverlayDrawn = false;
   m_war3UiDrawSeenThisFrame = false;
+  m_war3DrawsAfterWorldSceneThisFrame = 0u;
   }
 
   {
@@ -39529,6 +39789,16 @@ void D3D9DeviceEx::ResetState(D3DPRESENT_PARAMETERS *pPresentationParameters) {
 
   rs[D3DRS_AMBIENT] = 0;
   m_dirty.set(D3D9DeviceDirtyFlag::FFVertexData);
+
+  // The device state was just returned to D3D9 defaults: forget the game's
+  // remembered ("pure") lighting inputs. The scope itself stays as it is; the
+  // next world RenderScene boundary re-establishes it.
+  m_pureGameAmbient = 0;
+  m_war3PureAmbientValid = false;
+  m_war3PureAmbientSource = D3DMCS_MATERIAL;
+  m_war3AmbientSourceForced = false;
+  m_war3PureMaterialValid = false;
+  m_war3PureLight0Valid = false;
 
   rs[D3DRS_FOGENABLE] = FALSE;
   rs[D3DRS_FOGCOLOR] = 0;

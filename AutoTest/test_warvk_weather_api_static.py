@@ -106,8 +106,8 @@ class WeatherApiContract(unittest.TestCase):
 
     def test_main_runner_fallback_retires_weather_before_new_authoring(self):
         hook = read("src/d3d9/d3d9_war3_hook.cpp")
-        fallback = hook.split("void ObserveWar3MainRunnerEnter() {", 1)[1].split("void ObserveWar3MainRunnerComplete", 1)[0]
-        self.assertLess(fallback.index("onMainRunnerEnter()"), fallback.index("ResetWeatherAuthorState();"))
+        fallback = hook.split("void ObserveWar3MainRunnerEnter(const char *source) {", 1)[1].split("void ObserveWar3MainRunnerComplete", 1)[0]
+        self.assertLess(fallback.index("onMainRunnerEnter(worldLive)"), fallback.index("ResetWeatherAuthorState();"))
         self.assertLess(fallback.index("ResetWeatherAuthorState();"), fallback.index("RequestActiveDeviceShadowMapResetOrCpuFallback();"))
         scoped = self.cpp.split("void ResetWeatherAuthorState() noexcept {", 1)[1].split("void ResetAuthorState()", 1)[0]
         self.assertIn("it->second.type == ManagedType::Weather", scoped)

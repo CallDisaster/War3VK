@@ -214,7 +214,14 @@ class War3VolumetricFroxelStaticTests(unittest.TestCase):
         ):
             self.assertIn(token, self.integrate)
         self.assertIn("readabilityAttenuation", self.composite)
-        self.assertIn("guideEnabled ? 0.24f : 0.0f", self.cpp)
+        self.assertIn(
+            "constexpr float kVolumetricReadabilityMaxAttenuation = 0.36f;",
+            self.cpp)
+        self.assertEqual(
+            " ".join(self.cpp.split()).count(
+                "guideEnabled ? kVolumetricReadabilityMaxAttenuation : 0.0f,"),
+            1)
+        self.assertNotIn("guideEnabled ? 0.24f", self.cpp)
         early_out = self.composite[
             self.composite.index("float scatterPeak"):
             self.composite.index("// 单次散射合成")
@@ -250,8 +257,9 @@ class War3VolumetricFroxelStaticTests(unittest.TestCase):
             t = min(max((value - edge0) / (edge1 - edge0), 0.0), 1.0)
             return t * t * (3.0 - 2.0 * t)
 
-        weight = 2.10
+        weight = 2.50  # default since 1.22.03: full readability mix
         readability_mix = min(max((weight - 1.0) / 1.5, 0.0), 1.0)
+        self.assertEqual(readability_mix, 1.0)
         source_gate = smoothstep(0.004, 0.040, 1.0)
         attenuations = []
         for physical_guide in (0.0, 0.05, 0.10, 0.5, 1.0):
@@ -261,7 +269,7 @@ class War3VolumetricFroxelStaticTests(unittest.TestCase):
                 * (0.62 * 1.05)
                 * source_gate
                 * readability_mix,
-                0.24,
+                0.36,
             )
             attenuations.append(attenuation)
 
@@ -269,9 +277,18 @@ class War3VolumetricFroxelStaticTests(unittest.TestCase):
         self.assertTrue(all(
             a <= b for a, b in zip(attenuations, attenuations[1:])
         ))
-        self.assertLessEqual(max(attenuations), 0.24)
-        self.assertAlmostEqual(attenuations[-1], 0.24)
+        self.assertLessEqual(max(attenuations), 0.36)
+        # With the default weight the term stays linear in the guide all the
+        # way to a fully occluded column: the scale sits just under the cap,
+        # so the cap is a bound for authored weights, not a plateau.
+        self.assertAlmostEqual(attenuations[-1], 0.55 * 0.62 * 1.05)
+        self.assertLess(attenuations[-1], 0.36)
+        self.assertGreater(attenuations[-1], 0.24)
         self.assertLess(attenuations[1], 0.05)
+        # The composite clamps transmittance at exp(-1.5); the cap must stay
+        # clear of that floor so the bound, not the clamp, shapes the term.
+        import math
+        self.assertGreater(1.0 - 0.36, math.exp(-1.5))
 
     def test_optically_supported_peak_restores_clear_air_column_contrast(self):
         def smoothstep(edge0, edge1, value):
@@ -286,13 +303,13 @@ class War3VolumetricFroxelStaticTests(unittest.TestCase):
             peak_occlusion * evidence_gate * 0.74,
         ) * evidence_gate
         readability_scale = (
-            0.55 * (0.62 * 1.05) * ((2.10 - 1.0) / 1.5)
+            0.55 * (0.62 * 1.05) * min((2.50 - 1.0) / 1.5, 1.0)
         )
-        attenuation = min(physical_guide * readability_scale, 0.24)
+        attenuation = min(physical_guide * readability_scale, 0.36)
 
         self.assertAlmostEqual(physical_guide, 0.74)
         self.assertGreater(attenuation, 0.18)
-        self.assertLessEqual(attenuation, 0.24)
+        self.assertLessEqual(attenuation, 0.36)
 
     def test_rgba_upsample_uses_receiver_plane_and_independent_shadow_guide(self):
         upsample = self.composite[
@@ -474,7 +491,7 @@ class War3VolumetricFroxelStaticTests(unittest.TestCase):
             "kVolumetricDirectionalGuideCellBudget = 100'000'000ull",
             "kVolumetricDirectionalGuideTraversalBudget =\n"
             "    350'000'000ull",
-            "targetGuideCells <= kVolumetricDirectionalGuideCellBudget",
+            "war3::render::War3SelectDirectionalGuideDivisor(",
             "m_directionalGuideRefineEnabled",
             "guide=%ux%u refineSteps=%u",
         ):

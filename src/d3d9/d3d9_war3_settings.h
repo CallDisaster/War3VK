@@ -271,10 +271,14 @@ struct War3VolumetricLightSettings {
   // 默认可读档：先保证区间正确，再谈强度；勿再靠拉满 intensity 补柱。
   // Clear-air 默认档：空气本身不应先把全屏染灰；强光与真实阴影差值负责
   // 暴露介质。局部 volume 可在 global density=0 时独立存在。
-  float intensity = 1.20f;
+  // 1.22.03：光柱「不够明显」的反馈来自受光/缺光柱对比，而不是雾量。
+  // density 保持不变（它只增加全屏雾化），提高 intensity 让受光空气更亮，
+  // weight 取满可读性混合（(weight-1)/1.5 = 1），阴影柱压暗由
+  // kVolumetricReadabilityMaxAttenuation 限幅。
+  float intensity = 1.50f;
   float decay = 0.95f;
   float density = 0.22f;
-  float weight = 2.10f;
+  float weight = 2.50f;
   float skyThreshold = 0.72f;
   float fadeNear = 0.0f;
   float fadeFar = 0.45f;
@@ -335,12 +339,15 @@ struct War3VolumetricLightSettings {
   // 远级 volume cascade 水平半径（War3 世界单位）。
   float volumeSunOrthoRadius = 10000.0f;
   // 近级半径 = far * volumeSunNearRadiusScale（固定比例，仍不随 pitch 变）。
-  float volumeSunNearRadiusScale = 0.42f;
+  // 0.30 × 10000 = 3000：标准俯视相机的可见地面都落在近级内；配合 2048
+  // 分辨率，近级 texel 从 5.5 降到 2.9 世界单位（柱体边缘更清晰），
+  // 3000 以外由远级覆盖（9.8 单位/texel，原为 13.0）。
+  float volumeSunNearRadiusScale = 0.30f;
   // 向太阳侧 caster 深度余量；大于历史 C2/C3 的 384 以覆盖高空单位柱体。
   float volumeSunDepthExtension = 640.0f;
   float volumeSunDepthMargin = 96.0f;
   // 双层 depth 分辨率；far 级覆盖统一 Froxel 远端，near 级保留局部精度。
-  uint32_t volumeSunResolution = 1536;
+  uint32_t volumeSunResolution = 2048;
   // 体积专用 soft compare 半径（shader 内 3x3 footprint）。
   float volumeSunSoftRadius = 1.85f;
   // Receiver bias in War3 world units. The producer converts it to normalized

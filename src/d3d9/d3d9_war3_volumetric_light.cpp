@@ -6,6 +6,7 @@
 #include "d3d9_war3_shadow.h"
 #include "war3/core/war3_internal_test_config.h"
 #include "war3/render/war3_hybrid_ray_tracing.h"
+#include "war3/render/war3_volumetric_guide_divisor.h"
 #include "war3/tools/war3_perf_monitor.h"
 
 #include "../dxvk/dxvk_access.h"
@@ -88,6 +89,16 @@ constexpr uint32_t kVolumetricPointProbesPerLight = 2u;
 // receiver-plane depth footprint (5), centre guide (1), and four taps each for
 // effect, low-footprint depth, world reconstruction depth and guide (16).
 constexpr uint32_t kVolumetricCompositeTextureReadsPerPixel = 24u;
+// Stylized shaft readability: a column that the real volume-sun shadow map
+// proves occluded darkens the base colour by at most this fraction. From a
+// top-down RTS camera almost every view ray is lit air above the shadow, so
+// physical single scattering alone gives only a few levels of lit/shadowed
+// contrast; this bounded term is what makes a shaft read as a shaft.
+// 0.24 left fully occluded columns about 10 levels apart from lit ones on
+// dark ground; 0.36 with the default weight keeps the term linear in the
+// guide (scale 0.358 < cap) and well inside the composite's exp(-1.5) floor.
+constexpr float kVolumetricReadabilityMaxAttenuation = 0.36f;
+constexpr float kVolumetricReadabilityBaseScale = 0.55f * 0.62f;
 constexpr uint32_t kVolumetricDirectionalGuideTargetDivisor = 2u;
 constexpr uint64_t kVolumetricDirectionalGuideCellBudget = 100'000'000ull;
 constexpr uint64_t kVolumetricDirectionalGuideTraversalBudget =
@@ -2543,7 +2554,7 @@ bool War3VolumetricLightPass::drawVolumetricLight(
         (clampFinite(settings.weight, 0.0f, 3.0f, 1.0f) - 1.0f) / 1.5f,
         0.0f, 1.0f);
     m_directionalGuideReadabilityScale =
-        0.55f * 0.62f *
+        kVolumetricReadabilityBaseScale *
         (csmUbo.volumeSunParams.x > 0.5f ? 1.05f : 1.0f) *
         sourceGate * readabilityMix;
     m_directionalGuideReadyThisFrame =
@@ -2756,7 +2767,9 @@ bool War3VolumetricLightPass::compositeVolumetricLight(
                         float(input.scene.worldCamera.viewport.Height));
   pc.viewportZ = Vector4(input.scene.worldCamera.viewport.MinZ,
                          input.scene.worldCamera.viewport.MaxZ,
-                         guideEnabled ? 0.24f : 0.0f,
+                         guideEnabled
+                             ? kVolumetricReadabilityMaxAttenuation
+                             : 0.0f,
                          guideEnabled
                              ? m_directionalGuideReadabilityScale
                              : 0.0f);
@@ -3399,20 +3412,13 @@ void War3VolumetricLightPass::RunMedium(const Rc<DxvkCommandList>& ctx,
         settings.quality == War3VolumetricQuality::FroxelHigh
             ? kVolumetricFroxelHighDepth
             : kVolumetricFroxelMediumDepth;
-    const uint64_t targetGuideWidth =
-        (uint64_t(extent.width) +
-         kVolumetricDirectionalGuideTargetDivisor - 1u) /
-        kVolumetricDirectionalGuideTargetDivisor;
-    const uint64_t targetGuideHeight =
-        (uint64_t(extent.height) +
-         kVolumetricDirectionalGuideTargetDivisor - 1u) /
-        kVolumetricDirectionalGuideTargetDivisor;
-    const uint64_t targetGuideCells =
-        targetGuideWidth * targetGuideHeight * uint64_t(guideDepth);
+    // Finest guide that fits the cell budget (1/2 at 1080p, 1/3 at 1440p,
+    // 1/4 at 4K) instead of dropping straight back to the effect resolution.
     directionalGuideDivisor =
-        targetGuideCells <= kVolumetricDirectionalGuideCellBudget
-            ? kVolumetricDirectionalGuideTargetDivisor
-            : resolutionDivisor;
+        war3::render::War3SelectDirectionalGuideDivisor(
+            extent.width, extent.height, guideDepth,
+            kVolumetricDirectionalGuideTargetDivisor, resolutionDivisor,
+            kVolumetricDirectionalGuideCellBudget);
   }
 
   execution.stage = "resources-or-draw-failed";

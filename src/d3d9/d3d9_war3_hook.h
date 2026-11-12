@@ -162,7 +162,7 @@ void ActivateWar3Runtime(uintptr_t gameBase, const char *source);
 // publish at most one shadow-session reset request after each completed
 // MainRunner; Present remains the only owner that applies GPU retirement.
 void ObserveWar3JassNativeTableRebuild();
-void ObserveWar3MainRunnerEnter();
+void ObserveWar3MainRunnerEnter(const char *source);
 void ObserveWar3MainRunnerComplete();
 
 /**

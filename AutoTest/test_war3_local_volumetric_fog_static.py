@@ -145,9 +145,11 @@ class War3LocalVolumetricFogStaticTests(unittest.TestCase):
             SETTINGS,
             re.DOTALL,
         ).group(1)
-        self.assertIn("float intensity = 1.20f", defaults)
+        # 1.22.03 raised shaft energy/contrast; the haze amount (density) and
+        # the clear-air extinction below are deliberately unchanged.
+        self.assertIn("float intensity = 1.50f", defaults)
         self.assertIn("float density = 0.22f", defaults)
-        self.assertIn("float weight = 2.10f", defaults)
+        self.assertIn("float weight = 2.50f", defaults)
         self.assertIn("bool globalMediumEnabled = true", defaults)
         self.assertIn("bool heightFogEnabled = false", defaults)
         self.assertIn("float extinctionStrength = 0.05f", defaults)

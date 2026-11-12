@@ -2597,6 +2597,12 @@ int __fastcall Hook_WorldFrameUpdateAndPreparePasses(void *thisPtr, void *edx,
   return result;
 }
 
+static void SetDeviceWorldLightingScope(bool inWorld) {
+  dxvk::war3::RunWithActiveDevice([inWorld](D3D9DeviceEx &device) {
+    device.War3SetWorldLightingScope(inWorld);
+  });
+}
+
 int __fastcall Hook_WorldRenderScene(void *thisPtr, void *edx) {
   MarkWorldFrameThread();
   auto perfScope = MakeRenderHookFrameScope("Hook_WorldRenderScene");
@@ -2619,6 +2625,10 @@ int __fastcall Hook_WorldRenderScene(void *thisPtr, void *edx) {
 
   War3RenderState::OnWorldRenderSceneEnter();
   native_light::BeginWorld();
+  // The sun/ambient rewrites of light 0, D3DRS_AMBIENT and the material
+  // ambient apply to this scene only; the portrait and other UI-owned models
+  // drawn after it keep the game's own lighting.
+  SetDeviceWorldLightingScope(true);
   int result = 0;
   if (g_trampolineWorldRenderScene) {
     auto origScope =
@@ -2636,6 +2646,7 @@ int __fastcall Hook_WorldRenderScene(void *thisPtr, void *edx) {
         MakeRenderHookFrameScope("Hook_WorldRenderScene/WarVKPostHook");
     War3RenderState::OnWorldRenderSceneExit();
     native_light::EndWorld();
+    SetDeviceWorldLightingScope(false);
   }
   return result;
 }
@@ -2822,6 +2833,9 @@ int __fastcall Hook_WorldDispatch(void *thisPtr, void *edx, int stage, int a3,
   }
 
   War3RenderState::SetStage(stage);
+  if (stage >= 0 && stage < 100)
+    War3RenderState::NoteFrameEvent(
+        static_cast<uint16_t>(a5 == 0 ? stage : 100 + stage));
   if (a5 == 0) {
     War3RenderState::OnMainWorldStageEnter(stage);
   }

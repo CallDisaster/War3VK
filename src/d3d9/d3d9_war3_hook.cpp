@@ -451,16 +451,49 @@ bool ValidateGameModule(uintptr_t gameBase, ModuleInfo &gameInfo,
 
 } // namespace
 
+namespace {
+std::atomic<uint32_t> s_mapTransitionSignalCount{0u};
+std::atomic<uint32_t> s_liveWorldRunnerEntryCount{0u};
+
+// Field evidence for which lifecycle signal closed a shadow session. Each
+// accepted signal costs a full shadow-session reset, so the rate matters.
+void LogMapTransitionSignal(const char *source) {
+  const uint32_t n =
+      s_mapTransitionSignalCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
+  if (n <= 8u || (n & 0xFFu) == 0u) {
+    Logger::info(str::format("WarVK map transition signal: source=", source,
+                             " count=", n));
+  }
+}
+} // namespace
+
 void ObserveWar3JassNativeTableRebuild() {
   if (!s_mapTransitionGate.onNativeTableRebuild())
     return;
+  LogMapTransitionSignal("native-table");
   war3dbg::Print("DXVK War3Hook: JASS native-table rebuild requests shadow map reset\n");
   war3::RequestActiveDeviceShadowMapResetOrCpuFallback();
 }
 
-void ObserveWar3MainRunnerEnter() {
-  if (!s_mapTransitionGate.onMainRunnerEnter())
+void ObserveWar3MainRunnerEnter(const char *source) {
+  // A JASS thread resuming mid-game re-enters the runner while the world is
+  // still being drawn. Treating that as a map change retired the whole shadow
+  // session (and authored weather) several times per second in melee games
+  // with computer players: one frame without shadows/post-processing and a
+  // full caster-cache rebuild each time.
+  const bool worldLive = War3RenderState::IsWorldRenderSceneLive();
+  if (worldLive) {
+    const uint32_t n = s_liveWorldRunnerEntryCount.fetch_add(
+                           1u, std::memory_order_relaxed) + 1u;
+    if (n == 1u || (n & 0xFFFu) == 0u) {
+      Logger::info(str::format(
+          "WarVK map transition signal: ignored live-world runner entry"
+          " source=", source, " count=", n));
+    }
+  }
+  if (!s_mapTransitionGate.onMainRunnerEnter(worldLive))
     return;
+  LogMapTransitionSignal(source);
   // The native-table hook normally retires authored weather. This fallback
   // closes the same old-map lifetime before the original runner can execute
   // new JASS; a late Present reset must not erase new-map authoring instead.

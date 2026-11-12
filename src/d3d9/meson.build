@@ -379,6 +379,14 @@ player_settings_test = executable('player_settings_test',
   cpp_args : ['-UNDEBUG'], install : false)
 test('player_settings', player_settings_test, timeout : 30)
 
+# 1.22.03 render contracts: world-lighting scope (unit portrait), the BeforeUi
+# boundary at the end of the world scene (paused frames) and the volumetric
+# guide resolution. Header-only, no game or device.
+render_scope_contracts_test = executable('render_scope_contracts_test',
+  '../../AutoTest/test_render_scope_contracts.cpp',
+  cpp_args : ['-UNDEBUG'], install : false)
+test('render_scope_contracts', render_scope_contracts_test, timeout : 30)
+
 maintenance_python = import('python').find_installation()
 
 # Native draw observations and the exact production encoder/strict reader.

@@ -3382,7 +3382,7 @@ bool War3ShadowReceiverPass::renderVolumeSunShadow(
       256.0f, 10000.0f);
   const float nearScale = std::clamp(
       std::isfinite(vol.volumeSunNearRadiusScale) ? vol.volumeSunNearRadiusScale
-                                                  : 0.42f,
+                                                  : 0.30f,
       0.20f, 0.85f);
   const float radiusNear = std::max(radiusFar * nearScale, 128.0f);
   const float depthExt = std::clamp(

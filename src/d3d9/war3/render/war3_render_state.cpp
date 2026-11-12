@@ -3,14 +3,17 @@
 #include "war3_render_state.h"
 #include "../../d3d9_war3_debug.h"
 #include "../../d3d9_war3_settings.h"
+#include "../../util/log/log.h"
 #include "../../util/util_env.h"
 #include "../core/war3_internal_test_config.h"
+#include "../core/war3_map_transition_gate.h"
 #include "../war3.h"
 
 #include <algorithm>
 #include <atomic>
 #include <mutex>
 #include <shared_mutex>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -41,6 +44,10 @@ std::atomic<bool> g_worldFramePrepareCompletedThisFrame{false};
 std::atomic<bool> g_worldRenderSceneTouchedThisFrame{false};
 std::atomic<bool> g_worldRenderSceneCompletedThisFrame{false};
 std::atomic<bool> g_worldRenderSceneActive{false};
+// Presented-frame serial and the serial (+1, 0 = never) of the last frame
+// whose world RenderScene returned. Both survive OnFrameStart on purpose.
+std::atomic<uint64_t> g_presentedFrameSerial{0u};
+std::atomic<uint64_t> g_lastWorldRenderSceneFrameStamp{0u};
 std::atomic<bool> g_uiDispatchTouchedThisFrame{false};
 std::atomic<int> g_dispatcherStage{-1};
 std::atomic<bool> g_dispatcherTouchedThisFrame{false};
@@ -626,7 +633,102 @@ void War3RenderState::SetSkipUi(bool skip) {
   g_stateSkipUi.store(skip, std::memory_order_relaxed);
 }
 
+namespace {
+// Frame-sequence diagnostics. Render-thread only; a fixed buffer so the hot
+// path never allocates. Consecutive repeats are collapsed into a count.
+struct FrameSequenceTrace {
+  static constexpr size_t kCapacity = 96;
+  uint16_t codes[kCapacity] = {};
+  uint16_t counts[kCapacity] = {};
+  size_t size = 0;
+  bool overflow = false;
+  uint64_t lastHash = 0;
+  uint32_t logs = 0;
+  uint64_t frames = 0;
+};
+FrameSequenceTrace g_frameSequenceTrace;
+
+void FlushFrameSequenceTrace() {
+  auto& trace = g_frameSequenceTrace;
+  ++trace.frames;
+  uint64_t hash = 1469598103934665603ull;
+  for (size_t i = 0; i < trace.size; ++i) {
+    hash = (hash ^ trace.codes[i]) * 1099511628211ull;
+    // Bucket the repeat count so a varying draw count is not a new shape.
+    const uint16_t bucket = trace.counts[i] > 1u ? 2u : 1u;
+    hash = (hash ^ bucket) * 1099511628211ull;
+  }
+  if (trace.size != 0 && hash != trace.lastHash && trace.logs < 48u) {
+    trace.lastHash = hash;
+    ++trace.logs;
+    std::string line = "WarVK frame sequence: frame=" +
+        std::to_string(trace.frames) + " n=" + std::to_string(trace.logs) +
+        " [";
+    for (size_t i = 0; i < trace.size; ++i) {
+      const uint16_t code = trace.codes[i];
+      if (i != 0)
+        line += ' ';
+      if (code < 100u)
+        line += "s" + std::to_string(code);
+      else if (code < 200u)
+        line += "o" + std::to_string(code - 100u);
+      else if (code == War3RenderState::FrameEventUiDispatch)
+        line += "UiDispatch";
+      else if (code == War3RenderState::FrameEventRenderSceneEnter)
+        line += "Scene{";
+      else if (code == War3RenderState::FrameEventRenderSceneExit)
+        line += "}Scene";
+      else if (code == War3RenderState::FrameEventUiLikeDraw)
+        line += "uiLikeDraw";
+      else if (code == War3RenderState::FrameEventUiLayerDraw)
+        line += "uiLayerDraw";
+      else if (code == War3RenderState::FrameEventFrameEndRefused)
+        line += "frameEndRefused";
+      else if (code >= War3RenderState::FrameEventBeforeUiCommit &&
+               code < War3RenderState::FrameEventBeforeUiCommit + 16u)
+        line += "BeforeUi(t" + std::to_string(
+            code - War3RenderState::FrameEventBeforeUiCommit) + ")";
+      else
+        line += "?" + std::to_string(code);
+      if (trace.counts[i] > 1u)
+        line += "x" + std::to_string(trace.counts[i]);
+    }
+    line += trace.overflow ? " ...]" : "]";
+    Logger::info(line);
+  }
+  trace.size = 0;
+  trace.overflow = false;
+}
+} // namespace
+
+bool War3RenderState::IsFrameSequenceTraceEnabled() {
+  static const bool s_enabled =
+      env::getEnvVar("DXVK_WAR3_FRAME_SEQUENCE_TRACE") == "1";
+  return s_enabled;
+}
+
+void War3RenderState::NoteFrameEvent(uint16_t code) {
+  if (!IsFrameSequenceTraceEnabled())
+    return;
+  auto& trace = g_frameSequenceTrace;
+  if (trace.size != 0 && trace.codes[trace.size - 1] == code) {
+    if (trace.counts[trace.size - 1] != 0xFFFFu)
+      ++trace.counts[trace.size - 1];
+    return;
+  }
+  if (trace.size == FrameSequenceTrace::kCapacity) {
+    trace.overflow = true;
+    return;
+  }
+  trace.codes[trace.size] = code;
+  trace.counts[trace.size] = 1u;
+  ++trace.size;
+}
+
 void War3RenderState::OnFrameStart() {
+  if (IsFrameSequenceTraceEnabled())
+    FlushFrameSequenceTrace();
+  g_presentedFrameSerial.fetch_add(1u, std::memory_order_relaxed);
   g_stageTouchedThisFrame.store(false, std::memory_order_relaxed);
   g_maxStageThisFrame.store(-1, std::memory_order_relaxed);
   g_maxStageCompletedThisFrame.store(-1, std::memory_order_relaxed);
@@ -687,6 +789,14 @@ bool War3RenderState::IsWorldRenderSceneActive() {
   return g_worldRenderSceneActive.load(std::memory_order_relaxed);
 }
 
+bool War3RenderState::IsWorldRenderSceneLive() {
+  const uint64_t stamp =
+      g_lastWorldRenderSceneFrameStamp.load(std::memory_order_relaxed);
+  return dxvk::war3::War3IsWorldSceneLive(
+      stamp != 0u, g_presentedFrameSerial.load(std::memory_order_relaxed),
+      stamp != 0u ? stamp - 1u : 0u);
+}
+
 bool War3RenderState::IsMainWorldStageActive() {
   return g_mainWorldStageActive.load(std::memory_order_relaxed);
 }
@@ -715,15 +825,20 @@ void War3RenderState::OnWorldFramePrepareExit() {
 }
 
 void War3RenderState::OnWorldRenderSceneEnter() {
+  NoteFrameEvent(FrameEventRenderSceneEnter);
   g_worldRenderSceneTouchedThisFrame.store(true, std::memory_order_relaxed);
   g_worldRenderSceneCompletedThisFrame.store(false, std::memory_order_relaxed);
   g_worldRenderSceneActive.store(true, std::memory_order_relaxed);
 }
 
 void War3RenderState::OnWorldRenderSceneExit() {
+  NoteFrameEvent(FrameEventRenderSceneExit);
   g_worldRenderSceneTouchedThisFrame.store(true, std::memory_order_relaxed);
   g_worldRenderSceneCompletedThisFrame.store(true, std::memory_order_relaxed);
   g_worldRenderSceneActive.store(false, std::memory_order_relaxed);
+  g_lastWorldRenderSceneFrameStamp.store(
+      g_presentedFrameSerial.load(std::memory_order_relaxed) + 1u,
+      std::memory_order_relaxed);
 }
 
 void War3RenderState::OnStageExit(int stage) {
@@ -791,6 +906,8 @@ float War3RenderState::GetGameTime() {
 void War3RenderState::OnUiDispatch() {
   const bool wasSet =
       g_uiDispatchTouchedThisFrame.exchange(true, std::memory_order_relaxed);
+  if (!wasSet)
+    NoteFrameEvent(FrameEventUiDispatch);
   if (!wasSet) {
     // [DISABLED] ENTER LOG
   }

@@ -184,11 +184,28 @@ public:
   static bool HasWorldRenderSceneThisFrame();
   static bool HasCompletedWorldRenderSceneThisFrame();
   static bool IsWorldRenderSceneActive();
+  // True while the world RenderScene ran in this frame or the previous one.
+  static bool IsWorldRenderSceneLive();
   static bool IsMainWorldStageActive();
   static bool HasReachedStageThisFrame(int stage);
   static bool HasCompletedStageThisFrame(int stage);
   static bool HasMainWorldCompletedStageThisFrame(int stage);
   static void OnFrameStart();
+  // Opt-in frame-shape diagnostics (DXVK_WAR3_FRAME_SEQUENCE_TRACE=1): the
+  // ordered list of world stages, UI dispatch and BeforeUi events of a frame,
+  // logged whenever that list changes. Codes: 0..99 main-screen world stage,
+  // 100..199 off-screen world stage, 200+ see FrameEvent below.
+  enum FrameEvent : uint16_t {
+    FrameEventUiDispatch = 200,
+    FrameEventRenderSceneEnter = 201,
+    FrameEventRenderSceneExit = 202,
+    FrameEventUiLikeDraw = 210,
+    FrameEventUiLayerDraw = 211,
+    FrameEventBeforeUiCommit = 220, // + boundary tier
+    FrameEventFrameEndRefused = 240,
+  };
+  static bool IsFrameSequenceTraceEnabled();
+  static void NoteFrameEvent(uint16_t code);
   static void OnWorldFramePrepareEnter();
   static void OnWorldFramePrepareExit();
   static void OnWorldRenderSceneEnter();

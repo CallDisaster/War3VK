@@ -37,7 +37,7 @@ class MapTransitionSignalWiring(unittest.TestCase):
              "g_trampolineMainRunnerAlt(thisPtr, edx)"),
         ):
             section = body(LIFECYCLE, begin, end)
-            self.assertLess(section.index("ObserveWar3MainRunnerEnter()"),
+            self.assertLess(section.index("ObserveWar3MainRunnerEnter("),
                             section.index(original))
             self.assertGreater(section.index("ObserveWar3MainRunnerComplete()"),
                                section.index("ActivateWar3Runtime("))
@@ -48,8 +48,41 @@ class MapTransitionSignalWiring(unittest.TestCase):
         self.assertEqual(section.count(
             "war3::RequestActiveDeviceShadowMapResetOrCpuFallback()"), 2)
         self.assertIn("s_mapTransitionGate.onNativeTableRebuild()", section)
-        self.assertIn("s_mapTransitionGate.onMainRunnerEnter()", section)
+        self.assertIn("s_mapTransitionGate.onMainRunnerEnter(worldLive)",
+                      section)
         self.assertNotIn("War3ApplyShadowMapEpochResetAtPresent", section)
+
+    def test_live_world_runner_entry_is_not_a_transition(self) -> None:
+        # 1.27a re-enters the runner for every resumed JASS thread (melee AI
+        # scripts). Mid-game entries must reach the gate as "world live" so
+        # they neither reset the shadow session nor disarm the fallback.
+        section = body(HOOK, "void ObserveWar3MainRunnerEnter(const char *source) {",
+                       "void ObserveWar3MainRunnerComplete()")
+        self.assertIn(
+            "const bool worldLive = War3RenderState::IsWorldRenderSceneLive();",
+            section)
+        self.assertIn("s_mapTransitionGate.onMainRunnerEnter(worldLive)",
+                      section)
+        self.assertEqual(section.count("onMainRunnerEnter("), 1)
+        self.assertLess(
+            section.index("s_mapTransitionGate.onMainRunnerEnter(worldLive)"),
+            section.index("ResetWeatherAuthorState();"))
+        gate = (ROOT / "src/d3d9/war3/core/war3_map_transition_gate.h"
+                ).read_text(encoding="utf-8")
+        live = body(gate, "bool onMainRunnerEnter(bool worldLive = false)",
+                    "void onMainRunnerComplete()")
+        self.assertLess(live.index("if (worldLive)"),
+                        live.index("m_runningGeneration.exchange("))
+        state = (ROOT / "src/d3d9/war3/render/war3_render_state.cpp"
+                 ).read_text(encoding="utf-8")
+        start = body(state, "void War3RenderState::OnFrameStart() {",
+                     "bool War3RenderState::HasWorldStageThisFrame()")
+        self.assertEqual(start.count("g_presentedFrameSerial.fetch_add("), 1)
+        # The stamp must survive the per-frame reset.
+        self.assertNotIn("g_lastWorldRenderSceneFrameStamp", start)
+        leave = body(state, "void War3RenderState::OnWorldRenderSceneExit() {",
+                     "void War3RenderState::OnStageExit(")
+        self.assertIn("g_lastWorldRenderSceneFrameStamp.store(", leave)
 
     def test_explicit_game_exit_disarms(self) -> None:
         section = body(HOOK, "void ResetWar3RuntimeState() {",

@@ -14,10 +14,15 @@ class VisualApiContracts(unittest.TestCase):
         device = read("src/d3d9/d3d9_device.cpp")
         light = device[device.index("D3D9DeviceEx::SetLight("):device.index("D3D9DeviceEx::GetLight(")]
         self.assertIn("Index == 0 && m_war3Pipeline", light)
-        off = light[light.index("if (!sun.enabled)"):light.index("// Check if settings")]
+        # The sun rewrite lives in War3EffectiveLight0 so it can be re-derived
+        # at the world RenderScene boundary; SetLight still dirties the FF data.
+        self.assertIn("finalLight = War3EffectiveLight0(*pLight, worldLighting)", light)
+        self.assertIn("m_dirty.set(D3D9DeviceDirtyFlag::FFVertexData)", light)
+        effective = device[device.index("D3D9DeviceEx::War3EffectiveLight0("):device.index("D3D9DeviceEx::War3EffectiveAmbient(")]
+        off = effective[effective.index("if (!sun.enabled)"):effective.index("// Check if settings")]
         self.assertIn("if (finalLight.Type == D3DLIGHT_DIRECTIONAL)", off)
         self.assertIn("ApplyWar3DisabledSun(finalLight)", off)
-        self.assertIn("m_dirty.set(D3D9DeviceDirtyFlag::FFVertexData)", off)
+        self.assertIn("return finalLight;", off)
 
     def test_policy_preserves_indirect_and_other_fields(self):
         policy = read("src/d3d9/war3/render/war3_sun_light_policy.h")

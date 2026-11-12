@@ -81,7 +81,9 @@ FROZEN_ACCUMULATION_FUNCTIONS = {
 # The 2026-09-20 frozen run matrix additionally exports 19 existing War3 env
 # names and the OBS opt-out. This is report metadata, not new registry policy.
 # Keep exact cardinality AND exact single-occurrence names, not a wildcard skip.
-FROZEN_ENV_LITERALS = {str(DEVICE_CPP): 138, str(PM_H): 2, str(PM_CPP): 129}
+# 139 = 138 + DXVK_WAR3_BEFOREUI_FRAME_END_AFTER_UI, the 1.22.03 A/B switch for the
+# BeforeUi frame-end fallback guard (unrelated to the domain-count export).
+FROZEN_ENV_LITERALS = {str(DEVICE_CPP): 139, str(PM_H): 2, str(PM_CPP): 129}
 STAGE11_REPORT_ENV_KEYS = (
     "DXVK_WAR3_STAGE11_BUDGET_CENSUS",
     "DXVK_WAR3_STAGE11_UPLOAD_INDEX_RANGE",

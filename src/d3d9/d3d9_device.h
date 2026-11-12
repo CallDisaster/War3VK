@@ -60,6 +60,8 @@
 #include "war3/render/war3_shadow_generation_backed_stream.h"
 #include "war3/render/war3_drawtime_active_ledger.h"
 #include "war3/render/war3_stage11_snapshot_page_policy.h"
+#include "war3/render/war3_before_ui_boundary.h"
+#include "war3/render/war3_world_lighting_scope.h"
 #include "war3/render/war3_stage11_lifetime_page_policy.h"
 #include "war3/tools/war3_stage11_budget_census.h"
 #include "war3/render/war3_index_upload_summary.h"
@@ -1425,6 +1427,7 @@ private:
 
   // War3 渲染管线插入点检测（BeforeUi）
   void War3MaybeInsertBeforeUi(bool forceFrameEnd = false);
+  void War3FinishBeforeUiFrameTrace();
 
   // Applies a coalesced map-session reset only from the Present render-thread
   // boundary. Returns true when the current Arena generation was sealed and
@@ -2137,6 +2140,9 @@ private:
   bool m_war3DebugOverlayDrawn = false;
   // 本帧是否已经进入 UI 绘制（用于避免后处理污染 UI）
   bool m_war3UiDrawSeenThisFrame = false;
+  // Draws that reached the device after the hooked main-world RenderScene
+  // returned and before this frame's BeforeUi commit.
+  uint32_t m_war3DrawsAfterWorldSceneThisFrame = 0u;
 
   D3D9FFShaderModuleSet m_ffModules;
 #if defined(WARVK_D3D9_MIGRATION_CENSUS_DEV)
@@ -3300,7 +3306,53 @@ private:
   // War3 Ambient Tracking
   DWORD m_pureGameAmbient = 0x00000000;
 
+  // War3 world-lighting scope (see war3_world_lighting_scope.h). The game's
+  // own values for the three rewritten inputs, kept so the effective state can
+  // be recomputed at the world RenderScene boundary.
+  war3::render::War3WorldLightingScope m_war3LightingScope =
+      war3::render::War3WorldLightingScope::Unscoped;
+  bool m_war3PureMaterialValid = false;
+  D3DMATERIAL9 m_war3PureMaterial = {};
+  bool m_war3PureLight0Valid = false;
+  D3DLIGHT9 m_war3PureLight0 = {};
+  bool m_war3PureAmbientValid = false;
+  DWORD m_war3PureAmbientSource = D3DMCS_MATERIAL;
+  bool m_war3AmbientSourceForced = false;
+  // Frame-end BeforeUi fallback outcomes (see War3MaybeInsertBeforeUi).
+  uint64_t m_war3BeforeUiFrameEndCommitCount = 0u;
+  uint64_t m_war3BeforeUiFrameEndRefusedCount = 0u;
+  // Per-frame BeforeUi boundary trace (diagnostics only; logged on change).
+  uint32_t m_war3BeforeUiTraceUiDraws = 0u;
+  uint32_t m_war3BeforeUiTraceUiLikeDraws = 0u;
+  uint32_t m_war3BeforeUiTraceWorldDraws = 0u;
+  uint32_t m_war3BeforeUiTraceCalls = 0u;        // every per-draw call
+  uint32_t m_war3BeforeUiTraceGateRejects = 0u;  // shadow session/epoch gate
+  uint32_t m_war3BeforeUiTraceNotWanted = 0u;    // nothing needs BeforeUi
+  uint32_t m_war3BeforeUiTraceTier = 0u;
+  bool m_war3BeforeUiTraceFrameEnd = false;
+  bool m_war3BeforeUiTraceReady = false;
+  uint32_t m_war3BeforeUiTraceLastSignature = ~0u;
+  uint32_t m_war3BeforeUiTraceLogs = 0u;
+  uint64_t m_war3BeforeUiTraceFrames = 0u;
+  uint64_t m_war3LightingScopeSwitches = 0u;
+  uint64_t m_war3Light0SetsInWorld = 0u;
+  uint64_t m_war3Light0SetsOutside = 0u;
+
+  bool War3WorldLightingActive() const {
+    return war3::render::War3WorldLightingActive(m_war3LightingScope);
+  }
+  D3DMATERIAL9 War3EffectiveMaterial(const D3DMATERIAL9 &pure,
+                                     bool worldLighting) const;
+  D3DLIGHT9 War3EffectiveLight0(const D3DLIGHT9 &pure,
+                                bool worldLighting) const;
+  // Returns true when the ambient override replaced `value`.
+  bool War3EffectiveAmbient(DWORD &value, bool worldLighting) const;
+  void War3ApplyAmbientSourceForWorldLighting(bool overrideActive);
+  void War3ReapplyWorldLighting();
+
 public:
+  // Called by the world RenderScene boundary hook on the D3D thread.
+  void War3SetWorldLightingScope(bool inWorld);
   DWORD GetPureGameAmbient() const { return m_pureGameAmbient; }
   war3::reimpl::War3InstanceBuffer* GetWar3InstanceBuffer();
   War3ShadowReceiverPass* GetWar3ShadowReceiverPass() const {
