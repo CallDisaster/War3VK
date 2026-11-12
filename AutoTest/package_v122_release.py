@@ -11,7 +11,7 @@ import zipfile
 from package_v122_release_candidate import identity, pe_tables, create_text
 from release_v122_package_audit import _pe_identity
 
-VERSION = '1.22.02'
+VERSION = '1.22.03'
 PLAYER = ('d3d9.dll', 'README.md', 'README_CN.md', 'CHANGELOG.md', 'LICENSE',
           'COPYING', 'THIRD_PARTY_NOTICES.md', 'DEPENDENCY_LICENSES.txt',
           'WarVK_GPU_REQUIREMENTS.md', 'WarVK_LockD3D9.cmd', 'WarVK_UnlockD3D9.cmd')

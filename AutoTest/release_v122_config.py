@@ -9,7 +9,7 @@ import re
 import sys
 from pathlib import Path
 
-DEFAULT_VERSION = "1.22.02"
+DEFAULT_VERSION = "1.22.03"
 OPTION_RE = re.compile(
     r"option\s*\(\s*'(?P<name>[^']+)'\s*,\s*type\s*:\s*'(?P<type>[^']+)'\s*,\s*"
     r"value\s*:\s*(?P<raw>true|false|'(?:[^']*)')",

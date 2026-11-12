@@ -11,7 +11,7 @@ from package_v122_release import (make_archive, verify_archive, verify_win32, me
 
 class ReleaseArchiveTests(unittest.TestCase):
     def test_patch_version_and_player_identity(self):
-        self.assertEqual(VERSION, '1.22.02')
+        self.assertEqual(VERSION, '1.22.03')
         self.assertEqual(PLAYER_RUNNING_PREDECESSOR_SHA,
             '1FFE0BD14C51C8E1D2A9EB94425A06260CD4B480A7CA735E13E946EA93EE35CF')
         with tempfile.TemporaryDirectory() as tmp:
@@ -19,7 +19,7 @@ class ReleaseArchiveTests(unittest.TestCase):
             (package / 'README.md').write_text('payload', encoding='utf-8')
             make_archive(package, root / 'p.zip', ('README.md',), {})
             manifest = json.loads((package / 'manifest.json').read_text())
-            self.assertEqual(manifest['version'], '1.22.02')
+            self.assertEqual(manifest['version'], '1.22.03')
 
     def test_actual_pe_reader_contract(self):
         with tempfile.TemporaryDirectory() as tmp:

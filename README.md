@@ -1,10 +1,19 @@
-# WarVK 1.22.02
+# WarVK 1.22.03
 
 [简体中文](README_CN.md) · [Changelog](CHANGELOG.md) · [Map-author API](WarVK/README.md) · [Downloads](https://github.com/CallDisaster/War3VK/releases/latest)
 
 WarVK enhances **Warcraft III 1.27a (32-bit)** using a DXVK-derived D3D9-to-Vulkan backend. It adds directional/point shadows, volumetric lighting, local fog, post-processing, diagnostics and a bounded JASS API, without changing map gameplay.
 
-## Changes in 1.22.02
+## Changes in 1.22.03
+
+- **Panel settings are saved.** Anything changed under "built-in render settings" in the Ctrl+F1 panel is written to `WarVK\settings.ini` and restored on the next start. Only touched values are stored; the panel has a "restore defaults" button.
+- **Unit portraits are no longer tinted by WarVK lighting.** The sun/ambient rewrite now applies to the world scene only; the portrait model keeps the game's own light instead of getting darker or brighter with the time of day.
+- **Shadows and volumetric light no longer draw over the UI while the game is paused or the menu is open.** Paused frames dispatch the world stages through a different path, so the old boundary was never found and the passes ran at frame end. The boundary is now the end of the world scene.
+- **Melee games with computer players no longer drop a shadow frame about once a second.** 1.27a re-enters the script runner whenever a JASS thread resumes (melee AI does so several times per second); it was mistaken for a map change and reset the whole shadow session. It now counts as a map change only when the world is not being rendered.
+- **Sharper, more visible volumetric light.** Dedicated shadow map 1536→2048 with a tighter near layer (5.5→2.9 world units per texel); the shaft edge guide no longer falls straight to 1/8 at 1440p/4K (now 1/3 and 1/4). Default intensity 1.2→1.5, contrast 2.1→2.5, occluded-shaft darkening cap 24%→36%. Still off by default; about 14 MiB more VRAM when enabled.
+- Shader API 1.2.0 and JASS wire `warvk:v1` are unchanged. See the [changelog](CHANGELOG.md) and [1.22.03 notes](docs/RELEASE_1.22.03.md).
+
+### Earlier in 1.22.02
 
 - **Startup failures now explain themselves.** Previously a Vulkan start-up failure (or a missing `vulkan-1.dll`) made the game quit silently. WarVK now shows a dialog (Chinese) with the reason, every GPU's model/VRAM/current driver version, the vendor's minimum driver and download page, whether the GPU itself is supported, and "delete d3d9.dll to return to stock". The same text is saved to `WarVK\Log\startup-error.txt`. Warcraft III then shows its own DirectX error and exits; that part is the game's behavior.
 - **Documented GPU floor.** NVIDIA driver **551.61+** (Maxwell/GTX 750 and newer; Kepler unsupported), AMD Adrenalin **24.2.1+** (RX 5000/RDNA and newer, Ryzen 6000+ iGPUs; Polaris/Vega unsupported), Intel **32.0.101.6557+** (Arc, Core Ultra; Iris Xe listed but unverified). Floors come from published extension lists; only one NVIDIA GPU was tested. See `WarVK_GPU_REQUIREMENTS.md` in the player ZIP.
@@ -46,8 +55,8 @@ A historical same-DLL, matched isolated 2560×1440 A-B-B-A experiment measured m
 - Only verified executable/Game.dll signatures are supported; unknown layouts are not guessed.
 
 1. Fully exit Warcraft III and the editor; back up any existing `d3d9.dll` separately.
-2. Extract **WarVK-1.22.02-win32.zip** and put its DLL beside `war3.exe`.
-3. Start normally; `d3d9.log` should report `DXVK: 1.22.02`.
+2. Extract **WarVK-1.22.03-win32.zip** and put its DLL beside `war3.exe`.
+3. Start normally; `d3d9.log` should report `DXVK: 1.22.03`.
 4. Press **Ctrl+F1** for settings and Render Stats. Normal optimizations do not require recording.
 
 Do not use old experimental launch scripts for normal play. Environment variables are an internal diagnostic surface and can override defaults; supported player/author entry points are the panel and documented JAPI. Heavy frame evidence is **off by default**. Do not install conflicting D3D9 proxy DLLs.
@@ -80,7 +89,7 @@ Fully exit before restoring the backed-up DLL. To uninstall, remove WarVK's DLL;
 
 ## Development / licensing
 
-Product/JAPI display: **1.22.02**; subsequent fixes retain the 1.22 numbering series. External Shader API remains **1.2.0**, JASS wire remains **warvk:v1**; existing scripts do not need an ABI migration.
+Product/JAPI display: **1.22.03**; subsequent fixes retain the 1.22 numbering series. External Shader API remains **1.2.0**, JASS wire remains **warvk:v1**; existing scripts do not need an ABI migration.
 
 Runtime code: `src/d3d9/`; Warcraft integration: `src/d3d9/war3/`; shaders: `subprojects/war3fx/`; author integration: `WarVK/`; tests: `AutoTest/`. Use pinned dependencies and explicit release options, not an old diagnostic build directory. See [release scope](docs/RELEASE_1.22.02.md).
 
