@@ -16,6 +16,8 @@
 #include "war3/tools/war3_diagnostics_hub.h"
 #include "war3/tools/war3_frame_evidence.h"
 #include "war3/platform/war3_vram_preset.h"
+#include "war3/platform/war3_player_settings.h"
+#include "war3/ui/war3_imgui.h"
 
 #include "../util/util_env.h"
 #include "../util/util_error.h"
@@ -268,6 +270,29 @@ namespace dxvk {
                 dxvk::war3::gpureq::VramTierName(preset->tier), " source=", preset->source,
                 " csmResolution ", before, " -> ",
                 m_settings.shadows.csm.shadowResolution));
+        }
+
+        // 玩家在 Ctrl+F1 面板里改过并保存的设置（WarVK\settings.ini）。在显存档位
+        // 之后应用（玩家明确选的值优先于自动档位），在下面的诊断环境变量之前应用。
+        // 地图脚本之后仍可通过设置邮箱修改，那些修改不会写回文件。
+        {
+            war3::player::Extras extras;
+            extras.fpsUnlocked = war3::War3Imgui::isFpsUnlocked();
+            extras.nativeShadowMode = War3RenderState::GetNativeShadowMode();
+            const auto report = war3::player::ApplyAtStartup(m_settings, extras);
+            war3::War3Imgui::setFpsUnlocked(extras.fpsUnlocked);
+            War3RenderState::SetNativeShadowMode(extras.nativeShadowMode);
+            if (report.applied != 0u || report.unknown != 0u ||
+                !report.rejected.empty()) {
+                std::string rejected;
+                for (const auto& key : report.rejected)
+                    rejected += (rejected.empty() ? "" : ",") + key;
+                Logger::info(str::format("WarVK player settings: applied=",
+                    report.applied, " unknown=", report.unknown,
+                    " rejected=", report.rejected.size(),
+                    rejected.empty() ? "" : " [", rejected,
+                    rejected.empty() ? "" : "]"));
+            }
         }
 // Note: War3RenderPipeline needs to be updated to accept/store D3D9DeviceEx*
     // For now, commenting out shadow pass registration - will fix in pipeline refactor

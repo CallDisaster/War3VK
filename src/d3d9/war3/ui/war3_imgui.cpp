@@ -25,6 +25,7 @@
 #include "../render/war3_shadow_display_stats.h"
 #include "../render/war3_stage11_snapshot_page_policy.h"
 #include "../memory/war3_shadow_arena_stats.h"
+#include "../platform/war3_player_settings.h"
 
 #include <algorithm>
 
@@ -124,6 +125,7 @@ void War3Imgui::beginDeviceTeardown(D3D9DeviceEx* owner) {
 void War3Imgui::shutdown(D3D9DeviceEx* owner) {
   if (!m_initialized || m_device != owner)
     return;
+  player::FlushIfDue(true);
   beginDeviceTeardown(owner);
   m_renderStatsRefresh.reset();
   ImGuiContext* previous = ImGui::GetCurrentContext();
@@ -171,7 +173,12 @@ bool War3Imgui::handleWndProc(HWND hWnd, UINT msg, WPARAM wParam,
   return false;
 }
 
-void War3Imgui::toggleVisible() { m_visible = !m_visible; }
+void War3Imgui::toggleVisible() {
+  m_visible = !m_visible;
+  // Closing the panel saves pending edits right away.
+  if (!m_visible)
+    player::FlushIfDue(true);
+}
 
 bool War3Imgui::wantsCaptureMouse() const {
   if (!m_initialized || m_retiring || !m_visible)
@@ -300,6 +307,16 @@ void War3Imgui::drawFrameRecorderPanel() {
 void War3Imgui::drawDebugWindow() {
   ImGuiIO &io = ImGui::GetIO();
 
+  // Panel state outside War3RenderSettings that the player may save.
+  const auto currentExtras = []() {
+    player::Extras extras;
+    extras.fpsUnlocked = isFpsUnlocked();
+    extras.nativeShadowMode = War3RenderState::GetNativeShadowMode();
+    return extras;
+  };
+  const player::Extras extrasBefore = currentExtras();
+  bool recordExtras = true;
+
   // Allow resizing (removed ImGuiWindowFlags_AlwaysAutoResize)
   if (ImGui::Begin("War3VK 调试器", &m_visible, ImGuiWindowFlags_None)) {
     ImGui::Text("帧率 (FPS): %.1f (%.3f ms)", io.Framerate,
@@ -418,6 +435,40 @@ void War3Imgui::drawDebugWindow() {
           ImGui::TextDisabled("渲染设置暂不可写");
         if (settingsWrite) {
         auto &settings = *settingsWrite;
+        // The guard is held for the whole header, so the difference between
+        // this copy and the final state is exactly what the panel changed this
+        // frame. Map/JAPI writes use their own guards and are never recorded.
+        const War3RenderSettings settingsBefore = settings;
+        bool recordSettings = true;
+
+        if (ImGui::Button("恢复默认设置")) {
+          player::Extras extras = currentExtras();
+          if (player::ResetToBaseline(settings, extras)) {
+            setFpsUnlocked(extras.fpsUnlocked);
+            War3RenderState::SetNativeShadowMode(extras.nativeShadowMode);
+          }
+          recordSettings = false;
+          recordExtras = false;
+        }
+        ImGui::SameLine();
+        {
+          const auto status = player::GetStoreStatus();
+          if (status.lastSaveFailed)
+            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.3f, 1.0f),
+                               "保存失败：WarVK\\settings.ini 无法写入");
+          else if (status.savedKeys == 0u)
+            ImGui::TextDisabled("修改会自动保存，下次启动沿用");
+          else
+            ImGui::TextDisabled("已保存 %u 项到 WarVK\\settings.ini%s",
+                                unsigned(status.savedKeys),
+                                status.pending ? "（待写入）" : "");
+        }
+        if (ImGui::IsItemHovered()) {
+          ImGui::SetTooltip(
+              "只记录你在面板里改过的项。地图脚本仍可在游戏中临时修改这些设置，"
+              "\n那些修改不会被保存。删除 settings.ini 也能恢复默认。");
+        }
+
         ImGui::Checkbox("光影", &settings.shadows.enabled);
 
         if (ImGui::TreeNode("Shadow Debug Items")) {
@@ -491,6 +542,8 @@ void War3Imgui::drawDebugWindow() {
           bool debugAllObjects =
               War3RenderState::IsOutlineDebugAllObjectsEnabled();
           if (ImGui::Checkbox("调试：强制所有对象描边", &debugAllObjects)) {
+            // A debug action, not a player choice: do not save its side effects.
+            recordSettings = false;
             War3RenderState::SetOutlineDebugAllObjectsEnabled(debugAllObjects);
 
             // 按你的验证需求：强制所有目标、关闭常驻描边、仅显示被遮挡描边
@@ -1194,6 +1247,9 @@ void War3Imgui::drawDebugWindow() {
 
           ImGui::TreePop();
         }
+
+        if (recordSettings)
+          player::RecordPanelEdit(settingsBefore, settings);
         }
       }
     }
@@ -1290,6 +1346,11 @@ void War3Imgui::drawDebugWindow() {
     }
   }
   ImGui::End();
+
+  if (recordExtras)
+    player::RecordExtrasEdit(extrasBefore, currentExtras());
+  // Save once edits have settled; the close button saves right away.
+  player::FlushIfDue(!m_visible);
 }
 
 void War3Imgui::drawRenderStatsPanel() {

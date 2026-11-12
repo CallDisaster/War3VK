@@ -118,6 +118,7 @@ d3d9_src = [
   'war3/platform/war3_gpu_requirements.cpp',
   'war3/platform/war3_startup_error.cpp',
   'war3/platform/war3_vram_preset.cpp',
+  'war3/platform/war3_player_settings.cpp',
   'war3/math/war3_math_expression.cpp',
   'war3/math/war3_curve_runtime.cpp',
   'war3/memory/tlsf.c',
@@ -368,6 +369,15 @@ gpu_requirements_test = executable('gpu_requirements_test',
    'war3/platform/war3_gpu_requirements.cpp'],
   cpp_args : ['-UNDEBUG'], install : false)
 test('gpu_requirements', gpu_requirements_test, timeout : 30)
+
+# Saved Ctrl+F1 panel settings: value codec, ranges, settings.ini text,
+# atomic file I/O and the process store. Files go to a fresh %TEMP% folder.
+player_settings_test = executable('player_settings_test',
+  ['../../AutoTest/test_player_settings.cpp',
+   'war3/platform/war3_player_settings.cpp'],
+  include_directories : [ dxvk_include_path, include_directories('war3') ],
+  cpp_args : ['-UNDEBUG'], install : false)
+test('player_settings', player_settings_test, timeout : 30)
 
 maintenance_python = import('python').find_installation()
 
