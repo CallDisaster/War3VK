@@ -70,8 +70,9 @@ class WarVKLightingClockStaticTests(unittest.TestCase):
         self.assertIn("Vector4 finalLightDir = sunCycle.direction;", self.shadow)
         self.assertRegex(
             self.shadow,
+            # The panel gets the direction the world is shaded from (j1).
             r"if \(dayNightSettings\.celestialMotionEnabled\)\s+"
-            r"mailbox->pending\.sun\.direction = finalLightDir",
+            r"mailbox->pending\.sun\.direction = sunCycle\.lightDirection",
         )
         self.assertRegex(
             self.shadow,

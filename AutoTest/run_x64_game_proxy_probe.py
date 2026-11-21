@@ -36,6 +36,8 @@ reference arm of the comparison with the original game
 (run_v130_vanilla_compare.py), which counts frames from outside with Direct3D
 9's own Present events. The probe records the wall-clock start of its run
 (observer.beganUnixSeconds) so those events can be cut to the same window.
+With --opengl the game uses its own OpenGL renderer instead; the act uncap=1 then
+lifts the original game's 64 frames a second and nothing else (lift_frame_cap).
 """
 from __future__ import annotations
 
@@ -258,6 +260,250 @@ def kill_own_host(game_pid, host_path):
         kernel.CloseHandle(handle)
     return result
 
+
+def _pe_export(path, name):
+    """A 32-bit PE's export: ("rva", n) or ("forward", "module.function"), read from the file on disk."""
+    data = Path(path).read_bytes()
+    pe = struct.unpack_from("<I", data, 0x3C)[0]
+    require(data[pe:pe + 4] == b"PE\0\0", f"not a PE file: {path}")
+    sections, optional_size = struct.unpack_from("<HxxxxxxxxxxxxH", data, pe + 6)
+    optional = pe + 24
+    require(struct.unpack_from("<H", data, optional)[0] == 0x10B, f"not a 32-bit PE: {path}")
+    export_rva, export_size = struct.unpack_from("<II", data, optional + 96)
+    table = optional + optional_size
+    spans = [struct.unpack_from("<IIII", data, table + 40 * i + 8) for i in range(sections)]
+
+    def offset(rva):
+        for size, address, raw_size, raw in spans:
+            if address <= rva < address + max(size, raw_size):
+                return raw + rva - address
+        raise ValueError(f"rva {rva:#x} outside the sections of {path}")
+
+    base = offset(export_rva)
+    count, names, functions, name_table, ordinals = struct.unpack_from("<IIIII", data, base + 20)
+    for index in range(names):
+        at = offset(struct.unpack_from("<I", data, offset(name_table) + 4 * index)[0])
+        if data[at:data.index(b"\0", at)] == name.encode():
+            ordinal = struct.unpack_from("<H", data, offset(ordinals) + 2 * index)[0]
+            rva = struct.unpack_from("<I", data, offset(functions) + 4 * ordinal)[0]
+            if export_rva <= rva < export_rva + export_size:
+                at = offset(rva)
+                return "forward", data[at:data.index(b"\0", at)].decode("ascii")
+            return "rva", rva
+    raise ValueError(f"{name} is not exported by {path}")
+
+
+def _pe_import_slot(path, library, name):
+    """RVA of the import address table slot through which a 32-bit PE calls library!name."""
+    data = Path(path).read_bytes()
+    pe = struct.unpack_from("<I", data, 0x3C)[0]
+    sections, optional_size = struct.unpack_from("<HxxxxxxxxxxxxH", data, pe + 6)
+    optional = pe + 24
+    require(struct.unpack_from("<H", data, optional)[0] == 0x10B, f"not a 32-bit PE: {path}")
+    import_rva = struct.unpack_from("<I", data, optional + 104)[0]
+    table = optional + optional_size
+    spans = [struct.unpack_from("<IIII", data, table + 40 * i + 8) for i in range(sections)]
+
+    def offset(rva):
+        for size, address, raw_size, raw in spans:
+            if address <= rva < address + max(size, raw_size):
+                return raw + rva - address
+        raise ValueError(f"rva {rva:#x} outside the sections of {path}")
+
+    def string(rva):
+        at = offset(rva)
+        return data[at:data.index(b"\0", at)].decode("ascii")
+
+    descriptor = offset(import_rva)
+    while True:
+        names, _, _, dll, thunks = struct.unpack_from("<IIIII", data, descriptor)
+        if not dll:
+            raise ValueError(f"{path} does not import {library}")
+        if string(dll).lower() == library.lower():
+            index = 0
+            while True:
+                entry = struct.unpack_from("<I", data, offset(names or thunks) + 4 * index)[0]
+                if not entry:
+                    raise ValueError(f"{path} does not import {library}!{name}")
+                if not entry & 0x80000000 and string(entry + 2) == name:
+                    return thunks + 4 * index
+                index += 1
+        descriptor += 20
+
+
+def _swap_interval_stub(base, get_proc, original):
+    """32-bit code at base: once, wglSwapIntervalEXT(0) through wglGetProcAddress, then jmp to original.
+
+    Layout: +0 done flag, +4 "wglSwapIntervalEXT", +24 &wglGetProcAddress, +28 &original, +32 code.
+    It replaces Game.dll's import of wglSwapLayerBuffers (stdcall, two arguments): the stack is
+    left as the caller made it and the jump reaches the real function with it; the calls in
+    between are stdcall and clean up after themselves. eax, ecx and edx are the callee's to use.
+    """
+    pack = lambda v: struct.pack("<I", v)
+    data = pack(0) + b"wglSwapIntervalEXT\0".ljust(20, b"\0") + pack(get_proc) + pack(original)
+    code = (b"\x83\x3D" + pack(base) + b"\x00"            # cmp dword [done], 0
+            + b"\x75\x1D"                                 # jne jump
+            + b"\xC7\x05" + pack(base) + pack(1)          # mov dword [done], 1
+            + b"\x68" + pack(base + 4)                     # push "wglSwapIntervalEXT"
+            + b"\xFF\x15" + pack(base + 24)               # call [wglGetProcAddress]
+            + b"\x85\xC0"                                 # test eax, eax
+            + b"\x74\x04"                                 # jz jump
+            + b"\x6A\x00"                                 # push 0
+            + b"\xFF\xD0"                                 # call eax (wglSwapIntervalEXT)
+            + b"\xFF\x25" + pack(base + 28))              # jump: jmp [original]
+    require(len(data) == 32 and len(code) == 44, "stub layout")
+    return data + code
+
+
+def lift_frame_cap(expected):
+    """uncap=1 (with --vanilla only): the original game without its 64 frames a second, and nothing else.
+
+    Two limits hold the original game in OpenGL mode, both found by sampling its main thread:
+
+    - its main loop (Game.dll 1.27a, the scheduler around 0x6F05F7AD) waits for its next task with
+      WaitForSingleObject(handle, due - GetTickCount()). GetTickCount moves in steps of the system
+      tick, 15.625 ms, whatever timer resolution a process asks for: at most 64 frames a second
+      (v130-uncapped-check-20261122-r2..r7: timeBeginPeriod(1) alone, and with the request
+      honored on the invisible desktop, left it at 64.0);
+    - without it, the NVIDIA OpenGL driver's vertical sync (the game never sets a swap interval,
+      and OpenGL's default is 1): DrvPresentBuffers waits for the vertical blank, 144.0 frames a
+      second on this machine's isolated desktop (r9, r10).
+
+    WarVK presents without vertical sync and its DXVK raises the timer of the game process. Three
+    changes, in the sandbox instance's game process only:
+
+    1. the process asks for a 1 ms system timer: its power throttling state says to honor timer
+       requests although its window is invisible (it always is on the isolated desktop), and one
+       thread of its own runs its own winmm!timeBeginPeriod(1);
+    2. Game.dll's import slot for KERNEL32!GetTickCount is pointed at the game's own
+       winmm!timeGetTime: the same milliseconds since Windows started, read from the 1 ms timer;
+    3. Game.dll's import slot for OPENGL32!wglSwapLayerBuffers is pointed at a 76-byte stub in a
+       page of its own (_swap_interval_stub): on the first swap, on the game's render thread with
+       its context current, it calls wglSwapIntervalEXT(0), then always jumps to the real
+       wglSwapLayerBuffers.
+
+    The game's own limiter (the maxfps setting) then decides the pace. No DLL is loaded into the
+    game; what is written is the two import pointers, each checked against the function it held,
+    and the stub's page.
+    """
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    psapi = ctypes.WinDLL("psapi", use_last_error=True)
+    kernel.OpenProcess.restype = wt.HANDLE
+    kernel.OpenProcess.argtypes = (wt.DWORD, wt.BOOL, wt.DWORD)
+    kernel.GetProcessTimes.argtypes = (wt.HANDLE,) + (ctypes.POINTER(wt.FILETIME),) * 4
+    kernel.CreateRemoteThread.restype = wt.HANDLE
+    kernel.CreateRemoteThread.argtypes = (wt.HANDLE, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p,
+                                          ctypes.c_void_p, wt.DWORD, ctypes.POINTER(wt.DWORD))
+    kernel.WaitForSingleObject.argtypes = (wt.HANDLE, wt.DWORD)
+    kernel.GetExitCodeThread.argtypes = (wt.HANDLE, ctypes.POINTER(wt.DWORD))
+    kernel.CloseHandle.argtypes = (wt.HANDLE,)
+    kernel.SetProcessInformation.argtypes = (wt.HANDLE, ctypes.c_int, ctypes.c_void_p, wt.DWORD)
+    kernel.ReadProcessMemory.argtypes = (wt.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+                                         ctypes.POINTER(ctypes.c_size_t))
+    kernel.WriteProcessMemory.argtypes = kernel.ReadProcessMemory.argtypes
+    kernel.VirtualProtectEx.argtypes = (wt.HANDLE, ctypes.c_void_p, ctypes.c_size_t, wt.DWORD, ctypes.POINTER(wt.DWORD))
+    kernel.VirtualAllocEx.restype = ctypes.c_void_p
+    kernel.VirtualAllocEx.argtypes = (wt.HANDLE, ctypes.c_void_p, ctypes.c_size_t, wt.DWORD, wt.DWORD)
+    kernel.FlushInstructionCache.argtypes = (wt.HANDLE, ctypes.c_void_p, ctypes.c_size_t)
+    psapi.EnumProcessModulesEx.argtypes = (wt.HANDLE, ctypes.c_void_p, wt.DWORD, ctypes.POINTER(wt.DWORD), wt.DWORD)
+    psapi.GetModuleFileNameExW.argtypes = (wt.HANDLE, ctypes.c_void_p, wt.LPWSTR, wt.DWORD)
+    psapi.GetModuleInformation.argtypes = (wt.HANDLE, ctypes.c_void_p, ctypes.c_void_p, wt.DWORD)
+    # CREATE_THREAD | VM_OPERATION | VM_READ | VM_WRITE | SET_INFORMATION | QUERY_INFORMATION | SYNCHRONIZE
+    handle = kernel.OpenProcess(0x2 | 0x8 | 0x10 | 0x20 | 0x200 | 0x400 | 0x100000, False, expected["pid"])
+    require(handle, f"open the game (error {ctypes.get_last_error()})")
+    thread = None
+    try:
+        stamps = [wt.FILETIME() for _ in range(4)]
+        require(kernel.GetProcessTimes(handle, *(ctypes.byref(x) for x in stamps)), "game process times")
+        require((stamps[0].dwLowDateTime | stamps[0].dwHighDateTime << 32) == expected["creation100ns"],
+                "game process identity changed")
+        bases = (ctypes.c_void_p * 1024)()
+        needed = wt.DWORD()
+        require(psapi.EnumProcessModulesEx(handle, bases, ctypes.sizeof(bases), ctypes.byref(needed), 1),
+                "32-bit module snapshot")
+        modules = {}
+        for base in bases[:needed.value // ctypes.sizeof(ctypes.c_void_p)]:
+            path = ctypes.create_unicode_buffer(32768)
+            info = (ctypes.c_uint64 * 3)()  # MODULEINFO of a 64-bit caller: base, size (+pad), entry
+            if base and psapi.GetModuleFileNameExW(handle, base, path, len(path)) and \
+                    psapi.GetModuleInformation(handle, base, info, ctypes.sizeof(info)):
+                # A 64-bit caller is told System32 for the game's 32-bit system DLLs; they are in SysWOW64.
+                file = Path(path.value)
+                system32 = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
+                if os.path.normcase(str(file.parent)) == os.path.normcase(str(system32)):
+                    file = system32.parent / "SysWOW64" / file.name
+                modules[file.name.lower()] = (base, str(file), info[1] & 0xFFFFFFFF)
+
+        def export(module, function):
+            for _ in range(4):
+                require(module in modules, f"{module} is not loaded in the game")
+                kind, value = _pe_export(modules[module][1], function)
+                if kind == "rva":
+                    return modules[module][0] + value
+                target, _, function = value.partition(".")
+                module = target.lower() + ("" if target.lower().endswith(".dll") else ".dll")
+            raise ValueError("export forwarding too deep")
+
+        def owner(address):
+            return next((name for name, (base, _, size) in modules.items() if base <= address < base + size), None)
+
+        # 1. A 1 ms timer, honored although the window is invisible: ProcessPowerThrottling (4),
+        # version 1, control PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION (4), state 0.
+        state = (wt.ULONG * 3)(1, 4, 0)
+        require(kernel.SetProcessInformation(handle, 4, state, ctypes.sizeof(state)),
+                f"SetProcessInformation(ProcessPowerThrottling) (error {ctypes.get_last_error()})")
+        begin_period = export("winmm.dll", "timeBeginPeriod")
+        thread = kernel.CreateRemoteThread(handle, None, 0, begin_period, 1, 0, None)
+        require(thread, f"CreateRemoteThread (error {ctypes.get_last_error()})")
+        require(kernel.WaitForSingleObject(thread, 5000) == 0, "timeBeginPeriod thread did not end")
+        code = wt.DWORD()
+        require(kernel.GetExitCodeThread(thread, ctypes.byref(code)), "thread exit code")
+        require(code.value == 0, f"timeBeginPeriod(1) returned {code.value}")  # TIMERR_NOERROR
+        def repoint(library, function, held, value):
+            """One import slot of Game.dll from held (checked) to value; protection as it was."""
+            require("game.dll" in modules, "Game.dll is not loaded in the game")
+            slot = modules["game.dll"][0] + _pe_import_slot(modules["game.dll"][1], library, function)
+            before, moved = wt.DWORD(), ctypes.c_size_t()
+            require(kernel.ReadProcessMemory(handle, slot, ctypes.byref(before), 4, ctypes.byref(moved))
+                    and moved.value == 4, f"read Game.dll's {function} slot")
+            require(before.value == held, f"Game.dll's {function} slot holds {before.value:#x} "
+                    f"({owner(before.value)}), not {function}")
+            after = wt.DWORD(value)
+            # The import table is read-only once loaded: writable for this one write, then as it was.
+            protection = wt.DWORD()
+            require(kernel.VirtualProtectEx(handle, slot, 4, 0x04, ctypes.byref(protection)),  # PAGE_READWRITE
+                    f"unprotect Game.dll's {function} slot (error {ctypes.get_last_error()})")
+            try:
+                require(kernel.WriteProcessMemory(handle, slot, ctypes.byref(after), 4, ctypes.byref(moved))
+                        and moved.value == 4, f"write Game.dll's {function} slot (error {ctypes.get_last_error()})")
+            finally:
+                restored = wt.DWORD()
+                kernel.VirtualProtectEx(handle, slot, 4, protection.value, ctypes.byref(restored))
+            check = wt.DWORD()
+            require(kernel.ReadProcessMemory(handle, slot, ctypes.byref(check), 4, ctypes.byref(moved)) and
+                    check.value == after.value, f"Game.dll's {function} slot did not take the new value")
+            return dict(slot=hex(slot), protection=hex(protection.value), before=hex(before.value),
+                        beforeOwner=owner(before.value), after=hex(after.value), afterOwner=owner(after.value))
+
+        # 2. Game.dll's GetTickCount slot -> timeGetTime.
+        clock = repoint("KERNEL32.dll", "GetTickCount", export("kernel32.dll", "GetTickCount"),
+                        export("winmm.dll", "timeGetTime"))
+        # 3. Game.dll's wglSwapLayerBuffers slot -> the swap interval stub, which ends in the real one.
+        swap = export("opengl32.dll", "wglSwapLayerBuffers")
+        page = kernel.VirtualAllocEx(handle, None, 4096, 0x3000, 0x40)  # MEM_COMMIT|RESERVE, EXECUTE_READWRITE
+        require(page and page < 0x100000000, f"stub page (error {ctypes.get_last_error()})")
+        stub = _swap_interval_stub(page, export("opengl32.dll", "wglGetProcAddress"), swap)
+        moved = ctypes.c_size_t()
+        require(kernel.WriteProcessMemory(handle, page, stub, len(stub), ctypes.byref(moved)) and moved.value == len(stub),
+                "write the stub")
+        require(kernel.FlushInstructionCache(handle, page, len(stub)), "flush the stub")
+        sync = repoint("OPENGL32.dll", "wglSwapLayerBuffers", swap, page + 32)
+        return dict(posted=True, timerPeriodMs=1, timerResolutionHonoredWhenInvisible=True,
+                    getTickCount=clock, wglSwapLayerBuffers=sync, stubPage=hex(page), stubBytes=len(stub))
+    finally:
+        if thread:
+            kernel.CloseHandle(thread)
+        kernel.CloseHandle(handle)
 
 VA_REGIONS_END = 1 << 32  # the whole address space of a large-address-aware WOW64 process
 
@@ -541,13 +787,14 @@ def plane_act(native, output, action):
 
 def parse_actions(text, seconds):
     """'T:act,...' with act in key=K | activate=0|1 | show=minimize|restore | size=WxH | click=XxY | host=kill
-    | notice=dismiss | api=... | test=... | capture=NAME."""
+    | notice=dismiss | api=... | test=... | capture=NAME | uncap=1 (with --vanilla)."""
     rows = []
     for item in filter(None, (text or "").split(",")):
         at, _, action = item.partition(":")
         name, _, value = action.partition("=")
-        require(name in ("key", "activate", "show", "size", "click", "host", "notice", "va") + PLANE_ACTS and value,
-                f"action {item}")
+        require(name in ("key", "activate", "show", "size", "click", "host", "notice", "va", "uncap") + PLANE_ACTS
+                and value, f"action {item}")
+        require(name != "uncap" or value == "1", f"uncap {item}")
         require(name != "va" or value == "regions", f"va {item}")
         require(name != "notice" or value == "dismiss", f"notice {item}")
         require(name != "test" or value.partition(":")[0] in TEST_COMMANDS, f"test {item}")
@@ -741,6 +988,11 @@ def observe(desktop, launch_index, executable, output, stop, receipt, seconds, e
                         pending = [row for row in pending if row[1] == "notice=dismiss"]
                 elif action == "notice=dismiss":
                     done = dismiss_notice(native, expected, desktop.input_before)
+                elif action == "uncap=1":
+                    try:
+                        done = lift_frame_cap(expected)
+                    except Exception as error:
+                        done = dict(posted=False, error=f"{type(error).__name__}: {error}")
                 elif action == "va=regions":
                     try:
                         done = va_regions(native, output, len(receipt["actions"]))
@@ -840,6 +1092,8 @@ def main(argv=None):
         require(product is None or pe_bits(product) == 32, "x86 product DLL required")
         require(not args.in_process or product is not None, "--in-process needs --product-dll")
         require(not args.opengl or args.vanilla, "--opengl needs --vanilla")
+        require(args.vanilla or not any(action == "uncap=1" for _, action in actions),
+                "uncap=1 is for the original game only (--vanilla)")
         receipt["opengl"] = bool(args.opengl)
         receipt["mode"] = "vanilla" if args.vanilla else (
             ("product-in-process" if args.in_process else "product-proxy-mode") if product else "bare-proxy")

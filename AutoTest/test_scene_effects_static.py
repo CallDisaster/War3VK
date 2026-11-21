@@ -281,11 +281,19 @@ class SceneEffectTemplate(unittest.TestCase):
         self.assertIn("'d3d9_war3_bloom.cpp'", x86)
         self.assertIn("'d3d9_war3_scene_effects_fixture.cpp'", x86)
         self.assertNotIn("scene_effects_fixture", host)
-        self.assertIn("glsl_generator.process(war3fx_executor_shaders)", host)
+        # The host compiles the executor subset with its own generator: the
+        # same glslang arguments plus the host's layer-receiver define.
+        self.assertIn("host_effect_glsl = generator(glsl_compiler,", host)
+        self.assertIn("arguments: glsl_args + ['-DWARVK_HOST_LAYER_RECEIVER=1']", host)
+        self.assertIn("host_effect_glsl.process(war3fx_executor_shaders)", host)
         shaders = read(ROOT / "subprojects/war3fx/meson.build")
         subset = shaders[shaders.index("war3fx_executor_shaders = files(["):]
         subset = subset[:subset.index("])")]
-        for shader in re.findall(r"'([^']+)'", subset):
+        # Comments in the list may contain apostrophes ("the water's").
+        subset = "\n".join(line.split("#", 1)[0] for line in subset.splitlines())
+        names = re.findall(r"'([^']+)'", subset)
+        self.assertIn("shaders/war3_water_surface.frag", names)
+        for shader in names:
             self.assertEqual(2, shaders.count(f"'{shader}'"),
                              f"{shader} must also be in war3fx_shaders")
 

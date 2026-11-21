@@ -4,7 +4,8 @@
   environment already has a value, the host's recorder then keeps no frame ring and runs
   no tear audit, and WarVK_EvidenceStart.cmd (pure ASCII, CRLF) turns it on.
 - The comparison gate (run_v130_vanilla_compare.py) runs the original game without any
-  WarVK file and counts both arms with the kernel's present events.
+  WarVK file, the release in the game's own process and the release with its 64-bit
+  renderer, and counts every arm with the kernel's present events.
 """
 from pathlib import Path
 import re
@@ -83,9 +84,43 @@ class VanillaComparisonTests(unittest.TestCase):
         gate = read("AutoTest/run_v130_vanilla_compare.py")
         self.assertIn('PROVIDER = ("Microsoft-Windows-DxgKrnl", "0x8000000", "4")', gate)
         self.assertIn('PRESENT_EVENT = "184"', gate)
-        self.assertIn('pids = [pid] if arm == "vanilla" else (observer.get("hostPids") or [])', gate)
+        self.assertIn('ARMS = ("vanilla", "uncapped", "inprocess", "warvk")', gate)
+        self.assertIn('ORIGINAL = ("vanilla", "uncapped")', gate)
+        self.assertIn('pids = [pid] if arm in ORIGINAL + ("inprocess",) else (observer.get("hostPids") or [])', gate)
         self.assertIn('command += ["--vanilla", "--opengl"]', gate)
-        self.assertIn('"--profile", "product-async-delta"', gate)
+        # The uncapped original: a 1 ms timer and Game.dll's GetTickCount slot read from it, nothing else.
+        self.assertIn('(["5:uncap=1"] if arm == "uncapped" else [])', gate)
+        self.assertIn('row["probeOk"] = row["probeOk"] and bool(row["uncap"] and row["uncap"].get("posted"))', gate)
+        probe_text = read("AutoTest/run_x64_game_proxy_probe.py")
+        self.assertIn('begin_period = export("winmm.dll", "timeBeginPeriod")', probe_text)
+        self.assertIn('clock = repoint("KERNEL32.dll", "GetTickCount", export("kernel32.dll", "GetTickCount"),', probe_text)
+        self.assertIn('sync = repoint("OPENGL32.dll", "wglSwapLayerBuffers", swap, page + 32)', probe_text)
+        self.assertIn('"uncap=1 is for the original game only (--vanilla)"', probe_text)
+        # What is written into the game: the stub's page and the two import slots (one helper).
+        self.assertEqual(probe_text.count("kernel.WriteProcessMemory(handle,"), 2)
+        sys_path = str(ROOT / "AutoTest")
+        import sys
+        if sys_path not in sys.path:
+            sys.path.insert(0, sys_path)
+        import struct
+        import run_x64_game_proxy_probe as probe
+        stub = probe._swap_interval_stub(0x10000, 0x20000, 0x30000)
+        self.assertEqual(len(stub), 76)
+        self.assertEqual(stub[4:23], b"wglSwapIntervalEXT\0")
+        code = stub[32:]
+        # jne and jz both land on the final jmp [original] at code+38.
+        self.assertEqual(9 + code[8], 38)
+        self.assertEqual(34 + code[33], 38)
+        self.assertEqual(code[38:40], b"\xFF\x25")
+        self.assertEqual(struct.unpack_from("<I", code, 40)[0], 0x10000 + 28)
+        self.assertEqual(struct.unpack_from("<I", stub, 28)[0], 0x30000)
+        self.assertIn('command += ["--in-process"]', gate)
+        # The probe takes at most 300 s of timeout; 生与死 runs 170 s (v130-vanilla-compare-20261121-r3).
+        self.assertIn('"--timeout-seconds", str(min(seconds + 150, 300))', gate)
+        probe = read("AutoTest/run_x64_game_proxy_probe.py")
+        self.assertIn("args.seconds + 20 <= args.timeout_seconds <= 300", probe)
+        self.assertIn('checks[f"{name}:measured"] = all(summary[arm]["runs"] == args.rounds for arm in arms)', gate)
+        self.assertIn('"--profile", "product-async-delta", "--env", "WARVK_D3D9_EVIDENCE=0"', gate)
         # The same window for both arms, and the WarVK arm settled before it starts.
         self.assertIn("first <= clock <= last", gate)
         self.assertIn('row["readyInTime"] = ready is not None and ready + SETTLE_SECONDS <= first', gate)

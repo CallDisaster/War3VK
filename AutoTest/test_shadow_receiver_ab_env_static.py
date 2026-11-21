@@ -5,11 +5,13 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PIPELINE = ROOT / "src" / "d3d9" / "d3d9_war3_pipeline.cpp"
+# The environment overrides moved from the pipeline into the settings resolver
+# with the x64 work; the contract is the same.
+RESOLVER = ROOT / "src" / "d3d9" / "war3" / "render" / "war3_settings_resolver.cpp"
 
 
 def main() -> int:
-    text = PIPELINE.read_text(encoding="utf-8")
+    text = RESOLVER.read_text(encoding="utf-8")
     required = {
         "receiver mode":
             'ParseEnvInt("DXVK_WAR3_SHADOW_RECEIVER_MODE"',

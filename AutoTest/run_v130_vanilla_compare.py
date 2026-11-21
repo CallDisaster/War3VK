@@ -1,32 +1,45 @@
 #!/usr/bin/env python3
 """1.30.00: the original game against WarVK with its lighting on, on this machine.
 
-Two arms per map, alternating, the order flipping each round (the machine is shared):
+Four arms per map, alternating, the order flipping each round (the machine is shared):
 
-  vanilla  the game as it ships, no WarVK at all: no d3d9.dll in the instance, and the
-           game's own OpenGL renderer (run_x64_game_proxy_probe.py --vanilla --opengl).
-           Its Direct3D renderer cannot start on an isolated desktop: the game reports
-           that it could not initialize DirectX (v123-vanilla-diag-20261121-r2). The
-           tests never run on the input desktop, so the Direct3D original is not measured.
-  warvk    the release's x86 d3d9.dll in proxy mode with the release's x64 front end and
-           host and the transport the player package sets (product-async-delta), every
-           player setting at its default: sun shadows, volumetric light, fog,
-           post-processing and the new water as a player gets them.
+  vanilla    the game as it ships, no WarVK at all: no d3d9.dll in the instance, and the
+             game's own OpenGL renderer (run_x64_game_proxy_probe.py --vanilla --opengl).
+             Its Direct3D renderer cannot start on an isolated desktop: the game reports
+             that it could not initialize DirectX (v123-vanilla-diag-20261121-r2). The
+             tests never run on the input desktop, so the Direct3D original is not measured.
+  uncapped   the same original game with its frame limits lifted and nothing else (act
+             uncap=1, run_x64_game_proxy_probe.lift_frame_cap). Its main loop schedules the
+             next frame by GetTickCount, which moves in 15.625 ms steps (64 frames a second);
+             below that the NVIDIA OpenGL driver waits for vertical sync (144 on this machine's
+             isolated desktop). The game process gets a 1 ms timer, Game.dll's GetTickCount
+             import reads timeGetTime instead, and the first swap sets the swap interval to 0.
+             The game's own limiter (maxfps) is left as it is. WarVK presents without vertical
+             sync by default.
+  inprocess  the release's x86 d3d9.dll alone, the device in the game's own process: what a
+             player gets after removing WarVK\\x64 (the single-process mode of 1.22.03).
+  warvk      the release's x86 d3d9.dll in proxy mode with the release's x64 front end and
+             host and the transport the player package sets (product-async-delta).
 
-Both arms are counted the same way, from outside: the kernel's own present events
+Both WarVK arms keep every player setting at its default: sun light and shadows, Bloom,
+post-processing, the day/night light and the new water (in the 64-bit arm) are on;
+SSAO, volumetric light and point lights are off, as a player gets them.
+
+All arms are counted the same way, from outside: the kernel's own present events
 (ETW provider Microsoft-Windows-DxgKrnl, keyword Present, event 184), traced with
 logman for the whole run, converted by tracerpt and cut to the same window of each run
 (seconds after the probe saw the game start). The presenting process is the game in
-the vanilla arm and the x64 host in the WarVK arm (the probe records the host's pid).
-Frame rate and p50/p95/p99 frame times come from the intervals between presents. In the
-WarVK arm the product's own frame counter is recorded too, as a cross-check (on
-2026-11-21 the kernel counted 231.0 presents/s where the product counted 230.2 fps,
-v123-warvk-etw-diag-20261121-r1).
+the vanilla and in-process arms and the x64 host in the WarVK arm (the probe records
+the host's pid). Frame rate and p50/p95/p99 frame times come from the intervals between
+presents. In both WarVK arms the product's own frame counter is recorded too, as a
+cross-check (on 2026-11-21 the kernel counted 231.0 presents/s where the product counted
+230.2 fps, v123-warvk-etw-diag-20261121-r1).
 
 The original game caps itself: its OpenGL renderer presented exactly 64 frames a second
 on Lost Temple (v123-vanilla-gl-diag-20261121-r1), and its Direct3D renderer asks for
 vertical sync. WarVK lifts the cap by default. A vanilla frame rate at the cap means the
-game was waiting, not that the machine could do no more.
+game was waiting, not that the machine could do no more; the uncapped arm shows what the
+original does without the wait.
 
 Also per run: the x86 process's free low 2 GiB and largest hole at the close, its peak
 private bytes, and what else the machine was doing (busy cores, GPU load).
@@ -61,7 +74,8 @@ MAPS = {
     "shengyusi": dict(path=DEFAULT_SANDBOX_ROOT / "Maps/(4)生与死v1.28读档bug修复.w3x", seconds=170,
                       window=(135, 165), acts=["72:key=SPACE", "86:key=SPACE", "100:key=SPACE", "114:key=SPACE"]),
 }
-ARMS = ("vanilla", "warvk")
+ARMS = ("vanilla", "uncapped", "inprocess", "warvk")
+ORIGINAL = ("vanilla", "uncapped")
 PROVIDER = ("Microsoft-Windows-DxgKrnl", "0x8000000", "4")  # keyword Present, level informational
 PRESENT_EVENT = "184"
 SETTLE_SECONDS = 12.0
@@ -75,21 +89,24 @@ def require(condition, message):
 
 def machine():
     """What the numbers were measured on."""
-    script = ("$c=Get-CimInstance Win32_Processor|Select-Object -First 1 Name,NumberOfCores,NumberOfLogicalProcessors,"
+    # Windows PowerShell writes in the console code page unless told otherwise; the OS caption is localized.
+    script = ("[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;"
+              "$c=Get-CimInstance Win32_Processor|Select-Object -First 1 Name,NumberOfCores,NumberOfLogicalProcessors,"
               "MaxClockSpeed;$m=Get-CimInstance Win32_ComputerSystem|Select-Object TotalPhysicalMemory;"
               "$g=@(Get-CimInstance Win32_VideoController|Select-Object Name,DriverVersion,CurrentHorizontalResolution,"
               "CurrentVerticalResolution,CurrentRefreshRate);$o=Get-CimInstance Win32_OperatingSystem|"
               "Select-Object Caption,BuildNumber;[pscustomobject]@{cpu=$c;memory=$m;gpus=$g;os=$o}|ConvertTo-Json -Depth 4")
     row = {}
     try:
-        text = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True,
-                              text=True, timeout=60, creationflags=BELOW_NORMAL).stdout
-        row = json.loads(text)
-    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        text = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True,
+                              encoding="utf-8", errors="replace", timeout=60, creationflags=BELOW_NORMAL).stdout
+        row = json.loads(text or "null") or {}
+    except (OSError, ValueError, TypeError, subprocess.SubprocessError) as error:
         row["error"] = f"{type(error).__name__}: {error}"
     try:
         line = subprocess.run(["nvidia-smi", "--query-gpu=name,driver_version,memory.total",
-                               "--format=csv,noheader"], capture_output=True, text=True, timeout=10,
+                               "--format=csv,noheader"], capture_output=True, encoding="utf-8", errors="replace",
+                              timeout=10,
                               creationflags=BELOW_NORMAL).stdout.strip()
         row["nvidiaSmi"] = line
     except (OSError, subprocess.SubprocessError):
@@ -105,7 +122,7 @@ class PresentTrace:
 
     def start(self):
         result = subprocess.run(["logman", "start", self.name, "-p", *PROVIDER,
-                                 "-o", str(self.etl), "-ets"], capture_output=True, text=True,
+                                 "-o", str(self.etl), "-ets"], capture_output=True, text=True, errors="replace",
                                 creationflags=BELOW_NORMAL)
         self.started = result.returncode == 0
         return dict(started=self.started, code=result.returncode)
@@ -113,7 +130,7 @@ class PresentTrace:
     def stop(self):
         if not self.started:
             return dict(stopped=False)
-        result = subprocess.run(["logman", "stop", self.name, "-ets"], capture_output=True, text=True,
+        result = subprocess.run(["logman", "stop", self.name, "-ets"], capture_output=True, text=True, errors="replace",
                                 creationflags=BELOW_NORMAL)
         self.started = result.returncode != 0
         return dict(stopped=result.returncode == 0, code=result.returncode)
@@ -166,15 +183,21 @@ def interval_stats(times):
 
 def run_arm(output, name, arm, spec, args, stamp):
     seconds, (first, last) = spec["seconds"], spec["window"]
-    actions = ",".join(spec["acts"] + [f"{last + 1}:va=regions"])
+    actions = ",".join((["5:uncap=1"] if arm == "uncapped" else []) + spec["acts"] + [f"{last + 1}:va=regions"])
     command = [sys.executable, "-B", str(PROBE), "--output", str(output), "--instance-id", stamp,
-               "--map", str(spec["path"]), "--seconds", str(seconds), "--timeout-seconds", str(seconds + 150),
+               "--map", str(spec["path"]), "--seconds", str(seconds), "--timeout-seconds", str(min(seconds + 150, 300)),
                "--dump-every", "100000", "--actions", actions]
-    if arm == "vanilla":
+    if arm in ORIGINAL:
         command += ["--vanilla", "--opengl"]
     else:
+        # The probe names the front end itself, so the product does not take the player package's
+        # defaults (war3_proxy_auto.cpp kSettings): the transport is the profile of the same name,
+        # and frame evidence is switched off here as players have it.
         command += ["--proxy", str(args.front), "--host", str(args.host), "--product-dll", str(args.product_dll),
-                    "--profile", "product-async-delta"]
+                    "--profile", "product-async-delta", "--env", "WARVK_D3D9_EVIDENCE=0"]
+        if arm == "inprocess":
+            # The probe then drops the front end and every WARVK_D3D9_ switch: the device is in the game.
+            command += ["--in-process"]
     trace = PresentTrace(f"WarVK_Compare_{stamp}", output.parent / f"{output.name}.etl")
     row = dict(map=name, arm=arm, output=output.name, window=[first, last])
     load = LoadWatch()
@@ -196,6 +219,9 @@ def run_arm(output, name, arm, spec, args, stamp):
     observer = receipt.get("observer") or {}
     failed = [k for k, v in (receipt.get("checks") or {}).items() if not v and k != "frameNotFlat"]
     row.update(probeOk=not failed and not receipt.get("errors"), failedChecks=failed, errors=receipt.get("errors"))
+    if arm == "uncapped":
+        row["uncap"] = next((a for a in observer.get("actions") or [] if a.get("action") == "uncap=1"), None)
+        row["probeOk"] = row["probeOk"] and bool(row["uncap"] and row["uncap"].get("posted"))
     samples = observer.get("samples") or []
     va = observer.get("vaSample") or {}
     row["memory"] = dict(peakPrivateBytes=max((s["privateBytes"] for s in samples), default=None),
@@ -205,7 +231,7 @@ def run_arm(output, name, arm, spec, args, stamp):
         row["memory"]["scanLowUsableFreeBytes"] = scan["low"].get("usableFreeBytes")
     origin = observer.get("beganUnixSeconds")
     pid = (observer.get("processIdentity") or {}).get("pid")
-    pids = [pid] if arm == "vanilla" else (observer.get("hostPids") or [])
+    pids = [pid] if arm in ORIGINAL + ("inprocess",) else (observer.get("hostPids") or [])
     row["presentingPids"] = pids
     if origin is None or not pids or None in pids or not trace.etl.is_file():
         row["pace"] = None
@@ -217,7 +243,7 @@ def run_arm(output, name, arm, spec, args, stamp):
     row["eventKinds"] = kinds
     row["pace"] = interval_stats(times)
     (output / "presents.json").write_text(json.dumps([round((t - zero) / 1e7, 5) for t in times]), encoding="utf-8")
-    if arm == "warvk":
+    if arm not in ORIGINAL:
         plane = observer.get("controlPlane") or {}
         ready = plane.get("readyAtSeconds")
         series = [r for r in plane.get("frameSeries") or [] if r[1] is not None and r[2] is not None and r[3]]
@@ -243,6 +269,7 @@ def main(argv=None):
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--maps", default="losttemple,echoisles,shengyusi")
     parser.add_argument("--rounds", type=int, default=2)
+    parser.add_argument("--arms", default=",".join(ARMS), help="a subset of the arms, for a quick check")
     args = parser.parse_args(argv)
     output = args.output.resolve()
     receipt = dict(schema="warvk-v130-vanilla-compare/v1", ok=False, runs=[], maps={}, checks={}, errors=[],
@@ -250,6 +277,8 @@ def main(argv=None):
     try:
         require(ARTIFACT_ROOT in output.parents and not output.exists(), "fresh output under AutoTest/artifacts")
         names = [n for n in args.maps.split(",") if n]
+        arms = tuple(a for a in ARMS if a in args.arms.split(","))
+        require(arms and all(a in ARMS for a in args.arms.split(",")), "arms")
         require(names and all(n in MAPS for n in names) and 1 <= args.rounds <= 4, "maps / rounds")
         for path in (args.product_dll, args.front, args.host, *(MAPS[n]["path"] for n in names)):
             require(Path(path).is_file(), f"missing {path}")
@@ -258,7 +287,7 @@ def main(argv=None):
         serial = 0
         for name in names:
             for round_index in range(args.rounds):
-                order = ARMS if round_index % 2 == 0 else ARMS[::-1]
+                order = arms if round_index % 2 == 0 else arms[::-1]
                 for arm in order:
                     for attempt in range(1, RUN_ATTEMPTS + 1):
                         serial += 1
@@ -280,10 +309,10 @@ def main(argv=None):
                                                          encoding="utf-8")
         checks = receipt["checks"]
         checks["allRunsPassed"] = all(r.get("probeOk") for r in receipt["runs"])
-        checks["warvkReadyInTime"] = all(r.get("readyInTime") for r in receipt["runs"] if r["arm"] == "warvk")
+        checks["warvkReadyInTime"] = all(r.get("readyInTime") for r in receipt["runs"] if r["arm"] not in ORIGINAL)
         for name in names:
             summary = {}
-            for arm in ARMS:
+            for arm in arms:
                 runs = [r for r in receipt["runs"] if r["map"] == name and r["arm"] == arm and r.get("probeOk")
                         and r.get("pace")]
                 summary[arm] = dict(runs=len(runs),
@@ -292,13 +321,17 @@ def main(argv=None):
                     p95Ms=median([r["pace"].get("p95Ms") for r in runs]),
                     p99Ms=median([r["pace"].get("p99Ms") for r in runs]),
                     freeBytes=median([r["memory"]["freeBytes"] for r in runs]),
+                    # What VirtualAlloc can still hand out in the low 2 GiB (the README's "usable").
+                    lowUsableFreeBytes=median([r["memory"].get("scanLowUsableFreeBytes") for r in runs]),
                     largestHoleBytes=median([r["memory"]["largestHoleBytes"] for r in runs]),
                     peakPrivateBytes=median([r["memory"]["peakPrivateBytes"] for r in runs]),
                     busyCoresMedian=median([r["load"].get("cpuBusyCoresMedian") for r in runs]))
-            a, b = summary["vanilla"], summary["warvk"]
-            if a["fps"] and b["fps"]:
-                summary["fpsRatio"] = round(b["fps"] / a["fps"], 3)
-            checks[f"{name}:measured"] = a["runs"] == args.rounds and b["runs"] == args.rounds
+            fps = {arm: summary[arm]["fps"] for arm in arms}
+            for key, base in (("fpsRatio", "vanilla"), ("fpsRatioToUncapped", "uncapped"),
+                              ("fpsRatioToInprocess", "inprocess")):
+                if fps.get("warvk") and fps.get(base):
+                    summary[key] = round(fps["warvk"] / fps[base], 3)
+            checks[f"{name}:measured"] = all(summary[arm]["runs"] == args.rounds for arm in arms)
             receipt["maps"][name] = summary
         receipt["ok"] = all(checks.values())
     except Exception as error:
