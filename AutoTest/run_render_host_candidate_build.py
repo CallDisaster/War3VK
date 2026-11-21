@@ -17,6 +17,13 @@ from run_render_host_protocol_gate import identity, pe_identity
 from run_render_host_transport_gate import require
 from render_lab_raw_artifacts import capture_raw_artifacts, raw_manifests, verify_raw_artifacts
 
+
+def guarded_identity(path):
+    """Protected files are compared, never created: an absent player DLL must stay absent."""
+    if not path.exists():
+        return {'path': str(path), 'exists': False}
+    return identity(path)
+
 TARGET = Path('tools/render_host/dxvk_core/warvk-d3d9-host-dev.exe')
 PROTECTED = (
     Path('E:/Work/Warcraft III/d3d9.dll'),
@@ -66,7 +73,7 @@ def main():
     env['PATH'] = 'D:/Environment/Python3.13.11/Scripts;E:/Dev/Vulkan SDK/Bin;' + env['PATH']
     before = [identity(p) for p in sources()]
     receipt['sources'] = before
-    receipt['protectedBefore'] = [identity(p) for p in PROTECTED]
+    receipt['protectedBefore'] = [guarded_identity(p) for p in PROTECTED]
     try:
         require(os.name == 'nt', 'Windows build owner only')
         options = ['-D'+k+'=false' for k in
@@ -89,7 +96,7 @@ def main():
         try:
             receipt['sourcesPreserved'] = before == [identity(p) for p in sources()]
             require(receipt['sourcesPreserved'], 'source drift during build')
-            receipt['protectedAfter'] = [identity(p) for p in PROTECTED]
+            receipt['protectedAfter'] = [guarded_identity(p) for p in PROTECTED]
             receipt['protectedUnchanged'] = receipt['protectedBefore'] == receipt['protectedAfter']
             require(receipt['protectedUnchanged'], 'protected product changed')
             for item in raw_manifests(receipt):

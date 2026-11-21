@@ -14,14 +14,27 @@ class ClassifyTest(unittest.TestCase):
             'd3d9_war3_hook.cpp': 'data', 'jass_war3_jass.cpp': 'data',
             'war3_hooks_war3_hook_render.cpp': 'data', 'war3_state_war3_render_state.cpp': 'data',
             'war3_render_war3_renderer.cpp': 'mixed', 'war3_gpu_skin_war3_gpu_skin_compute.cpp': 'mixed',
-            'war3_shader_api.cpp': 'mixed', 'war3_shaderpack_image.cpp': 'effects',
+            'war3_shader_api.cpp': 'mixed', 'war3_shaderpack_image.cpp': 'stb',
+            'war3_shaderpack.cpp': 'effects',
             'war3_tools_war3_perf_monitor.cpp': 'tools', 'war3_ui_war3_imgui.cpp': 'ui',
             'war3_war3.cpp': 'runtime', 'war3_war3_user_example.cpp': 'data',
-            'meson-generated_.._war3_imgui_dx9_backend.cpp': 'imgui'}
+            'meson-generated_.._war3_imgui_dx9_backend.cpp': 'imgui',
+            'meson-generated_.._war3_imgui_dx9_proxy_backend.cpp': 'imgui',
+            'war3_ui_war3_imgui_inprocess.cpp': 'ui',
+            'war3_platform_war3_proxy_overlay.cpp': 'data'}
         for name, layer in cases.items():
             self.assertEqual(gate.classify(None, name), layer, name)
         self.assertIsNone(gate.classify(None, 'version'))
         self.assertEqual(gate.classify('dxvk', 'dxvk_device.cpp'), 'dxvk')
+
+    def test_layer_sets(self):
+        # Phase 3: ImGui stays in the game process (its overlay draws through
+        # IDirect3DDevice9) and the stb_image decoder is portable CPU code.
+        self.assertEqual(gate.CORE, {'device', 'effects', 'dxvk'})
+        self.assertLessEqual({'util', 'minhook', 'stb'}, gate.PORTABLE)
+        self.assertIn('imgui', gate.GROWABLE)
+        self.assertFalse(gate.CORE & gate.PORTABLE)
+        self.assertFalse(gate.CORE & gate.GROWABLE)
 
     def test_unknown_object_fails(self):
         for name in ('war3_newdir_x.cpp', 'other.cpp', 'war3_.cpp'):

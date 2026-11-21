@@ -21,7 +21,7 @@ def body(source: str, signature: str, next_signature: str | None = None) -> str:
 class VulkanReleaseReviewStaticTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.aa = read("src/d3d9/d3d9_war3_aa.cpp")
+        cls.aa = read("src/d3d9/war3/effects/war3_aa_executor.cpp")
         cls.cs = read("src/dxvk/dxvk_cs.cpp")
         cls.device = read("src/dxvk/dxvk_device.h")
         cls.presenter = read("src/dxvk/dxvk_presenter.cpp")
@@ -48,8 +48,8 @@ class VulkanReleaseReviewStaticTests(unittest.TestCase):
         self.assertIn("ctx->track(uploadBuffer, DxvkAccess::Read)", upload)
         create = body(
             self.aa,
-            "bool War3AAPass::createSmaaLookupTextures(",
-            "void War3AAPass::createFxaaPipeline",
+            "bool AaExecutor::createSmaaLookupTextures(",
+            "bool AaExecutor::ensurePipelines",
         )
         self.assertIn("candidateAreaTex", create)
         self.assertIn("candidateSearchTex", create)

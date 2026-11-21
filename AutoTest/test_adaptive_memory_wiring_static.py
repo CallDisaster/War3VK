@@ -15,7 +15,11 @@ class Wiring(unittest.TestCase):
         self.assertIn('page->sliceRecyclingSealed || !page->slices.hasSlot()',s)
     def test_all_shadow_consumers_retain(self):
         s=source('src/d3d9/d3d9_war3_shadow.cpp')
-        self.assertEqual(s.count('war3::memory::TrackSnapshotSlices(*ctx, draw);'), 3)
+        # The fourth: the water's surface depth replay (renderWaterDepth).
+        self.assertEqual(s.count('war3::memory::TrackSnapshotSlices(*ctx, draw);'), 4)
+        water=s[s.index('bool War3ShadowReceiverPass::renderWaterDepth('):]
+        water=water[:water.index('\n}\n')]
+        self.assertIn('war3::memory::TrackSnapshotSlices(*ctx, draw);', water)
         outline=source('src/d3d9/d3d9_war3_shadow_outline.cpp')
         self.assertEqual(outline.count('war3::memory::TrackSnapshotSlices(*ctx, draw);'), 2)
         capture=source('src/d3d9/war3/tools/war3_frame_inputs.cpp')

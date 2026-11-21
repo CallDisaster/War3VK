@@ -124,6 +124,10 @@ public:
   static void OnTerrainExit();
   static bool IsTerrainRendering();
 
+  static void OnWaterEnter();
+  static void OnWaterExit();
+  static bool IsWaterRendering();
+
   static void SetBatchTag(War3BatchTag tag);
   static War3BatchTag GetCurrentBatchTag();
   static War3BatchTag GetTlsBatchTag();
@@ -146,6 +150,9 @@ public:
   static bool HasOutlineHandles();
   static bool IsOutlineHandle(uint32_t handle);
   static uint32_t GetOutlineHandleCount();
+  // Copies up to `capacity` outline handles in ascending order; returns how
+  // many were written (the Outline scene record).
+  static uint32_t CopyOutlineHandles(uint32_t* out, uint32_t capacity);
 
   static void AddBloomHandle(uint32_t handle, float boost);
   static void RemoveBloomHandle(uint32_t handle);

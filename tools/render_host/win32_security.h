@@ -2,7 +2,7 @@
 #include "win32_transport.h"
 
 namespace warvk::host::lab {
-enum class SecurityObject { Pipe, Mapping, Mutex };
+enum class SecurityObject { Pipe, Mapping, Mutex, Event };
 // One logon-SID policy factory; never null/default DACL, execute, global names
 // or inheritable IPC objects. Kernel copies this descriptor during creation.
 class LogonSecurity {

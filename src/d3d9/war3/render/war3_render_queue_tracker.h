@@ -172,6 +172,18 @@ private:
   std::atomic<uint64_t> m_semanticLayerConflicts{0};
   uint32_t m_statFrame = 0;
 
+  // Occupancy, for sizing the table: entries stamped with the current epoch
+  // (new keys and re-stamped old ones) and inserts that ran out of probes,
+  // per epoch; Reset folds them into the peaks and logs a new peak.
+  std::atomic<uint32_t> m_epochStamped{0};
+  std::atomic<uint32_t> m_epochProbeFailures{0};
+  uint32_t m_peakStamped = 0;
+  uint32_t m_peakProbeFailures = 0;
+  uint32_t m_loggedPeakStamped = 0;
+  uint32_t m_loggedPeakProbeFailures = 0;
+  uint64_t m_totalProbeFailures = 0;
+  uint32_t m_occupancyEpochs = 0;
+
   std::atomic<bool> m_globalsValid{false};
   uint32_t *m_numOfElementsPtr = nullptr;
   void **m_batchArrayPtr = nullptr;

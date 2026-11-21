@@ -1,4 +1,5 @@
 #include "war3_hybrid_ray_tracing.h"
+#include "../effects/war3_effect_frame.h"
 
 #include "../../d3d9_war3_debug.h"
 
@@ -287,33 +288,9 @@ War3ImageRegion ComputeContactRegion(const War3WorldCameraState& camera,
 // endpoint. MinZ/MaxZ are viewport transforms and may themselves be reversed,
 // so this decision must be made in NDC/view space first.
 bool InferFarClearRaw(const War3WorldCameraState& camera, float& clearRaw) {
-  const Matrix4 invProj = inverse(camera.proj);
-  const Vector4 endpoint0 = invProj * Vector4(0.0f, 0.0f, 0.0f, 1.0f);
-  const Vector4 endpoint1 = invProj * Vector4(0.0f, 0.0f, 1.0f, 1.0f);
-  if (!FiniteVector(endpoint0) || !FiniteVector(endpoint1))
-    return false;
-
-  const auto endpointDistance = [](const Vector4& endpoint) {
-    if (std::abs(endpoint.w) <= 1.0e-7f)
-      return std::numeric_limits<float>::infinity();
-    return std::abs(endpoint.z / endpoint.w);
-  };
-
-  const float distance0 = endpointDistance(endpoint0);
-  const float distance1 = endpointDistance(endpoint1);
-  const bool finite0 = std::isfinite(distance0);
-  const bool finite1 = std::isfinite(distance1);
-  if (!finite0 && !finite1)
-    return false;
-
-  if (finite0 && finite1 &&
-      std::abs(distance0 - distance1) <=
-          1.0e-5f * std::max({distance0, distance1, 1.0f}))
-    return false;
-
-  const bool farIsOne = distance1 > distance0;
-  clearRaw = farIsOne ? camera.viewport.MaxZ : camera.viewport.MinZ;
-  return std::isfinite(clearRaw);
+  // One rule for every consumer of raw depth (war3/effects/war3_effect_frame.h).
+  return effects::InferFarClearRaw(camera.proj, camera.viewport.MinZ,
+                                   camera.viewport.MaxZ, clearRaw);
 }
 
 void DestroyPipeline(const Rc<DxvkDevice>& device, VkPipeline& pipeline) {

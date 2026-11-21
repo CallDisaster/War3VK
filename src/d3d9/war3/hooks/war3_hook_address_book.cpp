@@ -164,6 +164,7 @@ const War3HookAddressBook &GetWar3HookAddressBook127a() {
       0x19DFF0, // rqTransparentDispatchType2
       0x19BC20, // rqTransparentDispatchType3
       0x13A0B0, // rqTransparentDispatchType4
+      0x737960, // waterSubmitDraw (CTerrain::SubmitWaterDraw, __thiscall, ret 8)
   };
   return kBook;
 }

@@ -1,4 +1,4 @@
-#include "d3d9_war3_fog_volume.h"
+#include "war3_fog_volume.h"
 
 #include <algorithm>
 #include <cmath>
@@ -323,6 +323,27 @@ War3FogVolumeFrameSnapshot War3FogVolumeManager::GetFrameSnapshot(
   m_snapshot.hasAny = m_snapshot.count > 0u;
   m_snapshotValid = true;
   return m_snapshot;
+}
+
+uint32_t War3FogVolumeManager::ListFrameVolumesAuthored(
+    std::array<War3FogVolumeAuthored, War3FogVolumeFrameSnapshot::kMaxVolumes>& out) const {
+  std::lock_guard<std::mutex> lock(m_mutex);
+  uint32_t count = 0u;
+  for (const Record& record : m_volumes) {
+    // The filter and the limit of GetFrameSnapshot.
+    if (!record.active || record.density <= 1.0e-6f)
+      continue;
+    if (count >= War3FogVolumeFrameSnapshot::kMaxVolumes)
+      break;
+    War3FogVolumeAuthored& authored = out[count++];
+    authored.shape = record.shape;
+    authored.position = record.position;
+    authored.halfSize = record.halfSize;
+    authored.rotationDegrees = record.rotationDegrees;
+    authored.density = record.density;
+    authored.edgeFeather = record.edgeFeather;
+  }
+  return count;
 }
 
 bool War3FogVolumeManager::RebuildDerived(Record& record) {

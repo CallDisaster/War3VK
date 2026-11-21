@@ -141,10 +141,16 @@ class TransactionalNativeLight(unittest.TestCase):
         self.assertIn('accumLight += (resolved - col.rgb) * mul', shader)
         self.assertIn('if (nativeValid && i >= nativeSlot && i-nativeSlot < nativeCount) continue', shader)
         self.assertIn('nativeCount <= lightUbo.count-nativeSlot', SHADOW)
-        self.assertIn('std::array<DxvkDescriptorWrite, 17>', SHADOW)
+        # The receiver layout has 19 bindings (14-16: the native baselines,
+        # 17-18: the water surface depth and the water info it writes),
+        # named once; every pass that binds it writes all of them (4c-2: the
+        # shadow TAA passes wrote 14 and crashed in the descriptor update).
+        self.assertIn('constexpr uint32_t kReceiverLayoutBindingCount = 19u;', SHADOW)
+        self.assertEqual(SHADOW.count('std::array<DxvkDescriptorWrite, kReceiverLayoutBindingCount>'), 3)
+        self.assertNotIn('std::array<DxvkDescriptorWrite, 14>', SHADOW)
         layout = SHADOW.split('War3ShadowReceiverPass::createPipelineLayout() const',1)[1].split('War3ShadowReceiverPass::',1)[0]
-        self.assertIn('std::array<DxvkDescriptorSetLayoutBinding, 17>', layout)
-        self.assertEqual(layout.count('DxvkDescriptorSetLayoutBinding('),17)
+        self.assertIn('std::array<DxvkDescriptorSetLayoutBinding, kReceiverLayoutBindingCount>', layout)
+        self.assertEqual(layout.count('DxvkDescriptorSetLayoutBinding('),19)
         self.assertIn('barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL', SHADOW)
         self.assertIn('ctx->track(nativeBaseline->image(), DxvkAccess::Read)', SHADOW)
     def test_emitter_exclusion_is_owner_bound_and_only_own_light(self):

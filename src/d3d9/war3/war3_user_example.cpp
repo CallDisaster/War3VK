@@ -2,6 +2,7 @@
 
 #define WAR3_SHADER_API_INTERNAL
 #include "../war3_sdk.h"
+#include "core/war3_execution_services.h"
 #include "../../util/util_env.h"
 #include "../../util/log/log.h"
 
@@ -41,13 +42,13 @@ void OnLoad(void* userData) {
     }
 
     const char* packPath = "shaderpacks/vulkan_pack_template";
-    const auto err = war3shader::LoadShaderPack(packPath);
+    const auto err = dxvk::war3::ProcessServices().LoadShaderPack(packPath);
     if (err != war3shader::ShaderPackError::OK) {
         dxvk::Logger::warn(dxvk::str::format("UserExample: ShaderPack load failed: ",
-                                             war3shader::GetErrorString(err)));
+                                             war3shader::ShaderPackErrorName(err)));
     } else {
-        war3shader::EnableShaderPack(true);
-        war3shader::SetParamVec4(war3shader::ParamSlot::PARAMS0, 0.35f, 0.4f, 0.0f, 0.0f);
+        dxvk::war3::ProcessServices().EnableShaderPack(true);
+        dxvk::war3::ProcessServices().SetParamVec4(war3shader::ParamSlot::PARAMS0, 0.35f, 0.4f, 0.0f, 0.0f);
         dxvk::Logger::info("UserExample: ShaderPack enabled");
     }
 
@@ -73,7 +74,7 @@ void OnRenderEvent(war3shader::RenderEventID eventId,
         g_state.timeAccum = context->frameTimeCounter;
         const float strength = 0.35f + 0.35f * std::sin(g_state.timeAccum * 0.8f);
         const float vignette = 0.2f + 0.6f * (0.5f + 0.5f * std::sin(g_state.timeAccum * 0.4f));
-        war3shader::SetParamVec4(war3shader::ParamSlot::PARAMS0, strength, vignette, 0.0f, 0.0f);
+        dxvk::war3::ProcessServices().SetParamVec4(war3shader::ParamSlot::PARAMS0, strength, vignette, 0.0f, 0.0f);
     }
 }
 

@@ -11,6 +11,8 @@ def read(relative: str) -> str:
 
 SETTINGS = read("src/d3d9/d3d9_war3_settings.h")
 PIPELINE = read("src/d3d9/d3d9_war3_pipeline.cpp")
+# The environment overrides of the constructor, shared with proxy mode (5.1-c).
+SETTINGS_RESOLVER = read("src/d3d9/war3/render/war3_settings_resolver.cpp")
 SHADOW_H = read("src/d3d9/d3d9_war3_shadow.h")
 SHADOW_CPP = read("src/d3d9/d3d9_war3_shadow.cpp")
 RESOURCES = read("src/d3d9/d3d9_war3_shadow_resources.cpp")
@@ -30,8 +32,14 @@ SHADER = read("subprojects/war3fx/shaders/war3_shadow_receiver.frag")
 
 class ShadowReleaseHardeningStaticTests(unittest.TestCase):
     def test_taa_environment_is_constructor_only_and_ui_has_revision(self):
-        self.assertIn('getEnvVar("DXVK_WAR3_SHADOW_TAA_MODE")', PIPELINE)
-        self.assertIn('ParseEnvInt("DXVK_WAR3_SHADOW_TAA"', PIPELINE)
+        self.assertIn('getEnvVar("DXVK_WAR3_SHADOW_TAA_MODE")', SETTINGS_RESOLVER)
+        self.assertIn('ParseEnvInt("DXVK_WAR3_SHADOW_TAA"', SETTINGS_RESOLVER)
+        # Read once: from the pipeline constructor, and in proxy mode where the
+        # settings mailbox of the process is created.
+        constructor = PIPELINE.split("War3RenderPipeline::War3RenderPipeline(", 1)[1].split(
+            "War3RenderPipeline::~War3RenderPipeline", 1)[0]
+        self.assertIn("ApplyWar3SettingsEnvironmentOverrides(m_settings);", constructor)
+        self.assertEqual(PIPELINE.count("ApplyWar3SettingsEnvironmentOverrides("), 1)
         resolve_start = SHADOW_CPP.index("ResolveShadowTaaRequestedMode")
         resolve_end = SHADOW_CPP.index(
             "ShadowTaaDisableForSemanticDynamicEnabled", resolve_start

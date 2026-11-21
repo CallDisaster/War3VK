@@ -31,6 +31,7 @@
 #include "../shadow/war3_shadow_alpha_test_payload.h"
 #include "../../d3d9_war3_weather.h"
 #include "../../d3d9_war3_volumetric_light.h"
+#include "../core/war3_execution_services.h"
 #include "../../util/util_env.h"
 namespace dxvk::war3 {
 
@@ -4992,8 +4993,9 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
 
   // Export-time diagnostics, not members of the sampled workload series.
   // Distinct frame tags remain visible; command recording is not GPU completion.
-  const auto weatherDraw = QueryWar3WeatherDiagnostics();
-  const auto weatherVolume = QueryWar3WeatherVolumeDiagnostics();
+  const auto weatherDraw = ProcessServices().QueryWar3WeatherDiagnostics();
+  const auto weatherVolume =
+      ProcessServices().QueryWar3WeatherVolumeDiagnostics();
   json << "  \"weatherObservation\": {"
        << "\"sampleKind\":\"independent-live-diagnostics-at-export\","
        << "\"gpuCompletionCertified\":false,"

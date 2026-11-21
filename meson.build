@@ -191,6 +191,7 @@ imgui_dep = imgui.get_variable('imgui_dep')
 
 war3fx = subproject('war3fx')
 war3fx_shaders = war3fx.get_variable('war3fx_shaders')
+war3fx_executor_shaders = war3fx.get_variable('war3fx_executor_shaders')
 
 # Include the project root so generated headers like build32/version.h
 # remain visible to every target during incremental builds.

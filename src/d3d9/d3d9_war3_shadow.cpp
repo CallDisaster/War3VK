@@ -1,9 +1,12 @@
 #include "d3d9_war3_shadow.h"
 #include "d3d9_shader.h"
 #include "d3d9_war3_debug.h"
-#include "d3d9_war3_fog_volume.h"
+#include "war3/state/war3_fog_volume.h"
 #include "war3/core/war3_internal_test_config.h"
 #include "war3/core/war3_runtime_profile.h"
+#ifdef _WIN64
+#include "war3/effects/war3_shadow_scene.h"
+#endif
 #include "war3/gpu_skin/war3_gpu_skin_compute.h"
 #include "war3/hooks/war3_hook_widget_identity.h"
 #include "war3/render/war3_render_objects.h"
@@ -50,6 +53,7 @@
 #include <war3_shadow_caster_mask.h>
 #include <war3_shadow_caster_point_frag.h>
 #include <war3_shadow_caster_vert.h>
+#include <war3_water_depth_vert.h>
 #include <war3_shadow_receiver.h>
 #include <war3_shadow_visibility.h>
 #include <war3_unit_outline.h>
@@ -208,6 +212,13 @@ struct ShadowCasterPushConstants {
   uint32_t padding[2];    // Padding to 96 bytes (16-byte alignment)
   Vector4 pointLightPosRange; // xyz=point light position, w=range for linear cube depth
 };
+
+// With the small receiver bias the ground would darken itself and the foot of
+// every wall standing on it. Only the terrain moves away from the light, about
+// three texels, so what stands on the ground keeps its contact shadow.
+inline float DirectionalTerrainCasterDepthBias(uint32_t resolution) {
+  return 0.0008f * (4096.0f / float(std::max<uint32_t>(resolution, 1u)));
+}
 
 constexpr uint32_t kShadowCasterFlagUseBlend = WAR3_SHADOW_CASTER_FLAG_USE_BLEND;
 constexpr uint32_t kShadowCasterFlagIndexedBlend = WAR3_SHADOW_CASTER_FLAG_INDEXED_BLEND;
@@ -1339,25 +1350,22 @@ inline bool War3ReplayDrawIsAnonymousSmallMarker(
 }
 
 inline void War3ReplayNoteAnonymousStage11Reject(
-    const War3ShadowCasterDraw& draw) {
+    const War3ShadowCasterDraw& draw, const Vector4& origin) {
   static std::atomic<uint32_t> s_logCount{0};
   const uint32_t idx = s_logCount.fetch_add(1u, std::memory_order_relaxed);
   if (idx >= 24u)
     return;
 
-  const float wx = draw.worldMatrix[3].x;
-  const float wy = draw.worldMatrix[3].y;
-  const float wz = draw.worldMatrix[3].z;
   char buf[280];
   snprintf(buf, sizeof(buf),
            "DXVK War3Hook[Shadow]: PATH BLOCKER REJECT #%u rawcode=0x00000000 "
            "(anon-stage11) kind=%u vtx=%u idx=%u pos=(%.0f,%.0f,%.0f)",
            idx + 1u, unsigned(draw.objectKind), unsigned(draw.numVertices),
-           unsigned(draw.indexCount), double(wx), double(wy), double(wz));
+           unsigned(draw.indexCount), double(origin.x), double(origin.y), double(origin.z));
   ::dxvk::Logger::info(buf);
 }
 
-inline bool War3ReplayDrawIsPathBlocker(const War3ShadowCasterDraw& draw) {
+inline bool War3ReplayDrawIsPathBlocker(const War3ShadowCasterDraw& draw, const Vector4& origin) {
   if (!dxvk::war3::internal::kPathBlockerHideEnabled)
     return false;
   if (draw.pathBlocker)
@@ -1369,11 +1377,11 @@ inline bool War3ReplayDrawIsPathBlocker(const War3ShadowCasterDraw& draw) {
   if (War3ReplayIsPathBlockerRawcode(draw.rawcode))
     return true;
   if (War3ReplayDrawIsAnonymousSmallMarker(draw)) {
-    War3ReplayNoteAnonymousStage11Reject(draw);
+    War3ReplayNoteAnonymousStage11Reject(draw, origin);
     return true;
   }
   if (War3ReplayDrawIsAnonymousStage11Marker(draw)) {
-    War3ReplayNoteAnonymousStage11Reject(draw);
+    War3ReplayNoteAnonymousStage11Reject(draw, origin);
     return true;
   }
   // rawcode=0 的 handle 兜底历史上误判过真实单位；仅在显式开启时作为诊断/保险。
@@ -1392,7 +1400,7 @@ inline bool War3ReplayDrawIsPathBlocker(const War3ShadowCasterDraw& draw) {
   return false;
 }
 
-inline void War3ReplayDrawSurvey(const War3ShadowCasterDraw& draw) {
+inline void War3ReplayDrawSurvey(const War3ShadowCasterDraw& draw, const Vector4& origin) {
   // Shadow draw survey 属于取证输出，默认关闭；需要复查 caster 身份时可用
   // DXVK_WAR3_SHADOW_DRAW_SURVEY=1 临时打开。
   static const bool enabled = []() {
@@ -1446,9 +1454,6 @@ inline void War3ReplayDrawSurvey(const War3ShadowCasterDraw& draw) {
   // 2026-05-31：补充几何签名 + 世界坐标。path blocker 漏网时 rawcode/handle
   // 多半为 0，靠"顶点数 + 世界位置（在悬崖上）+ objectKind"才能确认它就是
   // 那个看不见的 marker。worldMatrix 第 4 行是平移（DXVK 列存：m[3] = 平移）。
-  const float wx = draw.worldMatrix[3].x;
-  const float wy = draw.worldMatrix[3].y;
-  const float wz = draw.worldMatrix[3].z;
   char buf[320];
   snprintf(buf, sizeof(buf),
            "DXVK War3Shadow: SHADOW DRAW SURVEY #%u rawcode=0x%08X (%s) "
@@ -1457,7 +1462,7 @@ inline void War3ReplayDrawSurvey(const War3ShadowCasterDraw& draw) {
            idx + 1, rawcode, (rawcode != 0u ? fc : "----"), unsigned(handle),
            unsigned(draw.objectKind), int(draw.category),
            unsigned(draw.numVertices), unsigned(draw.indexCount),
-           int(draw.vertexBlendEnabled), double(wx), double(wy), double(wz));
+           int(draw.vertexBlendEnabled), double(origin.x), double(origin.y), double(origin.z));
   ::dxvk::Logger::info(buf);
 }
 
@@ -1491,22 +1496,27 @@ const std::vector<const War3ShadowCasterDraw*>& BuildShadowReplayDraws(
       continue;
     const auto& caster = scene.shadowCasters[instance.replayDrawIndex];
     // 2026-05-31：draw-time 最终 path blocker 防线（覆盖所有上游漏判）。
-    if (War3ReplayDrawIsPathBlocker(caster)) {
+    const Vector4& origin =
+#ifdef _WIN64
+        caster.proxyCaster ? instance.worldMatrix[3] :
+#endif
+        caster.worldMatrix[3];
+    if (War3ReplayDrawIsPathBlocker(caster, origin)) {
       g_shadowReplayPathBlockerRejectCount.fetch_add(
           1, std::memory_order_relaxed);
       continue;
     }
-    War3ReplayDrawSurvey(caster);
+    War3ReplayDrawSurvey(caster, origin);
     draws.push_back(&caster);
   }
 
   for (const auto& fallback : scene.shadowFallbacks) {
-    if (War3ReplayDrawIsPathBlocker(fallback.snapshot)) {
+    if (War3ReplayDrawIsPathBlocker(fallback.snapshot, fallback.snapshot.worldMatrix[3])) {
       g_shadowReplayPathBlockerRejectCount.fetch_add(
           1, std::memory_order_relaxed);
       continue;
     }
-    War3ReplayDrawSurvey(fallback.snapshot);
+    War3ReplayDrawSurvey(fallback.snapshot, fallback.snapshot.worldMatrix[3]);
     draws.push_back(&fallback.snapshot);
   }
 
@@ -1951,6 +1961,7 @@ struct OutlineEdgePushConstants {
 //   u_params4; vec4 u_sunDir; vec4 u_params5; vec4 u_params6; vec4 u_viewport;
 //   vec4 u_viewportZ; mat4 u_prevViewProj; vec4 u_taaParams; mat4 u_proj;
 //   vec4 u_pointRayParams; vec4 u_pointRayParams2; vec4 u_depthContract;
+//   vec4 u_water; vec4 u_shadowTint;
 struct ShadowReceiverUniform {
   Matrix4 view;
   Matrix4 invViewProj;
@@ -1980,8 +1991,14 @@ struct ShadowReceiverUniform {
                           // w=surfaceThickness (view/world units)
   Vector4 pointRayParams2; // x=steps, y=startOffset, z=maxLights, w=A1 layers
   Vector4 depthContract; // x=far clear raw, y=known, z=raw quantum, w=reserved
+  // The water (x64 host): x = shadow fade start, y = fade end (world units of
+  // water above the ground), z = the surface's own shadow 0..1, w = 1 when the
+  // water's surface depth and info images are bound.
+  Vector4 water;
+  // Each channel's share of the sun shadow's strength (1 1 1: a grey shadow).
+  Vector4 shadowTint;
 };
-static_assert(sizeof(ShadowReceiverUniform) == 736u,
+static_assert(sizeof(ShadowReceiverUniform) == 768u,
               "ShadowReceiverUniform must match GLSL scalar layout");
 static_assert(offsetof(ShadowReceiverUniform, proj) == 624u,
               "ShadowReceiver projection ABI drift");
@@ -2183,7 +2200,12 @@ void PublishPointShadowPersistentDiagnostics(
 }
 
 War3ShadowReceiverPass::War3ShadowReceiverPass(D3D9DeviceEx *device)
-    : m_parent(device), m_device(device->GetDXVKDevice()),
+    : War3ShadowReceiverPass(device->GetDXVKDevice()) {
+  m_parent = device;
+}
+
+War3ShadowReceiverPass::War3ShadowReceiverPass(const Rc<DxvkDevice> &device)
+    : m_device(device),
       m_layout(createPipelineLayout()),
       m_shadowCasterLayout(createShadowCasterPipelineLayout()) {
   m_pointShadowPersistentRendererEpoch =
@@ -2321,6 +2343,10 @@ War3ShadowReceiverPass::~War3ShadowReceiverPass() {
     if (kv.second != VK_NULL_HANDLE)
       vk->vkDestroyPipeline(vk->device(), kv.second, nullptr);
   }
+  for (auto &kv : m_outlinePipelines) {
+    if (kv.second != VK_NULL_HANDLE)
+      vk->vkDestroyPipeline(vk->device(), kv.second, nullptr);
+  }
 }
 
 Rc<DxvkSampler> War3ShadowReceiverPass::getFallbackSampler(bool useMip,
@@ -2357,8 +2383,13 @@ Rc<DxvkSampler> War3ShadowReceiverPass::getFallbackSampler(bool useMip,
   return sampler;
 }
 
+// The receiver layout (m_layout) is shared by the receiver, the motion vector
+// and the shadow visibility passes. DXVK reads one descriptor per binding of
+// the layout, so every bindResources with it passes this many.
+constexpr uint32_t kReceiverLayoutBindingCount = 19u;
+
 const DxvkPipelineLayout *War3ShadowReceiverPass::createPipelineLayout() const {
-  std::array<DxvkDescriptorSetLayoutBinding, 17> bindings = {
+  std::array<DxvkDescriptorSetLayoutBinding, kReceiverLayoutBindingCount> bindings = {
       DxvkDescriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
                                      VK_SHADER_STAGE_FRAGMENT_BIT), // 0: color
       DxvkDescriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
@@ -2407,6 +2438,12 @@ const DxvkPipelineLayout *War3ShadowReceiverPass::createPipelineLayout() const {
       DxvkDescriptorSetLayoutBinding(
           VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
           VK_SHADER_STAGE_FRAGMENT_BIT), // 16: native FFP without both
+      DxvkDescriptorSetLayoutBinding(
+          VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
+          VK_SHADER_STAGE_FRAGMENT_BIT), // 17: the water's surface depth
+      DxvkDescriptorSetLayoutBinding(
+          VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1,
+          VK_SHADER_STAGE_FRAGMENT_BIT), // 18: the water's info (write)
   };
   return m_device->createBuiltInPipelineLayout(
       DxvkPipelineLayoutFlag::UsesSamplerHeap, VK_SHADER_STAGE_FRAGMENT_BIT,
@@ -2522,6 +2559,26 @@ War3ShadowReceiverPass::createShadowCasterPipelineLayout() const {
       sizeof(ShadowCasterPushConstants), bindings.size(), bindings.data());
 }
 
+// The caster vertex shader declares four inputs. A draw without blend data or
+// UVs reads only the position, but every declared location needs a source in
+// the pipeline (VUID-VkGraphicsPipelineCreateInfo-Input-07904). The unused
+// ones alias the position attribute: always inside the buffer, never read.
+// The unit outline's vertex shader declares the same four.
+void War3AliasUnusedShadowCasterInputs(
+    std::array<VkVertexInputAttributeDescription, 4> &attributes,
+    uint32_t &attributeCount) {
+  for (uint32_t location = 1u; location <= 3u; ++location) {
+    bool present = false;
+    for (uint32_t i = 0u; i < attributeCount; ++i)
+      present = present || attributes[i].location == location;
+    if (!present && attributeCount < attributes.size()) {
+      attributes[attributeCount] = attributes[0];
+      attributes[attributeCount].location = location;
+      ++attributeCount;
+    }
+  }
+}
+
 War3ShadowReceiverPass::ShadowCasterPipeline
 War3ShadowReceiverPass::getShadowCasterPipeline(
     const ShadowCasterPipelineKey &key) {
@@ -2609,6 +2666,7 @@ War3ShadowReceiverPass::createShadowCasterPipeline(
     attributes[attributeCount].offset = key.uvOffset;
     attributeCount++;
   }
+  War3AliasUnusedShadowCasterInputs(attributes, attributeCount);
 
   VkPipelineVertexInputStateCreateInfo viState = {
       VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
@@ -2653,7 +2711,9 @@ War3ShadowReceiverPass::createShadowCasterPipeline(
   } else if (key.pointShadowRadialDepth) {
     state.fs =
         util::DxvkBuiltInShaderStage(war3_shadow_caster_point_frag, nullptr);
-  } else {
+  } else if (key.alphaTestEnabled) {
+    // Only alpha-tested casters need fragments. The shader can discard, which
+    // would also cost opaque casters their early depth test.
     state.fs = util::DxvkBuiltInShaderStage(war3_shadow_caster_frag, nullptr);
   }
   if (key.casterMaskEnabled)
@@ -2741,6 +2801,7 @@ War3ShadowReceiverPass::createOutlineMaskPipeline(
     attributes[attributeCount].offset = key.uvOffset;
     attributeCount++;
   }
+  War3AliasUnusedShadowCasterInputs(attributes, attributeCount);
 
   VkPipelineVertexInputStateCreateInfo viState = {
       VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
@@ -2847,8 +2908,11 @@ War3ShadowReceiverPass::createOutlineMaskPipeline(
                // pViewportState matter.
   VkPipelineViewportStateCreateInfo vpInfo = {
       VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
-  vpInfo.viewportCount = 1;
-  vpInfo.scissorCount = 1;
+  // The viewports and scissors are set with their count
+  // (VK_DYNAMIC_STATE_*_WITH_COUNT), so the pipeline names none
+  // (VUID-VkGraphicsPipelineCreateInfo-pDynamicStates-03379/03380).
+  vpInfo.viewportCount = 0;
+  vpInfo.scissorCount = 0;
   pipeInfo.pViewportState = &vpInfo;
 
   pipeInfo.pRasterizationState = &rsState;
@@ -2876,6 +2940,14 @@ War3ShadowReceiverPass::createOutlineMaskPipeline(
   VkFormat colorFormats[2] = {VK_FORMAT_R8_UNORM, VK_FORMAT_R8_UNORM};
   renderingInfo.colorAttachmentCount = 2;
   renderingInfo.pColorAttachmentFormats = colorFormats;
+  // Where DXVK binds descriptors from descriptor buffers, a pipeline that
+  // reads them says so, as its built-in pipelines do
+  // (VUID-vkCmdDrawIndexed-None-08117).
+  VkPipelineCreateFlags2CreateInfo pipelineFlags = {
+      VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO};
+  if (m_device->canUseDescriptorBuffer())
+    pipelineFlags.flags |= VK_PIPELINE_CREATE_2_DESCRIPTOR_BUFFER_BIT_EXT;
+  renderingInfo.pNext = &pipelineFlags;
   pipeInfo.pNext = &renderingInfo;
 
   VkPipeline pipeline;
@@ -2973,7 +3045,17 @@ void War3ShadowReceiverPass::renderMotionVectors(
   ctx->cmdSetViewport(1, &viewport);
   ctx->cmdSetScissor(1, &scissor);
 
-  std::array<DxvkDescriptorWrite, 14> descriptors = {};
+  std::array<DxvkDescriptorWrite, kReceiverLayoutBindingCount> descriptors = {};
+  // Bindings 14-17, the receiver's native baselines and the water's depth:
+  // unused here, bound as the receiver binds them without a baseline or
+  // water; 18, the water's info, is written by the receiver alone.
+  for (uint32_t i = 14u; i < kReceiverLayoutBindingCount - 1u; ++i) {
+    descriptors[i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    descriptors[i].descriptor =
+        m_depthCopyView2D ? m_depthCopyView2D->getDescriptor() : nullptr;
+  }
+  descriptors[18].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+  descriptors[18].descriptor = nullptr;
   descriptors[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
   descriptors[0].descriptor =
       m_colorCopyView ? m_colorCopyView->getDescriptor() : nullptr;
@@ -3138,6 +3220,12 @@ void War3ShadowReceiverPass::InvalidateMapEpoch(uint64_t mapEpoch,
   g_shadowReplayDiagnostics.pointLateResultRejectCount.store(
       m_pointShadowLateResultRejectCount, std::memory_order_release);
   m_hasCompleteShadowMap = false;
+#ifdef _WIN64
+  m_proxyLayers = {};
+  m_proxyFootprints = {};
+  m_proxyAvailable = m_proxyHeld = 0;
+  m_proxyPartial = false;
+#endif
   m_replayValidationFailedThisFrame = false;
   m_replayValidationHoldFramesRemaining = 0u;
   m_shadowPublicationSettledFrameSerial = 0u;
@@ -3253,7 +3341,17 @@ void War3ShadowReceiverPass::renderShadowVisibility(
   ctx->cmdSetViewport(1, &viewport);
   ctx->cmdSetScissor(1, &scissor);
 
-  std::array<DxvkDescriptorWrite, 14> descriptors = {};
+  std::array<DxvkDescriptorWrite, kReceiverLayoutBindingCount> descriptors = {};
+  // Bindings 14-17, the receiver's native baselines and the water's depth:
+  // unused here, bound as the receiver binds them without a baseline or
+  // water; 18, the water's info, is written by the receiver alone.
+  for (uint32_t i = 14u; i < kReceiverLayoutBindingCount - 1u; ++i) {
+    descriptors[i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    descriptors[i].descriptor =
+        m_depthCopyView2D ? m_depthCopyView2D->getDescriptor() : nullptr;
+  }
+  descriptors[18].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+  descriptors[18].descriptor = nullptr;
   descriptors[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
   descriptors[0].descriptor =
       m_colorCopyView ? m_colorCopyView->getDescriptor() : nullptr;
@@ -3317,7 +3415,13 @@ void War3ShadowReceiverPass::renderShadowVisibility(
                        m_shadowVisibilityPipeline);
   ctx->bindResources(DxvkCmdBuffer::ExecBuffer, m_layout, descriptors.size(),
                      descriptors.data(), sizeof(pc), &pc);
+#ifdef _WIN64
+  proxyTimestamp(ctx, 2);
+#endif
   ctx->cmdDraw(3, 1, 0, 0);
+#ifdef _WIN64
+  proxyTimestamp(ctx, 3);
+#endif
   ctx->cmdEndRendering();
 
   // Transition to read-only for sampling
@@ -3859,7 +3963,12 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
         0u, std::memory_order_release);
   }
   m_replayValidationFailedThisFrame = false;
-  if (!validateShadowProducerCompleteness(
+  bool requireWholeProducer = true;
+#ifdef _WIN64
+  if (input.scene.proxyRecordFrame && !m_volumeSunRenderPathActive && m_proxySubsetProven)
+    requireWholeProducer = false; // Run verified the seal and attributed every omission.
+#endif
+  if (requireWholeProducer && !validateShadowProducerCompleteness(
           input, m_volumeSunRenderPathActive ? "volume-sun" : "csm")) {
     return false;
   }
@@ -4101,6 +4210,7 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
 
   const uint32_t casterCount =
       static_cast<uint32_t>(replayDraws.size());
+  const bool classTransforms = !m_volumeSunRenderPathActive && !m_casterTransforms.empty();
   m_shadowPreparedScratch.clear();
   m_shadowPreparedScratch.resize(casterCount);
   auto& prepared = m_shadowPreparedScratch;
@@ -4131,6 +4241,7 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
   // 预先准备 Pipeline 与排序 key（与级联无关）
   for (uint32_t i = 0; i < casterCount; i++) {
     const auto &draw = *replayDraws[i];
+    if (classTransforms && !m_casterTransforms[i].cast) continue;
     if (s_debugCasterStage >= 0 && draw.stage != s_debugCasterStage)
       continue;
     // A GPU-direct input draw deliberately disables the legacy blend binding:
@@ -4457,6 +4568,27 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
                });
   }
 
+#ifdef _WIN64
+  namespace proxyScene = war3::effects::scene;
+  const bool exactCull = m_proxyExactCull && !m_volumeSunRenderPathActive;
+  std::array<std::array<float, 16>, 4> lightMatrices;
+  std::array<bool, 4> affine{};
+  std::array<uint32_t, 4> proxyRemoved{};
+  uint32_t proxyOutsideEveryCascade = 0;
+  double clipLimit = 0;
+  if (exactCull) {
+    const auto& s = settings->shadows;
+    clipLimit = proxyScene::CasterClipLimit(m_shadowMapResolution,
+        std::max(s.pcfRadius, SemanticReceiverStablePcfRadiusOverride()),
+        s.pcssSearchRadius, s.pcssMinRadius, s.pcssMaxRadius);
+    for (uint32_t c = 0; c < cascadeCount; ++c) {
+      const Matrix4& m = m_csmData.cascades[c].lightViewProj;
+      for (unsigned i = 0; i < 16; ++i)
+        lightMatrices[c][i] = m.data[i/4][i%4];
+      affine[c] = proxyScene::CasterAffineMatrix(lightMatrices[c]);
+    }
+  }
+#endif
   m_shadowCascadeVisibilityMasksScratch.assign(casterCount, 0u);
   for (const uint32_t drawIndex : sortedDrawIndices) {
     const auto& draw = *replayDraws[drawIndex];
@@ -4487,8 +4619,26 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
       }
     }
 
+    const bool flattened = classTransforms && m_casterTransforms[drawIndex].k < 1;
+#ifdef _WIN64
+    const auto exactBox = flattened ? proxyScene::ExtendCasterBox(draw.proxyWorldBounds,
+        m_casterTransforms[drawIndex].z0) : draw.proxyWorldBounds;
+#endif
     uint8_t actualMask = 0u;
     for (uint32_t c = 0u; c < cascadeCount && c < 4u; ++c) {
+#ifdef _WIN64
+      if (draw.proxyCaster && !m_volumeSunRenderPathActive) {
+        if (!(m_proxyWriteMask & (1u << c))) continue;
+        if (exactCull && affine[c] && draw.proxyBoundsFrame && draw.proxyBoundsFrame == input.frameSerial &&
+            proxyScene::CasterOutsideCascade(exactBox, lightMatrices[c], clipLimit))
+          ++proxyRemoved[c];
+        else
+          actualMask |= uint8_t(1u << c);
+        continue;
+      }
+#endif
+      // A sphere of the original geometry cannot reject a flattened part.
+      if (flattened) { actualMask |= uint8_t(1u << c); continue; }
       const bool terrainWouldBeVisible =
           !terrainDraw ||
           terrainBoundsCullMode ==
@@ -4533,6 +4683,10 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
       }
     }
     m_shadowCascadeVisibilityMasksScratch[drawIndex] = actualMask;
+#ifdef _WIN64
+    if (exactCull && draw.proxyCaster && !actualMask)
+      ++proxyOutsideEveryCascade;
+#endif
   }
   const auto cascadeVisible = [&](uint32_t drawIndex,
                                   uint32_t cascadeIdx) {
@@ -4819,6 +4973,10 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
         war3::tools::GpuFlightBreadcrumb::CsmCascade, c);
     shadowMapPhaseTiming.enter(static_cast<size_t>(
         War3DirectionalShadowMapRawPhase::CascadeCull));
+#ifdef _WIN64
+    if (input.scene.proxyRecordFrame && !m_volumeSunRenderPathActive && !(m_proxyWriteMask & (1u << c)))
+      continue;
+#endif
     if (!m_shadowMapLayerViews[c])
       continue;
 
@@ -4930,15 +5088,15 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
       pc.blendCount = draw.vertexBlendCount;
       pc.flags = 0u;
       pc.mvp = m_csmData.cascades[c].lightViewProj;
+      if (classTransforms && m_casterTransforms[idx].k < 1)
+        pc.mvp = war3::effects::scene::CasterLightMatrix(pc.mvp, m_casterTransforms[idx].k, m_casterTransforms[idx].z0);
       const bool s1TerrainCaster =
           draw.category == War3RenderState::StageCategory::Terrain &&
           draw.stage == 1;
       if (s1TerrainCaster) {
         pc.flags |= kShadowCasterFlagStage1Terrain;
-        if (war3::internal::kShadowS1TerrainCasterDepthBiasEnabled) {
-          pc.terrainDepthBias =
-              war3::internal::kShadowS1TerrainCasterDepthBiasNdc;
-        }
+        pc.terrainDepthBias =
+            DirectionalTerrainCasterDepthBias(m_shadowMapResolution);
       }
 
       if (draw.vertexBlendEnabled) {
@@ -5148,8 +5306,11 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
         VkBuffer vbs[2] = {vb0, vb1};
         VkDeviceSize offsets[2] = {vb0Off, vb1Off};
         VkDeviceSize sizes[2] = {vb0Size, vb1Size};
-        VkDeviceSize strides[2] = {vb0Stride, vb1Stride};
-        ctx->cmdBindVertexBuffers(0, vbCount, vbs, offsets, sizes, strides);
+        // The strides are the pipeline's own: its key takes them from this
+        // draw. Naming them again here is a dynamic-state command, allowed
+        // only with a dynamic-stride pipeline, which a built-in one is not
+        // (VUID-vkCmdDrawIndexed-None-08608).
+        ctx->cmdBindVertexBuffers(0, vbCount, vbs, offsets, sizes, nullptr);
 
         boundVbCount = vbCount;
         boundVb0 = vb0;
@@ -5174,7 +5335,7 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
           const VkDeviceSize uvSize = draw.uvInfo.size;
           const VkDeviceSize uvStride = draw.uvStride;
           ctx->cmdBindVertexBuffers(2u, 1u, &uvBuffer, &uvOffset, &uvSize,
-                                    &uvStride);
+                                    nullptr);
           boundVb2 = uvBuffer;
           boundVb2Offset = uvOffset;
           boundVb2Size = uvSize;
@@ -5200,7 +5361,7 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
         event.bits[28]=uint32_t(vb0Stride);event.bits[29]=draw.positionOffset;event.bits[30]=draw.uvOffset;
         event.bits[31]=uint32_t(draw.uvFormat);event.bits[32]=draw.paletteIndex;event.bits[33]=gpuSkinDirect?1:0;
         event.bits[34]=m_volumeSunRenderPathActive?1:0;
-        event.bits[35]=uint32_t(m_shadowMap->handle());event.bits[36]=uint32_t(uint64_t(m_shadowMap->handle())>>32);
+        event.bits[35]=uint32_t(uint64_t(m_shadowMap->handle()));event.bits[36]=uint32_t(uint64_t(m_shadowMap->handle())>>32);
         event.bits[37]=m_shadowMapResolution;event.bits[38]=uint32_t(m_shadowMapRenderSerial);
         event.bits[39]=uint32_t(m_shadowMapRenderSerial>>32);
         event.bits[40]=uint32_t(inputEvidenceBatch);
@@ -5371,6 +5532,9 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
 
     uint32_t terrainMaskDraws = 0u;
     for (uint32_t c = 0; c < cascadeCount; c++) {
+#ifdef _WIN64
+      if (input.scene.proxyRecordFrame && !(m_proxyWriteMask & (1u << c))) continue;
+#endif
       if (!m_shadowMapLayerViews[c] || !m_shadowCasterMaskLayerViews[c])
         continue;
 
@@ -5474,10 +5638,8 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
         pc.flags = kShadowCasterFlagStage1Terrain;
         pc.mvp = m_csmData.cascades[c].lightViewProj;
         pc.paletteOffset = objectBase + idx;
-        if (war3::internal::kShadowS1TerrainCasterDepthBiasEnabled) {
-          pc.terrainDepthBias =
-              war3::internal::kShadowS1TerrainCasterDepthBiasNdc;
-        }
+        pc.terrainDepthBias =
+            DirectionalTerrainCasterDepthBias(m_shadowMapResolution);
 
         if (prep.effectiveAlphaTest && draw.diffuseTexture) {
           pc.flags |= kShadowCasterFlagAlphaTest;
@@ -5609,6 +5771,9 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
     const bool hasSkinnedCasters = skinnedCasterCount > 0u;
     // Phase 7.2: 对账计数器（每帧填充）
     reconciliation.shadowMapDrawnCasters = drawnCasters;
+#ifdef _WIN64
+    reconciliation.proxyCsmRemoved = proxyRemoved;
+#endif
     reconciliation.skinnedCasterCount = skinnedCasterCount;
     reconciliation.skinnedPreparedCount = skinnedPreparedCount;
     reconciliation.skinnedInvalidBufferCount = skinnedInvalidBufferCount;
@@ -5760,8 +5925,12 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
   reconciliation.shadowMapExecutedThisFrame = 1u;
   reconciliation.shadowMapRenderSerial = ++m_shadowMapRenderSerial;
   if (!m_volumeSunRenderPathActive) {
+    uint32_t drawnUnique = preparedDrawCount;
+#ifdef _WIN64
+    drawnUnique -= proxyOutsideEveryCascade;
+#endif
     g_shadowReplayDiagnostics.drawnCasterCount.store(
-        preparedDrawCount, std::memory_order_release);
+        drawnUnique, std::memory_order_release);
   }
   return true;
 }
@@ -8634,33 +8803,33 @@ void War3ShadowReceiverPass::renderPointShadow(
         VkBuffer vbs[2];
         VkDeviceSize offsets[2];
         VkDeviceSize sizes[2];
-        VkDeviceSize strides[2];
         uint32_t vbCount = 1;
         vbs[0] = draw.positionInfo.buffer;
         offsets[0] = draw.positionInfo.offset;
         sizes[0] = draw.positionInfo.size;
-        strides[0] = draw.positionStride;
         if (draw.blendBinding == 1) {
           vbCount = 2;
           vbs[1] = draw.blendInfo.buffer;
           offsets[1] = draw.blendInfo.offset;
           sizes[1] = draw.blendInfo.size;
-          strides[1] = draw.blendStride;
         } else if (effectiveAlphaTestShadowPoint && draw.uvBinding == 1u) {
           vbCount = 2;
           vbs[1] = draw.uvInfo.buffer;
           offsets[1] = draw.uvInfo.offset;
           sizes[1] = draw.uvInfo.size;
-          strides[1] = draw.uvStride;
         }
-        ctx->cmdBindVertexBuffers(0, vbCount, vbs, offsets, sizes, strides);
+        // The strides are the pipeline's own: its key takes them from this
+        // draw (positionStride, blendStride, uvStride above). Naming them
+        // again here is a dynamic-state command, allowed only with a
+        // dynamic-stride pipeline, which a built-in one is not
+        // (VUID-vkCmdDrawIndexed-None-08608).
+        ctx->cmdBindVertexBuffers(0, vbCount, vbs, offsets, sizes, nullptr);
         if (effectiveAlphaTestShadowPoint && draw.uvBinding == 2u) {
           const VkBuffer uvBuffer = draw.uvInfo.buffer;
           const VkDeviceSize uvOffset = draw.uvInfo.offset;
           const VkDeviceSize uvSize = draw.uvInfo.size;
-          const VkDeviceSize uvStride = draw.uvStride;
           ctx->cmdBindVertexBuffers(2u, 1u, &uvBuffer, &uvOffset, &uvSize,
-                                    &uvStride);
+                                    nullptr);
         }
 
         if (draw.indexed) {
@@ -8996,7 +9165,14 @@ void War3ShadowReceiverPass::drawReceiver(const Rc<DxvkCommandList> &ctx,
   VkRenderingAttachmentInfo attachment = {
       VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
   attachment.imageView = dstView->handle();
-  attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  // The layout the target is in (copyColor restored it): the attachment
+  // layout in the x86 device, GENERAL where the frame's target is kept in
+  // GENERAL (the x64 render host). Rendering names it, it does not assume it.
+  attachment.imageLayout =
+      dstView->image()->queryLayout(dstView->imageSubresources()) ==
+              VK_IMAGE_LAYOUT_GENERAL
+          ? VK_IMAGE_LAYOUT_GENERAL
+          : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
   attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
   attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
 
@@ -9024,7 +9200,7 @@ void War3ShadowReceiverPass::drawReceiver(const Rc<DxvkCommandList> &ctx,
   ctx->cmdSetViewport(1, &viewport);
   ctx->cmdSetScissor(1, &scissor);
 
-  std::array<DxvkDescriptorWrite, 17> descriptors = {};
+  std::array<DxvkDescriptorWrite, kReceiverLayoutBindingCount> descriptors = {};
   for (uint32_t i=0; i<3; ++i) {
     descriptors[14+i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     descriptors[14+i].descriptor = nativeBaselines[i]
@@ -9035,6 +9211,16 @@ void War3ShadowReceiverPass::drawReceiver(const Rc<DxvkCommandList> &ctx,
 
   descriptors[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
   descriptors[1].descriptor = m_depthCopyView->getDescriptor();
+
+  // The water (renderWaterDepth): its surface depth, and where the receiver
+  // writes what it finds on the surface. Without water, the shader reads
+  // neither (u_water.w = 0).
+  const bool water = m_waterFrame.valid && m_waterDepthView && m_waterInfoStorageView;
+  descriptors[17].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+  descriptors[17].descriptor = water ? m_waterDepthView->getDescriptor()
+      : (m_depthCopyView2D ? m_depthCopyView2D->getDescriptor() : nullptr);
+  descriptors[18].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+  descriptors[18].descriptor = water ? m_waterInfoStorageView->getDescriptor() : nullptr;
 
   descriptors[2].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
   descriptors[2].descriptor = m_shadowMapSampleView->getDescriptor();
@@ -9110,13 +9296,23 @@ void War3ShadowReceiverPass::drawReceiver(const Rc<DxvkCommandList> &ctx,
   ctx->bindResources(DxvkCmdBuffer::ExecBuffer, pipeline.layout,
                      descriptors.size(), descriptors.data(), sizeof(pc), &pc);
 
+#ifdef _WIN64
+  proxyTimestamp(ctx, 4);
+#endif
   ctx->cmdDraw(3, 1, 0, 0);
+#ifdef _WIN64
+  proxyTimestamp(ctx, 5);
+#endif
 
   ctx->cmdEndRendering();
 
   ctx->track(dstView->image(), DxvkAccess::Write);
   ctx->track(m_colorCopy, DxvkAccess::Read);
   ctx->track(m_depthCopy, DxvkAccess::Read);
+  if (water) {
+    ctx->track(m_waterDepth, DxvkAccess::Read);
+    ctx->track(m_waterInfo, DxvkAccess::Write);
+  }
   if (m_pointRayHiZVisibilityView)
     ctx->track(m_pointRayHiZVisibilityView->image(), DxvkAccess::Read);
   if (m_pointRayHiZView)
@@ -9143,10 +9339,348 @@ void War3ShadowReceiverPass::drawReceiver(const Rc<DxvkCommandList> &ctx,
   reconciliation.receiverDrawExecutedThisFrame = 1u;
 }
 
+// ---- the water's surface ------------------------------------------------------
+// The game draws its water over the ground without writing depth, so the
+// frame's depth under the water is the ground's, and the receiver shadowed the
+// water by the ground beneath it: deep water showed the shadows of the bed,
+// cliffs' shadows ran down it in streaks. The x64 host has the water's draws as
+// records (War3FrameScene::waterSurfaces). Replayed here with the frame's
+// camera, depth only, they give the surface's depth on the receiver's pixel
+// grid (binding 17); the receiver fades the ground's shadow with the depth of
+// the water above it and writes what it finds on the surface (binding 18) for
+// the water pass.
+
+void War3ShadowReceiverPass::ensureWaterResources(VkExtent3D extent) {
+  if (m_waterDepth && m_waterInfo) {
+    const VkExtent3D have = m_waterDepth->info().extent;
+    if (have.width == extent.width && have.height == extent.height)
+      return;
+  }
+  VkComponentMapping identity = {
+      VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+      VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
+
+  DxvkImageCreateInfo info = {};
+  info.type = VK_IMAGE_TYPE_2D;
+  info.format = VK_FORMAT_D32_SFLOAT;
+  info.sampleCount = VK_SAMPLE_COUNT_1_BIT;
+  info.extent = {extent.width, extent.height, 1u};
+  info.numLayers = 1;
+  info.mipLevels = 1;
+  info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+               VK_IMAGE_USAGE_SAMPLED_BIT;
+  info.stages = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+  info.access = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                VK_ACCESS_SHADER_READ_BIT;
+  info.tiling = VK_IMAGE_TILING_OPTIMAL;
+  info.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+  info.debugName = "War3WaterDepth";
+  m_waterDepth = m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+  m_waterDepthLayoutState.reset();
+
+  DxvkImageViewKey view = {};
+  view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  view.format = info.format;
+  view.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+  view.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+  view.aspects = VK_IMAGE_ASPECT_DEPTH_BIT;
+  view.mipIndex = 0;
+  view.mipCount = 1;
+  view.layerIndex = 0;
+  view.layerCount = 1;
+  view.packedSwizzle = DxvkImageViewKey::packSwizzle(identity);
+  m_waterDepthView = m_waterDepth->createView(view);
+  view.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+  view.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+  m_waterDepthAttachmentView = m_waterDepth->createView(view);
+
+  info.format = VK_FORMAT_R16G16_SFLOAT;
+  info.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+               VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  info.stages = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                VK_PIPELINE_STAGE_TRANSFER_BIT;
+  info.access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                VK_ACCESS_TRANSFER_WRITE_BIT;
+  info.layout = VK_IMAGE_LAYOUT_GENERAL;
+  info.debugName = "War3WaterInfo";
+  m_waterInfo = m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+  m_waterInfoLayoutState.reset();
+
+  // Two views of one image: DXVK encodes a view's descriptor from its usage,
+  // so the receiver's storage binding and the water pass's sampled read each
+  // get a view of their own kind.
+  view.format = info.format;
+  view.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+  view.layout = VK_IMAGE_LAYOUT_GENERAL;
+  view.aspects = VK_IMAGE_ASPECT_COLOR_BIT;
+  m_waterInfoView = m_waterInfo->createView(view);
+  view.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+  m_waterInfoStorageView = m_waterInfo->createView(view);
+}
+
+Rc<war3::render::War3TrackedVkPipeline>
+War3ShadowReceiverPass::getWaterDepthPipeline(const War3ShadowCasterDraw &draw) {
+  const uint64_t key = uint64_t(draw.positionFormat) |
+                       (uint64_t(draw.positionStride & 0xffffu) << 32) |
+                       (uint64_t(draw.positionOffset & 0xffu) << 48) |
+                       (uint64_t(draw.topology & 0xffu) << 56);
+  auto it = m_waterDepthPipelines.find(key);
+  if (it != m_waterDepthPipelines.end())
+    return it->second;
+
+  if (!m_waterDepthLayout) {
+    m_waterDepthLayout = m_device->createBuiltInPipelineLayout(
+        DxvkPipelineLayoutFlags(), VK_SHADER_STAGE_VERTEX_BIT,
+        sizeof(Matrix4), 0u, nullptr);
+  }
+  VkVertexInputBindingDescription binding = {};
+  binding.binding = 0;
+  binding.stride = draw.positionStride;
+  binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+  VkVertexInputAttributeDescription attribute = {};
+  attribute.location = 0;
+  attribute.binding = 0;
+  attribute.format = draw.positionFormat;
+  attribute.offset = draw.positionOffset;
+  VkPipelineVertexInputStateCreateInfo viState = {
+      VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+  viState.vertexBindingDescriptionCount = 1u;
+  viState.pVertexBindingDescriptions = &binding;
+  viState.vertexAttributeDescriptionCount = 1u;
+  viState.pVertexAttributeDescriptions = &attribute;
+  VkPipelineInputAssemblyStateCreateInfo iaState = {
+      VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+  iaState.topology = draw.topology;
+  VkPipelineRasterizationStateCreateInfo rsState = {
+      VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+  rsState.polygonMode = VK_POLYGON_MODE_FILL;
+  rsState.cullMode = VK_CULL_MODE_NONE;
+  rsState.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+  rsState.lineWidth = 1.0f;
+  VkPipelineDepthStencilStateCreateInfo dsState = {
+      VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+  dsState.depthTestEnable = VK_TRUE;
+  dsState.depthWriteEnable = VK_TRUE;
+  dsState.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+  util::DxvkBuiltInGraphicsState state = {};
+  state.vs = util::DxvkBuiltInShaderStage(war3_water_depth_vert, nullptr);
+  state.depthFormat = VK_FORMAT_D32_SFLOAT;
+  state.viState = &viState;
+  state.iaState = &iaState;
+  state.rsState = &rsState;
+  state.dsState = &dsState;
+  const VkPipeline pipeline =
+      m_device->createBuiltInGraphicsPipeline(m_waterDepthLayout, state);
+  Rc<war3::render::War3TrackedVkPipeline> lifetime =
+      war3::render::AdoptWar3TrackedVkPipeline(m_device, pipeline);
+  if (lifetime)
+    m_waterDepthPipelines.insert({key, lifetime});
+  return lifetime;
+}
+
+bool War3ShadowReceiverPass::renderWaterDepth(
+    const Rc<DxvkCommandList> &ctx, const War3PipelineInput &input,
+    const War3WorldCameraState &camera, const War3RenderSettings &settings) {
+  m_waterFrame = WaterFrame();
+  const auto &draws = input.scene.waterSurfaces;
+  const auto &worlds = input.scene.waterWorlds;
+  if (draws.empty() || draws.size() != worlds.size() || !m_depthCopy ||
+      !camera.valid)
+    return false;
+  // A standard depth range only (the game's): the far clear is the largest
+  // raw depth, so the nearest surface is the smallest.
+  float farRaw = 0.0f;
+  if (!war3::render::InferWar3FarClearRaw(camera, farRaw) || !(farRaw >= 0.5f))
+    return false;
+  const VkExtent3D extent = m_depthCopy->info().extent;
+  const auto &vp = camera.viewport;
+  if (extent.width == 0u || extent.height == 0u || vp.Width == 0u ||
+      vp.Height == 0u || vp.X >= extent.width || vp.Y >= extent.height)
+    return false;
+  ensureWaterResources(extent);
+  if (!m_waterDepthView || !m_waterDepthAttachmentView || !m_waterInfoView ||
+      !m_waterInfoStorageView)
+    return false;
+
+  const VkImageSubresourceRange depthRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0u,
+                                              1u, 0u, 1u};
+  const VkImageSubresourceRange infoRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u,
+                                             0u, 1u};
+  const auto barrier = [&](war3::render::War3OwnedImageLayoutState &layout,
+                           const Rc<DxvkImage> &image,
+                           const VkImageSubresourceRange &range,
+                           VkImageLayout newLayout, VkPipelineStageFlags2 stages,
+                           VkAccessFlags2 access) {
+    const auto transition = layout.plan(newLayout, stages, access);
+    const VkImageMemoryBarrier2 b =
+        war3::render::MakeWar3OwnedImageBarrier(transition, image->handle(), range);
+    VkDependencyInfo dependency = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    dependency.imageMemoryBarrierCount = 1u;
+    dependency.pImageMemoryBarriers = &b;
+    ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &dependency);
+    war3::render::CommitWar3OwnedImageLayout(layout, transition, *image, range);
+  };
+
+  // What the receiver finds on the surface, (1, 0) where it finds no water.
+  barrier(m_waterInfoLayoutState, m_waterInfo, infoRange,
+          VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+          VK_ACCESS_2_TRANSFER_WRITE_BIT);
+  VkClearColorValue noWater = {};
+  noWater.float32[0] = 1.0f;
+  ctx->cmdClearColorImage(DxvkCmdBuffer::ExecBuffer, m_waterInfo->handle(),
+                          VK_IMAGE_LAYOUT_GENERAL, &noWater, 1u, &infoRange);
+  barrier(m_waterInfoLayoutState, m_waterInfo, infoRange,
+          VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+          VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+
+  barrier(m_waterDepthLayoutState, m_waterDepth, depthRange,
+          VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+          VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+              VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+          VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+              VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+
+  VkRenderingAttachmentInfo depthAttachment = {
+      VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+  depthAttachment.imageView = m_waterDepthAttachmentView->handle();
+  depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+  depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+  depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  depthAttachment.clearValue.depthStencil = {1.0f, 0u};
+  VkRenderingInfo renderInfo = {VK_STRUCTURE_TYPE_RENDERING_INFO};
+  renderInfo.renderArea.extent = {extent.width, extent.height};
+  renderInfo.layerCount = 1u;
+  renderInfo.pDepthAttachment = &depthAttachment;
+  ctx->cmdBeginRendering(&renderInfo);
+
+  // The game's own viewport as DXVK binds it (BindViewportAndScissor): the
+  // half-pixel offset, Y flipped, the same depth range.
+  const float zBias = vp.MinZ >= 0.5f ? 0.0f : 0.001f;
+  VkViewport viewport = {};
+  viewport.x = float(vp.X) + 0.5f;
+  viewport.y = float(vp.Height + vp.Y) + 0.5f;
+  viewport.width = float(vp.Width);
+  viewport.height = -float(vp.Height);
+  viewport.minDepth = std::clamp(vp.MinZ, 0.0f, 1.0f);
+  viewport.maxDepth = std::clamp(std::max(vp.MaxZ, vp.MinZ + zBias), 0.0f, 1.0f);
+  VkRect2D scissor = {};
+  scissor.offset = {int32_t(vp.X), int32_t(vp.Y)};
+  scissor.extent = {std::min<uint32_t>(vp.Width, extent.width - vp.X),
+                    std::min<uint32_t>(vp.Height, extent.height - vp.Y)};
+  ctx->cmdSetViewport(1, &viewport);
+  ctx->cmdSetScissor(1, &scissor);
+
+  const Matrix4 viewProj = camera.viewProj;
+  const Matrix4 identityWorld;
+  uint32_t drawn = 0u;
+  for (size_t i = 0; i < draws.size(); ++i) {
+    const auto &draw = draws[i];
+    // The capture admits world-space water only (an identity world matrix).
+    if (std::memcmp(&worlds[i], &identityWorld, sizeof(Matrix4)) != 0 ||
+        !draw.indexed || draw.positionInfo.buffer == VK_NULL_HANDLE ||
+        draw.indexInfo.buffer == VK_NULL_HANDLE ||
+        draw.positionFormat == VK_FORMAT_UNDEFINED || draw.positionStride == 0u)
+      continue;
+    const Rc<war3::render::War3TrackedVkPipeline> pipeline =
+        getWaterDepthPipeline(draw);
+    if (!pipeline)
+      continue;
+    ctx->track(pipeline);
+    ctx->cmdBindPipeline(DxvkCmdBuffer::ExecBuffer,
+                         VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->handle());
+    ctx->bindResources(DxvkCmdBuffer::ExecBuffer, m_waterDepthLayout, 0u,
+                       nullptr, sizeof(viewProj), &viewProj);
+    if (draw.positionStorage.ptr() != nullptr)
+      ctx->track(draw.positionStorage);
+    war3::memory::TrackSnapshotSlices(*ctx, draw);
+    if (draw.positionPinnedAllocation.ptr() != nullptr)
+      ctx->track(draw.positionPinnedAllocation);
+    if (draw.indexStorage.ptr() != nullptr &&
+        draw.indexStorage.ptr() != draw.positionStorage.ptr())
+      ctx->track(draw.indexStorage);
+    if (draw.indexPinnedAllocation.ptr() != nullptr &&
+        draw.indexPinnedAllocation.ptr() != draw.positionPinnedAllocation.ptr())
+      ctx->track(draw.indexPinnedAllocation);
+    VkBuffer vb = draw.positionInfo.buffer;
+    VkDeviceSize vbOffset = draw.positionInfo.offset;
+    VkDeviceSize vbSize = draw.positionInfo.size;
+    VkDeviceSize vbStride = draw.positionStride;
+    ctx->cmdBindVertexBuffers(0, 1, &vb, &vbOffset, &vbSize, &vbStride);
+    ctx->cmdBindIndexBuffer2(draw.indexInfo.buffer, draw.indexInfo.offset,
+                             draw.indexInfo.size, draw.indexType);
+    ctx->cmdDrawIndexed(draw.indexCount, 1, draw.firstIndex, draw.vertexOffset, 0);
+    ++drawn;
+  }
+  ctx->cmdEndRendering();
+
+  barrier(m_waterDepthLayoutState, m_waterDepth, depthRange,
+          VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+          VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+          VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+  ctx->track(m_waterDepth, DxvkAccess::Write);
+  ctx->track(m_waterInfo, DxvkAccess::Write);
+
+  static uint32_t s_logged = 0u;
+  if (s_logged < 3u && drawn != 0u) {
+    ++s_logged;
+    Logger::info(str::format("WarVK water surface: frame=", input.frameSerial,
+                             " records=", draws.size(), " drawn=", drawn,
+                             " extent=", extent.width, "x", extent.height));
+  }
+  if (drawn == 0u)
+    return false;
+  WaterFrame &frame = m_waterFrame;
+  frame.valid = true;
+  frame.drawCount = drawn;
+  frame.waterDepth = m_waterDepthView;
+  frame.waterInfo = m_waterInfoView;
+  frame.sceneColor = m_colorCopyView;
+  frame.sceneDepth = m_depthCopyView;
+  frame.view = camera.view;
+  frame.proj = camera.proj;
+  frame.invViewProj = camera.invViewProj;
+  frame.viewport = Vector4(float(vp.X), float(vp.Y), float(vp.Width), float(vp.Height));
+  frame.viewportZ = Vector4(vp.MinZ, vp.MaxZ, 0.0f, 0.0f);
+  frame.depthContract = Vector4(farRaw, 1.0f, 0.0f, 0.0f);
+  // A switched-off sun gives no glint; the ambient below still lights the body.
+  const float intensity = !settings.sun.enabled ? 0.0f
+      : std::isfinite(settings.sun.intensity) ? settings.sun.intensity : 1.0f;
+  frame.sunColor = Vector4(settings.sun.color.x * intensity, settings.sun.color.y * intensity,
+                           settings.sun.color.z * intensity, 0.0f);
+  frame.ambient = settings.ambient.overrideEnabled ? settings.ambient.color
+      : Vector4(frame.sunColor.x * 0.2f, frame.sunColor.y * 0.2f, frame.sunColor.z * 0.2f, 0.0f);
+  return true;
+}
+
+// After the receiver: what it wrote on the water, readable by the water pass.
+void War3ShadowReceiverPass::publishWaterInfo(const Rc<DxvkCommandList> &ctx) {
+  if (!m_waterFrame.valid || !m_waterInfo)
+    return;
+  const VkImageSubresourceRange infoRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u,
+                                             0u, 1u};
+  const auto transition = m_waterInfoLayoutState.plan(
+      VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+      VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+  const VkImageMemoryBarrier2 b = war3::render::MakeWar3OwnedImageBarrier(
+      transition, m_waterInfo->handle(), infoRange);
+  VkDependencyInfo dependency = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+  dependency.imageMemoryBarrierCount = 1u;
+  dependency.pImageMemoryBarriers = &b;
+  ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &dependency);
+  war3::render::CommitWar3OwnedImageLayout(m_waterInfoLayoutState, transition,
+                                           *m_waterInfo, infoRange);
+  ctx->track(m_waterInfo, DxvkAccess::Read);
+}
+
 void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
                                  const War3PipelineInput &input) {
   // [Perf] Add timing scope for Shadow/Outline pass
   auto perfScope = war3::War3PerfMonitor::instance().scope("Shadow/Main", ctx);
+  m_waterFrame = WaterFrame();
   m_gpuWorkloadGovernor.beginFrame(input.frameSerial);
   m_workloadGovernorRejectedThisFrame = false;
   [[maybe_unused]] auto gpuWorkloadDiagnosticsPublish =
@@ -9265,6 +9799,15 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
 
   // Phase 7.2: 每帧重置对账计数器
   reconciliation = {};
+#ifdef _WIN64
+  m_proxyFootprints = {};
+  m_proxyWriteMask = 0xf;
+  m_proxySubsetProven = false;
+  const bool hostOmission = input.scene.proxyRecordFrame &&
+      !input.scene.producerCompleteness.accepts(input.frameSerial, input.mapEpoch, input.deviceEpoch);
+#else
+  constexpr bool hostOmission = false;
+#endif
   const auto evidenceSession=war3::tools::evidence::ActiveSession();
   [[maybe_unused]] auto evidenceSummary=MakeWar3ScopeExit([&,evidenceSession]() noexcept {
     if (!evidenceSession) return;
@@ -9932,7 +10475,14 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
   }
   const float casterBias = std::max(settings->shadows.casterDepthBias, 0.0f);
   const float casterSlope = std::max(settings->shadows.casterSlopeBias, 0.0f);
-  const float casterClamp = std::max(settings->shadows.casterBiasClamp, 0.0f);
+  // The clamp is authored for a 4096 map, like the receiver bias: its size in
+  // texels must not shrink with a smaller map.
+  const uint32_t casterClampResolution = std::max<uint32_t>(
+      m_shadowMapResolution ? m_shadowMapResolution
+                            : settings->shadows.csm.shadowResolution,
+      1u);
+  const float casterClamp = std::max(settings->shadows.casterBiasClamp, 0.0f) *
+                            (4096.0f / float(casterClampResolution));
   if (casterBias != m_shadowCasterBiasConstant ||
       casterSlope != m_shadowCasterBiasSlope ||
       casterClamp != m_shadowCasterBiasClamp) {
@@ -9990,11 +10540,6 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
   const auto now = std::chrono::steady_clock::now();
   if (!m_timeInitialized) {
     m_timeInitialized = true;
-    m_timeStart = now;
-    m_timeSmoothingInitialized = false;
-    m_time01LastUpdate = now;
-    m_time01LastRawSample = now;
-    m_time01Speed = 1.0f / std::max(1.0f, m_dayLengthSeconds);
 
     // 推断 worldUp（保持原有逻辑）
     const Matrix4 invView = inverse(input.scene.worldCamera.view);
@@ -10021,187 +10566,23 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
                     (yScore >= zScore) ? "Y" : "Z");
   }
 
-  // 1. 计算当前时间（0..1）
-  auto wrap01 = [](float v) {
-    v = std::fmod(v, 1.0f);
-    if (v < 0.0f)
-      v += 1.0f;
-    return v;
-  };
-  auto diffSigned01 = [&](float a, float b) {
-    // 返回 a-b 的最短差值，范围约 [-0.5, 0.5)
-    float d = a - b;
-    d -= std::floor(d + 0.5f);
-    return d;
-  };
-  auto diffForward01 = [&](float a, float b) {
-    // 返回从 b 走到 a 的“正向”差值，范围 [0, 1)
-    float d = a - b;
-    d -= std::floor(d);
-    return d;
-  };
-
-  float rawTime01 = 0.0f;
-  const float realGameTime = War3RenderState::GetGameTime();
+  // 1-6. 当前时间、太阳轨迹与主光源：war3/effects/war3_sun_cycle.h。
+  // 代理模式下 x86 数据层用同一份实现解析固定管线的世界光照。
   const War3DayNightSettings &dayNightSettings = settings->dayNight;
   War3RenderSettings mutableSettings = *settings;
-
-  static bool s_hasValidGameTime = false;
-  const bool hasRealGameTime =
-      realGameTime >= 0.0f && realGameTime <= 24.0f;
-  const War3LightingClockMode clockMode = dayNightSettings.clockMode;
-  if (clockMode != War3LightingClockMode::GameTime) {
-    rawTime01 = wrap01(dayNightSettings.renderTimeHours / 24.0f);
-    m_timeSmoothingInitialized = false;
-  } else if (hasRealGameTime) {
-    // Game Time 0=Midnight, 6=Sunrise, 18=Sunset, 24=Midnight.
-    if (!s_hasValidGameTime) {
-      s_hasValidGameTime = true;
-      WAR3_RENDER_LOG("DXVK War3Shadow: Switched to Real Game Time! t=%f\n",
-                      realGameTime);
-    }
-    rawTime01 = wrap01(realGameTime / 24.0f);
-  } else {
-    // Follow-game mode retains the historical startup fallback until the
-    // native TIME_OF_DAY source becomes readable.
-    static int s_failLog = 0;
-    if (s_failLog++ < 10) {
-      WAR3_RENDER_LOG("DXVK War3Shadow: Fallback used. RealGameTime=%.4f "
-                      "(Valid Range: 0-24)\n",
-                      realGameTime);
-    }
-    const float elapsed =
-        std::chrono::duration<float>(now - m_timeStart).count();
-    rawTime01 = wrap01(elapsed / m_dayLengthSeconds + m_startTime01);
-  }
-
   const War3ShadowSettings &shadowSettings = settings->shadows;
-  if (shadowSettings.lockSun) {
-    rawTime01 = std::clamp(shadowSettings.lockSunTime, 0.0f, 1.0f);
-    // 锁太阳时强制重置平滑状态，避免解锁后“追赶”造成突跳
-    m_timeSmoothingInitialized = false;
-  }
+  const War3SunCycle::Result sunCycle =
+      m_sunCycle.Resolve(&*settings, War3RenderState::GetGameTime(), now);
+  const float time01 = sunCycle.time01;
+  const float realAltitudeRad = sunCycle.realAltitudeRad;
+  const float shadowAltRad = sunCycle.shadowAltRad;
+  const float kTransitionRad = sunCycle.transitionRad;
+  Vector4 finalLightDir = sunCycle.direction;
+  Vector4 finalLightColor = sunCycle.color;
+  float finalShadowStrength = sunCycle.shadowStrength;
+  const Vector4 receiverShadowTint = sunCycle.shadowTint;
 
-  // 说明：TIME_OF_DAY 通常是 100ms 台阶更新；这里把它平滑成逐帧连续值，
-  // 以消除日夜切换/太阳移动时的高频跳变（尤其在 CSM 与阴影接收器上很明显）。
-  float time01 = rawTime01;
-  if (clockMode == War3LightingClockMode::GameTime && hasRealGameTime &&
-      !shadowSettings.lockSun) {
-    if (!m_timeSmoothingInitialized) {
-      m_timeSmoothingInitialized = true;
-      m_time01Smoothed = rawTime01;
-      m_time01LastRaw = rawTime01;
-      m_time01Speed = 1.0f / std::max(1.0f, m_dayLengthSeconds);
-      m_time01LastUpdate = now;
-      m_time01LastRawSample = now;
-    } else {
-      const float dt =
-          std::chrono::duration<float>(now - m_time01LastUpdate).count();
-      m_time01LastUpdate = now;
-      if (dt > 0.0f && dt < 0.25f) {
-        m_time01Smoothed = wrap01(m_time01Smoothed + m_time01Speed * dt);
-      }
-
-      const float rawDelta = diffForward01(rawTime01, m_time01LastRaw);
-      if (rawDelta > 1e-5f) {
-        const float rawDt =
-            std::chrono::duration<float>(now - m_time01LastRawSample).count();
-        m_time01LastRawSample = now;
-        m_time01LastRaw = rawTime01;
-
-        // 时间被脚本/触发器重置时可能会出现大跳变；此时直接对齐，避免“极速追赶”
-        if constexpr (dxvk::war3::internal::kShadowTimeAdaptiveSpeedEnabled) {
-          if (rawDt > 0.0f && rawDt < 2.0f && rawDelta < 0.25f) {
-            const float newSpeed = rawDelta / rawDt;
-            // 合理上限：允许加速（比如加速昼夜），但避免异常值把系统带飞
-            const float maxSpeed = 1.0f / 5.0f; // 5 秒跑完一天已经非常夸张
-            m_time01Speed = std::clamp(newSpeed, 0.0f, maxSpeed);
-          } else {
-            m_time01Smoothed = rawTime01;
-            m_time01Speed = 1.0f / std::max(1.0f, m_dayLengthSeconds);
-          }
-        } else {
-          if (rawDelta >= 0.25f || rawDt >= 2.0f)
-            m_time01Smoothed = rawTime01;
-          m_time01Speed = 1.0f / std::max(1.0f, m_dayLengthSeconds);
-        }
-      }
-
-      const float err = diffSigned01(rawTime01, m_time01Smoothed);
-      const float absErr = std::abs(err);
-      if (absErr > 0.25f) {
-        // 误差过大（例如瞬移时间/重置时间），直接对齐
-        m_time01Smoothed = rawTime01;
-      } else {
-        // 小误差回正：限制每帧回正幅度，避免可见跳动
-        constexpr float kPull = 0.05f;
-        constexpr float kMaxPullPerFrame = 0.02f;
-        const float pull =
-            std::clamp(err * kPull, -kMaxPullPerFrame, kMaxPullPerFrame);
-        m_time01Smoothed = wrap01(m_time01Smoothed + pull);
-      }
-    }
-    time01 = m_time01Smoothed;
-  }
-
-  mutableSettings.dayNight.renderTimeHours = wrap01(time01) * 24.0f;
-
-  // 2. 计算太阳的“真实”轨迹 (Real Trajectory)
-  // 假设：X=东, -X=西, Y=北, -Y=南, Z=上
-  // 方位角(Azimuth): 从东(0) -> 南(PI/2) -> 西(PI)
-  // 让太阳稍微偏南一点，保证阴影更有立体感
-  // Time 0.25(Sunrise) -> Azimuth 0 (East)
-  // Time 0.50(Noon)    -> Azimuth PI/2 (South)
-  // Time 0.75(Sunset)  -> Azimuth PI (West)
-
-  // 真实高度角 (Real Altitude): 正弦波模拟
-  // T=0.25(Sunrise) -> Alt=0, T=0.5(Noon) -> Alt=90
-  // sin argument: (time01 - 0.25) * 2 * PI -> 0 ~ PI (for 0.25~0.75 range)
-  // (time01 - 0.25) * 2PI 涵盖整个 0..1 周期 (对应 0..2PI)
-  float sunAnglePhase = (time01 - 0.25f) * 2.0f * 3.14159265f;
-  float realAltitudeRad = std::sin(sunAnglePhase) * (3.14159265f / 2.0f);
-
-  // 3. 计算受控的“投影”高度角（全时段平滑变化）
-  float minAltRad = m_minSunAltitudeDeg * (3.14159265f / 180.0f);
-  float maxAltRad = m_maxSunAltitudeDeg * (3.14159265f / 180.0f);
-  const float halfPi = 3.14159265f / 2.0f;
-
-  auto smoothstep01 = [](float v) {
-    v = std::min(1.0f, std::max(0.0f, v));
-    return v * v * (3.0f - 2.0f * v);
-  };
-
-  auto calcLinearBell01 = [&](float phase01) {
-    float p = std::min(1.0f, std::max(0.0f, phase01));
-    float tri = 1.0f - std::abs(p * 2.0f - 1.0f);
-    return std::min(1.0f, std::max(0.0f, tri));
-  };
-
-  float lengthScale = std::clamp(shadowSettings.shadowLengthScale, 0.1f, 2.0f);
-  float maxLenScale =
-      std::clamp(shadowSettings.shadowMaxLengthScale, 0.1f, 2.0f);
-
-  auto calcShadowAltitude01 = [&](float altitude01) {
-    float t = smoothstep01(altitude01);
-    float minAltForLength = minAltRad;
-    if (maxLenScale > 0.0f) {
-      float baseTan = std::tan(std::max(0.001f, minAltRad));
-      float scaledMinAlt = std::atan(baseTan * (lengthScale / maxLenScale));
-      minAltForLength = std::min(scaledMinAlt, maxAltRad - 0.01f);
-    }
-    float baseAlt = minAltForLength + (maxAltRad - minAltForLength) * t;
-    float tanBase = std::tan(std::max(0.001f, baseAlt));
-    return std::atan(tanBase / lengthScale);
-  };
-
-  float dayPhase = (time01 - 0.25f) / 0.5f;
-  float dayAlt01 = 0.0f;
-  if (shadowSettings.altitudeMode == War3ShadowAltitudeMode::TimeLinear) {
-    dayAlt01 = calcLinearBell01(dayPhase);
-  } else {
-    dayAlt01 = std::clamp(realAltitudeRad / halfPi, 0.0f, 1.0f);
-  }
-  float shadowAltRad = calcShadowAltitude01(dayAlt01);
+  mutableSettings.dayNight.renderTimeHours = sunCycle.renderTimeHours;
 
   // 2026-07-21 优化：进程环境变量在启动后不可变，每帧两次 getenv+string
   // 分配是纯浪费。与其他 flag 一致改为静态缓存（语义完全等价）。
@@ -10226,188 +10607,6 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
         static_cast<uint32_t>(s_pointDebugOverride);
   }
 
-  // 5. 计算光源方向向量 (Z-Up)
-  // 修正：War3 中 +X=East, +Y=North.
-  // 想要太阳从东(X) -> 南(-Y) -> 西(-X)
-  // Angle 0 = East (+X).
-  // Angle -90 (PI/2) = South (-Y).
-  // Angle -180 (PI) = West (-X).
-  // 所以我们让 azimuth 从 0 变到 -PI
-
-  // [Fix] Optional time quantization for diagnosis. Default stays smooth:
-  // quantized sun steps can look like periodic shadow pops when visual QA is
-  // focused on flicker.
-  const float kSunQuantStep = 0.0002f;
-  float quantizedTime01 = time01;
-  if constexpr (dxvk::war3::internal::kShadowSunTimeQuantizationEnabled)
-    quantizedTime01 = std::round(time01 / kSunQuantStep) * kSunQuantStep;
-
-  float rawDayPhase = (quantizedTime01 - 0.25f) / 0.5f;
-  float sunYaw = -rawDayPhase * 3.14159265f;
-
-  // 球坐标转笛卡尔 (Z-Up)
-  // X = cos(Alt) * cos(Yaw)
-  // Y = cos(Alt) * sin(Yaw)
-  // Z = sin(Alt)
-  float cosAlt = std::cos(shadowAltRad);
-  float sinAlt = std::sin(shadowAltRad);
-  float cosYaw = std::cos(sunYaw);
-  float sinYaw = std::sin(sunYaw);
-
-  Vector4 sunPos;
-  sunPos.x = cosAlt * cosYaw;
-  sunPos.y = cosAlt * sinYaw;
-  sunPos.z = sinAlt;
-
-  // LightDir = -SunPos
-  mutableSettings.sun.direction =
-      Vector4(-sunPos.x, -sunPos.y, -sunPos.z, 0.0f);
-
-  // 6. 光源逻辑 (Sun vs Moon)
-  Vector4 finalLightDir;
-  Vector4 finalLightColor;
-  float finalShadowStrength = 0.0f;
-
-  // 关键视觉参数
-  // 地平线颜色：改为【暖灰/米色】，消除过于鲜艳的红色，提供更自然的晨昏过渡
-  // 原值(0.5, 0.35, 0.35)太红 -> 新值(0.7, 0.65, 0.6)更亮且低饱和
-  const Vector4 kColorHorizon = Vector4(0.7f, 0.65f, 0.60f, 1.0f);
-  // 月光颜色：更偏冷蓝以增强夜间氛围
-  const Vector4 kColorMoon = Vector4(0.4f, 0.55f, 0.95f, 1.0f);
-
-  // 混合过渡带宽度 (度)：加大到 24 度，让变化更从容
-  const float kTransitionDeg = 24.0f;
-  const float kTransitionRad = kTransitionDeg * (3.14159265f / 180.0f);
-
-  // 阴影衰减地平线 (Decoupled Fade Horizon)
-  const float kFadeHorizonDeg = 10.0f;
-  const float kFadeHorizonRad = kFadeHorizonDeg * (3.14159265f / 180.0f);
-
-  // ======== 白天 (Sun) 结果 ========
-  Vector4 dayLightDir = mutableSettings.sun.direction;
-  float dayAlt = std::max(0.0f, realAltitudeRad);
-  Vector4 dayColor;
-  if (dayAlt > kTransitionRad) {
-    float range = (3.14159265f / 2.0f) - kTransitionRad;
-    float tPrime = std::max(0.0f, (dayAlt - kTransitionRad) / range);
-    float kelvin = 2500.0f + tPrime * 4000.0f;
-    dayColor = kelvinToRgb(kelvin);
-  } else {
-    float linearBlend =
-        (kTransitionRad > 0.0f) ? (dayAlt / kTransitionRad) : 0.0f;
-    float blend = linearBlend * linearBlend * (3.0f - 2.0f * linearBlend);
-    Vector4 sunLow = kelvinToRgb(2500.0f);
-    dayColor = kColorHorizon + (sunLow - kColorHorizon) * blend;
-  }
-  float dayFadeRatio = (kFadeHorizonRad > 0.0f)
-                           ? std::min(1.0f, dayAlt / kFadeHorizonRad)
-                           : 0.0f;
-
-  // 【修复】太阳光强度应该与阴影强度绑定
-  // 原代码使用 minLightFactor (0.85) 作为最低值，导致太阳落下后依然很亮
-  // 修改为：太阳升起时 100%，太阳落下时接近 0%（只保留月光水平）
-  const float nightLightLevel = 0.15f; // 夜间光照水平（月光）
-  const float dayLightFactor =
-      nightLightLevel + (1.0f - nightLightLevel) * dayFadeRatio;
-
-  Vector4 dayLightColor = dayColor * dayLightFactor;
-  float dayShadowStrength = dayFadeRatio * 0.6075f;
-
-  // ======== 黑夜 (Moon) 结果 ========
-  float moonRealAlt = std::max(0.0f, -realAltitudeRad);
-  float nightPhase = 0.0f;
-  if (time01 < 0.25f) {
-    nightPhase = (time01 + 0.25f) / 0.5f;
-  } else {
-    nightPhase = (time01 - 0.75f) / 0.5f;
-  }
-  float moonAlt01 = 0.0f;
-  if (shadowSettings.altitudeMode == War3ShadowAltitudeMode::TimeLinear) {
-    moonAlt01 = calcLinearBell01(nightPhase);
-  } else {
-    moonAlt01 = std::clamp(moonRealAlt / halfPi, 0.0f, 1.0f);
-  }
-  float moonShadowAlt = calcShadowAltitude01(moonAlt01);
-  float moonYaw = sunYaw + 3.14159265f;
-  float cAlt = std::cos(moonShadowAlt);
-  float sAlt = std::sin(moonShadowAlt);
-  float cYaw = std::cos(moonYaw);
-  float sYaw = std::sin(moonYaw);
-  Vector4 moonPos;
-  moonPos.x = cAlt * cYaw;
-  moonPos.y = cAlt * sYaw;
-  moonPos.z = sAlt;
-  Vector4 nightLightDir = Vector4(-moonPos.x, -moonPos.y, -moonPos.z, 0.0f);
-
-  Vector4 nightColor;
-  if (moonRealAlt < kTransitionRad) {
-    float linearBlend =
-        (kTransitionRad > 0.0f) ? (moonRealAlt / kTransitionRad) : 0.0f;
-    float blend = linearBlend * linearBlend * (3.0f - 2.0f * linearBlend);
-    nightColor = kColorHorizon + (kColorMoon - kColorHorizon) * blend;
-  } else {
-    nightColor = kColorMoon;
-  }
-  float moonFadeRatio = (kFadeHorizonRad > 0.0f)
-                            ? std::min(1.0f, moonRealAlt / kFadeHorizonRad)
-                            : 0.0f;
-
-  // 【修复】月光强度使用夜间基础水平，月亮落下后保持最低亮度
-  // 复用上面定义的 nightLightLevel
-  const float nightLightFactor =
-      nightLightLevel + (1.0f - nightLightLevel) * moonFadeRatio;
-  Vector4 nightLightColor = nightColor * nightLightFactor;
-  const float nightShadowScale =
-      std::clamp(shadowSettings.nightShadowScale, 0.0f, 1.0f);
-  float nightShadowStrength = moonFadeRatio * 0.5508f * nightShadowScale;
-
-  // ======== 主光源选择（解决“日夜切换阴影方向瞬移”） ========
-  // 说明：
-  // -
-  // 日落/日出时，太阳与月亮方向接近相反，直接对方向做线性混合会出现“向量相互抵消”，
-  //   进而产生极端角速度：看起来像太阳/月亮在一秒内快速乱跑。
-  // - 我们渲染端只有一套方向光阴影（CSM），因此在过渡带内应当“选一个主光源”，
-  //   并依赖地平线附近的阴影强度淡出使切换不可见。
-  const bool useDayLight = realAltitudeRad >= 0.0f;
-  finalLightDir = useDayLight ? dayLightDir : nightLightDir;
-  finalLightColor = useDayLight ? dayLightColor : nightLightColor;
-  finalShadowStrength = useDayLight ? dayShadowStrength : nightShadowStrength;
-
-  if (dayNightSettings.timeColorGradingEnabled &&
-      dayNightSettings.customColorTemperatureProfile) {
-    const auto validKelvin = [](float value, float fallback) {
-      return std::isfinite(value)
-          ? std::clamp(value, 1000.0f, 20000.0f)
-          : fallback;
-    };
-    const float keyKelvin[4] = {
-        validKelvin(dayNightSettings.midnightKelvin, 9000.0f),
-        validKelvin(dayNightSettings.dawnKelvin, 2500.0f),
-        validKelvin(dayNightSettings.noonKelvin, 6500.0f),
-        validKelvin(dayNightSettings.duskKelvin, 2500.0f),
-    };
-    const float hours = wrap01(time01) * 24.0f;
-    const uint32_t segment =
-        std::min(3u, static_cast<uint32_t>(hours / 6.0f));
-    const uint32_t next = (segment + 1u) & 3u;
-    const float segmentT = smoothstep01(
-        (hours - static_cast<float>(segment) * 6.0f) / 6.0f);
-    const float kelvin = keyKelvin[segment] +
-        (keyKelvin[next] - keyKelvin[segment]) * segmentT;
-    const float brightness =
-        useDayLight ? dayLightFactor : nightLightFactor;
-    finalLightColor = kelvinToRgb(kelvin) * brightness;
-  }
-
-  // Manual ownership is final. When a cycle is disabled the pass neither
-  // rewrites the corresponding global sun value nor substitutes a local CSM
-  // value, so a JASS setting remains stable on every subsequent frame.
-  if (!dayNightSettings.celestialMotionEnabled) {
-    finalLightDir = settings->sun.direction;
-    finalShadowStrength = settings->shadows.strength;
-  }
-  if (!dayNightSettings.timeColorGradingEnabled)
-    finalLightColor = settings->sun.color;
 
   // [Event System] Update Phase
   bool isRising = std::cos(time01 * (2.0f * 3.14159265f)) >= 0.0f;
@@ -10431,6 +10630,8 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
   // Feed only resolved day/night fields back for the next render-owner frame.
   // A newer JASS/UI edit increments pendingRevision and rejects this stale CS
   // feedback instead of being overwritten by an older queued command.
+  // The direction fed back is the one the world is shaded from (light 0),
+  // not the shadow's: the pass keeps the shadow's for itself.
   if (input.settingsMailbox != nullptr) {
     const auto mailbox = input.settingsMailbox;
     std::lock_guard<std::mutex> lock(mailbox->mutex);
@@ -10438,9 +10639,25 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
       mailbox->pending.dayNight.renderTimeHours =
           mutableSettings.dayNight.renderTimeHours;
       if (dayNightSettings.celestialMotionEnabled)
-        mailbox->pending.sun.direction = finalLightDir;
+        mailbox->pending.sun.direction = sunCycle.lightDirection;
       if (dayNightSettings.timeColorGradingEnabled)
         mailbox->pending.sun.color = finalLightColor;
+      ++mailbox->pendingRevision;
+    } else {
+      // The open panel commits every frame: what it wrote stays, and the
+      // outputs of the cycles that are still running follow the sun, or
+      // the world light would wait for the panel to close.
+      auto &pending = mailbox->pending;
+      if (dayNightSettings.clockMode == War3LightingClockMode::GameTime &&
+          pending.dayNight.clockMode == War3LightingClockMode::GameTime)
+        pending.dayNight.renderTimeHours =
+            mutableSettings.dayNight.renderTimeHours;
+      if (dayNightSettings.celestialMotionEnabled &&
+          pending.dayNight.celestialMotionEnabled)
+        pending.sun.direction = sunCycle.lightDirection;
+      if (dayNightSettings.timeColorGradingEnabled &&
+          pending.dayNight.timeColorGradingEnabled)
+        pending.sun.color = finalLightColor;
       ++mailbox->pendingRevision;
     }
   }
@@ -10558,7 +10775,7 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
   m_hasPointLights =
       m_pointLightsEnabled && (input.nativeLightCount != 0 || War3LightManager::Instance().HasActiveLights());
   bool hasPointShadow =
-      m_pointLightsEnabled && mutableSettings.shadows.pointShadowEnabled &&
+      !hostOmission && m_pointLightsEnabled && mutableSettings.shadows.pointShadowEnabled &&
       mutableSettings.shadows.pointShadowMaxLights > 0 && m_hasPointLights;
   m_pointShadowEnabled = hasPointShadow;
   {
@@ -10660,7 +10877,7 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
   // backing identities match the map that was actually rendered. This hash is
   // therefore always computed; the optional continuity report merely exposes
   // the already-required contract.
-  const War3ReplayContinuityHashes replayHashes =
+  War3ReplayContinuityHashes replayHashes =
       War3BuildReplayContinuityHashes(replayDraws);
   if (War3CsmContinuityTraceEnabled()) {
     reconciliation.replayBackingHash = replayHashes.backingHash;
@@ -10765,6 +10982,12 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
       // Do not leave an arbitrarily old CSM publication visible to the later
       // volumetric pass after the receiver has rejected its camera source.
       m_hasCompleteShadowMap = false;
+#ifdef _WIN64
+      m_proxyLayers = {};
+      m_proxyAvailable = m_proxyHeld = 0;
+      if (input.scene.proxyRecordFrame)
+        reconciliation.proxyUnavailable = (1u << std::min(m_csmConfig.cascadeCount, 4u)) - 1u;
+#endif
       static bool s_warned = false;
       if (!s_warned) {
         s_warned = true;
@@ -10830,7 +11053,7 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
   };
   freezePointUniform(pointLightSnapshot);
   hasPointShadow =
-      m_pointLightsEnabled && mutableSettings.shadows.pointShadowEnabled &&
+      !hostOmission && m_pointLightsEnabled && mutableSettings.shadows.pointShadowEnabled &&
       mutableSettings.shadows.pointShadowMaxLights > 0u && m_hasPointLights;
   m_pointShadowEnabled = hasPointShadow;
   if (!m_pointShadowEnabled) {
@@ -10851,7 +11074,7 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
       shadowsEnabled && (debugNeedsDirectionalShadowMap ||
                          (debugModeEnum == War3ShadowDebugMode::None &&
                           activeShadowStrength > 1e-3f));
-  const bool needOutlineDepth = settings->occludedOutline.enabled &&
+  const bool needOutlineDepth = outlineEnabled &&
                                 settings->occludedOutline.useScreenSpace &&
                                 War3RenderState::HasOutlineHandles();
   const bool needReceiverPass =
@@ -10923,6 +11146,134 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
   const bool producerCompleteForFrame =
       input.scene.producerCompleteness.accepts(
           input.frameSerial, input.mapEpoch, input.deviceEpoch);
+  namespace scene = war3::effects::scene;
+  const auto& classes = settings->casterClasses;
+  const auto& direction = (hasCandidateCsm ? newCsm : m_csmData).lightDirection;
+  bool policyChanged = false, customize = false, flatten = false;
+  for (size_t i = 0; i < classes.size(); ++i) {
+    const auto& cls = classes[i];
+    const float k = scene::CasterHeightScale(cls.maxShadowLength, direction.x, direction.y, direction.z);
+    // The sun moves a little every frame and k follows it. That drift is an
+    // ordinary light change (the cascade hash already sees it); only a setting
+    // or a jump of the light may drop the maps and the temporal history.
+    policyChanged |= cls.castShadow != m_directionalClasses[i].castShadow ||
+        cls.maxShadowLength != m_directionalClasses[i].maxShadowLength ||
+        std::abs(k - m_heightScales[i]) > 0.02f;
+    m_heightScales[i] = k;
+    customize |= !cls.castShadow || k < 1;
+    flatten |= k < 1;
+  }
+  m_directionalClasses = classes;
+  if (policyChanged) {
+    m_hasCompleteShadowMap = false;
+    m_shadowHistoryValid = m_shadowTaaHistoryContractValid = false;
+    reconciliation.shadowHistoryInvalidationMask |= kShadowTaaInvalidateCsm;
+#ifdef _WIN64
+    m_proxyAvailable = m_proxyHeld = 0;
+    m_proxyLayers = {};
+#endif
+  }
+
+  const auto partBase = [&](const War3ShadowCasterDraw& draw) {
+    const Vector4* origin = &draw.worldMatrix[3];
+    float minimum = scene::CasterPartBase::unknown;
+#ifdef _WIN64
+    if (input.scene.proxyRecordFrame && draw.proxyCaster) {
+      if (draw.proxyBoundsFrame && draw.proxyBoundsFrame == input.frameSerial)
+        minimum = draw.proxyWorldBounds[2];
+      // The record executor appends one instance per draw. Its matrix keeps
+      // the authored placement even if the packed VB has a decode transform.
+      const auto index = size_t(&draw - input.scene.shadowCasters.data());
+      origin = &input.scene.shadowInstances[index].worldMatrix[3];
+    }
+#endif
+    return scene::CasterBase(draw.jHandle ? draw.jHandle : draw.batchHandle,
+        origin->x, origin->y, origin->z, minimum);
+  };
+  m_casterTransforms.clear();
+  if (flatten) {
+    size_t parts = input.scene.shadowCasters.size() + input.scene.shadowFallbacks.size();
+#ifdef _WIN64
+    parts += m_omittedParts.size();
+#endif
+    m_objectBases.reset(parts);
+    for (const auto& draw : input.scene.shadowCasters) m_objectBases.add(partBase(draw));
+    for (const auto& fallback : input.scene.shadowFallbacks) m_objectBases.add(partBase(fallback.snapshot));
+#ifdef _WIN64
+    for (const auto& omitted : m_omittedParts) m_objectBases.add(omitted.part);
+#endif
+  }
+  if (customize) {
+    m_casterTransforms.reserve(replayCasterCount);
+    for (const auto* draw : capturedReplayDraws) {
+      CasterTransform transform{1, 0, true};
+      if (draw) {
+        const size_t cls = size_t(scene::ClassifyCaster(uint32_t(draw->category), draw->stage,
+            draw->objectKind, draw->shadowUnitIdentityProven));
+        if (cls < classes.size()) {
+          transform.cast = classes[cls].castShadow;
+          if (m_heightScales[cls] < 1) {
+            transform.z0 = m_objectBases.resolve(partBase(*draw),
+                scene::CasterBasePrefersOrigin(scene::CasterClass(cls)));
+            if (std::isfinite(transform.z0)) transform.k = m_heightScales[cls];
+          }
+        }
+      }
+      replayHashes.contentHash = bit::fnv1a_iter(replayHashes.contentHash, transform.cast);
+      if (transform.k < 1)
+        replayHashes.contentHash = bit::fnv1a_iter(replayHashes.contentHash, bit::cast<uint32_t>(transform.z0));
+      m_casterTransforms.push_back(transform);
+    }
+  }
+  bool proxySubset = false;
+  bool proxyLayerCycle = false;
+#ifdef _WIN64
+  const uint32_t proxyCount = std::min(newCsm.cascadeCount, 4u);
+  const uint32_t proxyAll = (1u << (proxyCount ? proxyCount : std::min(m_csmData.cascadeCount, 4u))) - 1u;
+  const auto proxyLayerIdentity = [&] {
+    return war3::effects::scene::CasterLayerIdentity{input.mapEpoch, input.deviceEpoch,
+        m_shadowMapResourceGeneration, shadowLifecycleTombstoneSerial, shadowStagePolicyRevision};
+  };
+  if (input.scene.proxyRecordFrame) {
+    auto& f = m_proxyFootprints;
+    f.count = proxyCount;
+    const auto& s = settings->shadows;
+    f.limit = war3::effects::scene::CasterClipLimit(m_shadowMapResolution,
+        std::max(s.pcfRadius, SemanticReceiverStablePcfRadiusOverride()),
+        s.pcssSearchRadius, s.pcssMinRadius, s.pcssMaxRadius);
+    for (unsigned c = 0; c < f.count; ++c)
+      for (unsigned i = 0; i < 16; ++i)
+        f.light[c][i] = newCsm.cascades[c].lightViewProj.data[i/4][i%4];
+
+    // The ordinary seal remains authoritative for every other consumer.
+    // A directional exception accounts for every omission, at the same stamp.
+    const auto& seal = input.scene.producerCompleteness;
+    const auto& boxes = input.scene.proxyOmittedBounds;
+    m_proxyWriteMask = proxyAll;
+    if (!producerCompleteForFrame) {
+      const bool accounted = !boxes.empty() && seal.sealed && !seal.counterOverflow &&
+          seal.sealFrameSerial == input.frameSerial && seal.mapEpoch == input.mapEpoch &&
+          seal.deviceEpoch == input.deviceEpoch &&
+          seal.arenaAdmissionCount == boxes.size() &&
+          seal.reasonMask == uint32_t(War3RequiredCasterOmissionReason::ArenaAdmission) &&
+          replayBindingsResolvedForFrame;
+      const auto* footprints = boxes.data();
+      if (flatten && accounted) {
+        m_omittedFootprints.assign(boxes.begin(), boxes.end());
+        for (const auto& p : m_omittedParts) {
+          if (p.boxIndex < boxes.size() && size_t(p.cls) < classes.size() && m_heightScales[size_t(p.cls)] < 1)
+            m_omittedFootprints[p.boxIndex] = scene::ExtendCasterBox(boxes[p.boxIndex],
+                m_objectBases.resolve(p.part, scene::CasterBasePrefersOrigin(p.cls)));
+        }
+        footprints = m_omittedFootprints.data();
+      }
+      m_proxyWriteMask = war3::effects::scene::CasterCompleteLayers(
+          f, footprints, boxes.size(), seal.requiredCasterOmissionCount, accounted);
+      m_proxySubsetProven = proxySubset = m_proxyWriteMask != 0;
+    }
+    proxyLayerCycle = m_proxyPartial || input.scene.proxyBudgetOmission;
+  }
+#endif
   const auto shadowCandidateRejectedForRecovery = [&] () noexcept {
     return !producerCompleteForFrame || m_replayValidationFailedThisFrame ||
            m_workloadGovernorRejectedThisFrame;
@@ -10932,7 +11283,7 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
   // separate rejected-candidate branch below keeps the existing bounded,
   // same-epoch eight-frame recovery policy.
   const bool ordinaryShadowMapReuseAllowed =
-      !shadowCandidateRejectedForRecovery();
+      !proxyLayerCycle && !shadowCandidateRejectedForRecovery();
   const bool canHoldCompleteShadowMap =
       ordinaryShadowMapReuseAllowed && receiverNeedsShadowMap &&
       m_hasCompleteShadowMap && m_shadowMap && m_shadowMapSampleView;
@@ -11133,7 +11484,7 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
     m_csmData = newCsm;
   }
 
-  const bool allowPointShadowPrepare = replayBindingsResolvedForFrame &&
+  const bool allowPointShadowPrepare = !hostOmission && replayBindingsResolvedForFrame &&
       (!semanticReceiverStabilityActive ||
        !SemanticReceiverDisablePointLightsEnabled()) &&
       m_pointLightsEnabled && mutableSettings.shadows.pointShadowEnabled &&
@@ -11186,14 +11537,22 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
                                  &replayDraws);
     }
 
+#ifdef _WIN64
+    proxyTimestamp(ctx, 0);
+#endif
     if (reuseLastShadowMap) {
       war3::War3PerfMonitor::instance().noteShadowMapFallback(true, false);
       reconciliation.receiverReuseShadowMap = 1u;
       directionalMapResolvedForFrame = true;
     } else {
       auto perfScope = war3::War3PerfMonitor::instance().scope("ShadowMap", ctx);
-      const bool renderedShadowMap = renderShadowMap(ctx, input, &replayDraws);
-      if (renderedShadowMap && producerCompleteForFrame &&
+#ifdef _WIN64
+      const bool oldLayersValid = (m_hasCompleteShadowMap || (m_proxyPartial && m_proxyAvailable)) &&
+          m_shadowMap && m_shadowMapSampleView;
+#endif
+      const bool renderedShadowMap = (!proxyLayerCycle || hasCandidateCsm) &&
+          renderShadowMap(ctx, input, &replayDraws);
+      if (renderedShadowMap && (producerCompleteForFrame || proxySubset) &&
           !m_replayValidationFailedThisFrame &&
           !m_workloadGovernorRejectedThisFrame) {
         directionalMapResolvedForFrame = true;
@@ -11270,12 +11629,60 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
           m_hasLastShadowMapLighting = false;
         }
       }
+#ifdef _WIN64
+      if (input.scene.proxyRecordFrame) {
+        const uint32_t written = renderedShadowMap && (producerCompleteForFrame || proxySubset) &&
+            !m_replayValidationFailedThisFrame && !m_workloadGovernorRejectedThisFrame ? m_proxyWriteMask : 0;
+        const uint32_t previous = m_proxyAvailable;
+        const uint32_t previousHeld = m_proxyHeld;
+        const uint32_t held = m_proxyLayers.settle(input.scene.proxyPictureSerial, proxyAll, written, oldLayersValid, proxyLayerIdentity());
+        if (proxyLayerCycle) {
+          // Both rendering loops skipped the held layers. Restore the entire
+          // cascade, including its split, texel size and snapped projection.
+          for (unsigned c = 0; c < 4; ++c)
+            if (held & (1u << c)) m_csmData.cascades[c] = csmDataBeforeShadowCandidate.cascades[c];
+          m_proxyAvailable = written | held;
+          m_proxyHeld = held;
+          m_hasCompleteShadowMap = proxyAll && m_proxyAvailable == proxyAll;
+          reconciliation.receiverReuseShadowMap = held != 0;
+          directionalMapResolvedForFrame = written == proxyAll;
+          m_proxyPartial = written != proxyAll;
+          if (previous != m_proxyAvailable || previousHeld != held) {
+            m_shadowHistoryValid = false;
+            m_shadowTaaHistoryContractValid = false;
+            reconciliation.shadowHistoryInvalidationMask |= kShadowTaaInvalidateCsm;
+          }
+        } else {
+          m_proxyAvailable = m_hasCompleteShadowMap ? proxyAll : 0;
+          m_proxyHeld = reconciliation.receiverReuseShadowMap ? m_proxyAvailable : 0;
+        }
+        reconciliation.proxyComplete = written;
+      }
+#endif
     }
+#ifdef _WIN64
+    proxyTimestamp(ctx, 1);
+    if (input.scene.proxyRecordFrame) {
+      if (reuseLastShadowMap) {
+        m_proxyHeld = m_proxyAvailable;
+        // Ordinary reuse keeps its existing hold rules. Start a subsequent
+        // overflow with the same eight-frame allowance as the legacy path.
+        m_proxyLayers.settle(input.scene.proxyPictureSerial, proxyAll, m_proxyAvailable, true, proxyLayerIdentity());
+      }
+      reconciliation.proxyHeld = m_proxyHeld;
+      reconciliation.proxyUnavailable = proxyAll & ~m_proxyAvailable;
+    }
+#endif
   }
   m_shadowAdaptiveFrameIndex++;
   reconciliation.receiverHasCompleteShadowMap =
       (m_hasCompleteShadowMap && m_shadowMap && m_shadowMapSampleView) ? 1u
                                                                        : 0u;
+  bool surfaceMapAvailable = m_hasCompleteShadowMap;
+#ifdef _WIN64
+  if (input.scene.proxyRecordFrame && m_proxyPartial)
+    surfaceMapAvailable = m_proxyAvailable != 0;
+#endif
   reconciliation.receiverCsmCascadeCount = m_csmData.cascadeCount;
   recordShadowResourceFingerprint(m_shadowHistoryIndex & 1u,
                                   (m_shadowHistoryIndex & 1u) ^ 1u);
@@ -11319,7 +11726,7 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
         volumeIntensity > 1.0e-6f && volSettings.sampleCount > 0 &&
         (hasGlobalMedium || hasLocalMedium) && hasEffectiveSun;
     const bool wantVolumeSun =
-        mutableSettings.postFx.enabled && volSettings.enabled &&
+        !hostOmission && mutableSettings.postFx.enabled && volSettings.enabled &&
         volSettings.volumeSunShadowEnabled && hasEffectiveVolumeConsumer &&
         hasCandidateCsm &&
         m_csmData.cascadeCount > 0u && !replayDraws.empty();
@@ -11376,7 +11783,7 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
       !semanticReceiverStabilityActive ||
       !SemanticReceiverDisablePointLightsEnabled();
 
-  if (semanticReceiverPointLightsAllowed && m_pointLightsEnabled &&
+  if (!hostOmission && semanticReceiverPointLightsAllowed && m_pointLightsEnabled &&
       mutableSettings.shadows.pointShadowEnabled &&
       mutableSettings.shadows.pointShadowMaxLights > 0 && m_hasPointLights) {
     renderPointShadow(ctx, input, pointLightSnapshot, &replayDraws);
@@ -11747,6 +12154,13 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
       reconciliation.shadowHistoryWriteIndex = 0u;
     }
 
+    // The water's surface, before the uniforms that say whether it is bound.
+    if (needReceiverPass) {
+      auto waterScope =
+          war3::War3PerfMonitor::instance().scope("Shadow/WaterDepth", ctx);
+      renderWaterDepth(ctx, input, effectiveWorldCamera, mutableSettings);
+    }
+
     // Update receiver uniforms (device-local UBO via cmdUpdateBuffer)
     ShadowReceiverUniform ubo = {};
     ubo.view = effectiveWorldCamera.view;
@@ -11776,7 +12190,7 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
     ubo.splitFar = Vector4(split0, split1, split2, split3);
 
     const bool receiverHasUsableDirectionalShadow =
-        receiverNeedsShadowMap && m_hasCompleteShadowMap && m_shadowMap &&
+        receiverNeedsShadowMap && surfaceMapAvailable && m_shadowMap &&
         m_shadowMapSampleView;
     // Newly allocated/new-epoch depth images have no meaningful contents
     // before the first complete candidate. Sampling them with normal strength
@@ -11804,7 +12218,11 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
     ubo.params = Vector4(uboShadowStrength, pcfRadius, invShadowRes,
                          float(m_csmData.cascadeCount));
 
-    const float receiverBias = settings->shadows.receiverBias;
+    // Depth biases are authored for a 4096 map. A texel of a smaller map covers
+    // more depth, and the bias has to keep its size in texels.
+    const float biasResolutionScale = 4096.0f * invShadowRes;
+    const float receiverBias =
+        settings->shadows.receiverBias * biasResolutionScale;
     const float cascadeBlendRange = settings->shadows.cascadeBlendRange;
     const float debugModeF =
         float(static_cast<int>(mutableSettings.shadows.debugMode));
@@ -11848,11 +12266,28 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
       sunDir.z *= invLen;
     }
     ubo.sunDir = sunDir;
+    if (m_waterFrame.valid)
+      m_waterFrame.sunDir = Vector4(sunDir.x, sunDir.y, sunDir.z, 0.0f);
+#ifdef _WIN64
+    // Negative tags select the host shader's coverage-aware lookup. All
+    // ordinary frames keep the original cascade selection and blend.
+    if (input.scene.proxyRecordFrame) {
+      ubo.sunDir.w = 0;
+      bool mixedProjection = false;
+      for (unsigned c = 0; c < proxyCount; ++c)
+        if ((m_proxyHeld & (1u << c)) &&
+            std::memcmp(&m_csmData.cascades[c].lightViewProj, &newCsm.cascades[c].lightViewProj,
+                        sizeof(Matrix4)) != 0) mixedProjection = true;
+      if (m_proxyPartial && (m_proxyAvailable != proxyAll || mixedProjection))
+        ubo.sunDir.w = -float(16u + m_proxyAvailable);
+    }
+#endif
 
     const float normalBiasScale =
         semanticReceiverStabilityActive
             ? 0.0f
-            : std::max(settings->shadows.normalBiasScale, 0.0f);
+            : std::max(settings->shadows.normalBiasScale, 0.0f) *
+                  biasResolutionScale;
     const float receiverMode =
         semanticReceiverStabilityActive
             ? float(static_cast<uint32_t>(War3ShadowReceiverMode::Legacy))
@@ -11896,7 +12331,7 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
         Vector4(float(vp.X), float(vp.Y), float(vp.Width), float(vp.Height));
     const bool s1TerrainCasterMaskForReceiver =
         ShadowS1TerrainCasterMaskRuntimeEnabled() &&
-        m_shadowCasterMaskSampleView && m_hasCompleteShadowMap;
+        m_shadowCasterMaskSampleView && surfaceMapAvailable;
     ubo.viewportZ =
         Vector4(vp.MinZ, vp.MaxZ,
                 s1TerrainCasterMaskForReceiver ? 1.0f : 0.0f,
@@ -11908,6 +12343,23 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
     ubo.depthContract = Vector4(
         receiverClearRaw, receiverClearKnown ? 1.0f : 0.0f,
         war3::render::War3RawDepthQuantum(m_cachedDepthFormat), 0.0f);
+    if (m_waterFrame.valid)
+      m_waterFrame.depthContract.z = ubo.depthContract.z; // the raw depth quantum
+    {
+      // The water: the ground's shadow fades with the water above it.
+      const auto &water = mutableSettings.water;
+      const auto finiteOr = [](float v, float d) { return std::isfinite(v) ? v : d; };
+      const float fadeStart = std::clamp(finiteOr(water.shadowFadeStart, 24.0f), 0.0f, 512.0f);
+      const float fadeEnd = std::clamp(finiteOr(water.shadowFadeEnd, 72.0f), fadeStart + 1.0f, 1024.0f);
+      ubo.water = Vector4(fadeStart, fadeEnd,
+          std::clamp(finiteOr(water.surfaceShadow, 0.3f), 0.0f, 1.0f),
+          m_waterFrame.valid ? 1.0f : 0.0f);
+    }
+    {
+      const auto share = [](float v) { return std::isfinite(v) ? std::clamp(v, 0.0f, 4.0f) : 1.0f; };
+      ubo.shadowTint = Vector4(share(receiverShadowTint.x), share(receiverShadowTint.y),
+                               share(receiverShadowTint.z), 0.0f);
+    }
 
     // Shadow TAA / Motion Vector：TemporalHistory 必须重投影到实际生成当前
     // history image 的相机。若本帧只做调试 motion vector，则回退到普通上一帧。
@@ -12168,6 +12620,7 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
       drawReceiver(ctx, input.colorView,
         nativeCommit ? input.nativeLightBaselines : std::array<Rc<DxvkImageView>,3>(),
         nativeSlot, nativeCommit ? input.nativeLightCount : 0u);
+      publishWaterInfo(ctx);
       if (nativeCommit && reconciliation.receiverDrawExecutedThisFrame != 0u &&
           input.frameSerial % 120 == 1)
         Logger::info(str::format("NativeModelLights receiver committed frame=", input.frameSerial,
@@ -12287,7 +12740,7 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
       static_cast<size_t>(War3ShadowMainRawPhase::OutlineAndPublish));
   // 单位被遮挡描边
   // 此时场景已完全渲染，深度缓冲完整，可以正确判断遮挡
-  if (settings->occludedOutline.enabled) {
+  if (outlineEnabled) {
     war3::tools::SetGpuFlightBreadcrumb(
         war3::tools::GpuFlightBreadcrumb::ShadowOutline);
     auto perfScope = war3::War3PerfMonitor::instance().scope("Outline", ctx);
@@ -12315,7 +12768,7 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
   m_shadowTaaPreviousSunDirection = receiverSunDirSource;
   m_shadowTaaHasPreviousSunDirection = true;
   if (input.frameSerial != 0u && receiverNeedsShadowMap &&
-      directionalMapResolvedForFrame &&
+      directionalMapResolvedForFrame && !hostOmission &&
       m_hasCompleteShadowMap && m_shadowMapSampleView &&
       m_csmData.cascadeCount != 0u &&
       War3WorldCameraIsFreshForFrame(effectiveWorldCamera,
@@ -12401,47 +12854,6 @@ size;
     }
 
 } // namespace dxvk */
-
-// Tanner Helland's algorithm (simplified)
-Vector4 War3ShadowReceiverPass::kelvinToRgb(float k) {
-  float temp = k / 100.0f;
-  float r, g, b;
-
-  // Red
-  if (temp <= 66.0f) {
-    r = 255.0f;
-  } else {
-    r = temp - 60.0f;
-    r = 329.698727446f * std::pow(r, -0.1332047592f);
-    r = std::min(255.0f, std::max(0.0f, r));
-  }
-
-  // Green
-  if (temp <= 66.0f) {
-    g = temp;
-    g = 99.4708025861f * std::log(g) - 161.1195681661f;
-    g = std::min(255.0f, std::max(0.0f, g));
-  } else {
-    g = temp - 60.0f;
-    g = 288.1221695283f * std::pow(g, -0.0755148492f);
-    g = std::min(255.0f, std::max(0.0f, g));
-  }
-
-  // Blue
-  if (temp >= 66.0f) {
-    b = 255.0f;
-  } else {
-    if (temp <= 19.0f) {
-      b = 0.0f;
-    } else {
-      b = temp - 10.0f;
-      b = 138.5177312231f * std::log(b) - 305.0447927307f;
-      b = std::min(255.0f, std::max(0.0f, b));
-    }
-  }
-
-  return Vector4(r / 255.0f, g / 255.0f, b / 255.0f, 1.0f);
-}
 
 void War3ShadowReceiverPass::UpdatePhase(float altitudeRad, bool isRising,
                                          float transRad) {

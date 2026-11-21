@@ -132,6 +132,64 @@ class ImGuiAdapterTest(unittest.TestCase):
                 adapter.generate(SOURCE, output)
             self.assertEqual(output.read_bytes(), b"unrelated user file\n")
 
+    def test_device_output_is_the_pre_proxy_output(self):
+        # Proxy mode's overlay added a second variant; the in-process output
+        # stays byte for byte what the shipped 1.22.x builds compiled.
+        self.assertEqual(hashlib.sha256(self.generated.encode("utf-8")).hexdigest().upper(),
+                         "B545855C4509345F75168A4D41BF636DBE5BF25779D8ECB34DDB4D8210F657ED")
+        self.assertEqual(adapter.transform(self.original, "device"), self.generated.encode("utf-8"))
+        self.assertNotIn("War3ProxyImGui_ImplDX9_", self.generated)
+        self.assertNotIn("imgui_proxy", self.generated)
+
+    def test_proxy_variant_same_sites_own_prefix_and_no_abort(self):
+        proxy = adapter.transform(self.original, "proxy").decode("utf-8")
+        config = adapter.VARIANTS["proxy"]
+        self.assertTrue(proxy.startswith(config["banner"]))
+        self.assertNotEqual(config["banner"], adapter.GENERATED_BANNER)
+        # The same ten lifetime sites, routed to the proxy helpers, plus one.
+        lifetime = adapter.lifetime_edits("dxvk::war3::imgui_proxy::")
+        self.assertEqual([e[:2] + e[3:] for e in lifetime], [e[:2] + e[3:] for e in adapter.EDITS])
+        self.assertEqual(config["edits"], lifetime + adapter.PROXY_EDITS)
+        self.assertEqual(sum(edit[3] for edit in config["edits"]), 11)
+        for _label, _old, new, expected in config["edits"]:
+            self.assertEqual(proxy.count(new), expected)
+        self.assertNotIn('IM_ASSERT(hr >= 0 && "Backend failed to create texture!");', proxy)
+        self.assertNotIn("imgui_owned", proxy)
+        self.assertNotIn("War3ImGui_ImplDX9_", proxy)
+        header = (ROOT / "src/d3d9/war3/ui/war3_imgui_dx9_proxy.h").read_text(encoding="utf-8")
+        for name in adapter.ENTRY_POINTS:
+            self.assertEqual(proxy.count(f"#define ImGui_ImplDX9_{name} War3ProxyImGui_ImplDX9_{name}\n"), 1)
+            self.assertIn(f"War3ProxyImGui_ImplDX9_{name}(", header)
+        # Each refused site fails the proxy variant independently too.
+        for label, old, _new, _expected in config["edits"]:
+            with self.subTest(site=label):
+                with self.assertRaisesRegex(ValueError, label):
+                    adapter.apply_lifetime_edits(self.source.replace(old, "/* removed */", 1), config["edits"])
+
+    def test_proxy_helpers_managed_atlas_and_no_public_reference(self):
+        owner = (ROOT / "src/d3d9/war3/ui/war3_imgui_dx9_proxy_ownership.h").read_text(encoding="utf-8")
+        texture = owner[owner.index("inline HRESULT CreateTexture("):owner.index("inline void ReleaseVertexBuffer(")]
+        self.assertIn("width, height, levels, 0, format, D3DPOOL_MANAGED, output, sharedHandle", texture)
+        retain = owner[owner.index("inline HRESULT RetainCreatedResource("):owner.index("inline HRESULT CreateVertexBuffer(")]
+        self.assertLess(retain.index("proxy::RetainPrivate(*output)"), retain.index("(*output)->Release();"))
+        self.assertIn("*output = nullptr;", retain)
+        self.assertEqual(owner.count("proxy::ReleasePrivate(resource);"), 3)
+        self.assertNotIn("AddRefPrivate", owner)
+
+    def test_generate_proxy_variant_into_own_output(self):
+        with tempfile.TemporaryDirectory(prefix="warvk-imgui-adapter-") as directory:
+            device = Path(directory) / "device.cpp"
+            proxy = Path(directory) / "proxy.cpp"
+            adapter.generate(SOURCE, device)
+            result = adapter.generate(SOURCE, proxy, "proxy")
+            self.assertEqual(result["lifetimeSites"], 11)
+            self.assertEqual(device.read_bytes(), self.generated.encode("utf-8"))
+            # Neither variant overwrites the other's output.
+            with self.assertRaisesRegex(ValueError, "non-generated"):
+                adapter.generate(SOURCE, device, "proxy")
+            with self.assertRaisesRegex(ValueError, "non-generated"):
+                adapter.generate(SOURCE, proxy)
+
     def test_bad_input_does_not_touch_prior_generated_output(self):
         with tempfile.TemporaryDirectory(prefix="warvk-imgui-adapter-") as directory:
             root = Path(directory)

@@ -375,6 +375,11 @@ float sampleShadowPcf(uint cascadeIndex, vec2 uv, float refDepth,
   float kernel = ubo.u_params6.x;
   if (!validFloat(kernel) || kernel < 0.0 || kernel > 3.0)
     return 1.0;
+  float uniformVisibility = 1.0;
+  if (shadowKernelIsUniform(cascadeIndex, uv, refDepth, radiusTexel, kernel,
+                            receiverPlaneGradient, receiverPlaneValid,
+                            uniformVisibility))
+    return uniformVisibility;
   if (kernel >= 0.5 && kernel < 1.5)
     return sampleShadowGrid(cascadeIndex, uv, refDepth, radiusTexel, 2,
                             receiverPlaneGradient, receiverPlaneValid);
@@ -445,6 +450,10 @@ float computeWallFilterWeight(float wallFactor, float wallStabilityFactor,
   return clamp(receiverWeight * grazingWeight, 0.0, 1.0);
 }
 
+#ifdef WARVK_HOST_LAYER_RECEIVER
+#include "war3_shadow_available.glsl"
+#endif
+
 float computeShadowVisibility(vec3 worldPos, vec3 worldDx, vec3 worldDy,
                               float viewDepth, float biasExtra, vec2 rot,
                               float wallFilterWeight) {
@@ -471,6 +480,11 @@ float computeShadowVisibility(vec3 worldPos, vec3 worldDx, vec3 worldDy,
       return diagnoseCsm ? 0.0 : 1.0;
   }
 
+#ifdef WARVK_HOST_LAYER_RECEIVER
+  if (ubo.u_sunDir.w <= -16.0 && ubo.u_sunDir.w >= -31.0)
+    return availableShadowVisibility(int(-ubo.u_sunDir.w) - 16, cascadeCount, worldPos,
+        worldDx, worldDy, viewDepth, biasExtra, rot, wallFilterWeight);
+#endif
   int c0 = cascadeCount - 1;
   for (int i = 0; i < cascadeCount; i++) {
     if (viewDepth <= splits[i]) {

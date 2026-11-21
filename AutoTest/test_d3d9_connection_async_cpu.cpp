@@ -4,7 +4,9 @@
 #define WARVK_D3D9_CONNECTION_CPU_TEST 1
 #include "d3d9_connection.h"
 #include <array>
+#include <cstring>
 #include <cwchar>
+#include <functional>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -470,6 +472,9 @@ struct ConnectionCpuTest {
     boundedDrawBatch(expectedDesktop,expectedInputDesktop);
     boundedFixedBatch(expectedDesktop,expectedInputDesktop);
     annotatedDrawBatch(expectedDesktop,expectedInputDesktop);
+    sessionResetBeforePresent(expectedDesktop,expectedInputDesktop);
+    contentPayload(expectedDesktop,expectedInputDesktop);
+    commandRing(expectedDesktop,expectedInputDesktop);
     asyncDrawBatch();
     asyncOrderedState();
     asyncEventCompletion();
@@ -540,11 +545,392 @@ struct ConnectionCpuTest {
     CHECK(on->annotateNextDraw(2,bytes.data(),d9::DrawTagBytes)==D3DERR_INVALIDCALL
       &&on->annotateNextDraw(tagSchema,bytes.data(),12)==D3DERR_INVALIDCALL
       &&on->annotateNextDraw(tagSchema,nullptr,d9::DrawTagBytes)==D3DERR_INVALIDCALL);
-    CHECK(on->stageMarker(0)==D3DERR_INVALIDCALL&&on->stageMarker(5)==D3DERR_INVALIDCALL);
+    CHECK(on->stageMarker(0)==D3DERR_INVALIDCALL&&on->stageMarker(7)==D3DERR_INVALIDCALL);
     d9::FrameCamera camera;camera.view[0]=std::numeric_limits<float>::quiet_NaN();
     const auto scene=d9::EncodeFrameCamera(camera);
     CHECK(on->frameScene(uint32_t(d9::AnnotationSchema::FrameCamera),scene.data(),d9::FrameCameraBytes)==D3DERR_INVALIDCALL);
     CHECK(on->sequence==1&&!on->nextRecordCount&&!on->annotationRecordsAdmitted);
+  }
+  // ---- Command ring. The real ring-mode Connection (attach, admission,
+  // barriers, the watching worker, terminal causes) against an in-process
+  // host that opens the regions as the x64 host does. An event stands in for
+  // the host's process handle: signalling it is the host exiting.
+  struct RingFixture {
+    using Script=std::function<bool(const d9::Header&,bool)>;
+    std::unique_ptr<Connection> c;
+    std::unique_ptr<d9::ring::PeerChannel> channel;
+    std::unique_ptr<d9::ring::Consumer> consumer;
+    lab::Handle hostProcess{CreateEventW(nullptr,TRUE,FALSE,nullptr)};
+    std::thread host;
+    std::atomic<bool> hold{false},quit{false},sawClosed{false},okay{true};
+    std::atomic<uint64_t> executed{0};
+    std::atomic<int> hookCalls{0};std::atomic<uint32_t> hookKind{0};
+    Script script; // false: the host stops consuming (it staged its fault)
+    static void hook(void* context,const Connection::TerminalReport& report) {
+      auto& f=*static_cast<RingFixture*>(context);f.hookKind=uint32_t(report.kind);++f.hookCalls;
+    }
+    ~RingFixture() { try{finish();}catch(...){} }
+    // Executes one record as a healthy host: reply, progress, wake.
+    void reply(const d9::Header& h,bool sync,HRESULT hr=D3D_OK) {
+      const uint64_t n=executed.load()+1;
+      const std::array<uint8_t,4> payload{0x5a,0x5b,0x58,0x59};
+      if(sync)consumer->writeReply(h,d9::Reply{DWORD(hr),n,n,n,0,SUCCEEDED(hr)&&h.op==d9::Op::Readback?4u:0u},payload.data());
+      consumer->publishApplied(h.sequence,n,n,n,0);executed=n;
+      if(h.op==d9::Op::Finish&&SUCCEEDED(hr))consumer->publishFinished();
+      if(consumer->producerWaiting())SetEvent(channel->progress());
+    }
+    // The reply of `named` published as the completion of `h`: applied never passes what x86
+    // published, so the reply's identity is the only thing wrong.
+    void replyAs(const d9::Header& named,const d9::Header& h) {
+      const uint64_t n=executed.load()+1;
+      const std::array<uint8_t,4> payload{0x5a,0x5b,0x58,0x59};
+      consumer->writeReply(named,d9::Reply{DWORD(D3D_OK),n,n,n,0,h.op==d9::Op::Readback?4u:0u},payload.data());
+      consumer->publishApplied(h.sequence,n,n,n,0);executed=n;
+    }
+    void serve() {
+      try {
+        using Read=d9::ring::Consumer::Read;
+        d9::Packet packet{};d9::Header h;bool sync=false;
+        for(;;) {
+          if(quit.load())return;
+          if(hold.load()){Sleep(1);continue;}
+          auto status=consumer->tryRead(packet,h,sync);
+          if(status==Read::Empty) {
+            consumer->setParked(true);status=consumer->tryRead(packet,h,sync);
+            if(status==Read::Empty){WaitForSingleObject(channel->work(),20);consumer->setParked(false);continue;}
+            consumer->setParked(false);
+          }
+          if(status==Read::Closed){sawClosed=true;return;}
+          if(status==Read::Faulted) {
+            consumer->publishFault(consumer->fault(),0,consumer->expected());SetEvent(channel->progress());return;
+          }
+          if(!script(h,sync))return;
+        }
+      } catch(...) {okay=false;}
+    }
+    void attach(const std::wstring& desktop,const std::wstring& input,const char* name) {
+      c=make();ready(*c);c->ringRequested=true;c->ringCapacity=d9::ring::MinCapacity;
+      c->setTerminalHook(&RingFixture::hook,this);
+      // The worker keeps the object, not this fixture's pointer to it: the
+      // pointer is cleared before the destructor joins the worker.
+      c->worker=std::thread([this,c=c.get(),desktop,input,name] {
+        try {
+          workerDesktop(desktop,input,name);
+          const auto batch=awaitBatch(*c);const auto h=header(batch);
+          CHECK(h.op==d9::Op::AttachRing&&h.sequence==2&&h.args[0]==d9::ring::MinCapacity
+            &&h.args[1]==d9::ring::ReplyCapacity&&h.args[2]==d9::ring::Version&&!h.payloadBytes);
+          channel=std::make_unique<d9::ring::PeerChannel>(c->nonce,h.args[0]);
+          consumer=std::make_unique<d9::ring::Consumer>(channel->producerBlock(),channel->data(),
+            channel->consumerBlock(),channel->reply(),channel->capacity(),c->nonce,h.sequence);
+          host=std::thread([this]{serve();});
+          complete(*c,batch);
+          c->watchRing(hostProcess.get());
+        } catch(...) {c->failClosed();} // As the product worker does.
+      });
+      CHECK(c->attachRing()==D3D_OK&&c->ring&&c->ringAttachSequence==2&&c->sequence==2&&c->settledSequence()==2);
+    }
+    void expect(Connection::Terminal kind,const char* detail,uint32_t result=0) {
+      Connection::TerminalReport report;
+      CHECK(c->terminalReport(report)&&report.kind==kind&&report.result==result&&report.tick);
+      CHECK(!std::strncmp(report.detail,detail,std::strlen(detail)));
+      CHECK(hookCalls.load()==1&&hookKind.load()==uint32_t(kind));
+      // Every entry point now refuses, and the first cause stays the only one.
+      d9::Header read;read.op=d9::Op::Readback;std::array<uint8_t,4> out{};
+      CHECK(c->call(read,nullptr,out.data(),4)==D3DERR_DEVICELOST&&c->enqueueClear(clear(9))==D3DERR_DEVICELOST);
+      CHECK(c->terminalReport(report)&&report.kind==kind&&hookCalls.load()==1);
+    }
+    void finish() {
+      if(!c)return;
+      c->closeProducer();quit=true;
+      if(host.joinable())host.join();
+      c.reset();consumer.reset();channel.reset();
+    }
+  };
+  static HRESULT ringRead(Connection& c) {
+    d9::Header read;read.op=d9::Op::Readback;std::array<uint8_t,4> out{};
+    const auto hr=c.call(read,nullptr,out.data(),4);
+    if(hr==D3D_OK)CHECK((out==std::array<uint8_t,4>{0x5a,0x5b,0x58,0x59}));
+    return hr;
+  }
+  static void awaitTrue(const std::function<bool()>& ready) {
+    const auto deadline=GetTickCount64()+5000;
+    while(!ready()){if(GetTickCount64()>=deadline)throw std::runtime_error("ring fixture condition timeout");Sleep(1);}
+  }
+  static void commandRing(const std::wstring& desktop,const std::wstring& input) {
+    using Terminal=Connection::Terminal;
+    { // Ordered traffic, a barrier's reply, backpressure without loss, Finish.
+      RingFixture f;f.script=[&](const d9::Header& h,bool sync){f.reply(h,sync);return true;};
+      f.attach(desktop,input,"ring-healthy");auto& c=*f.c;
+      for(uint32_t i=0;i<5;++i)CHECK(c.enqueueClear(clear(i))==D3D_OK);
+      CHECK(ringRead(c)==D3D_OK&&c.ringRecords==6&&c.ringSyncCalls==1&&c.sequence==8&&c.settledSequence()==8&&f.executed==6);
+      Connection::TerminalReport report;CHECK(c.healthy()&&!c.terminalReport(report)&&!f.hookCalls);
+      // 3000 Clear records exceed the 256 KiB ring while the host is not consuming.
+      f.hold=true;std::thread release([&]{Sleep(200);f.hold=false;});
+      const uint32_t burst=3000;
+      for(uint32_t i=0;i<burst;++i)CHECK(c.enqueueClear(clear(i))==D3D_OK);
+      release.join();
+      CHECK(ringRead(c)==D3D_OK&&c.backpressureCalls>=1&&c.fullObservations>=1);
+      CHECK(c.ringRecords==burst+7&&f.executed==burst+7&&c.settledSequence()==c.sequence&&c.sequence==burst+9);
+      d9::Header finish;finish.op=d9::Op::Finish;
+      CHECK(c.call(finish)==D3D_OK&&c.ringFinish.load()==1&&c.healthy()&&!f.hookCalls);
+      f.finish();CHECK(f.okay);
+    }
+    { // The host dies holding an unanswered barrier.
+      RingFixture f;f.script=[&](const d9::Header& h,bool sync){
+        if(h.op!=d9::Op::Readback){f.reply(h,sync);return true;}
+        SetEvent(f.hostProcess.get());return false;};
+      f.attach(desktop,input,"ring-host-exit-barrier");auto& c=*f.c;
+      CHECK(c.enqueueClear(clear(1))==D3D_OK);
+      const auto begin=GetTickCount64();
+      CHECK(ringRead(c)==D3DERR_DEVICELOST&&GetTickCount64()-begin<5000);
+      f.expect(Terminal::HostExited,"host process exited");CHECK(c.failed.load()&&!c.deviceLost.load());
+      f.finish();CHECK(f.okay);
+    }
+    { // The host dies while nothing is in flight: the watching worker notices.
+      RingFixture f;f.script=[&](const d9::Header& h,bool sync){f.reply(h,sync);return true;};
+      f.attach(desktop,input,"ring-host-exit-idle");auto& c=*f.c;
+      CHECK(ringRead(c)==D3D_OK);SetEvent(f.hostProcess.get());
+      awaitTrue([&]{return !c.healthy();});
+      f.expect(Terminal::HostExited,"host process exited");
+      f.finish();CHECK(f.okay);
+    }
+    { // An asynchronous record the host refuses ends the session with its result.
+      RingFixture f;f.script=[&](const d9::Header& h,bool sync){
+        if(h.op!=d9::Op::Clear||h.args[0]!=2){f.reply(h,sync);return true;}
+        f.consumer->publishFault(d9::ring::Fault::AsyncRefused,uint32_t(D3DERR_INVALIDCALL),h.sequence);
+        SetEvent(f.channel->progress());return false;};
+      f.attach(desktop,input,"ring-async-refused");auto& c=*f.c;
+      for(uint32_t i=0;i<3;++i)CHECK(c.enqueueClear(clear(i))==D3D_OK);
+      CHECK(ringRead(c)==D3DERR_DEVICELOST);
+      f.expect(Terminal::HostRejected,"async-refused",uint32_t(D3DERR_INVALIDCALL));
+      CHECK(c.failed.load()&&c.settledSequence()==4); // The two records before it were executed.
+      f.finish();CHECK(f.okay);
+    }
+    { // DEVICELOST is an acknowledged remote terminal, not a transport failure.
+      RingFixture f;f.script=[&](const d9::Header& h,bool sync){
+        if(h.op!=d9::Op::Readback){f.reply(h,sync);return true;}
+        f.consumer->publishFault(d9::ring::Fault::DeviceLost,uint32_t(D3DERR_DEVICELOST),h.sequence);
+        f.reply(h,sync,D3DERR_DEVICELOST);SetEvent(f.channel->progress());SetEvent(f.hostProcess.get());return false;};
+      f.attach(desktop,input,"ring-device-lost");auto& c=*f.c;
+      CHECK(c.enqueueClear(clear(1))==D3D_OK&&ringRead(c)==D3DERR_DEVICELOST);
+      f.expect(Terminal::HostDeviceLost,"device-lost",uint32_t(D3DERR_DEVICELOST));
+      CHECK(c.deviceLost.load()&&!c.failed.load());
+      f.finish();CHECK(f.okay);
+    }
+    // What the host publishes is checked before it is used: an impossible
+    // head, an impossible executed sequence, a reply for another message.
+    struct Lie { const char* name;const char* detail;int kind; };
+    for(const Lie lie:{Lie{"ring-head-invalid","head-invalid",0},Lie{"ring-applied-invalid","applied-invalid",1},
+        Lie{"ring-reply-invalid","reply-invalid",2}}) {
+      RingFixture f;f.script=[&](const d9::Header& h,bool sync){
+        if(h.op!=d9::Op::Readback){f.reply(h,sync);return true;}
+        auto* block=f.channel->consumerBlock();
+        if(lie.kind==0)block->head.store(f.channel->producerBlock()->tail.load()+16);
+        else if(lie.kind==1)block->applied.store(h.sequence+7);
+        else {auto other=h;++other.sequence;f.replyAs(other,h);}
+        SetEvent(f.channel->progress());return false;};
+      f.attach(desktop,input,lie.name);auto& c=*f.c;
+      CHECK(c.enqueueClear(clear(1))==D3D_OK&&ringRead(c)==D3DERR_DEVICELOST);
+      f.expect(Terminal::RingCorrupt,lie.detail);CHECK(c.failed.load());
+      f.finish();CHECK(f.okay);
+    }
+    { // A record damaged in x86 memory: the host refuses it, executes nothing
+      // after it and says why; x86 reports that reason.
+      RingFixture f;f.script=[&](const d9::Header& h,bool sync){f.reply(h,sync);return true;};
+      f.attach(desktop,input,"ring-record-damaged");auto& c=*f.c;
+      CHECK(ringRead(c)==D3D_OK);
+      auto* block=c.ringChannel->producerBlock();const auto tail=block->tail.load();
+      std::memset(c.ringChannel->data()+(uint32_t(tail)&(d9::ring::MinCapacity-1)),0xff,32);
+      block->tail.store(tail+32);SetEvent(c.ringChannel->work());
+      awaitTrue([&]{return c.ring->hostState().state==d9::ring::State::Faulted;});
+      CHECK(f.executed==1&&ringRead(c)==D3DERR_DEVICELOST);
+      f.expect(Terminal::RingCorrupt,"record-header");
+      f.finish();CHECK(f.okay);
+    }
+    { // A host that stops consuming: the full ring is backpressure until the
+      // rolling no-progress limit, then a reported hang. The failed session
+      // ends the stream for the host as a closed pipe would.
+      RingFixture f;f.script=[&](const d9::Header& h,bool sync){f.reply(h,sync);return true;};
+      f.attach(desktop,input,"ring-host-hung");auto& c=*f.c;
+      c.ringNoProgressMs=400;CHECK(ringRead(c)==D3D_OK);
+      f.hold=true;Sleep(50);
+      const auto begin=GetTickCount64();HRESULT hr=D3D_OK;uint32_t admitted=0;
+      for(;admitted<4000&&hr==D3D_OK;++admitted)hr=c.enqueueClear(clear(admitted));
+      const auto elapsed=GetTickCount64()-begin;
+      CHECK(hr==D3DERR_DEVICELOST&&admitted>1500&&admitted<2000&&elapsed>=400&&elapsed<5000);
+      Connection::TerminalReport report;
+      CHECK(c.terminalReport(report)&&report.kind==Terminal::HostHung&&!std::strcmp(report.detail,"no progress"));
+      f.hold=false;awaitTrue([&]{return f.sawClosed.load();});
+      f.expect(Terminal::HostHung,"no progress");
+      f.finish();CHECK(f.okay);
+    }
+  }
+  // Content payloads: the staged prefix first, then the blob's chunks in
+  // order. x86 keeps the index, never the bytes, and refuses locally whatever
+  // the host would refuse; the worker runs the host's index on what arrives.
+  static void contentPayload(const std::wstring& desktop,const std::wstring& input) {
+    using Admit=d9::ContentIndex::Admit;
+    auto c=make();ready(*c);c->drawBatching=true;c->annotations=true;
+    const auto geometry=uint32_t(d9::ContentKind::Geometry),bones=uint32_t(d9::ContentKind::BoneMatrices);
+    const auto geometryRef=uint16_t(d9::AnnotationSchema::GeometryRef),bonesRef=uint16_t(d9::AnnotationSchema::BonesRef);
+    const uint64_t mesh=0x1000000000000007ull,palette=0x2000000000000009ull;
+    const uint32_t meshBytes=150000;
+    std::vector<uint8_t> big(meshBytes);for(size_t i=0;i<big.size();++i)big[i]=uint8_t(i*7+3);
+    std::array<uint8_t,96> floats{};for(uint32_t i=0;i<24;++i)d9::P32(floats.data()+4*i,d9::FloatBits(float(i)));
+    std::atomic<bool> workerOkay{true};
+    c->worker=std::thread([&] {
+      try {
+        workerDesktop(desktop,input,"content-payload");
+        d9::ContentIndex host;d9::ContentChunk chunk;
+        // The draw staged before the upload leaves first.
+        auto batch=awaitBatch(*c);CHECK(header(batch).op==d9::Op::DrawBatch&&header(batch).args[0]==1);complete(*c,batch);
+        uint32_t offset=0;
+        for(const uint32_t count:{d9::MaxPayload,d9::MaxPayload,meshBytes-2*d9::MaxPayload}) {
+          batch=awaitBatch(*c);const auto h=header(batch);const auto* p=batch.payload.data()+d9::HeaderBytes;
+          CHECK(d9::DecodeContentUpload(h,p,chunk)&&chunk.kind==geometry&&chunk.key==mesh&&chunk.revision==1
+            &&chunk.total==meshBytes&&chunk.offset==offset&&chunk.count==count&&!std::memcmp(p,big.data()+offset,count));
+          offset+=count;
+          CHECK(host.admit(chunk)==(offset==meshBytes?Admit::Complete:Admit::More));complete(*c,batch);
+        }
+        batch=awaitBatch(*c);auto h=header(batch);
+        CHECK(d9::DecodeContentUpload(h,batch.payload.data()+d9::HeaderBytes,chunk)&&chunk.kind==bones&&chunk.key==palette
+          &&chunk.revision==2&&chunk.total==96&&!chunk.offset&&chunk.count==96&&host.admit(chunk)==Admit::Complete);
+        complete(*c,batch);
+        // The annotated draw (tag, geometry, bones) leaves before the blob that replaces its geometry.
+        batch=awaitBatch(*c);h=header(batch);d9::DrawAnnotations records;
+        CHECK(h.op==d9::Op::AnnotateDraws&&h.args[0]==3&&h.args[1]==1
+          &&d9::DecodeDrawAnnotations(h,batch.payload.data()+d9::HeaderBytes,records));
+        uint32_t bound=0;
+        records.forEach([&](uint16_t,uint16_t schema,const uint8_t* data,uint16_t) {
+          if(const auto kind=d9::ContentKindOf(schema)){CHECK(host.bound(d9::DecodeContentRef(data),kind));++bound;}});
+        CHECK(bound==2);complete(*c,batch);
+        batch=awaitBatch(*c);CHECK(header(batch).op==d9::Op::DrawBatch&&header(batch).args[0]==1);complete(*c,batch);
+        batch=awaitBatch(*c);h=header(batch);
+        CHECK(d9::DecodeContentUpload(h,batch.payload.data()+d9::HeaderBytes,chunk)&&chunk.key==mesh&&chunk.revision==3
+          &&chunk.total==10&&host.admit(chunk)==Admit::Complete&&!host.bound({mesh,1},geometry)&&host.bound({mesh,3},geometry));
+        complete(*c,batch);
+        // ContentRead: the reply carries the bytes.
+        batch=awaitBatch(*c);h=header(batch);d9::ContentRef ref;uint32_t at=0,count=0;
+        CHECK(d9::DecodeContentRead(h,ref,at,count)&&ref.key==palette&&ref.revision==2&&at==4&&count==8);
+        complete(*c,batch,D3D_OK,8);
+        batch=awaitBatch(*c);h=header(batch);
+        CHECK(d9::DecodeContentRelease(h,ref)&&ref.key==palette&&ref.revision==2&&host.release(ref));complete(*c,batch);
+        // The reset, then the Present it precedes.
+        batch=awaitBatch(*c);CHECK(d9::ValidSessionReset(header(batch)));complete(*c,batch);
+        batch=awaitBatch(*c);CHECK(header(batch).op==d9::Op::Present);complete(*c,batch);
+        batch=awaitBatch(*c);h=header(batch);
+        CHECK(d9::DecodeContentUpload(h,batch.payload.data()+d9::HeaderBytes,chunk)&&chunk.key==mesh&&chunk.revision==4);
+        complete(*c,batch,D3DERR_INVALIDCALL);
+      }catch(...){workerOkay=false;c->failClosed();}
+    });
+    uint64_t revision=77;std::array<uint8_t,8> out{};
+    auto name=[&](Connection& owner,uint16_t schema,uint64_t key,uint64_t rev) {
+      const auto bytes=d9::EncodeContentRef({key,rev});return owner.annotateNextDraw(schema,bytes.data(),d9::ContentRefBytes);};
+    // Local refusals publish nothing and leave the caller's revision alone.
+    auto nonfinite=floats;d9::P32(nonfinite.data()+8,0x7fc00000u);
+    CHECK(c->uploadContent(0,mesh,big.data(),16,&revision)==D3DERR_INVALIDCALL
+      &&c->uploadContent(3,mesh,big.data(),16,&revision)==D3DERR_INVALIDCALL
+      &&c->uploadContent(geometry,0,big.data(),16,&revision)==D3DERR_INVALIDCALL
+      &&c->uploadContent(geometry,mesh,big.data(),0,&revision)==D3DERR_INVALIDCALL
+      &&c->uploadContent(geometry,mesh,nullptr,16,&revision)==D3DERR_INVALIDCALL
+      &&c->uploadContent(geometry,mesh,big.data(),16,nullptr)==D3DERR_INVALIDCALL
+      &&c->uploadContent(geometry,mesh,big.data(),d9::MaxContentBlobBytes+1,&revision)==D3DERR_INVALIDCALL
+      &&c->uploadContent(bones,palette,floats.data(),94,&revision)==D3DERR_INVALIDCALL
+      &&c->uploadContent(bones,palette,nonfinite.data(),96,&revision)==D3DERR_INVALIDCALL);
+    CHECK(c->releaseContent(mesh,1)==D3DERR_INVALIDCALL&&name(*c,geometryRef,mesh,1)==D3DERR_INVALIDCALL
+      &&c->readContent(mesh,1,0,out.data(),8)==D3DERR_INVALIDCALL);
+    CHECK(revision==77&&c->sequence==1&&c->contentLocalRefusals==12&&!c->contentIndex.count()&&!c->contentIndex.lastRevision());
+    d9::DrawPacket draw{};CHECK(c->submitDraw(draw)==D3D_OK&&c->drawBatchCount==1);
+    CHECK(c->uploadContent(geometry,mesh,big.data(),meshBytes,&revision)==D3D_OK&&revision==1&&!c->drawBatchCount&&c->sequence==5);
+    CHECK(c->uploadContent(bones,palette,floats.data(),96,&revision)==D3D_OK&&revision==2&&c->sequence==6);
+    CHECK(c->contentIndex.count()==2&&c->contentIndex.bytes()==meshBytes+96&&c->contentChunksSent==4&&c->contentUploadsSent==2
+      &&c->contentBytesSent==meshBytes+96);
+    // A reference names a live blob of the kind its schema requires.
+    CHECK(name(*c,bonesRef,mesh,1)==D3DERR_INVALIDCALL&&name(*c,geometryRef,palette,2)==D3DERR_INVALIDCALL
+      &&name(*c,geometryRef,mesh,2)==D3DERR_INVALIDCALL&&name(*c,geometryRef,mesh,0)==D3DERR_INVALIDCALL
+      &&c->annotateNextDraw(geometryRef,nullptr,d9::ContentRefBytes)==D3DERR_INVALIDCALL);
+    {const auto bytes=d9::EncodeContentRef({mesh,1});CHECK(c->annotateNextDraw(geometryRef,bytes.data(),12)==D3DERR_INVALIDCALL);}
+    const auto tag=d9::EncodeDrawTag({5,1,0});
+    CHECK(c->annotateNextDraw(uint16_t(d9::AnnotationSchema::DrawTag),tag.data(),d9::DrawTagBytes)==D3D_OK
+      &&name(*c,geometryRef,mesh,1)==D3D_OK&&name(*c,bonesRef,palette,2)==D3D_OK&&c->nextRecordCount==3&&c->contentRefsAdmitted==2);
+    // Content does not change under records already taken for the next draw.
+    CHECK(c->uploadContent(geometry,mesh,big.data(),10,&revision)==D3DERR_INVALIDCALL&&c->releaseContent(palette,2)==D3DERR_INVALIDCALL
+      &&revision==2&&c->sequence==6);
+    CHECK(c->submitDraw(draw)==D3D_OK&&c->drawBatchCount==1&&c->batchRecordCount==3&&!c->nextRecordCount);
+    // A replacement: the staged draw and its records leave first, and the old revision no longer binds.
+    CHECK(c->uploadContent(geometry,mesh,big.data(),10,&revision)==D3D_OK&&revision==3&&c->sequence==9&&!c->drawBatchCount);
+    CHECK(name(*c,geometryRef,mesh,1)==D3DERR_INVALIDCALL&&c->contentIndex.bytes()==106&&c->contentIndex.replacedBlobs==1);
+    CHECK(c->readContent(palette,2,4,out.data(),8)==D3D_OK&&c->sequence==10);
+    for(uint32_t i=0;i<8;++i)CHECK(out[i]==uint8_t(i^0x5a));
+    CHECK(c->readContent(palette,2,90,out.data(),8)==D3DERR_INVALIDCALL&&c->readContent(palette,2,0,out.data(),0)==D3DERR_INVALIDCALL
+      &&c->readContent(palette,2,0,nullptr,8)==D3DERR_INVALIDCALL&&c->readContent(palette,1,0,out.data(),8)==D3DERR_INVALIDCALL
+      &&c->sequence==10);
+    CHECK(c->releaseContent(palette,2)==D3D_OK&&c->sequence==11&&c->releaseContent(palette,2)==D3DERR_INVALIDCALL
+      &&name(*c,bonesRef,palette,2)==D3DERR_INVALIDCALL&&c->contentIndex.count()==1);
+    // A session reset drops every blob and any record still waiting for a draw.
+    CHECK(name(*c,geometryRef,mesh,3)==D3D_OK&&c->nextRecordCount==1&&c->requestSessionReset(1,5)==D3D_OK);
+    d9::Header present;present.op=d9::Op::Present;
+    CHECK(c->call(present)==D3D_OK&&c->sequence==13&&!c->contentIndex.count()&&!c->nextRecordCount
+      &&c->annotationRecordsDiscarded==1&&c->contentIndex.clearedBlobs==1&&name(*c,geometryRef,mesh,3)==D3DERR_INVALIDCALL
+      &&c->contentIndex.lastRevision()==3);
+    // A host that refuses admitted content is a protocol fault, not a recoverable call.
+    CHECK(c->uploadContent(geometry,mesh,big.data(),10,&revision)==D3DERR_DEVICELOST&&revision==3&&!c->healthy());
+    c->closeProducer();c->worker.join();
+    CHECK(workerOkay&&c->contentUploadsSent==3&&c->contentReleasesSent==1&&c->contentReadsSent==1&&c->contentBytesRead==8);
+    // Without the negotiated feature nothing is admitted.
+    auto off=make();ready(*off);
+    CHECK(off->uploadContent(geometry,mesh,big.data(),16,&revision)==D3DERR_INVALIDCALL&&off->releaseContent(mesh,1)==D3DERR_INVALIDCALL
+      &&off->readContent(mesh,1,0,out.data(),8)==D3DERR_INVALIDCALL&&name(*off,geometryRef,mesh,1)==D3DERR_INVALIDCALL&&off->sequence==1);
+    // Asynchronous profile: chunks are admitted without their replies, and a
+    // refusal that arrives later ends the session.
+    auto a=make();ready(*a);a->drawBatching=true;a->asyncDrawBatches=true;a->annotations=true;
+    CHECK(a->uploadContent(geometry,mesh,big.data(),d9::MaxPayload+5,&revision)==D3D_OK&&revision==1&&a->sequence==3&&a->done.load()==1);
+    for(uint32_t i=0;i<2;++i){const auto batch=take(*a);CHECK(header(batch).op==d9::Op::ContentUpload);complete(*a,batch);}
+    CHECK(a->done.load()==3&&a->healthy()&&a->releaseContent(mesh,1)==D3D_OK&&a->sequence==4&&a->done.load()==3);
+    {const auto batch=take(*a);CHECK(header(batch).op==d9::Op::ContentRelease);
+      try {complete(*a,batch,D3DERR_INVALIDCALL);}catch(...) {}}
+    CHECK(!a->healthy()&&a->asyncFailureSequence==4&&a->uploadContent(geometry,mesh,big.data(),8,&revision)==D3DERR_DEVICELOST);
+  }
+  // A session reset may be requested on any thread. Only the newest request
+  // is sent, by the owner, immediately ahead of its next Present.
+  static void sessionResetBeforePresent(const std::wstring& desktop,const std::wstring& input) {
+    auto c=make();ready(*c);c->drawBatching=true;c->annotations=true;
+    const uint64_t second=(uint64_t(1)<<32)|9,third=(uint64_t(1)<<32)|10;
+    std::atomic<bool> workerOkay{true};
+    c->worker=std::thread([&] {
+      try {
+        workerDesktop(desktop,input,"session-reset");
+        // The draw staged before the Present leaves first, then the reset.
+        auto batch=awaitBatch(*c);CHECK(header(batch).op==d9::Op::DrawBatch&&header(batch).args[0]==1);complete(*c,batch);
+        batch=awaitBatch(*c);auto h=header(batch);
+        CHECK(d9::ValidSessionReset(h)&&h.args[0]==uint32_t(d9::SessionResetReason::GameExit)&&h.args[1]==9&&h.args[2]==1);
+        complete(*c,batch);
+        batch=awaitBatch(*c);CHECK(header(batch).op==d9::Op::Present);complete(*c,batch);
+        batch=awaitBatch(*c);CHECK(header(batch).op==d9::Op::Present);complete(*c,batch);
+        batch=awaitBatch(*c);h=header(batch);
+        CHECK(d9::ValidSessionReset(h)&&h.args[0]==uint32_t(d9::SessionResetReason::MapTransition)&&h.args[1]==10&&h.args[2]==1);
+        complete(*c,batch,D3DERR_INVALIDCALL);
+        batch=awaitBatch(*c);CHECK(header(batch).op==d9::Op::Present);complete(*c,batch);
+      }catch(...){workerOkay=false;c->failClosed();}
+    });
+    CHECK(c->requestSessionReset(0,1)==D3DERR_INVALIDCALL&&c->requestSessionReset(3,1)==D3DERR_INVALIDCALL
+      &&c->requestSessionReset(1,0)==D3DERR_INVALIDCALL&&!c->sessionResetsRequested);
+    CHECK(c->requestSessionReset(1,7)==D3D_OK&&c->requestSessionReset(1,7)==D3DERR_INVALIDCALL
+      &&c->requestSessionReset(2,6)==D3DERR_INVALIDCALL);
+    std::thread other([&]{CHECK(c->requestSessionReset(2,second)==D3D_OK);});other.join();
+    // Requests send nothing, and neither does any call but Present.
+    d9::DrawPacket draw{};CHECK(c->submitDraw(draw)==D3D_OK&&c->sequence==1&&c->sessionResetsRequested==2);
+    d9::Header present;present.op=d9::Op::Present;
+    CHECK(c->call(present)==D3D_OK&&c->sessionResetsSent==1&&c->sequence==4);
+    CHECK(c->call(present)==D3D_OK&&c->sessionResetsSent==1&&c->sequence==5);
+    // A host refusal is counted, the request is dropped and the frame ends.
+    CHECK(c->requestSessionReset(1,third)==D3D_OK);
+    CHECK(c->call(present)==D3D_OK&&c->sessionResetsSent==1&&c->sessionResetsRefused==1&&c->sequence==7&&c->healthy());
+    CHECK(c->requestSessionReset(1,third)==D3DERR_INVALIDCALL);
+    c->closeProducer();c->worker.join();
+    CHECK(workerOkay&&c->sessionResetsRequested==3&&!c->sessionResetPending.load());
+    auto off=make();ready(*off);
+    CHECK(off->requestSessionReset(1,1)==D3DERR_INVALIDCALL&&!off->sessionResetsRequested);
   }
   static void boundedDrawBatch(const std::wstring& desktop,const std::wstring& input) {
     auto c=make();ready(*c);c->drawBatching=true;

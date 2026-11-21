@@ -1,0 +1,16 @@
+@FIXED_FUNCTION@
+
+layout(set = 0, binding = 32, scalar, row_major) uniform WaterVertex {
+    mat4 world;
+} water;
+layout(location = 12) out vec3 waterPosition;
+layout(location = 13) out vec4 waterVertexColor;
+
+void main() {
+    // The same clip position, light 0, fog, and transformed texture coordinates
+    // as the original draw, including the declaration's default components.
+    gameFixedFunction();
+    vec4 position = in_Position0 * water.world;
+    waterPosition = position.xyz / position.w;
+    waterVertexColor = vertexHasColor0() ? in_Color0 : vec4(1.0);
+}

@@ -32,6 +32,12 @@ PROBES=ROOT/'AutoTest/artifacts/host-child-surface-cpu-20261023-r2'
 PLAYER=Path('E:/Work/Warcraft III/d3d9.dll')
 REFERENCE=ROOT/'build32_device_owner_mdl_low_20261024/src/d3d9/d3d9.dll'
 
+def guarded_identity(path):
+    """Frozen inputs are compared, never created: an absent player DLL must stay absent."""
+    if not path.exists():
+        return {'path': str(path), 'exists': False}
+    return identity(path)
+
 def singleton(rows,schema):
     values=[r for r in rows if r.get('schema')==schema]
     require(len(values)==1,'exactly one '+schema)
@@ -188,6 +194,8 @@ def main():
     ap.add_argument('--stream',action='store_true',help='paired grouped controls versus one host stream list per sync interval')
     ap.add_argument('--admission-profile',action='store_true',help='bounded per-EVENT host/worker/producer CPU attribution; instrumented cost only')
     ap.add_argument('--fixed-function',action='store_true',help='fixed-function workload: stream DrawFixed controls versus stream fixed batches')
+    ap.add_argument('--command-ring',action='store_true',help='with --fixed-function: stream fixed batches on the pipe (controls) '
+                    'versus the same traffic on the shared-memory command ring')
     args=ap.parse_args();out=args.output.resolve()
     REFERENCE=args.reference_dll.resolve()
     require(not args.gpu_groups or args.event_completion,'GPU groups compare the event-completion baseline')
@@ -204,6 +212,9 @@ def main():
     receipt['batchStateComparison']=args.state_reuse
     receipt['streamComparison']=args.stream
     receipt['admissionProfile']=args.admission_profile
+    receipt['commandRingComparison']=args.command_ring
+    require(not args.command_ring or (args.fixed_function and not args.admission_profile),
+        'the command ring comparison is the fixed-function workload without admission sampling')
     receipt['fixedFunctionWorkload']=args.fixed_function
     require(not (args.admission_profile and args.validation),'admission timing is not a validation run')
     if args.validation:receipt['scope']='OFFSCREEN_REAL_DXVK_BATCH_VVL365_NOT_PERFORMANCE'
@@ -227,7 +238,7 @@ def main():
         frozen += [identity(Path(m.__file__).resolve()) for m in list(sys.modules.values())
             if getattr(m,'__file__',None) and Path(m.__file__).suffix=='.py'
             and Path(m.__file__).resolve().is_relative_to(ROOT/'AutoTest')]
-        frozen += [identity(p) for p in (Path(__file__).resolve(),ROOT/'AutoTest/test_render_host_d3d9_batch.cpp',
+        frozen += [guarded_identity(p) for p in (Path(__file__).resolve(),ROOT/'AutoTest/test_render_host_d3d9_batch.cpp',
             ROOT/'AutoTest/test_render_host_d3d9_batch_rejection.cpp',ROOT/'AutoTest/test_render_host_d3d9_parent.cpp',
             ROOT/'AutoTest/test_condition_variable_deadline.cpp',
             ROOT/'AutoTest/test_render_host_d3d9_resource_lifetime.cpp',PLAYER,REFERENCE,host,
@@ -338,6 +349,14 @@ def main():
                        ('reference-before',fixture,False,True),('async-event-stream-T1',fixture,True,False),
                        ('async-event-stream-fixed-F1',fixture,True,False),('async-event-stream-fixed-F2',fixture,True,False),
                        ('async-event-stream-T2',fixture,True,False),('reference-after',fixture,False,True)]
+            if args.command_ring:
+                # Same workload and profile on both transports: pipe F1/F2 around ring R1/R2.
+                cases=[('rejections-stream',reject,False,False),('rejections-stream-cmdring',reject,False,False),
+                       ('legacy-async-event-stream-cmdring',legacy,True,False),
+                       ('reference-before',fixture,False,True),('async-event-stream-fixed-F1',fixture,True,False),
+                       ('async-event-stream-fixed-cmdring-R1',fixture,True,False),
+                       ('async-event-stream-fixed-cmdring-R2',fixture,True,False),
+                       ('async-event-stream-fixed-F2',fixture,True,False),('reference-after',fixture,False,True)]
             if args.validation:
                 selected=('rejections-flights','legacy-async-event-flights','async-event-flight-E1') if args.event_completion else (
                     'rejections-flights','legacy-async-flights','async-flight-D1')
@@ -345,6 +364,8 @@ def main():
                 if args.state_reuse:selected=('rejections-group-state-flights','legacy-async-event-group-state-flights','async-event-group-state-flight-S1a')
                 if args.stream:selected=('rejections-stream','legacy-async-event-stream','async-event-stream-T1')
                 if args.fixed_function:selected=('rejections-stream','legacy-async-event-stream','async-event-stream-fixed-F1')
+                if args.command_ring:
+                    selected=('rejections-stream-cmdring','legacy-async-event-stream-cmdring','async-event-stream-fixed-cmdring-R1')
                 cases=[c for c in cases if c[0] in selected]
             for label,program,batching,reference in cases:
                 folder=out/label;folder.mkdir();local_exe=folder/'fixture.exe';local_dll=folder/'renderer.dll'
@@ -372,6 +393,8 @@ def main():
                 if asynchronous:local['WARVK_D3D9_ASYNC_BATCH']='1'
                 events='event' in label
                 if events:local['WARVK_D3D9_ASYNC_EVENTS']='1'
+                command_ring='cmdring' in label
+                if command_ring:local['WARVK_D3D9_COMMAND_RING']='1'
                 if args.validation:local.update(vvl.validation_env(folder,manifest,empty))
                 command=[local_exe,'--dll',local_dll,'--scenario','normal']
                 if reference:command+=['--reference']
@@ -398,6 +421,17 @@ def main():
                         and ds['desktop']==desktop.desktop_name and ds['inputDesktop']==desktop.input_before,'bound host identity/desktop')
                     require(hs['submitted']==hs['gpuCompleted']==hs['retired'],'GPU and DXVK retirement')
                     require(pr['exchanges']==hs['accepted']+hs['rejected'],'command balance')
+                    ring_proxy=prefixed(folder/'case.stderr','D3D9 command-ring-proxy: ')
+                    ring_host=prefixed(folder/'host.log','D3D9 command-ring-host: ')
+                    ring_terminal=prefixed(folder/'case.stderr','D3D9 terminal: ')
+                    if command_ring:
+                        rp=singleton(ring_proxy,'warvk-d3d9-command-ring-proxy/v1');rh=singleton(ring_host,'warvk-d3d9-command-ring-host/v1')
+                        rt=singleton(ring_terminal,'warvk-d3d9-terminal/v1')
+                        require(rp['attached'] is True and rp['finishExecuted'] is True and rp['records']==rh['records']>0
+                            and rp['syncCalls']==rh['syncRecords'] and rp['published']==rp['applied']==rp['attachSequence']+rp['records']
+                            and pr['exchanges']==rp['published'] and rt['kind']=='none','every ring record executed in order')
+                        case['commandRing']=dict(proxy=rp,host=rh)
+                    else:require(not ring_proxy and not ring_host and not ring_terminal,'command ring account without the profile')
                     case['childSettlement']=child_settled(pr['childPid'],pr['childCreation'])
                     batches=prefixed(folder/'host.log','D3D9 draw-batch-host: ')
                     require(len(batches)==1,'batch owner metrics');case['batchHost']=batches[0]
@@ -508,7 +542,7 @@ def main():
     except Exception as error:receipt['error']=str(error)
     finally:
         try:
-            receipt['inputsPreserved']=all(identity(Path(r['path']))==r for r in frozen)
+            receipt['inputsPreserved']=all(guarded_identity(Path(r['path']))==r for r in frozen)
             require(bool(frozen) and receipt['inputsPreserved'],'input drift')
             require(all(identity(Path(r['path']))==r for r in receipt['copies']),'case copy drift')
             for raw in receipt['raw']:verify_raw_artifacts(raw)

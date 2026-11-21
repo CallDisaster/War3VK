@@ -1486,21 +1486,7 @@ WAR3_PACK_API const char* GetLastShaderError() {
 }
 
 WAR3_PACK_API const char* GetErrorString(ShaderPackError error) {
-    switch (error) {
-        case ShaderPackError::OK: return "OK";
-        case ShaderPackError::NOT_FOUND: return "NOT_FOUND";
-        case ShaderPackError::INVALID_FORMAT: return "INVALID_FORMAT";
-        case ShaderPackError::SHADER_NOT_FOUND: return "SHADER_NOT_FOUND";
-        case ShaderPackError::SHADER_COMPILE_ERROR: return "SHADER_COMPILE_ERROR";
-        case ShaderPackError::TEXTURE_NOT_FOUND: return "TEXTURE_NOT_FOUND";
-        case ShaderPackError::TEXTURE_LOAD_ERROR: return "TEXTURE_LOAD_ERROR";
-        case ShaderPackError::TOO_MANY_PASSES: return "TOO_MANY_PASSES";
-        case ShaderPackError::NO_PACK_LOADED: return "NO_PACK_LOADED";
-        case ShaderPackError::INVALID_SLOT: return "INVALID_SLOT";
-        case ShaderPackError::INTERNAL_ERROR: return "INTERNAL_ERROR";
-        case ShaderPackError::POLICY_DISABLED: return "POLICY_DISABLED";
-        default: return "UNKNOWN";
-    }
+    return ShaderPackErrorName(error);
 }
 
 WAR3_PACK_API ShaderPackError SetRenderScale(float scale) {

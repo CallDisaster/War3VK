@@ -8,6 +8,8 @@ SHADOW_H = ROOT / "src/d3d9/d3d9_war3_shadow.h"
 SHADERPACK = ROOT / "src/d3d9/war3_shaderpack.cpp"
 POLICY = ROOT / "src/d3d9/war3_shaderpack_policy.h"
 UI = ROOT / "src/d3d9/war3/ui/war3_imgui.cpp"
+# The ShaderPack section is the in-process device's (proxy-mode overlay work).
+UI_DEVICE = ROOT / "src/d3d9/war3/ui/war3_imgui_inprocess.cpp"
 MESON = ROOT / "src/d3d9/meson.build"
 
 
@@ -24,7 +26,7 @@ class War3PipelineLifetimeStaticTests(unittest.TestCase):
         cls.shadow_h = SHADOW_H.read_text(encoding="utf-8")
         cls.shaderpack = SHADERPACK.read_text(encoding="utf-8")
         cls.policy = POLICY.read_text(encoding="utf-8")
-        cls.ui = UI.read_text(encoding="utf-8")
+        cls.ui = UI.read_text(encoding="utf-8") + UI_DEVICE.read_text(encoding="utf-8")
         cls.meson = MESON.read_text(encoding="utf-8")
 
     def test_shadow_bias_invalidation_releases_only_cache_owner(self):

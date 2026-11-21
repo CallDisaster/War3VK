@@ -1,0 +1,656 @@
+@FIXED_FUNCTION@
+
+layout(location = 12) in vec3 waterPosition;
+layout(location = 13) in vec4 waterVertexColor;
+layout(set = 0, binding = 32, scalar, row_major) uniform WaterFragment {
+    mat4 world, invViewProj, view, viewProj;
+    vec4 viewport;                // game viewport, before the half-pixel offset
+    vec4 depthRange;              // min, inverse span, far endpoint, near-to-far sign
+    vec4 controls;                // style, absorption, foam, refraction
+    vec2 waves;                   // integrated time, slope scale
+    vec2 forwardXY;               // horizontal world bearing of the draw camera
+    vec4 camera;                  // eye, 1 for perspective; towards the eye, 0 for ortho
+    vec4 toSun, sunColor, ambient;
+    vec4 lightControls;           // reflection, specular, caustics
+} water;
+layout(set = 0, binding = 33) uniform texture2D waterSceneColor;
+layout(set = 0, binding = 34) uniform texture2D waterSceneDepth;
+
+// Optical and stylized-physical water tuning. Distances are Warcraft world units.
+// All wave speeds are integer cycles per 256-second clock and all noise drifts
+// are half-cell multiples per second so the 256-second wrap has zero jump.
+const float Pi = 3.14159265359;
+const float Tau = 6.28318530718;
+const vec2 SunRise = vec2(0.04, 0.24);          // twilight horizon to vibrant golden-hour & daylight sun
+const vec2 GlintAltitude = vec2(0.22, 0.74);    // view-coupled RTS glint elevation bounds
+const float GlintTiltOffset = 0.08;             // lands H gently onto sunlit ripples across camera pitches
+const float GlintSunShare = 0.22;               // gentle sun azimuth pull blended with local view reflection
+const float SheenAlpha = 0.20;                  // whisper-soft silky glow on sunlit swells
+const float RibbonAlpha = 0.040;                // slender crisp liquid highlights along flowing crests
+const float SparkleAlpha = 0.018;               // delicate dancing capillary wave-crest glints
+const float SheenGain = 0.032;
+const float RibbonGain = 0.42;
+const float SparkleGain = 1.45;
+const float RealSunGain = 0.24;
+const vec2 SparkleFootprint = vec2(0.85, 3.6);  // world units per pixel: crisp capillary glint to smooth rolloff
+const float FresnelFloorMax = 0.11;             // 0.6 slider -> 0.066 glassy floor; crisp grazing sky reflection
+const float FresnelPower = 4.0;                 // clean translucent body overhead, silky sky at grazing angles
+const float ReflectionOn = 0.05, MinReflection = 0.001;
+const float MapTintShare = 0.24;
+const vec2 SkyAltitude = vec2(0.10, 0.55);
+const vec3 SkyDayHorizon = vec3(0.76, 0.89, 1.00), SkyDayZenith = vec3(0.18, 0.44, 0.78);
+const vec3 SkyDuskHorizon = vec3(0.98, 0.70, 0.45), SkyDuskZenith = vec3(0.20, 0.30, 0.52);
+const int ReflectionSteps = 16, ReflectionBisections = 4;
+const float RayLift = 1.0, RayReach = 768.0, RayFadeStart = 540.0;
+const vec2 HitGap = vec2(4.0, 16.0);
+const float HitRise = 4.0, ScreenEdge = 0.045;
+const float CausticScale = 44.0;                // world units per soft sunlit dapple cell
+const vec2 CausticBand = vec2(0.38, 0.86);      // soft luminous pools (no thin spider-web lines)
+const vec4 CausticDepth = vec4(1.8, 8.5, 52.0, 104.0);
+const float CausticWarp = 0.72, CausticWobble = 0.48;
+const float CausticGain = 0.66;
+const float FoamReach = 9.0;                    // shore froth reach in vertical units
+const float FoamPixels = 15.0;                  // or pixels on screen, whichever is nearer
+const float FoamEdge = 0.9;                     // depth where game water begins along a bank
+const float FoamRise = 3.5;                     // soft rise width in pixels
+const vec2 FoamFade = vec2(0.30, 1.0);
+const float FoamWander = 0.30;
+const vec2 FoamStretch = vec2(0.18, 0.56);
+const float FoamBubbles = 0.26;
+const float FoamOpacity = 0.58;
+const float ClearWater = 4.0;                   // first units stay crystal clear
+const float ShoreLight = 5.0;                   // reflection/glint fade over last shore units
+const float ShoreAlphaDepth = 3.0;              // soft waterline alpha feathering
+const float SubsurfaceGain = 0.18;              // subtle sunlit aqua crest translucency (daylight only)
+
+// Integer fetches ignore the game's wrapping and filtering. The colour and
+// foreground tests below use exactly the same four texels.
+#define SNAP(image) sampler2D(image, sampler_heap[loadSamplerHeapIndex(0u)])
+
+struct WaveField {
+    vec2 macroSlope;    // gentle flowing swells for clean refraction and SSR
+    vec2 detailSlope;   // full crisp ripple spectrum for GGX & sky reflection
+    vec2 microCap;      // ultra-fine flowing wind wavelets for dancing glints
+    float crest;        // normalized gentle crest height [0, 1]
+    float microVar;     // sub-pixel filtered slope variance for Toksvig roughness AA
+};
+
+float waterNoise(vec2 xy) {
+    vec2 cell = floor(xy), f = fract(xy);
+    f = f * f * (3.0 - 2.0 * f);
+    vec4 x = mod(cell.x + vec4(0, 1, 0, 1), 128.0);
+    vec4 y = mod(cell.y + vec4(0, 0, 1, 1), 128.0);
+    vec4 h = fract((x * 0.1031 + y * 0.11369) * (x * 19.19 + y * 3.17 + 7.7));
+    return mix(mix(h.x, h.y, f.x), mix(h.z, h.w, f.x), f.y);
+}
+
+// Smooth tileable (mod 128) 2D quintic C2 gradient noise returning
+// (dN/dx, dN/dy, N). C2 continuity guarantees glassy smooth GGX reflections
+// with zero grid creases, zero basket-weave plaid, and zero straight streaks.
+vec3 tileableGradNoise(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    vec2 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+    vec2 du = 30.0 * f * f * (f * (f - 2.0) + 1.0);
+
+    // The 128-cell wrap in integers: & 127 is the same as a float mod 128 for
+    // whole numbers, negative ones included.
+    ivec2 c = ivec2(i);
+    // One unit gradient per corner from an integer hash (pcg2d, Jarzynski and
+    // Olano 2020) and a normalize: no sine hash and no cos/sin of an angle,
+    // which cost 12 special-function ops per call, six calls per pixel, and
+    // a large-argument sine hash differs between GPU vendors.
+    uvec4 hx = uvec4((c.x + ivec4(0, 1, 0, 1)) & 127) * 1664525u + 1013904223u;
+    uvec4 hy = uvec4((c.y + ivec4(0, 0, 1, 1)) & 127) * 1664525u + 1013904223u;
+    hx += hy * 1664525u; hy += hx * 1664525u;
+    hx ^= hx >> 16u; hy ^= hy >> 16u;
+    hx += hy * 1664525u; hy += hx * 1664525u;
+    hx ^= hx >> 16u; hy ^= hy >> 16u;
+    vec4 gx = vec4(hx >> 8u) * (2.0 / 16777216.0) - 1.0;
+    vec4 gy = vec4(hy >> 8u) * (2.0 / 16777216.0) - 1.0;
+    vec4 unit = inversesqrt(max(gx * gx + gy * gy, 1e-4));
+    gx *= unit;
+    gy *= unit;
+
+    vec4 fx = f.x - vec4(0.0, 1.0, 0.0, 1.0);
+    vec4 fy = f.y - vec4(0.0, 0.0, 1.0, 1.0);
+    vec4 n = gx * fx + gy * fy;
+
+    float k0 = n.x;
+    float k1 = n.y - n.x;
+    float k2 = n.z - n.x;
+    float k3 = n.x - n.y - n.z + n.w;
+    float val = k0 + k1 * u.x + k2 * u.y + k3 * u.x * u.y;
+    vec2 grad = mix(mix(vec2(gx.x, gy.x), vec2(gx.y, gy.y), u.x),
+                    mix(vec2(gx.z, gy.z), vec2(gx.w, gy.w), u.x), u.y)
+              + vec2(du.x * (k1 + k3 * u.y), du.y * (k2 + k3 * u.x));
+    return vec3(grad, val);
+}
+
+// Evaluate one rotated wind-advected C2 ripple layer: scrolling strictly forward
+// along its rotated wind axis (half-cell/s multiple for exact 256s wrap) gives
+// crisp, lightweight flowing liquid ripples with zero crawling domain warp.
+vec3 advectedRippleLayer(vec2 xy, vec2 dir, float cellSize, float driftCellsPerSec, float t, vec2 seed) {
+    vec2 perp = vec2(-dir.y, dir.x);
+    vec2 uv = vec2(dot(xy, dir), dot(xy, perp)) * (1.0 / cellSize) + seed - vec2(t * driftCellsPerSec, 0.0);
+    vec3 gn = tileableGradNoise(uv);
+    vec2 worldGrad = dir * gn.x + perp * gn.y;
+    return vec3(worldGrad, gn.z);
+}
+
+// Hybrid water wave field:
+//  1) 4 gentle long directional swells give serene forward-gliding ocean/lake
+//     undulation and subtle refraction flow without standing-wave lumps;
+//  2) 4 wind-advected rotated C2 gradient-noise ripple octaves supply a full
+//     continuous broadband liquid spectrum — zero parallel stripes, zero
+//     basket-weave plaid, zero polka dots, and zero viscous crawling domain warp.
+WaveField evaluateWaves(vec2 xy, float phase, float footprint, bool visible, bool glinting) {
+    WaveField wf;
+    wf.macroSlope = vec2(0.0);
+    wf.detailSlope = vec2(0.0);
+    wf.microCap = vec2(0.0);
+    wf.crest = 0.0;
+    wf.microVar = 0.0;
+    // Unexplored water (black mask) shows none of the waves: refraction, foam,
+    // reflection and glints are all off there, so skip the whole field.
+    if (!visible || water.waves.y <= 0.0)
+        return wf;
+
+    // Keep liquid slopes thin and glassy at default 1.0 (~0.92x) and softly
+    // compressed at 2.0 (~1.16x) so cranked settings stay watery, never thick.
+    float ampScale = 0.92 * water.waves.y / (1.0 + 0.58 * max(0.0, water.waves.y - 1.0));
+    float t = water.waves.x;
+
+    // Gentle breeze-gust patch gliding forward with the wind (exact 256s wrap).
+    float gust = mix(0.76, 1.18, waterNoise(xy * (1.0 / 300.0) - t * vec2(0.5, 0.0)));
+    vec2 p = xy;
+
+    // Layer A: 4 gentle long wind swells (non-orthogonal fan within -6..+40 deg).
+    const vec2 dirs[4] = vec2[4](
+        vec2( 0.9659,  0.2588), // +15 deg: primary serene swell
+        vec2( 0.7880,  0.6157), // +38 deg: soft oblique swell
+        vec2( 0.9945, -0.1045), //  -6 deg: gentle flanking swell
+        vec2( 0.8910,  0.4540)  // +27 deg: medium rolling swell
+    );
+    const float freqs[4]   = float[4](0.022, 0.033, 0.049, 0.072);
+    const float speeds[4]  = float[4](11.0,  17.0,  23.0,  31.0);
+    const float weights[4] = float[4](0.026, 0.022, 0.018, 0.015);
+    const float drags[4]   = float[4](1.4,   0.9,   0.5,   0.2);
+
+    float swellCrest = 0.0;
+    float swellNorm = 0.0;
+
+    for (int i = 0; i < 4; ++i) {
+        vec2 d = dirs[i];
+        float freq = freqs[i];
+        float x = dot(p, d) * freq - phase * speeds[i];
+        float w = exp(sin(x) - 1.0);
+        float dw = w * cos(x);
+        p += d * (-dw * drags[i]);
+
+        float resolved = 1.0 - smoothstep(0.45, 1.50, footprint * freq);
+        float amp = weights[i] * ampScale;
+        vec2 g = -d * (dw * amp * resolved);
+        wf.macroSlope += g;
+        wf.detailSlope += g;
+        swellCrest += w * weights[i];
+        swellNorm += weights[i];
+    }
+
+    // Layer B: 4 wind-advected rotated C2 gradient-noise ripple octaves.
+    // Every layer flows smoothly forward with the breeze (+16, -8, +34, +4 deg)
+    // at half-cell/s multiples so the 256-second clock wraps seamlessly with zero
+    // geometric periodicity, zero basket plaid, and zero viscous stretching.
+    const vec2 rDirs[4] = vec2[4](
+        vec2( 0.9613,  0.2756), // +16 deg: broad organic water ripples
+        vec2( 0.9903, -0.1392), //  -8 deg: crisp cross-breeze ripples
+        vec2( 0.8290,  0.5592), // +34 deg: fine glassy wind wavelets
+        vec2( 0.9976,  0.0698)  //  +4 deg: delicate shimmering capillary ripples
+    );
+    const float rCells[4]  = float[4](62.0, 32.0, 16.5, 8.8);
+    const float rDrifts[4] = float[4](0.5,  1.0,  1.5,  2.0);
+    const float rAmps[4]   = float[4](0.056, 0.048, 0.038, 0.028);
+    const vec2 rSeeds[4]   = vec2[4](vec2(3.7, 11.2), vec2(29.4, 7.1), vec2(53.8, 41.6), vec2(89.3, 19.5));
+
+    float rippleCrest = 0.0;
+    for (int i = 0; i < 4; ++i) {
+        float effFreq = Tau / rCells[i];
+        float resolved = 1.0 - smoothstep(0.55, 1.85, footprint * effFreq);
+        float amp = rAmps[i] * ampScale * (i >= 1 ? gust : mix(0.88, 1.12, gust - 0.76));
+        if (resolved > 0.0) {
+            vec3 layer = advectedRippleLayer(xy, rDirs[i], rCells[i], rDrifts[i], t, rSeeds[i]);
+            vec2 g = layer.xy * (amp * resolved);
+            wf.detailSlope += g;
+            wf.macroSlope += g * (i == 0 ? 0.65 : (i == 1 ? 0.30 : 0.08));
+            rippleCrest += layer.z * (i == 0 ? 0.55 : (i == 1 ? 0.30 : 0.15));
+        }
+        float missed = 1.0 - resolved;
+        wf.microVar += (amp * amp) * missed * 0.45;
+    }
+
+    float baseCrest = (swellCrest / max(swellNorm, 1e-5) - 0.16) / 0.68;
+    wf.crest = clamp(mix(baseCrest, 0.5 + 0.95 * rippleCrest, 0.62), 0.0, 1.0);
+
+    // Layer C: Ultra-fine wind-advected C2 capillary glints (zero sine lattice,
+    // zero corduroy stripes, zero polka dots; smoothly footprint-filtered).
+    // Only the sparkle reads them: none at night, in fog or with the glints off.
+    float capResolved = 1.0 - smoothstep(SparkleFootprint.x, SparkleFootprint.y, footprint);
+    if (glinting && capResolved > 0.0) {
+        vec3 capA = advectedRippleLayer(xy, vec2(0.9336, 0.3584), 6.4, 2.5, t, vec2(17.3, 63.9));
+        vec3 capB = advectedRippleLayer(xy, vec2(0.9511, -0.3090), 4.6, 3.0, t, vec2(71.8, 27.4));
+        float capAmp = 0.064 * min(1.30, ampScale) * capResolved * gust;
+        wf.microCap = (capA.xy + capB.xy * 0.78) * capAmp;
+    }
+
+    return wf;
+}
+
+vec3 refractedColor(ivec2 pixel, vec2 offset, float surfaceDepth, vec2 gradient, vec3 original) {
+    vec2 p = vec2(pixel) + offset;
+    ivec2 base = ivec2(floor(p));
+    if (any(lessThan(base, ivec2(water.viewport.xy))) ||
+        any(greaterThanEqual(base + 1, ivec2(water.viewport.xy + water.viewport.zw))))
+        return original;
+    const ivec2 taps[4] = ivec2[4](ivec2(0), ivec2(1,0), ivec2(0,1), ivec2(1));
+    vec3 c[4];
+    for (int i = 0; i < 4; ++i) {
+        ivec2 tap = base + taps[i];
+        // Compare against the triangle's water plane at the displaced pixel as
+        // well as this fragment. This matters at a low camera angle.
+        float raw = texelFetch(SNAP(waterSceneDepth), tap, 0).r;
+        float along = (raw - surfaceDepth) * water.depthRange.w;
+        float plane = dot(gradient, vec2(tap - pixel)) * water.depthRange.w;
+        if (!(along >= max(0.0, plane)))
+            return original;
+        c[i] = texelFetch(SNAP(waterSceneColor), tap, 0).rgb;
+    }
+    vec2 f = fract(p);
+    return mix(mix(c[0], c[1], f.x), mix(c[2], c[3], f.x), f.y);
+}
+
+bool snapshotWorld(ivec2 pixel, float raw, out vec3 world) {
+    // D3D9's integer pixel centre and the negative-height Vulkan viewport.
+    vec2 ndc = (vec2(pixel) - water.viewport.xy) / water.viewport.zw * vec2(2,-2) + vec2(-1,1);
+    float z = (raw - water.depthRange.x) * water.depthRange.y;
+    if (raw == water.depthRange.z || !(z >= 0.0 && z <= 1.0)) return false;
+    vec4 h = vec4(ndc, z, 1) * water.invViewProj;
+    if (!(abs(h.w) >= 1e-7)) return false;
+    world = h.xyz / h.w;
+    return !any(isnan(world)) && !any(isinf(world));
+}
+
+// Soft organic sunlit caustic dapples on the underwater bed: two gently drifting
+// warped noise layers forming rounded luminous pools rather than thin spider-web
+// lines. Drifts are half-cell multiples per second for exact 256-second wrap.
+float causticPool(vec2 q, float t) {
+    float a = waterNoise(q - t * vec2(0.5, 0.0));
+    float b = waterNoise(q * 1.75 + vec2(17.0, 29.0) - t * vec2(0.5, 0.5));
+    // Soft luminous focal pools where both wave-lens fields converge.
+    float pooled = mix(0.55 * a + 0.45 * b, sqrt(max(a * b, 0.0)), 0.45);
+    return smoothstep(CausticBand.x, CausticBand.y, pooled);
+}
+
+// The dapple at p, and at p + shift for the warm fringe. Both share one warp:
+// a shift of a few units moves the 96-unit warp field by a few hundredths of
+// a cell, so a second warp would cost two noise taps for no visible change.
+vec2 causticDapples(vec2 p, vec2 shift) {
+    float t = water.waves.x;
+    vec2 warp = vec2(waterNoise(p * (1.0 / 96.0) - t * vec2(0.5, 0.0)),
+                     waterNoise(p * (1.0 / 96.0) + vec2(31.0, 7.0) - t * vec2(0.0, 0.5)));
+    vec2 q = p * (1.0 / CausticScale) + CausticWarp * warp;
+    return vec2(causticPool(q, t), causticPool(q + shift * (1.0 / CausticScale), t));
+}
+
+vec3 shallowCaustics(vec3 bottomWorld, float vertical, vec2 slope, vec3 directLight) {
+    float depth = smoothstep(CausticDepth.x, CausticDepth.y, vertical)
+                * (1.0 - smoothstep(CausticDepth.z, CausticDepth.w, vertical));
+    float amount = water.lightControls.z * depth;
+    if (amount <= 0.0 || !any(greaterThan(directLight, vec3(0)))) return vec3(0);
+    vec2 p = bottomWorld.xy + slope * (vertical * CausticWobble);
+    vec2 dapples = causticDapples(p, vec2(3.5, -2.5));
+    float dapple = pow(dapples.x, 1.15);
+    // Subtle sunlit warmth in focal pools without hard web edges.
+    float warmShift = dapples.y;
+    vec3 tint = vec3(mix(dapple, warmShift, 0.25) * 1.05, dapple, dapple * 0.90);
+    return directLight * (amount * CausticGain * tint);
+}
+
+// Art-directed RTS glint light vector: starts from each pixel's local mirror
+// reflection bearing (-V.xy, falling back to water.forwardXY) and blends in
+// the real map sun azimuth so shimmering highlights dance naturally across the
+// full width of ponds and seas instead of collapsing into a narrow edge strip,
+// while still responding to sun rotation, golden hour, and night.
+vec3 glintLightDir(vec3 V) {
+    float sunAlt = clamp(water.toSun.z, 0.0, 1.0);
+    float viewMatched = clamp(V.z - GlintTiltOffset, GlintAltitude.x, GlintAltitude.y);
+    float altitude = clamp(mix(viewMatched, sunAlt, 0.14), GlintAltitude.x, GlintAltitude.y);
+    vec2 localRefl = -V.xy;
+    float localLen = length(localRefl);
+    vec2 bearing = localLen > 1e-4 ? (localRefl / localLen) : water.forwardXY;
+    // Gently pull toward camera forwardXY + real sun azimuth for coherent light flow.
+    vec2 sunHoriz = water.toSun.xy;
+    float sunHorizLen = length(sunHoriz);
+    vec2 target = water.forwardXY;
+    if (sunHorizLen > 1e-4) {
+        vec2 blended = water.forwardXY * (1.0 - GlintSunShare) + (sunHoriz / sunHorizLen) * GlintSunShare;
+        float bLen = length(blended);
+        if (bLen > 1e-4)
+            target = blended / bLen;
+    }
+    vec2 combined = bearing * 0.65 + target * 0.35;
+    float cLen = length(combined);
+    bearing = cLen > 1e-4 ? (combined / cLen) : target;
+    return vec3(bearing * sqrt(max(0.0, 1.0 - altitude * altitude)), altitude);
+}
+
+// Normalized GGX micro-facet distribution (divided by pi, peak ~ 1/(pi*a^2)).
+float ggxNdf(float ndoth, float alpha) {
+    float a2 = alpha * alpha;
+    float denom = ndoth * ndoth * (a2 - 1.0) + 1.0;
+    return a2 / max(Pi * denom * denom, 1e-6);
+}
+
+vec4 premultiplied(vec4 color) {
+    color = clamp(color, 0.0, 1.0);
+    return vec4(color.rgb * color.a, color.a);
+}
+
+vec4 waterBody(vec4 game, vec3 mapTint, float fogMask, float fogVis, float fogOptical,
+               ivec2 pixel, vec2 gradient, WaveField wf,
+               vec3 V, vec3 Lglint, vec3 directLight, out float openSurface) {
+    openSurface = water.controls.x * fogMask;
+    float bottom = texelFetch(SNAP(waterSceneDepth), pixel, 0).r;
+    vec3 bottomWorld;
+    if ((bottom - gl_FragCoord.z) * water.depthRange.w < 0.0 || !snapshotWorld(pixel, bottom, bottomWorld))
+        return premultiplied(game);
+    vec3 column = waterPosition - bottomWorld;
+    if (column.z < -0.25) return premultiplied(game);
+    float thickness = length(column);
+    float vertical = max(0.0, column.z);
+    vec3 original = texelFetch(SNAP(waterSceneColor), pixel, 0).rgb;
+    vec3 refracted = original;
+    if (water.controls.w > 0.0 && fogMask > 0.0) {
+        vec2 screen = (vec4(wf.macroSlope, 0, 0) * water.view).xy * vec2(1,-1);
+        vec2 offset = screen * (water.viewport.w / 1080.0) * 64.0 * water.controls.w * fogMask
+                    * (1.0 - exp(-thickness / 48.0));
+        refracted = refractedColor(pixel, offset, gl_FragCoord.z, gradient, original);
+    }
+    refracted *= fogMask;
+    // Unexplored water (black mask) gets no caustics anyway: skip the noise.
+    vec3 bottomLight = fogOptical > 0.0
+                     ? shallowCaustics(bottomWorld, vertical, wf.macroSlope, directLight) * fogOptical
+                     : vec3(0.0);
+    refracted *= 1.0 + bottomLight;
+
+    // Adaptive Beer-Lambert spectral absorption: crystal-clear shallows transition
+    // into clear sapphire/teal mid-water and map-faithful deep water.
+    float opticalDepth = max(0.0, 0.68 * thickness + 0.32 * vertical - ClearWater);
+    float tintMax = max(max(mapTint.r, mapTint.g), max(mapTint.b, 0.05));
+    vec3 tintHue = clamp(mapTint / tintMax, vec3(0.28), vec3(1.0));
+    vec3 sigma = vec3(0.021, 0.0080, 0.0042) * mix(vec3(1.0), 1.32 - 0.62 * tintHue, 0.45);
+    vec3 transmission = exp(-sigma * water.controls.y * opticalDepth);
+
+    // Translucent deep-water volumetric scatter modulated cleanly by scene lighting
+    // and Fog-of-War / Black-Mask visibility (pure black in unexplored Black Mask).
+    vec3 sceneLight = clamp(water.ambient.rgb * 0.68 + directLight * 0.52, vec3(0.06), vec3(1.25));
+    vec3 jewelDeep = vec3(0.045, 0.21, 0.33) * mix(vec3(1.0), tintHue, 0.58);
+    vec3 mapDeep = mix(mapTint, game.rgb, 0.20) * vec3(0.32, 0.58, 0.76);
+    vec3 deep = mix(jewelDeep, mapDeep, 0.58) * sceneLight * fogVis;
+
+    // Subtle backlit daylight translucency on thin wave crests (fades to zero
+    // at night and inside Fog of War so night water stays sleek and glassy).
+    float sunDay = smoothstep(0.10, 0.34, water.toSun.z);
+    float sssCrest = smoothstep(0.30, 0.90, wf.crest) * smoothstep(3.0, 24.0, vertical);
+    float sssBacklit = 0.40 + 0.60 * pow(clamp(dot(V, -Lglint), 0.0, 1.0), 2.2);
+    vec3 sssTint = mix(vec3(0.04, 0.38, 0.46), tintHue * vec3(0.16, 0.48, 0.54), 0.40);
+    vec3 sss = sssTint * directLight * (sssCrest * sssBacklit * SubsurfaceGain * sunDay * fogOptical * min(1.3, water.controls.y));
+
+    vec3 body = refracted * transmission + deep * (1.0 - transmission) + sss;
+
+    // Shore foam: organic lacy froth hugging rocks, dock pilings, boats, and cliffs,
+    // constrained by both vertical depth and screen-pixel reach so gentle beaches
+    // stay delicate and never widen into a hard stripe.
+    vec2 xy = waterPosition.xy;
+    float foam = 0.0;
+    if (water.controls.z > 0.0 && fogMask > 0.0 && vertical < FoamReach * (FoamFade.y + FoamWander)) {
+        float perPixel = 1e-3;
+        ivec2 last = ivec2(water.viewport.xy + water.viewport.zw) - 1;
+        for (int i = 0; i < 2; ++i) {
+            ivec2 next = min(pixel + (i == 0 ? ivec2(1, 0) : ivec2(0, 1)), last);
+            vec3 nextBottom;
+            if (next != pixel && snapshotWorld(next, texelFetch(SNAP(waterSceneDepth), next, 0).r, nextBottom))
+                perPixel = max(perPixel, abs(nextBottom.z - bottomWorld.z));
+        }
+        float pixelsOut = (vertical - FoamEdge) / perPixel;
+        float reach = max(vertical / FoamReach, pixelsOut / FoamPixels);
+        float wander = FoamWander * 2.0 * (waterNoise(xy * 0.03 - water.waves.x * vec2(0.5, 0.0)) - 0.5);
+        float stretch = smoothstep(FoamStretch.x, FoamStretch.y,
+                                   waterNoise(xy * 0.014 - water.waves.x * vec2(0.0, 0.5)));
+        float clumps = waterNoise(xy * 0.10 - water.waves.x * vec2(0.5, 0.5));
+        float froth = mix(FoamBubbles, 1.0, smoothstep(0.30, 0.70,
+                          0.6 * clumps + 0.4 * waterNoise(xy * 0.27 - water.waves.x * vec2(0.5, 0.5))));
+        foam = smoothstep(0.0, FoamRise * (0.4 + 1.2 * clumps), pixelsOut)
+             * (1.0 - smoothstep(FoamFade.x, FoamFade.y, reach + wander)) * stretch * froth;
+        foam = clamp(water.controls.z * foam, 0.0, 1.0);
+    }
+
+    // Full refraction coverage in open water eliminates the ghostly un-refracted
+    // double image of submerged rocks and boats, while melting cleanly at shore edges.
+    float shoreFade = smoothstep(0.0, ShoreAlphaDepth, vertical);
+    float waterAlpha = clamp(max(game.a, shoreFade * smoothstep(0.01, 0.14, game.a)), 0.0, 1.0);
+    float cover = foam * FoamOpacity * fogMask;
+    float coverage = mix(waterAlpha, 1.0, cover);
+    vec3 frothLit = mix(vec3(0.86, 0.92, 0.96), mapTint, 0.12)
+                  * clamp(water.ambient.rgb * 0.56 + directLight * 0.68, vec3(0.10), vec3(1.15))
+                  * fogVis;
+    vec4 ours = vec4((frothLit * cover + body * waterAlpha * (1.0 - cover)) / max(coverage, 1e-4), coverage);
+    openSurface *= waterAlpha * (1.0 - foam) * smoothstep(0.0, ShoreLight, thickness);
+    vec4 base = premultiplied(mix(game, ours, water.controls.x));
+    // Any remaining uncovered shallow edge receives matching bottom caustic lift.
+    base.rgb += (1.0 - base.a) * openSurface * (original * bottomLight * transmission);
+    return base;
+}
+
+// Multi-lobe GGX specular & continuous wave-crest capillary glints.
+// Zero circular dot grid and zero wide chalky blobs: highlights form slender,
+// dancing sunlit ribbons and delicate wind sparkles gliding along flowing crests.
+vec3 surfaceGlints(vec3 V, vec3 Nmacro, vec3 Ndetail, WaveField wf, vec3 Lglint,
+                   float footprint, vec3 directLight, float specSlider) {
+    vec3 H = V + Lglint;
+    H *= inversesqrt(max(dot(H, H), 1e-8));
+    float ndothMacro = clamp(dot(Nmacro, H), 0.0, 1.0);
+    float ndothDetail = clamp(dot(Ndetail, H), 0.0, 1.0);
+
+    // Toksvig-style roughness broadening from unresolved sub-pixel wave variance.
+    float toksvig = sqrt(wf.microVar);
+    float aSheen = clamp(SheenAlpha + toksvig * 0.55, 0.10, 0.44);
+    float aRibbon = clamp(RibbonAlpha + toksvig * 0.65, 0.020, 0.22);
+
+    // Layer 1: Whisper-soft solar sheen following gentle swells.
+    float sheen = ggxNdf(ndothMacro, aSheen) * (Pi * aSheen * aSheen) * SheenGain;
+    // Layer 2: Slender liquid highlights hugging the flowing wave crests.
+    float crestMask = mix(0.30, 1.0, smoothstep(0.24, 0.86, wf.crest));
+    float ribbon = ggxNdf(ndothDetail, aRibbon) * (Pi * aRibbon * aRibbon) * crestMask * RibbonGain;
+
+    // Layer 3: Delicate sparkling capillary micro-glints born where fine wind
+    // wavelets cross sunlit crests (zero polka dots, zero periodic cell lattice).
+    float sparkle = 0.0;
+    if (water.waves.y > 0.0 && dot(wf.microCap, wf.microCap) > 0.0) {
+        vec3 Ncap = normalize(vec3(wf.detailSlope + wf.microCap, 1.0));
+        float ndothCap = clamp(dot(Ncap, H), 0.0, 1.0);
+        float aSpark = clamp(SparkleAlpha + toksvig * 0.30, 0.012, 0.10);
+        float rawSpark = ggxNdf(ndothCap, aSpark) * (Pi * aSpark * aSpark);
+        // Drifting breeze patches let sparkle clusters glide organically with the wind.
+        float patches = smoothstep(0.24, 0.78,
+            waterNoise(waterPosition.xy * (1.0 / 136.0) - water.waves.x * vec2(0.5, 0.0)));
+        float macro2 = ndothMacro * ndothMacro;
+        float crestGate = smoothstep(0.18, 0.80, wf.crest) * (macro2 * macro2 * ndothMacro);
+        sparkle = pow(rawSpark, 1.25) * (0.30 + 0.70 * crestGate) * (0.45 + 0.55 * patches) * SparkleGain;
+    }
+
+    // Layer 4: True map-sun directional specular accent (vivid at golden hour & dusk).
+    float realSpec = 0.0;
+    if (water.toSun.z > 0.05) {
+        vec3 Lreal = normalize(water.toSun.xyz);
+        vec3 Hreal = V + Lreal;
+        Hreal *= inversesqrt(max(dot(Hreal, Hreal), 1e-8));
+        float ndothReal = clamp(dot(Ndetail, Hreal), 0.0, 1.0);
+        realSpec = ggxNdf(ndothReal, aRibbon * 1.25) * (Pi * aRibbon * aRibbon) * RealSunGain;
+    }
+
+    // Smooth slider curve & grazing balance: shimmering & crisp at default 1.0,
+    // dramatic yet clean at 2.0, without piling into a flat white sheet.
+    float goldenBoost = 1.0 + 0.50 * (1.0 - smoothstep(0.12, 0.50, water.toSun.z));
+    float grazingBalance = mix(0.62, 1.0, smoothstep(0.28, 0.68, V.z));
+    float crispScale = specSlider / (1.0 + 0.38 * max(0.0, specSlider - 1.0));
+    float sheenScale = min(specSlider, 1.10);
+    float energy = grazingBalance * goldenBoost * (sheenScale * sheen + crispScale * (ribbon + sparkle + realSpec));
+    float shaped = energy / (1.0 + 0.36 * energy);
+    vec3 glintTint = mix(directLight, mix(directLight, vec3(1.0, 0.98, 0.94), 0.45), clamp(shaped, 0.0, 1.0));
+    return glintTint * shaped;
+}
+
+// Clean atmospheric sky dome: silky horizon-to-zenith gradient and subtle solar
+// glow so ripples read as crisp glassy reflections without patchy stains.
+vec3 waterSky(vec3 ray, float altitude, vec3 sunlight, vec3 Lglint) {
+    float h = clamp(ray.z, 0.0, 1.0);
+    float brightness = dot(sunlight, vec3(0.2126, 0.7152, 0.0722));
+    vec3 dayH = water.ambient.rgb * 0.52 + sunlight * (0.22 + 0.38 * brightness) * SkyDayHorizon;
+    vec3 dayZ = water.ambient.rgb * 0.34 + sunlight * (0.12 + 0.34 * brightness) * SkyDayZenith;
+    vec3 day = mix(dayH, dayZ, pow(h, 0.56));
+
+    vec3 duskH = water.ambient.rgb * 0.42 + sunlight * SkyDuskHorizon * 0.72;
+    vec3 duskZ = water.ambient.rgb * 0.32 + sunlight * SkyDuskZenith * 0.54;
+    vec3 dusk = mix(duskH, duskZ, pow(h, 0.52));
+
+    vec3 sky = mix(dusk, day, smoothstep(SkyAltitude.x, SkyAltitude.y, altitude));
+
+    // Soft atmospheric solar glow along the glint azimuth.
+    float sunGlow = pow(clamp(dot(ray, Lglint), 0.0, 1.0), 10.0);
+    sky += sunlight * smoothstep(SunRise.x, SunRise.y, altitude) * (sunGlow * 0.22);
+    return sky;
+}
+
+// Classify a ray point against the snapshot: outside (-1), clear/in front
+// (0), or behind the sampled depth (1). Both projection directions use D3D Z.
+int reflectionSide(vec4 clip, out ivec2 tap, out float raw) {
+    if (!(clip.w > 1e-6)) return -1;
+    vec3 ndc = clip.xyz / clip.w;
+    if (!all(lessThanEqual(abs(ndc.xy), vec2(1))) || !(ndc.z >= 0.0 && ndc.z <= 1.0)) return -1;
+    vec2 uv = ndc.xy * vec2(0.5,-0.5) + 0.5;
+    tap = ivec2(floor(water.viewport.xy + uv * water.viewport.zw + 0.5));
+    if (any(lessThan(tap, ivec2(water.viewport.xy))) ||
+        any(greaterThanEqual(tap, ivec2(water.viewport.xy + water.viewport.zw)))) return -1;
+    raw = texelFetch(SNAP(waterSceneDepth), tap, 0).r;
+    float sceneZ = (raw - water.depthRange.x) * water.depthRange.y;
+    return raw != water.depthRange.z && sceneZ >= 0.0 && sceneZ <= 1.0 &&
+           (ndc.z - sceneZ) * water.depthRange.w >= 0.0 ? 1 : 0;
+}
+
+vec3 traceWaterReflection(vec3 ray, vec3 sky) {
+    if (ray.z <= 0.0) return sky;
+    vec3 origin = waterPosition + vec3(0, 0, RayLift);
+    vec4 start = vec4(origin, 1) * water.viewProj;
+    vec4 direction = vec4(ray, 0) * water.viewProj;
+    float lo = 0.0;
+    for (int i = 1; i <= ReflectionSteps; ++i) {
+        float f = float(i) / float(ReflectionSteps);
+        float hi = RayReach * f * f;
+        ivec2 hitTap;
+        float hitRaw;
+        int side = reflectionSide(start + hi * direction, hitTap, hitRaw);
+        if (side < 0) break;
+        if (side == 0) { lo = hi; continue; }
+        for (int j = 0; j < ReflectionBisections; ++j) {
+            float mid = (lo + hi) * 0.5;
+            ivec2 tap;
+            float raw;
+            if (reflectionSide(start + mid * direction, tap, raw) == 1) {
+                hi = mid;
+                hitTap = tap;
+                hitRaw = raw;
+            } else lo = mid;
+        }
+        vec3 hit;
+        if (!snapshotWorld(hitTap, hitRaw, hit) || hit.z <= waterPosition.z ||
+            dot(hit - origin, ray) <= 0.0) break;
+        // A depth edge can cross the projected ray without touching the world
+        // ray. Only fetch colour from the very texel whose 3D position passed.
+        float gap = distance(hit, origin + hi * ray);
+        vec2 uv = (vec2(hitTap) + 0.5 - water.viewport.xy) / water.viewport.zw;
+        vec2 edge = min(uv, 1.0 - uv);
+        float confidence = (1.0 - smoothstep(HitGap.x, HitGap.y, gap))
+                         * smoothstep(0.0, HitRise, hit.z - waterPosition.z)
+                         * (1.0 - smoothstep(RayFadeStart, RayReach, hi))
+                         * smoothstep(0.0, ScreenEdge, min(edge.x, edge.y));
+        if (confidence > 0.0)
+            return mix(sky, texelFetch(SNAP(waterSceneColor), hitTap, 0).rgb, confidence);
+        break;
+    }
+    return sky;
+}
+
+void main() {
+    gameFixedFunction();
+    vec4 game = out_Color0;
+    if (water.controls.x == 0.0)
+        return;
+
+    // Derivatives precede per-pixel water, shore and reflection decisions.
+    // Game.dll's Water_UpdateVertexColorsWithFogOfWar (0x6F72F6E0) multiplies
+    // Fog-of-War / Black-Mask RGB directly into waterVertexColor.rgb while
+    // keeping alpha intact: (0,0,0) in Black Mask, ~0.35 in Explored Fog.
+    vec3 mapTint = sampleTexture(0u, in_Texcoord0, vec4(0)).rgb * waterVertexColor.rgb;
+    float vPeak = max(waterVertexColor.r, max(waterVertexColor.g, waterVertexColor.b));
+    float fogMask = smoothstep(0.004, 0.055, vPeak);
+    float fogVis = fogMask * clamp(vPeak / 0.56, 0.0, 1.0);
+    float fogOptical = fogVis * fogVis;
+    float fogGlint = smoothstep(0.32, 0.76, fogVis);
+
+    vec2 gradient = vec2(dFdx(gl_FragCoord.z), dFdy(gl_FragCoord.z));
+    float footprint = max(length(dFdx(waterPosition.xy)), length(dFdy(waterPosition.xy)));
+    float phase = water.waves.x * (Tau / 256.0);
+    vec3 sunlight = clamp(water.sunColor.rgb, 0.0, 4.0);
+    vec3 directLight = sunlight * smoothstep(SunRise.x, SunRise.y, water.toSun.z);
+    bool glinting = water.lightControls.y > 0.0 && fogGlint > 0.0 && any(greaterThan(directLight, vec3(0)));
+    WaveField wf = evaluateWaves(waterPosition.xy, phase, footprint, fogMask > 0.0, glinting);
+    vec3 toEye = water.camera.xyz - waterPosition * water.camera.w;
+    vec3 V = toEye * inversesqrt(max(dot(toEye, toEye), 1e-8));
+    vec3 Lglint = glintLightDir(V);
+
+    float openSurface;
+    vec4 base = waterBody(game, mapTint, fogMask, fogVis, fogOptical,
+                          ivec2(gl_FragCoord.xy), gradient, wf, V, Lglint, directLight, openSurface);
+
+    vec3 Nmacro = normalize(vec3(wf.macroSlope, 1.0));
+    vec3 Ndetail = normalize(vec3(wf.detailSlope, 1.0));
+    // The glints before the reflection march, so only their colour stays live
+    // through it: the wave field and both normals die here. On an RTX 4060 Ti
+    // this took the shader from 72 registers to 64 (28 to 32 warps per SM;
+    // the k4 water had 56, the game's fixed function alone 48), and register
+    // count limits every water pixel, Style 0 included.
+    vec3 glint = vec3(0.0);
+    if (glinting && openSurface > 0.0)
+        glint = openSurface * fogGlint * surfaceGlints(V, Nmacro, Ndetail, wf, Lglint, footprint, directLight, water.lightControls.y);
+    vec3 Nrefl = normalize(vec3(mix(wf.macroSlope, wf.detailSlope, 0.40), 1.0));
+
+    float slider = water.lightControls.x;
+    if (slider > 0.0 && fogOptical > 0.0) {
+        float floorF = slider * FresnelFloorMax;
+        float fresnel = floorF + (1.0 - floorF) * pow(1.0 - clamp(dot(Nrefl, V), 0.0, 1.0), FresnelPower);
+        float weight = openSurface * fresnel * smoothstep(0.0, ReflectionOn, slider) * fogOptical;
+        if (weight > MinReflection) {
+            vec3 R = reflect(-V, Nrefl);
+            vec3 Rsky = reflect(-V, Ndetail);
+            vec3 sky = waterSky(Rsky, water.toSun.z, sunlight, Lglint);
+            vec3 reflected = traceWaterReflection(R, sky);
+            reflected *= mix(vec3(1.0), mapTint, MapTintShare) * fogVis;
+            base = mix(base, vec4(reflected, 1.0), weight);
+        }
+    }
+    base.rgb += glint;
+
+    if (any(isnan(base)) || any(isinf(base)))
+        base = premultiplied(game);
+    out_Color0 = base;
+}

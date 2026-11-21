@@ -51,8 +51,12 @@
 
 
 #include "d3d9_war3_shadow.h"
+#include "d3d9_war3_volumetric_light.h"
+#include "war3/core/war3_execution_services.h"
 #include "war3/model/war3_native_light_bridge.h"
 #include "d3d9_war3_ssao.h"
+#include "d3d9_war3_weather.h"
+#include "d3d9_war3_scene_effects_fixture.h"
 #include "war3/shadow/war3_shadow_backend_dxvk.h"
 // 2026-09-18 T7 批次 4（U5）：registry domain 的显式类型与 owner-check 判定内核。
 #include "war3/shadow/war3_shadow_geometry_domain.h"
@@ -101,6 +105,7 @@ struct NativeVertexOutputProof;
 }
 } // namespace dxvk
 #include "d3d9_war3_aa.h"
+#include "d3d9_war3_bloom.h"
 
 #include "../util/util_flush.h"
 
@@ -113,7 +118,6 @@ struct NativeVertexOutputProof;
 namespace dxvk {
 
 class War3RenderPipeline;
-class War3PostProcess;
 namespace war3::reimpl { class War3InstanceBuffer; }
 
 // Draw-time vertex snapshots belong to one object instance and one logical
@@ -401,7 +405,10 @@ struct War3ShadowLifecycleDiagnostics {
   uint32_t producerReady = 0u;
 };
 
-class D3D9DeviceEx final : public ComObjectClamp<IDirect3DDevice9Ex> {
+// war3::IDeviceServices is how the data layer reaches the published device;
+// its members are implemented below under their own names.
+class D3D9DeviceEx final : public ComObjectClamp<IDirect3DDevice9Ex>,
+                           public war3::IDeviceServices {
   constexpr static uint32_t DefaultFrameLatency = 3;
   constexpr static uint32_t MaxFrameLatency = 20;
 
@@ -1530,6 +1537,34 @@ public:
       uint64_t* outTombstoneSerial = nullptr);
   void War3RequestShadowMapEpochReset();
   War3ShadowLifecycleDiagnostics QueryWar3ShadowLifecycleDiagnostics() const;
+  // Runs this device's own shadow pass, SSAO, weather, AA and bloom from a
+  // scene packet, for the fixture interface above. Never called by the game.
+  // runBloom false leaves a bloom record to the caller (the fixture's legacy
+  // oracle). With a Lighting record the shadow pass runs first over
+  // shadowScene, which moves into it; shadowFacts is the pass's account of
+  // that run, read after the CS thread finished it.
+  HRESULT War3RunSceneEffectsForFixture(
+      const war3::effects::scene::FramePacket& packet, uint64_t frameSerial,
+      bool runBloom = true,
+      const war3::effects::scene::ShadowPacket* shadow = nullptr,
+      War3FrameScene* shadowScene = nullptr,
+      const war3::effects::ShadowCasterAccount* shadowAccount = nullptr,
+      war3::effects::ShadowRunFacts* shadowFacts = nullptr,
+      bool* shadowRan = nullptr);
+  // DrawIndexedPrimitive, then the draw's own vertex and index buffer become
+  // a caster of the fixture's scene (war3_shadow_scene_input.h), noted in its
+  // account; what the draw read from a dynamic buffer is copied into pool.
+  HRESULT War3DrawShadowCasterForFixture(
+      const war3::effects::scene::ShadowCaster& record,
+      const war3::effects::scene::ShadowCasterAlpha* alpha, D3DPRIMITIVETYPE type,
+      INT baseVertexIndex, UINT minVertexIndex, UINT numVertices,
+      UINT startIndex, UINT primitiveCount, uint64_t frameSerial,
+      War3FrameScene& scene, war3::effects::ShadowCasterPool& pool,
+      war3::effects::ShadowCasterAccount& account);
+
+  int64_t QueryWar3DeviceStatus() const {
+    return static_cast<int64_t>(m_dxvkDevice->getDeviceStatus());
+  }
   bool War3ResetGpuSkinBridgeForTest(bool deviceEpoch);
   bool War3LogGpuSkinDiagnosticsForTest(
       bool requireQuiescent = false, bool* outQuiescent = nullptr);
@@ -3293,9 +3328,13 @@ private:
 
   // War3 Shadow
   War3ShadowReceiverPass *m_shadowReceiverPass = nullptr;
+  War3VolumetricLightPass *m_volumetricPass = nullptr;
   War3SsaoPass *m_ssaoPass = nullptr;
+  War3WeatherPass *m_weatherPass = nullptr;
+  // Two-mode effect comparison only (d3d9_war3_scene_effects_fixture.h).
+  std::unique_ptr<D3D9War3SceneEffectsFixture> m_war3SceneEffectsFixture;
   War3AAPass *m_aaPass = nullptr;
-  War3PostProcess *m_war3PostProcess = nullptr;
+  std::unique_ptr<War3BloomPass> m_war3BloomPass;
   std::unique_ptr<war3::reimpl::War3InstanceBuffer> m_war3InstanceBuffer;
   dxvk::war3::shadow::DxvkValidationBackend m_war3SemanticDxvkBackend;
   Com<IDirect3DVertexShader9> m_shadowFakeVS;
@@ -3355,6 +3394,13 @@ public:
   void War3SetWorldLightingScope(bool inWorld);
   DWORD GetPureGameAmbient() const { return m_pureGameAmbient; }
   war3::reimpl::War3InstanceBuffer* GetWar3InstanceBuffer();
+  // war3::IDeviceServices: material shaders (d3d9_war3_material_shader.cpp).
+  bool War3CreateMaterialVertexShader(const uint32_t* tokens, size_t bytes,
+      const std::string& path, IDirect3DVertexShader9** shader,
+      std::string* error);
+  bool War3CreateMaterialPixelShader(const uint32_t* tokens, size_t bytes,
+      const std::string& path, IDirect3DPixelShader9** shader,
+      std::string* error);
   War3ShadowReceiverPass* GetWar3ShadowReceiverPass() const {
     return m_shadowReceiverPass;
   }

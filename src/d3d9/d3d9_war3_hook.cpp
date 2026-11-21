@@ -227,6 +227,23 @@ bool GetEnvBool(const char *name, bool defaultValue) {
   return defaultValue;
 }
 
+// Game.dll frees d3d9.dll while it shuts the graphics device down and then keeps
+// calling Storm, whose exports jump into this module. Hooks and trampolines stay
+// live until the process exits (see StormHook_Uninstall), so the module must as
+// well. A load that never reaches a hook keeps its ordinary lifetime.
+void PinModuleForInstalledHooks(const char *source) {
+  static std::atomic<bool> s_attempted{false};
+  if (s_attempted.exchange(true, std::memory_order_acq_rel))
+    return;
+  HMODULE self = nullptr;
+  const BOOL pinned = ::GetModuleHandleExW(
+      GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+      reinterpret_cast<LPCWSTR>(&PinModuleForInstalledHooks), &self);
+  war3dbg::Print("DXVK War3Hook: module pin %s source=%s error=%lu\n",
+                 pinned ? "ok" : "failed", source ? source : "unknown",
+                 pinned ? 0ul : static_cast<unsigned long>(::GetLastError()));
+}
+
 void TryInstallStormBreakerEarly(const char *source) {
   if constexpr (!dxvk::war3::internal::kWar3StormBreakerEnabled) {
     static std::atomic<bool> s_logged{false};
@@ -522,6 +539,7 @@ void ActivateWar3Runtime(uintptr_t gameBase, const char *source) {
   }
 
   war3dbg::Print("DXVK War3Hook: Activation triggered by %s\n", source);
+  PinModuleForInstalledHooks(source);
 
   auto tStart = std::chrono::high_resolution_clock::now();
 
@@ -611,6 +629,7 @@ void TryInstallShadowHooksEarly(uintptr_t gameBase, const char *source) {
     }
     return;
   }
+  PinModuleForInstalledHooks(source);
   TryInstallStormBreakerEarly(source);
 
   // Phase 7.99/7.170：CWidget identity 与 Shadow producer hooks 必须早装。
@@ -931,6 +950,8 @@ void War3Hook::InstallHooks(IDirect3DDevice9 *device) {
     g_bootstrapInstalled.store(true, std::memory_order_release);
     return;
   }
+
+  PinModuleForInstalledHooks("Bootstrap");
 
   // 最小化模式只保留能建立控制管道的 JASS/MainRunner 入口，用于排除
   // Storm、Shadow producer 与 model provenance 的启动期侵入。

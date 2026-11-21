@@ -86,6 +86,12 @@ public:
       uint32_t eligibleLightCount,
       uint64_t frameSerial);
 
+  // What the tracer keeps from one frame to the next, for its owner's
+  // storage account (War3ShadowReceiverPass::ResourceBytes).
+  const Rc<DxvkImage>& HizImage() const { return m_hizImage; }
+  const Rc<DxvkImage>& VisibilityImage() const { return m_visibilityImage; }
+  const Rc<DxvkBuffer>& UniformBuffer() const { return m_uniformBuffer; }
+
 private:
   bool ensureResources(VkExtent3D fullExtent, uint32_t lightLayerCount);
   void initializeOrAcquireResources(const Rc<DxvkCommandList>& ctx);

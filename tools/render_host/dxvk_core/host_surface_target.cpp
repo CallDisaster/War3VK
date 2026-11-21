@@ -126,6 +126,9 @@ struct HostSurfaceTarget::State {
   lab::Handle peerProcess, peerThread, ready, wake;
   std::wstring peerMarker, ownMarker, className;
   wchar_t desktop[256]{}, inputDesktop[256]{};
+  // The author's trial profile (d3d9_window_identity.h): the session's desktop
+  // is the one the user looks at.
+  bool interactive = false;
   DpiApi api;
   DPI_AWARENESS_CONTEXT expectedContext = nullptr;
   UINT expectedDpi = 0;
@@ -156,6 +159,10 @@ struct HostSurfaceTarget::State {
     Need(NameEquals(GetProcessWindowStation(), L"WinSta0")
       && NameEquals(GetThreadDesktop(GetCurrentThreadId()), desktop)
       && NameEquals(GetThreadDesktop(peerTid), desktop), Fault::Desktop);
+    // Interactive: the session's desktop IS the input desktop and may be
+    // "Default", and the input desktop changes under it (a consent prompt,
+    // the lock screen) without anything being wrong with the session.
+    if (interactive) return;
     const auto input = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS);
     wchar_t actual[256]{};
     const bool okay = input && ObjectName(input, actual);
@@ -417,7 +424,8 @@ void HostSurfaceTarget::start(Mode mode, HWND parent, DWORD pid, DWORD tid,
     const auto input = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS);
     const bool named = input && ObjectName(input, s->inputDesktop);
     if (input) CloseDesktop(input);
-    Need(named, Fault::Desktop);
+    s->interactive = d9::AuthorTrialProfile();
+    Need(named || s->interactive, Fault::Desktop);
     s->api.load(); s->expectedContext = s->api.window(parent); s->expectedDpi = s->api.dpi(parent);
     Need(s->expectedContext && s->expectedDpi, Fault::DpiChanged);
     {

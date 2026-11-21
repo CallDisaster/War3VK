@@ -1,34 +1,15 @@
 #pragma once
 
 #include "d3d9_war3_pipeline.h"
-#include "war3/render/war3_owned_image_layout.h"
-#include "war3/render/war3_tracked_vk_pipeline.h"
-#include "war3/render/war3_weather_resource_retry.h"
+#include "war3/effects/war3_snow_executor.h"
 
 namespace dxvk {
 
 class D3D9DeviceEx;
 
-enum class War3WeatherDrawStage : uint32_t {
-  Disabled = 0,
-  NoSnowfall,
-  MissingTargets,
-  EpochMismatch,
-  CameraUnavailable,
-  CameraInvalid,
-  UnsupportedSamples,
-  UnsupportedTarget,
-  UnsupportedDepth,
-  DepthCopyBudget,
-  DepthCopyUnavailable,
-  UndefinedLayout,
-  PipelineUnavailable,
-  DuplicateFrame,
-  CommandsRecorded,
-  ResourceRetryWait,
-  ResourceAllocationFailed,
-  ResourceHostAllocationFailed,
-};
+// Where the snow draw ended this frame. The draw itself is the shared executor
+// (war3/effects/war3_snow_executor.h); this pass only adapts the pipeline input.
+using War3WeatherDrawStage = war3::effects::SnowStage;
 
 // Values describe command recording, not GPU completion or visual acceptance.
 // No mapped GPU state is polled and no particle data is read back.
@@ -54,12 +35,35 @@ struct War3WeatherDiagnostics {
 };
 
 War3WeatherDiagnostics QueryWar3WeatherDiagnostics();
-const char* War3WeatherDrawStageName(War3WeatherDrawStage stage) noexcept;
+// Pure mapping, kept inline so diagnostics code needs no symbol from this pass.
+inline const char* War3WeatherDrawStageName(War3WeatherDrawStage stage) noexcept {
+  switch (stage) {
+    case War3WeatherDrawStage::Disabled: return "disabled";
+    case War3WeatherDrawStage::NoSnowfall: return "no-snowfall";
+    case War3WeatherDrawStage::MissingTargets: return "missing-targets";
+    case War3WeatherDrawStage::EpochMismatch: return "epoch-mismatch";
+    case War3WeatherDrawStage::CameraUnavailable: return "camera-unavailable";
+    case War3WeatherDrawStage::CameraInvalid: return "camera-invalid";
+    case War3WeatherDrawStage::UnsupportedSamples: return "unsupported-msaa";
+    case War3WeatherDrawStage::UnsupportedTarget: return "unsupported-color";
+    case War3WeatherDrawStage::UnsupportedDepth: return "unsupported-depth";
+    case War3WeatherDrawStage::DepthCopyBudget: return "depth-copy-budget";
+    case War3WeatherDrawStage::DepthCopyUnavailable: return "depth-copy-unavailable";
+    case War3WeatherDrawStage::UndefinedLayout: return "undefined-layout";
+    case War3WeatherDrawStage::PipelineUnavailable: return "pipeline-unavailable";
+    case War3WeatherDrawStage::DuplicateFrame: return "duplicate-frame";
+    case War3WeatherDrawStage::CommandsRecorded: return "commands-recorded";
+    case War3WeatherDrawStage::ResourceRetryWait: return "resource-retry-wait";
+    case War3WeatherDrawStage::ResourceAllocationFailed: return "resource-allocation-failed";
+    case War3WeatherDrawStage::ResourceHostAllocationFailed: return "resource-host-allocation-failed";
+  }
+  return "unknown";
+}
 
 class War3WeatherPass final : public War3RenderPass {
 public:
-  static constexpr uint32_t kMaxParticles = 16384;
-  static constexpr uint64_t kMaxDepthCopyBytes = 32u * 1024u * 1024u;
+  static constexpr uint32_t kMaxParticles = war3::effects::SnowExecutor::kMaxParticles;
+  static constexpr uint64_t kMaxDepthCopyBytes = war3::effects::SnowExecutor::kMaxDepthCopyBytes;
 
   explicit War3WeatherPass(D3D9DeviceEx* parent);
   ~War3WeatherPass() override = default;
@@ -71,28 +75,8 @@ public:
            const War3PipelineInput& input) override;
 
 private:
-  bool ensurePipeline(VkFormat format);
-  bool ensureDepthCopy(VkExtent3D extent, VkFormat format);
-  void copyDepth(const Rc<DxvkCommandList>& ctx,
-                 const Rc<DxvkImageView>& source,
-                 const VkImageSubresourceRange& sourceRange,
-                 VkImageLayout sourceOriginal);
-  void clearDepthCopy();
-  Rc<DxvkDevice> m_device;
-  const DxvkPipelineLayout* m_layout = nullptr;
-  Rc<war3::render::War3TrackedVkPipeline> m_pipeline;
-  VkFormat m_pipelineFormat = VK_FORMAT_UNDEFINED;
-  Rc<DxvkSampler> m_depthSampler;
-  Rc<DxvkImageView> m_depthSampleView;
-  Rc<DxvkImage> m_depthCopy;
-  Rc<DxvkImageView> m_depthCopyView;
-  war3::render::War3OwnedImageLayoutState m_depthCopyLayout;
-  uint64_t m_depthCopyBytes = 0;
-  war3::render::WeatherResourceRetry m_resourceRetry;
+  war3::effects::SnowExecutor m_executor;
   bool m_wasEnabled = false;
-  uint64_t m_lastFrameSerial = 0;
-  uint64_t m_lastMapEpoch = 0;
-  uint64_t m_lastDeviceEpoch = 0;
 };
 
 } // namespace dxvk

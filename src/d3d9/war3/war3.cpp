@@ -15,11 +15,17 @@ namespace dxvk::war3 {
 static bool s_initialized = false;
 static uintptr_t s_gameDllBase = 0;
 static std::atomic<D3D9DeviceEx*> s_activeDevice{ nullptr };
+// The same publication as the service interface. It is stored separately so
+// that a call through it never carries the concrete type.
+static std::atomic<IDeviceServices*> s_activeDeviceServices{ nullptr };
 // Some active-device transactions re-enter through shadow allocation while a
 // render hook is executing. Keep publication exclusion across the complete
 // callback without deadlocking that same render thread.
 static std::recursive_mutex s_activePublicationMutex;
 static std::shared_ptr<War3RenderSettingsMailbox> s_activeSettingsMailbox;
+// True while PublishProxyDeviceServices is in effect (guarded by the
+// publication mutex).
+static bool s_proxyServicesPublished = false;
 
 bool Initialize(uintptr_t gameDllBase) {
     if (s_initialized)
@@ -84,6 +90,7 @@ void PublishActiveDeviceLocked(D3D9DeviceEx* device) {
     // handoff may briefly fail to acquire the new mailbox, but must never see
     // a mailbox for a device that has not yet been published.
     s_activeDevice.store(device, std::memory_order_release);
+    s_activeDeviceServices.store(device, std::memory_order_release);
     std::atomic_store_explicit(
         &s_activeSettingsMailbox, std::move(mailbox),
         std::memory_order_release);
@@ -110,7 +117,35 @@ bool ClearActiveDeviceIfCurrent(D3D9DeviceEx* device) {
         &s_activeSettingsMailbox,
         std::shared_ptr<War3RenderSettingsMailbox>{},
         std::memory_order_release);
+    s_activeDeviceServices.store(nullptr, std::memory_order_release);
     s_activeDevice.store(nullptr, std::memory_order_release);
+    return true;
+}
+
+void PublishProxyDeviceServices(
+        IDeviceServices* services,
+        std::shared_ptr<War3RenderSettingsMailbox> mailbox) {
+    std::lock_guard<std::recursive_mutex> lock(s_activePublicationMutex);
+    // The author's settings outlive a device in this mode: the mailbox is
+    // the process's (platform/war3_proxy_frame.h), not the device's.
+    s_activeDeviceServices.store(services, std::memory_order_release);
+    std::atomic_store_explicit(
+        &s_activeSettingsMailbox, mailbox, std::memory_order_release);
+    s_proxyServicesPublished = true;
+}
+
+bool ClearProxyDeviceServices(IDeviceServices* services) {
+    std::lock_guard<std::recursive_mutex> lock(s_activePublicationMutex);
+    if (s_activeDeviceServices.load(std::memory_order_acquire) != services ||
+        s_activeDevice.load(std::memory_order_acquire) != nullptr) {
+        return false;
+    }
+    std::atomic_store_explicit(
+        &s_activeSettingsMailbox,
+        std::shared_ptr<War3RenderSettingsMailbox>{},
+        std::memory_order_release);
+    s_activeDeviceServices.store(nullptr, std::memory_order_release);
+    s_proxyServicesPublished = false;
     return true;
 }
 
@@ -132,11 +167,29 @@ bool RunWithActiveDevice(
     return true;
 }
 
+bool RunWithActiveDeviceServices(
+    const std::function<void(IDeviceServices&)>& transaction) {
+    std::lock_guard<std::recursive_mutex> lock(s_activePublicationMutex);
+    auto* const device =
+        s_activeDeviceServices.load(std::memory_order_acquire);
+    if (device == nullptr)
+        return false;
+    if (transaction)
+        transaction(*device);
+    return true;
+}
+
 bool HasActivePipeline() {
     bool available = false;
     RunWithActiveDevice([&available](D3D9DeviceEx& device) {
         available = device.GetWar3Pipeline() != nullptr;
     });
+    // Proxy mode: the pipeline is in the x64 host; what this answers for the
+    // data layer (JAPI readiness) is "a renderer takes the author's settings".
+    if (!available) {
+        std::lock_guard<std::recursive_mutex> lock(s_activePublicationMutex);
+        available = s_proxyServicesPublished;
+    }
     return available;
 }
 
@@ -155,10 +208,10 @@ bool RunWithActiveDevicePublication(
 void RequestActiveDeviceShadowMapResetOrCpuFallback() {
     std::lock_guard<std::recursive_mutex> lock(s_activePublicationMutex);
     if (auto* const device =
-            s_activeDevice.load(std::memory_order_acquire)) {
+            s_activeDeviceServices.load(std::memory_order_acquire)) {
         device->War3RequestShadowMapEpochReset();
     } else {
-        D3D9DeviceEx::War3ResetCpuSemanticMapSession();
+        ProcessServices().War3ResetCpuSemanticMapSession();
     }
 }
 
@@ -254,7 +307,7 @@ bool ExecuteSemanticShadowSceneForValidation(
     bool unitsOnly,
     bool executeNativeBackendValidation) {
     bool executed = false;
-    RunWithActiveDevice([&](D3D9DeviceEx& device) {
+    RunWithActiveDeviceServices([&](IDeviceServices& device) {
         executed = device.War3ExecuteSemanticShadowSceneForValidation(
             unitsOnly, executeNativeBackendValidation);
     });

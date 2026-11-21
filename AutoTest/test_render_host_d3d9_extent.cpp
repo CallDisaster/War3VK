@@ -14,6 +14,9 @@
 // the window instead of a Reset and lets its WM_SIZE through: WarVK's window
 // hook resets the swap chain itself, keeping every resource and state except
 // RT0's viewport and scissor, and the application never sees the WM_SIZE.
+// --stale-viewport applies a recorded viewport across that resize;
+// --destroy-ahead closes the live device window immediately after Present.
+// Both use the plain presenter so the call can return ahead of the host.
 // No game module, no input, nothing deployed.
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -22,6 +25,7 @@
 #include <d3d9.h>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -38,6 +42,10 @@ constexpr DWORD Behavior = D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_FPU_P
 constexpr uint64_t FnvOffset = 14695981039346656037ull, FnvPrime = 1099511628211ull;
 constexpr wchar_t WindowClass[] = L"WarVK_D3D9_Extent_Fixture";
 constexpr UINT PresentFrames = 3;
+// One partial Clear is one GPU submit-and-wait on the host. At 25 us of
+// backlog per record, 4096 give about 100 ms; the 160-byte records together
+// fit in the 4 MiB ring. The gate checks an actual wait at WM_DESTROY.
+constexpr UINT DestroyAheadClears = 4096;
 
 void Require(bool condition, const char* reason) { if (!condition) throw std::runtime_error(reason); }
 void Check(HRESULT hr, const char* operation) {
@@ -72,6 +80,7 @@ struct Options {
   std::wstring dll;
   UINT width = 0, height = 0, resetWidth = 0, resetHeight = 0, resizeWidth = 0, resizeHeight = 0;
   bool reference = false, present = false, zeroExtent = false, resetZero = false, ring = false, depthBias = false;
+  bool destroyAhead = false, staleViewport = false;
   D3DFORMAT format = D3DFMT_A8R8G8B8, depth = D3DFMT_D32F_LOCKABLE;
   DWORD interval = D3DPRESENT_INTERVAL_ONE;
   // A second extent, by the application's Reset or by the window's own resize.
@@ -100,6 +109,8 @@ Options ParseOptions(int argc, wchar_t** argv) {
     else if (arg == L"--reset-zero" && !o.resetZero) o.resetZero = true;
     else if (arg == L"--ring" && !o.ring) o.ring = true;
     else if (arg == L"--depth-bias" && !o.depthBias) o.depthBias = true;
+    else if (arg == L"--destroy-ahead" && !o.destroyAhead) o.destroyAhead = true;
+    else if (arg == L"--stale-viewport" && !o.staleViewport) o.staleViewport = true;
     else if (arg == L"--format" && value && !format && std::wstring(argv[i + 1]) == L"x8") { o.format = D3DFMT_X8R8G8B8; format = true; ++i; }
     else if (arg == L"--depth" && value && !depth && std::wstring(argv[i + 1]) == L"d16") { o.depth = D3DFMT_D16; depth = true; ++i; }
     else if (arg == L"--interval" && value && !interval) {
@@ -107,9 +118,15 @@ Options ParseOptions(int argc, wchar_t** argv) {
       Require(name == L"immediate" || name == L"default", "bad --interval");
       o.interval = name == L"immediate" ? D3DPRESENT_INTERVAL_IMMEDIATE : D3DPRESENT_INTERVAL_DEFAULT;
     } else throw std::runtime_error("usage: --dll ABS --extent WxH [--reference] [--present] [--zero-extent]"
-      " [--reset WxH [--reset-zero]] [--resize WxH] [--ring] [--depth-bias] [--format x8] [--depth d16] [--interval immediate|default]");
+      " [--reset WxH [--reset-zero]] [--resize WxH] [--ring] [--depth-bias] [--destroy-ahead | --stale-viewport]"
+      " [--format x8] [--depth d16] [--interval immediate|default]");
   }
   Require(o.dll.size() > 3 && o.dll[1] == L':' && o.width, "an absolute DLL and an extent are required");
+  Require(!(o.destroyAhead && o.staleViewport), "--destroy-ahead and --stale-viewport are mutually exclusive");
+  if (o.destroyAhead || o.staleViewport) o.present = true;
+  Require(!o.destroyAhead || !o.secondExtent(), "--destroy-ahead requires a fixed extent");
+  Require(!o.staleViewport || (o.resizeWidth && (o.resizeWidth < o.width || o.resizeHeight < o.height)),
+    "--stale-viewport needs a smaller --resize WxH");
   Require(!(o.present && o.reference), "--present is remote-only");
   Require(!o.resetZero || o.resetWidth, "--reset-zero needs --reset");
   Require(!(o.ring || o.depthBias) || (!o.present && !o.secondExtent()), "--ring and --depth-bias run without --present, --reset or --resize");
@@ -179,8 +196,21 @@ struct Window {
     Require(GetClientRect(hwnd.load(), &client) && client.right == LONG(w) && client.bottom == LONG(h), "resized client extent");
     width = w; height = h;
   }
+  void syncMessages() {
+    DWORD_PTR result = 0;
+    Require(SendMessageTimeoutW(hwnd.load(), WM_NULL, 0, 0, SMTO_BLOCK, 5000, &result) != 0, "window thread round trip");
+  }
+  void destroyNow() {
+    const HWND window = hwnd.load();
+    DWORD_PTR result = 0;
+    // WM_CLOSE returns after DestroyWindow on the owner thread, including the
+    // proxy's WM_DESTROY wait (up to 5 s). Keep all COM references until then.
+    Require(SendMessageTimeoutW(window, WM_CLOSE, 0, 0, SMTO_BLOCK, 10000, &result) != 0, "synchronous window close");
+    Require(!IsWindow(window), "WM_CLOSE returned with a live window");
+    hwnd.store(nullptr);
+  }
   void stop() {
-    Require(PostMessageW(hwnd.load(), WM_CLOSE, 0, 0) != FALSE, "window close post");
+    if (hwnd.load()) Require(PostMessageW(hwnd.load(), WM_CLOSE, 0, 0) != FALSE, "window close post");
     Require(WaitForSingleObject(thread, 5000) == WAIT_OBJECT_0, "window shutdown timeout");
     DWORD exit = STILL_ACTIVE;
     Require(GetExitCodeThread(thread, &exit) && exit == 0 && !failure.load(), "window thread failure");
@@ -266,16 +296,22 @@ struct Fixture {
 void CreateDevice(Fixture& f) {
   f.stage = "window-and-device";
   Require(!GetModuleHandleW(L"Game.dll"), "game module present");
+  bool presentedReadback = false;
   if (f.options.present) {
     wchar_t profile[64]{};
     const DWORD count = GetEnvironmentVariableW(L"WARVK_D3D9_PROFILE", profile, 64);
-    Require(count && count < 64 && std::wcscmp(profile, L"presenter-readback-isolated-v1") == 0,
-      "--present requires WARVK_D3D9_PROFILE=presenter-readback-isolated-v1");
+    const bool plain = count && count < 64 && std::wcscmp(profile, L"presenter-isolated-v1") == 0;
+    presentedReadback = count && count < 64 && std::wcscmp(profile, L"presenter-readback-isolated-v1") == 0;
+    // A presented-image reply always waits for this Present, even on the ring.
+    if (f.options.destroyAhead || f.options.staleViewport)
+      Require(plain, "window lifetime requires WARVK_D3D9_PROFILE=presenter-isolated-v1");
+    else Require(presentedReadback || (plain && f.options.resizeWidth),
+      "--present requires the readback profile (plain presenter also supported for --resize)");
   }
   SizeMessages.store(f.options.resizeWidth != 0);
   f.window.start(f.options.width, f.options.height, f.options.present);
   f.renderer = LoadLibraryW(f.options.dll.c_str()); Require(f.renderer != nullptr, "renderer load");
-  if (f.options.present) {
+  if (presentedReadback) {
     f.readPresented = reinterpret_cast<ReadPresentedImage>(GetProcAddress(f.renderer, "WarVKD3D9ReadPresentedImage"));
     Require(f.readPresented != nullptr, "presented-image diagnostic export");
   }
@@ -706,16 +742,19 @@ void Present(Fixture& f, UINT64 frameBase = 0) {
   if (!f.options.present) return;
   f.stage = "presented-frames";
   auto& d = *f.device.get();
-  std::vector<uint8_t> presented(size_t(f.w) * f.h * 4);
+  std::vector<uint8_t> presented(f.readPresented ? size_t(f.w) * f.h * 4 : 0);
   UINT64 frame = 0;
-  Require(f.readPresented(f.device.get(), presented.data(), UINT(presented.size()), &frame) == D3DERR_INVALIDCALL,
-    "presented image before the first Present at this extent");
+  if (f.readPresented)
+    Require(f.readPresented(f.device.get(), presented.data(), UINT(presented.size()), &frame) == D3DERR_INVALIDCALL,
+      "presented image before the first Present at this extent");
   for (UINT i = 0; i < PresentFrames; ++i) {
     const DWORD background = 0xff000000u | (0x10u + i * 0x30u) << 16 | 0x2040u;
     Check(d.Clear(0, nullptr, D3DCLEAR_TARGET, background, 1, 0), "frame clear");
     Check(d.BeginScene(), "frame scene"); f.drawQuad(4 + i); Check(d.EndScene(), "frame scene end");
     f.fill(background); f.rect(f.quads[4 + i], f.quadColors[4 + i]); f.checkImage();
     Check(d.Present(nullptr, nullptr, nullptr, nullptr), "Present");
+    ++f.presentedFrames;
+    if (!f.readPresented) continue;
     Check(f.readPresented(f.device.get(), presented.data(), UINT(presented.size()), &frame), "presented image");
     Require(frame == frameBase + i + 1, "presented frame number");
     unsigned failures = 0;
@@ -730,8 +769,72 @@ void Present(Fixture& f, UINT64 frameBase = 0) {
     }
     Require(!failures, "presented image differs from the target it was blitted from");
     f.presentedHash = Hash(presented.data(), presented.size(), f.presentedHash);
-    ++f.presentedFrames;
   }
+}
+
+void DrawLifeTriangle(Fixture& f) {
+  Check(f.device->BeginScene(), "triangle scene");
+  Check(f.device->DrawPrimitive(D3DPT_TRIANGLELIST, 0, 1), "triangle"); ++f.draws;
+  Check(f.device->EndScene(), "triangle scene end");
+}
+
+void PresentLifeFrame(Fixture& f) {
+  Check(f.device->Present(nullptr, nullptr, nullptr, nullptr), "Present");
+  ++f.presentedFrames;
+}
+
+double DestroyAhead(Fixture& f) {
+  f.stage = "destroy-ahead";
+  BindScreen(f);
+  for (UINT i = 0; i < PresentFrames; ++i) {
+    Check(f.device->Clear(0, nullptr, D3DCLEAR_TARGET, 0xff102040 + i, 1, 0), "warm-up clear");
+    DrawLifeTriangle(f); PresentLifeFrame(f);
+  }
+  DrawLifeTriangle(f);
+  const D3DRECT half{0, 0, LONG(std::max(1u, f.w / 2)), LONG(f.h)};
+  // Draw before the backlog: a synchronous draw or readback after the
+  // clears could drain it before the window thread gets to WM_DESTROY.
+  for (UINT i = 0; i < DestroyAheadClears; ++i)
+    Check(f.device->Clear(1, &half, D3DCLEAR_TARGET, 0xff304000 + i, 1, 0), "backlog ClearRegions");
+  PresentLifeFrame(f);
+  const auto returned = std::chrono::steady_clock::now();
+  f.window.destroyNow();
+  return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - returned).count();
+}
+
+void StaleViewport(Fixture& f) {
+  f.stage = "stale-viewport";
+  auto& d = *f.device.get();
+  BindScreen(f);
+  const D3DVIEWPORT9 full{0, 0, f.w, f.h, 0, 1}, probe{0, 0, 1, 1, 0, 1};
+  Com<IDirect3DStateBlock9> block;
+  Check(d.SetViewport(&full), "full viewport");
+  Check(d.BeginStateBlock(), "BeginStateBlock");
+  Check(d.SetViewport(&full), "record full viewport");
+  Check(d.EndStateBlock(block.put()), "EndStateBlock");
+  // An empty block or an Apply that ignores every viewport would also leave
+  // the resized viewport intact. Prove restoration while the old target fits.
+  Check(d.SetViewport(&probe), "probe viewport");
+  Check(block->Apply(), "Apply before resize");
+  D3DVIEWPORT9 view{};
+  Check(d.GetViewport(&view), "GetViewport before resize");
+  Require(!view.X && !view.Y && view.Width == f.w && view.Height == f.h, "state block did not restore the full viewport");
+
+  const UINT w = f.options.resizeWidth, h = f.options.resizeHeight;
+  f.window.resize(w, h); f.window.syncMessages();
+  // Apply must be the first size-dependent call: it follows the window and
+  // must keep the viewport established by ResetKeepResources.
+  Check(block->Apply(), "Apply after resize");
+  Check(d.GetViewport(&view), "GetViewport after Apply");
+  if (view.X || view.Y || view.Width != w || view.Height != h || view.MinZ != 0 || view.MaxZ != 1) {
+    std::fprintf(stderr, "GetViewport after Apply: (%lu,%lu) %lux%lu depth %g..%g, target %ux%u\n",
+      view.X, view.Y, view.Width, view.Height, view.MinZ, view.MaxZ, w, h);
+    throw std::runtime_error("stale viewport after Apply");
+  }
+  const D3DRECT rects[] = {{LONG(w / 2), 0, LONG(f.w), LONG(f.h)}, {0, 0, 1, 1}};
+  Check(d.Clear(2, rects, D3DCLEAR_TARGET, 0xff102030, 1, 0), "clipped ClearRegions after Apply");
+  Check(d.Clear(0, nullptr, D3DCLEAR_TARGET, 0xff203040, 1, 0), "full Clear after Apply");
+  for (UINT i = 0; i < 2; ++i) { DrawLifeTriangle(f); PresentLifeFrame(f); }
 }
 
 // D3D9 Reset to the second extent, in native order: refused parameters keep
@@ -844,8 +947,11 @@ void ResizeWindow(Fixture& f) {
   f.stage = "resize-window";
   f.window.resize(nextWidth, nextHeight);
   // Whatever the size messages queued on the window thread is handled by now.
-  DWORD_PTR none = 0;
-  Require(SendMessageTimeoutW(f.window.hwnd.load(), WM_NULL, 0, 0, SMTO_BLOCK, 5000, &none) != 0, "window thread round trip");
+  f.window.syncMessages();
+  // Only the plain presenter can publish without a reply. Present checks the
+  // old extent first, then follows WM_SIZE with an ordered Reset.
+  if (f.options.present && !f.readPresented)
+    Check(d.Present(nullptr, nullptr, nullptr, nullptr), "Present before window Reset");
 
   f.stage = "resize-checks";
   Require(AppSizeMessages.load() == appSizeMessages, "WM_SIZE reached the application"); ++f.resizeChecks;
@@ -906,9 +1012,24 @@ int wmain(int argc, wchar_t** argv) {
     f = new Fixture;
     f->options = ParseOptions(argc, argv);
     CreateDevice(*f); Prepare(*f);
+    if (f->options.destroyAhead || f->options.staleViewport) {
+      double destroyMs = 0;
+      if (f->options.destroyAhead) destroyMs = DestroyAhead(*f);
+      else StaleViewport(*f);
+      Teardown(*f);
+      std::printf("{\"schema\":\"warvk-d3d9-extent-fixture/v1\",\"ok\":true,\"scenario\":\"%s\",",
+        f->options.destroyAhead ? "destroy-ahead" : "stale-viewport");
+      if (f->options.destroyAhead) std::printf("\"destroyMs\":%.3f,\"backlogClears\":%u,", destroyMs, DestroyAheadClears);
+      std::printf("\"presentedFrames\":%u,\"draws\":%u,\"normalTeardown\":true}\n", f->presentedFrames, f->draws);
+      delete f; return 0;
+    }
     if (f->options.ring || f->options.depthBias) { ExerciseRing(*f); ExerciseDepthBias(*f); }
     else { Exercise(*f); ExerciseTextureAndAlpha(*f); Present(*f); }
     if (f->options.secondExtent()) {
+      // The skip case changes the HWND between two frames. Finish the last
+      // pre-resize Present before touching the HWND, including its WSI work.
+      if (f->options.present && !f->readPresented)
+        Check(f->device->GetRenderTargetData(f->back.get(), f->readback.get()), "settle Present before window resize");
       Reset(*f); ResizeWindow(*f); Prepare(*f); Exercise(*f); ExerciseTextureAndAlpha(*f); Present(*f, PresentFrames);
     }
     const auto images = f->images; const auto pixelChecks = f->pixelChecks;

@@ -1,4 +1,4 @@
-#include "../../../d3d9_war3_fog_volume.h"
+#include "../../state/war3_fog_volume.h"
 
 #include <cmath>
 #include <iostream>

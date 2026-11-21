@@ -7,6 +7,7 @@
 #include "core/war3_memory.h"
 #include "core/war3_game_structs.h"
 #include "core/war3_native_structs.h"
+#include "core/war3_execution_services.h"
 
 // Handle 模块
 #include "handle/war3_handle_resolver.h"
@@ -82,8 +83,19 @@ bool IsActiveDevice(const D3D9DeviceEx* expected);
 bool HasActivePipeline();
 bool RunWithActiveDevice(
     const std::function<void(D3D9DeviceEx&)>& transaction);
+// The same transaction through the service interface. Data-layer code uses
+// this one: a call through D3D9DeviceEx binds the caller to the concrete
+// device and to d3d9_device.cpp.
+bool RunWithActiveDeviceServices(
+    const std::function<void(IDeviceServices&)>& transaction);
 bool RunWithActiveDevicePublication(
     D3D9DeviceEx* expected, const std::function<void()>& transaction);
+// Proxy mode (platform/war3_proxy_mode.h): the device lives in the x64 host,
+// so only the service interface is published, together with a settings
+// mailbox of its own. No D3D9DeviceEx is ever active in that mode.
+void PublishProxyDeviceServices(
+    IDeviceServices* services, std::shared_ptr<War3RenderSettingsMailbox> mailbox);
+bool ClearProxyDeviceServices(IDeviceServices* services);
 void RequestActiveDeviceShadowMapResetOrCpuFallback();
 
 // 获取有生命周期约束的可写渲染设置；离开作用域时提交到下一帧安全点。

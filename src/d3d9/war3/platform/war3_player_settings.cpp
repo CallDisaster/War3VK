@@ -115,6 +115,51 @@ const Field kFields[] = {
     F("Shadows.NormalBiasScale", shadows.normalBiasScale, 0, 0.01),
     F("Shadows.FilterMode", shadows.filterMode, 0, 1),
     F("Shadows.AltitudeMode", shadows.altitudeMode, 0, 1),
+    F_BOOL("Shadows.UnitCast", casterClasses[0].castShadow),
+    F("Shadows.UnitMaxLength", casterClasses[0].maxShadowLength, 0, 8),
+    F_BOOL("Shadows.BuildingCast", casterClasses[1].castShadow),
+    F("Shadows.BuildingMaxLength", casterClasses[1].maxShadowLength, 0, 8),
+    F_BOOL("Shadows.DoodadCast", casterClasses[2].castShadow),
+    F("Shadows.DoodadMaxLength", casterClasses[2].maxShadowLength, 0, 8),
+    F_BOOL("Shadows.DestructibleCast", casterClasses[3].castShadow),
+    F("Shadows.DestructibleMaxLength", casterClasses[3].maxShadowLength, 0, 8),
+    F_BOOL("Shadows.OtherCast", casterClasses[4].castShadow),
+    F("Shadows.OtherMaxLength", casterClasses[4].maxShadowLength, 0, 8),
+    // 太阳圆盘：真实阴影长度、光色曲线（00:00 月光、06:00 日出、09:00 上午、
+    // 12:00 正午、15:00 下午、18:00 日落）
+    F_BOOL("Sun.RealShadowLength", sunStyle.realShadowLength),
+    F("Sun.NoonAltitude", sunStyle.noonAltitudeDeg, 10, 90),
+    F_BOOL("Sun.CustomTint", sunStyle.customTint),
+    F_BOOL("Sun.PathSet", sunStyle.pathSet),
+    F("Sun.PathNorth", sunStyle.pathNorth, -1, 1),
+#define WARVK_SUN_KEY(name, index) \
+    F("Sun." name "R", sunStyle.tint[index].r, 0, 1), \
+    F("Sun." name "G", sunStyle.tint[index].g, 0, 1), \
+    F("Sun." name "B", sunStyle.tint[index].b, 0, 1), \
+    F("Sun." name "Brightness", sunStyle.tint[index].intensity, 0, 3)
+    WARVK_SUN_KEY("Moon", 0),
+    WARVK_SUN_KEY("Sunrise", 1),
+    WARVK_SUN_KEY("Morning", 2),
+    WARVK_SUN_KEY("Noon", 3),
+    WARVK_SUN_KEY("Afternoon", 4),
+    WARVK_SUN_KEY("Sunset", 5),
+#undef WARVK_SUN_KEY
+    // 水面：水下阴影随水深淡出、水面自己的阴影、反射与高光（x64 渲染）
+    F("Water.ShadowFadeStart", water.shadowFadeStart, 0, 512),
+    F("Water.ShadowFadeEnd", water.shadowFadeEnd, 1, 1024),
+    F("Water.SurfaceShadow", water.surfaceShadow, 0, 1),
+    F_BOOL("Water.Surface", water.surfaceEnabled),
+    F("Water.Reflection", water.reflection, 0, 1),
+    F("Water.Specular", water.specular, 0, 2),
+    F("Water.WaveScale", water.waveScale, 0, 2),
+    F("Water.WaveSpeed", water.waveSpeed, 0, 3),
+    F("Water.Clarity", water.clarity, 0, 1),
+    F("Water.InPlace", water.inPlace, 0, 2),
+    F("Water.Style", water.style, 0, 1),
+    F("Water.DepthColor", water.depthColor, 0, 2),
+    F("Water.Foam", water.foam, 0, 2),
+    F("Water.Refraction", water.refraction, 0, 2),
+    F("Water.Caustics", water.caustics, 0, 2),
     F("Shadows.LengthScale", shadows.shadowLengthScale, 0.6, 1.2),
     F("Shadows.MaxLengthScale", shadows.shadowMaxLengthScale, 0.5, 1.2),
     F("Shadows.NightScale", shadows.nightShadowScale, 0, 1),
@@ -235,6 +280,7 @@ const Field kFields[] = {
 #undef WARVK_PLAYER_FIELD_IMPL
 
 constexpr const char* kFpsUnlockedKey = "General.FpsUnlocked";
+constexpr const char* kBlockNativeStaticShadowsKey = "Shadows.BlockNativeStatic";
 constexpr const char* kNativeShadowModeKey = "Shadows.NativeMode";
 constexpr const char* kTaaModeKey = "Shadows.TaaMode";
 constexpr const char* kSectionName = "PlayerSettings";
@@ -253,7 +299,8 @@ const Field* FindField(const std::string& key) {
 }
 
 bool IsExtraKey(const std::string& key) {
-  return key == kFpsUnlockedKey || key == kNativeShadowModeKey;
+  return key == kFpsUnlockedKey || key == kNativeShadowModeKey ||
+         key == kBlockNativeStaticShadowsKey;
 }
 
 double ReadNumber(const Field& field, const War3RenderSettings& settings) {
@@ -432,6 +479,8 @@ std::string FormatFieldValue(const Field& field, const War3RenderSettings& setti
 }
 
 bool ParseExtra(const std::string& key, const std::string& text, Extras& extras) {
+  if (key == kBlockNativeStaticShadowsKey)
+    return ParseBool(text, extras.blockNativeStaticShadows);
   if (key == kFpsUnlockedKey) {
     bool value = false;
     if (!ParseBool(text, value))
@@ -582,6 +631,10 @@ size_t RecordExtraChanges(const Extras& before, const Extras& after,
     overrides[kFpsUnlockedKey] = after.fpsUnlocked ? "1" : "0";
     ++written;
   }
+  if (before.blockNativeStaticShadows != after.blockNativeStaticShadows) {
+    overrides[kBlockNativeStaticShadowsKey] = after.blockNativeStaticShadows ? "1" : "0";
+    ++written;
+  }
   if (before.nativeShadowMode != after.nativeShadowMode) {
     overrides[kNativeShadowModeKey] =
         std::to_string((std::min)(after.nativeShadowMode, 2u));
@@ -607,6 +660,9 @@ void RestoreBaseline(Overrides& overrides,
     } else if (key == kFpsUnlockedKey) {
       extras.fpsUnlocked = baselineExtras.fpsUnlocked;
       it = overrides.erase(it);
+    } else if (key == kBlockNativeStaticShadowsKey) {
+      extras.blockNativeStaticShadows = baselineExtras.blockNativeStaticShadows;
+      it = overrides.erase(it);
     } else if (key == kNativeShadowModeKey) {
       extras.nativeShadowMode = baselineExtras.nativeShadowMode;
       it = overrides.erase(it);
@@ -621,7 +677,7 @@ bool IsKnownKey(const std::string& key) {
   return FindField(key) != nullptr || IsExtraKey(key);
 }
 
-size_t KnownKeyCount() { return std::size(kFields) + 2u; }
+size_t KnownKeyCount() { return std::size(kFields) + 3u; }
 
 std::vector<std::string> KnownKeys() {
   std::vector<std::string> keys;
@@ -630,6 +686,7 @@ std::vector<std::string> KnownKeys() {
     keys.emplace_back(field.key);
   keys.emplace_back(kFpsUnlockedKey);
   keys.emplace_back(kNativeShadowModeKey);
+  keys.emplace_back(kBlockNativeStaticShadowsKey);
   return keys;
 }
 
@@ -840,6 +897,20 @@ std::wstring DefaultSettingsPath() {
       directory = exe.substr(0, slash);
   }
   return directory + L"\\WarVK\\settings.ini";
+}
+
+bool BlockNativeStaticShadowsAtStartup() {
+  static const bool block = [] {
+    auto& state = State();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    LoadLocked(state);
+    const auto it = state.overrides.find(kBlockNativeStaticShadowsKey);
+    Extras extras;
+    if (it != state.overrides.end())
+      ParseExtra(it->first, it->second, extras);
+    return extras.blockNativeStaticShadows;
+  }();
+  return block;
 }
 
 ApplyReport ApplyAtStartup(War3RenderSettings& settings, Extras& extras) {

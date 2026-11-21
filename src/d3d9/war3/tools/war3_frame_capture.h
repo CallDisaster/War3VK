@@ -5,6 +5,7 @@
 #include <string>
 
 struct IDirect3DDevice9;
+struct IDirect3DSurface9;
 
 namespace dxvk {
 class D3D9DeviceEx;
@@ -100,6 +101,12 @@ bool HasPendingFrameCaptureRequest();
 
 // Public D3D9 interface only, no link edge into the device class (S2 cut).
 bool ProcessPendingFrameCapture(IDirect3DDevice9* device, D3D9Surface* sourceSurface,
+                                War3FrameCaptureResult* outResult = nullptr);
+
+// Proxy mode: the same request served from the back buffer of a device that
+// is not ours (the D3D9 front end). Only GetDesc, CreateOffscreenPlainSurface,
+// GetRenderTargetData and LockRect are called on it.
+bool ProcessPendingFrameCapture(IDirect3DDevice9* device, IDirect3DSurface9* backBuffer,
                                 War3FrameCaptureResult* outResult = nullptr);
 
 } // namespace dxvk::war3::tools

@@ -1,6 +1,5 @@
 #include "war3_internal_test_api.h"
 #include "war3_async_screenshot.h"
-#include "../../d3d9_window.h"
 #include "war3_frame_history.h"
 #include "../hooks/war3_native_capture.h"
 
@@ -14,8 +13,14 @@
 #include "../core/war3_internal_test_config.h"
 #include "../game/war3_unit_animation_api.h"
 #include "../hooks/war3_jass_command_bridge.h"
+#include "../platform/war3_proxy_mode.h"
+#include "../platform/war3_proxy_overlay.h"
+#include "../ui/war3_imgui.h"
+#include "../render/war3_render_objects.h"
 #include "../render/war3_render_state.h"
+#include "../platform/war3_proxy_status.h"
 #include "../shader/war3_shader_manager.h"
+#include "../state/war3_fog_volume.h"
 #include "../war3.h"
 #include "war3_diagnostics_hub.h"
 
@@ -32,6 +37,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <vector>
 
 namespace dxvk::war3::tools {
 
@@ -151,6 +157,166 @@ void SetResult(std::shared_ptr<PendingInternalTestRequest>& state,
     state->done = true;
   }
   state->cv.notify_all();
+}
+
+// outline.pick / outline.clear / outline.status: development probes that
+// register one object for the outline exactly as a map's JASS does through
+// AddOutlineHandle, so both modes can be compared at the same camera. The
+// outline settings they touch are restored by outline.clear.
+struct OutlinePickState {
+  bool settingsCaptured = false;
+  dxvk::War3OccludedOutlineSettings settingsBefore = {};
+  // The scene collector registers only tracked handles (outline/bloom) unless
+  // every object is tracked: the first pick turns the all-objects tracking on
+  // so the registry has candidates on the next frames; the pick that then
+  // succeeds (or outline.clear) puts it back.
+  bool trackingArmed = false;
+  bool allObjectsBefore = false;
+};
+
+OutlinePickState s_outlinePick;
+
+void RestoreOutlineTracking() {
+  if (!s_outlinePick.trackingArmed)
+    return;
+  dxvk::War3RenderState::SetOutlineDebugAllObjectsEnabled(s_outlinePick.allObjectsBefore);
+  s_outlinePick.trackingArmed = false;
+}
+
+std::string FourCcText(uint32_t code) {
+  std::string text;
+  for (int shift = 24; shift >= 0; shift -= 8) {
+    const char c = char((code >> shift) & 0xFFu);
+    if (c < 0x20 || c > 0x7E)
+      return std::to_string(code);
+    text.push_back(c);
+  }
+  return text;
+}
+
+json OutlineSettingsJson(const dxvk::War3OccludedOutlineSettings& s) {
+  return json{{"enabled", s.enabled}, {"mode", uint32_t(s.mode)},
+              {"useScreenSpace", s.useScreenSpace}, {"widthPx", s.widthPx},
+              {"showVisible", s.showVisible}, {"showOccluded", s.showOccluded},
+              {"color", {s.colorR, s.colorG, s.colorB, s.colorA}}};
+}
+
+void OutlineCommand(const std::string& command, const json& payload,
+                    json& response, War3InternalTestResult& result) {
+  using dxvk::War3RenderState;
+  namespace render = dxvk::war3::render;
+  auto settings = dxvk::war3::GetMutableSettings();
+  if (command == "outline.clear") {
+    RestoreOutlineTracking();
+    War3RenderState::ClearOutlineHandles();
+    if (s_outlinePick.settingsCaptured && settings != nullptr)
+      settings->occludedOutline = s_outlinePick.settingsBefore;
+    s_outlinePick = {};
+  } else if (command == "outline.pick" && payload.value("rangeCount", 0u) != 0u) {
+    // A contiguous window of JASS handles, one AddOutlineHandle each as a
+    // map's script registers them: the same set in both modes, without the
+    // render object registry (which the product may leave empty).
+    const uint32_t lo = payload.value("rangeLo", 0x100000u);
+    const uint32_t count = std::min(payload.value("rangeCount", 0u), 1024u);
+    if (settings != nullptr && !s_outlinePick.settingsCaptured) {
+      s_outlinePick.settingsBefore = settings->occludedOutline;
+      s_outlinePick.settingsCaptured = true;
+    }
+    for (uint32_t i = 0; i < count; ++i)
+      War3RenderState::AddOutlineHandle(lo + i);
+    if (settings != nullptr) {
+      auto& outline = settings->occludedOutline;
+      outline.enabled = true;
+      outline.showVisible = payload.value("showVisible", outline.showVisible);
+      outline.showOccluded = payload.value("showOccluded", outline.showOccluded);
+      outline.widthPx = std::clamp(payload.value("widthPx", outline.widthPx), 1.0f, 16.0f);
+    }
+    response["rangeLo"] = lo;
+    response["rangeCount"] = count;
+    result.ok = settings != nullptr && War3RenderState::GetOutlineHandleCount() >= count;
+    if (!result.ok)
+      result.error = "outline handle range registration failed";
+  } else if (command == "outline.pick") {
+    const std::string kind = payload.value("kind", std::string("building"));
+    const uint32_t index = payload.value("index", 0u);
+    uint32_t handle = payload.value("handle", 0u);
+    std::vector<uint32_t> rawcodes;
+    if (payload.contains("rawcodes") && payload["rawcodes"].is_array()) {
+      for (const auto& value : payload["rawcodes"]) {
+        const std::string text = value.is_string() ? value.get<std::string>() : std::string();
+        if (text.size() == 4u)
+          rawcodes.push_back(uint32_t(uint8_t(text[0])) << 24 | uint32_t(uint8_t(text[1])) << 16 |
+                             uint32_t(uint8_t(text[2])) << 8 | uint32_t(uint8_t(text[3])));
+      }
+    }
+    const auto wanted = [&](const render::RenderObjectInfo& info) {
+      if (info.jHandle == 0u)
+        return false;
+      if (!rawcodes.empty() &&
+          std::find(rawcodes.begin(), rawcodes.end(), info.rawcode) == rawcodes.end())
+        return false;
+      return kind == "any" ||
+             (kind == "unit" && info.kind == render::ObjectKind::Unit) ||
+             (kind == "building" && info.kind == render::ObjectKind::Building) ||
+             (kind == "destructible" && info.kind == render::ObjectKind::Destructible);
+    };
+    const auto objects = render::RenderObjectRegistry::instance().getAllObjects();
+    std::vector<render::RenderObjectInfo> candidates;
+    for (const auto& info : objects) {
+      if (wanted(info) && std::none_of(candidates.begin(), candidates.end(),
+                                       [&](const auto& c) { return c.jHandle == info.jHandle; }))
+        candidates.push_back(info);
+    }
+    std::sort(candidates.begin(), candidates.end(),
+              [](const auto& a, const auto& b) { return a.jHandle < b.jHandle; });
+    response["registryObjects"] = objects.size();
+    response["candidateCount"] = candidates.size();
+    json listed = json::array();
+    for (size_t i = 0; i < candidates.size() && i < 24u; ++i)
+      listed.push_back({{"handle", candidates[i].jHandle}, {"rawcode", FourCcText(candidates[i].rawcode)},
+                        {"kind", render::ObjectKindToString(candidates[i].kind)}});
+    response["candidates"] = listed;
+    if (handle == 0u) {
+      if (index >= candidates.size()) {
+        if (!s_outlinePick.trackingArmed) {
+          s_outlinePick.allObjectsBefore = War3RenderState::IsOutlineDebugAllObjectsEnabled();
+          War3RenderState::SetOutlineDebugAllObjectsEnabled(true);
+          s_outlinePick.trackingArmed = true;
+        }
+        response["trackingArmed"] = true;
+        result.ok = false;
+        result.error = "no outline candidate yet; object tracking armed, retry";
+        return;
+      }
+      handle = candidates[index].jHandle;
+      response["rawcode"] = FourCcText(candidates[index].rawcode);
+      response["kind"] = render::ObjectKindToString(candidates[index].kind);
+    }
+    if (settings != nullptr && !s_outlinePick.settingsCaptured) {
+      s_outlinePick.settingsBefore = settings->occludedOutline;
+      s_outlinePick.settingsCaptured = true;
+    }
+    War3RenderState::AddOutlineHandle(handle);
+    RestoreOutlineTracking();
+    if (settings != nullptr) {
+      auto& outline = settings->occludedOutline;
+      outline.enabled = true;
+      outline.showVisible = payload.value("showVisible", outline.showVisible);
+      outline.showOccluded = payload.value("showOccluded", outline.showOccluded);
+      outline.widthPx = std::clamp(payload.value("widthPx", outline.widthPx), 1.0f, 16.0f);
+    }
+    response["picked"] = handle;
+    result.ok = settings != nullptr && War3RenderState::IsOutlineHandle(handle);
+    if (!result.ok)
+      result.error = "outline handle registration failed";
+  }
+  if (command != "outline.pick")
+    result.ok = true;
+  response["handleCount"] = War3RenderState::GetOutlineHandleCount();
+  if (settings != nullptr)
+    response["settings"] = OutlineSettingsJson(settings->occludedOutline);
+  // Proxy mode: the casters' handle and outline-match account (null in process).
+  response["proxyMode"] = dxvk::war3::proxy::StatusJson();
 }
 
 } // namespace
@@ -292,7 +458,7 @@ bool ProcessPendingInternalTestRequest(uint64_t frameIndex,
   json response = json::object();
   if (state->request.command == "weather-status" ||
       state->request.command == "weather.status") {
-    const auto draw = QueryWar3WeatherDiagnostics();
+    const auto draw = ProcessServices().QueryWar3WeatherDiagnostics();
     const auto weather = render::WeatherRuntime::instance().snapshot(
         frameIndex, draw.mapEpoch, draw.deviceEpoch);
     response["runtime"] = {{"id", weather.id}, {"enabled", weather.enabled},
@@ -331,14 +497,15 @@ bool ProcessPendingInternalTestRequest(uint64_t frameIndex,
                     {"windSpeed", frozen.params.windSpeed},
                     {"gust", frozen.params.gust},
                     {"haze", frozen.params.haze}, {"lowSnow", frozen.params.lowSnow}}}};
-    const auto volume = QueryWar3WeatherVolumeDiagnostics();
+    const auto volume = ProcessServices().QueryWar3WeatherVolumeDiagnostics();
     response["volumetric"] = {{"compositeSubmitted", volume.compositeSubmitted},
         {"stage", volume.stage}, {"frameSerial", volume.frameSerial},
         {"mapEpoch", volume.mapEpoch}, {"deviceEpoch", volume.deviceEpoch},
         {"resourceBytes", volume.resourceBytes},
         {"width", volume.width}, {"height", volume.height},
         {"admittedShaderWork", volume.admittedShaderWork}};
-    const auto ordinary = QueryWar3VolumetricExecutionDiagnostics();
+    const auto ordinary =
+        ProcessServices().QueryWar3VolumetricExecutionDiagnostics();
     response["ordinaryVolumetric"] = {
         {"frameSerial", ordinary.frameSerial}, {"mapEpoch", ordinary.mapEpoch},
         {"deviceEpoch", ordinary.deviceEpoch}, {"compositeSubmitted", ordinary.compositeSubmitted},
@@ -380,7 +547,7 @@ bool ProcessPendingInternalTestRequest(uint64_t frameIndex,
     response["frequency"] = s.frequency;
     result.ok = true;
   } else if (state->request.command == "frame_history.test_shortcut") {
-    result.ok=::dxvk::TestFrameHistoryWindowShortcut();
+    result.ok=ProcessServices().TestFrameHistoryWindowShortcut();
     response["route"]="installed-window-proc-private-test-message";
     const auto recorder=QueryFrameHistoryHud();
     response["notice"]=recorder.notice;
@@ -391,6 +558,52 @@ bool ProcessPendingInternalTestRequest(uint64_t frameIndex,
     response["recorderError"]=recorder.error;
     response["globalInputUsed"]=false;
     if(!result.ok)result.error="installed window route unavailable";
+  } else if (state->request.command == "ui.panel_open" ||
+             state->request.command == "ui.panel_close") {
+    // The settings panel (Ctrl+F1). Proxy mode: a private message through the
+    // overlay's window subclass, which opens it at the next Present. In
+    // process: the panel's own toggle on this (the game's window) thread.
+    const bool open = state->request.command == "ui.panel_open";
+    auto& panel = War3Imgui::get();
+    if (proxy::Requested()) {
+      result.ok = proxy::RoutePanelRequest(open);
+      response["route"] = "installed-window-proc-private-test-message";
+      if (!result.ok) result.error = "overlay window route unavailable";
+    } else {
+      result.ok = panel.isInitialized();
+      if (result.ok && panel.isVisible() != open) panel.toggleVisible();
+      response["route"] = "in-process-owner-thread-toggle";
+      if (!result.ok) result.error = "in-process panel not initialized";
+    }
+    response["requested"] = open ? "open" : "close";
+    response["globalInputUsed"] = false;
+  } else if (state->request.command == "ui.panel_status") {
+    const auto panel = War3Imgui::get().status();
+    response["mode"] = proxy::Requested() ? "proxy" : "in-process";
+    response["initialized"] = panel.initialized;
+    response["visible"] = panel.visible;
+    response["proxyPanel"] = panel.proxy;
+    response["framesDrawn"] = panel.framesDrawn;
+    response["framesSkipped"] = panel.framesSkipped;
+    response["textureFailures"] = panel.textureFailures;
+    response["lastCommands"] = panel.lastCommands;
+    response["lastVertices"] = panel.lastVertices;
+    response["atlasWidth"] = panel.atlasWidth;
+    response["atlasHeight"] = panel.atlasHeight;
+    response["wantCaptureMouse"] = panel.wantCaptureMouse;
+    response["wantCaptureKeyboard"] = panel.wantCaptureKeyboard;
+    if (proxy::Requested()) {
+      const auto overlay = proxy::QueryOverlayStatus();
+      response["overlay"] = {{"available", overlay.available}, {"wantOpen", overlay.wantOpen},
+          {"routedRequests", overlay.routedRequests}, {"toggles", overlay.toggles},
+          {"swallowedInput", overlay.swallowedInput}, {"opens", overlay.opens},
+          {"closes", overlay.closes}, {"presentsDrawn", overlay.presentsDrawn},
+          {"resourcesCreated", overlay.resourcesCreated},
+          {"resourceFailures", overlay.resourceFailures},
+          {"lastResourceResult", overlay.lastResourceResult},
+          {"privateBytes", overlay.privateBytes}, {"virtualUsed", overlay.virtualUsed}};
+    }
+    result.ok = true;
   } else if (state->request.command == "screenshot.flicker_burst") {
     result.ok = ::dxvk::war3::tools::ArmAsyncScreenshotBurstForTest();
     if (!result.ok) result.error = "burst requires owner/gate and all three free slots";
@@ -861,6 +1074,10 @@ bool ProcessPendingInternalTestRequest(uint64_t frameIndex,
         static_cast<unsigned long long>(frameIndex));
     if (!applied)
       result.error = "GPU skin outline test mode actuation failed";
+  } else if (state->request.command == "outline.pick" ||
+             state->request.command == "outline.clear" ||
+             state->request.command == "outline.status") {
+    OutlineCommand(state->request.command, payload, response, result);
   } else if (state->request.command == "unit.walk.snapshot") {
     const auto diag = game::QueryUnitWalkDiagnostics();
     response["evidenceKind"] = "bounded-cpu-hook-counters-not-animation-visual-proof";
@@ -924,7 +1141,8 @@ bool ProcessPendingInternalTestRequest(uint64_t frameIndex,
       response["heightFog"] = {vol.heightFogBase, vol.heightFogFalloff, vol.heightFogStrength};
       response["fogCount"] = War3FogVolumeManager::Instance().GetVolumeCount();
       response["fogGeneration"] = War3FogVolumeManager::Instance().GetGeneration();
-      const auto execution = QueryWar3VolumetricExecutionDiagnostics();
+      const auto execution =
+          ProcessServices().QueryWar3VolumetricExecutionDiagnostics();
       response["execution"] = {
           {"frameSerial", execution.frameSerial}, {"mapEpoch", execution.mapEpoch},
           {"deviceEpoch", execution.deviceEpoch}, {"requestedBackend", execution.requestedBackend},
@@ -970,8 +1188,9 @@ bool ProcessPendingInternalTestRequest(uint64_t frameIndex,
     ::dxvk::Logger::info(snapshotMarker);
     bool quiescent = false;
     bool logged = false;
-    const bool activeDeviceAvailable = dxvk::war3::RunWithActiveDevice(
-        [&](D3D9DeviceEx& device) {
+    const bool activeDeviceAvailable =
+        dxvk::war3::RunWithActiveDeviceServices(
+        [&](IDeviceServices& device) {
           logged = device.War3LogGpuSkinDiagnosticsForTest(
               requireQuiescent, &quiescent);
         });
@@ -1005,7 +1224,7 @@ bool ProcessPendingInternalTestRequest(uint64_t frameIndex,
     uint64_t shadowMapResetRequestedBefore = 0u;
     uint64_t shadowMapResetRequestedAfter = 0u;
     const bool activeDeviceAvailable = validScope &&
-        dxvk::war3::RunWithActiveDevice([&](D3D9DeviceEx& device) {
+        dxvk::war3::RunWithActiveDeviceServices([&](IDeviceServices& device) {
           shadowMapResetRequestedBefore =
               device.QueryWar3ShadowLifecycleDiagnostics()
                   .requestedResetSerial;
@@ -1061,6 +1280,15 @@ bool ProcessPendingInternalTestRequest(uint64_t frameIndex,
     }
     response["stockEndGameInvoked"] = result.ok;
     response["processExitProven"] = false;
+  } else if (state->request.command == "game.restart_for_map_test") {
+    // The same opt-in as the exit test: the stock RestartGame unloads the map
+    // and loads it again, which is the map transition the tests need.
+    if (env::getEnvVar("DXVK_WAR3_INTERNAL_EXIT_TEST") != "1") {
+      result.error = "native exit test not enabled";
+    } else {
+      result.ok = hooks::RestartJassGameForMapTest(result.error);
+    }
+    response["stockRestartGameInvoked"] = result.ok;
   } else if (state->request.command == "shutdown.session") {
     response["accepted"] = true;
     response["softOnly"] = true;

@@ -36,7 +36,11 @@ class RenderStatsPanelContract(unittest.TestCase):
             self.assertNotIn(forbidden, self.panel)
 
     def test_all_reads_inside_throttle(self):
-        reads = body(self.panel, "if (m_renderStatsRefresh.due(GetTickCount64()))")
+        # Proxy mode returns before these reads (its statistics are the host's).
+        self.assertEqual(self.panel.count("m_renderStatsRefresh.due("), 1)
+        self.assertIn("const bool statsDue = m_renderStatsRefresh.due(statsNow);", self.panel)
+        self.assertLess(self.panel.index("if (m_proxy) {"), self.panel.index("if (statsDue) {\n    samples.producer"))
+        reads = body(self.panel, "if (statsDue) {\n    samples.producer")
         for query in ("QueryShadowProducerRuntimeDiagnostics()", "ShadowArena_QueryMemoryStats()",
                       "QueryShadowReplayDiagnostics()", "QueryCsmResolutionDiagnostics()",
                       "QueryShadowDisplayStats()",

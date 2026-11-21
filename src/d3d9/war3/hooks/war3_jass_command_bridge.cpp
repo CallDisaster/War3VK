@@ -1952,6 +1952,16 @@ bool EndJassGameForExitTest(std::string& error) {
   return true;
 }
 
+bool RestartJassGameForMapTest(std::string& error) {
+  void* function = nullptr;
+  std::string signature;
+  if (!ResolveNativeStrict("RestartGame", "(B)V", 1u, function, signature, error))
+    return false;
+  // One cdecl boolean, as EndGame: no score screen.
+  reinterpret_cast<NativeVoidBooleanFn>(function)(0u);
+  return true;
+}
+
 JassCameraFieldTestResult SetJassCameraAngleOfAttackForTest(
     float angleDegrees) {
   JassCameraFieldTestResult result = {};

@@ -416,6 +416,11 @@ struct RuntimeParentLinkQueryResult {
 // sprite/pose/local-point 这类高侵入 hook 提前到 runtime 激活之前。
 void Init(uintptr_t gameBase, bool bootstrapOnly = false);
 
+// An automatically found proxy could not start and the process continues in
+// process: the palette tables proxy mode skipped are needed after all. Call
+// before any device exists.
+void AllocateProducerPaletteTables();
+
 // 清理只属于当前地图的 producer/cache 状态。Hook 仍保持安装和激活；
 // 地图切换不能把已安装的 MinHook 伪装成已卸载。
 void ResetMapSession();

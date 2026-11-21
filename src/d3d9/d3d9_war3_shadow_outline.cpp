@@ -142,6 +142,7 @@ VkPipeline War3ShadowReceiverPass::getOrCreateUnitOutlinePipeline(
     attributes[attributeCount++] = {
         3u, key.uvBinding, key.uvFormat, key.uvOffset};
   }
+  War3AliasUnusedShadowCasterInputs(attributes, attributeCount);
 
   VkPipelineVertexInputStateCreateInfo viState = {
       VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
@@ -597,14 +598,18 @@ void War3ShadowReceiverPass::renderUnitOutlineScreenSpace(
         strides[1] = draw.uvStride;
       }
 
-      ctx->cmdBindVertexBuffers(0, vbCount, vbs, offsets, sizes, strides);
+      // The strides are the pipeline's own: its key takes them from this draw.
+      // Naming them again here is a dynamic-state command, allowed only with a
+      // dynamic-stride pipeline, which this one is not
+      // (VUID-vkCmdDrawIndexed-None-08608).
+      (void)strides;
+      ctx->cmdBindVertexBuffers(0, vbCount, vbs, offsets, sizes, nullptr);
       if (key.alphaTestEnabled && draw.uvBinding == 2u) {
         const VkBuffer uvBuffer = draw.uvInfo.buffer;
         const VkDeviceSize uvOffset = draw.uvInfo.offset;
         const VkDeviceSize uvSize = draw.uvInfo.size;
-        const VkDeviceSize uvStride = draw.uvStride;
         ctx->cmdBindVertexBuffers(2u, 1u, &uvBuffer, &uvOffset, &uvSize,
-                                  &uvStride);
+                                  nullptr);
       }
 
       // [FIX] Restore batchHandle to TLS so D3D9Device::OnDraw can identify the
@@ -698,7 +703,14 @@ void War3ShadowReceiverPass::renderUnitOutlineScreenSpace(
   VkRenderingAttachmentInfo colorAtt = {
       VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
   colorAtt.imageView = colorView->handle();
-  colorAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  // The layout the scene colour is in: the attachment layout in the x86
+  // device, GENERAL where the frame's target is kept in GENERAL (the x64
+  // render host). Rendering names it, it does not assume it.
+  colorAtt.imageLayout =
+      colorView->image()->queryLayout(colorView->imageSubresources()) ==
+              VK_IMAGE_LAYOUT_GENERAL
+          ? VK_IMAGE_LAYOUT_GENERAL
+          : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
   colorAtt.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
   colorAtt.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
 
@@ -876,14 +888,25 @@ void War3ShadowReceiverPass::renderUnitOutline(const Rc<DxvkCommandList> &ctx,
   VkRenderingAttachmentInfo colorAtt = {
       VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
   colorAtt.imageView = colorView->handle();
-  colorAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  // The layouts the scene colour and depth are in: GENERAL where the frame's
+  // targets are kept in GENERAL (the x64 render host), the attachment layouts
+  // otherwise. Rendering names them, it does not assume them.
+  colorAtt.imageLayout =
+      colorView->image()->queryLayout(colorView->imageSubresources()) ==
+              VK_IMAGE_LAYOUT_GENERAL
+          ? VK_IMAGE_LAYOUT_GENERAL
+          : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
   colorAtt.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; // 保留现有颜色
   colorAtt.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
 
   VkRenderingAttachmentInfo depthAtt = {
       VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
   depthAtt.imageView = depthView->handle();
-  depthAtt.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+  depthAtt.imageLayout =
+      depthView->image()->queryLayout(depthView->imageSubresources()) ==
+              VK_IMAGE_LAYOUT_GENERAL
+          ? VK_IMAGE_LAYOUT_GENERAL
+          : VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
   depthAtt.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;   // 使用现有深度（只读）
   depthAtt.storeOp = VK_ATTACHMENT_STORE_OP_NONE; // 不写入深度
 
@@ -1056,14 +1079,18 @@ void War3ShadowReceiverPass::renderUnitOutline(const Rc<DxvkCommandList> &ctx,
       strides[1] = draw.uvStride;
     }
 
-    ctx->cmdBindVertexBuffers(0, vbCount, vbs, offsets, sizes, strides);
+    // The strides are the pipeline's own: its key takes them from this draw.
+    // Naming them again here is a dynamic-state command, allowed only with a
+    // dynamic-stride pipeline, which this one is not
+    // (VUID-vkCmdDrawIndexed-None-08608).
+    (void)strides;
+    ctx->cmdBindVertexBuffers(0, vbCount, vbs, offsets, sizes, nullptr);
     if (key.alphaTestEnabled && draw.uvBinding == 2u) {
       const VkBuffer uvBuffer = draw.uvInfo.buffer;
       const VkDeviceSize uvOffset = draw.uvInfo.offset;
       const VkDeviceSize uvSize = draw.uvInfo.size;
-      const VkDeviceSize uvStride = draw.uvStride;
       ctx->cmdBindVertexBuffers(2u, 1u, &uvBuffer, &uvOffset, &uvSize,
-                                &uvStride);
+                                nullptr);
     }
 
     // 绘制

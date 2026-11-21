@@ -16,6 +16,7 @@ LogonSecurity::LogonSecurity(SecurityObject object) {
     case SecurityObject::Pipe: rights = L"0x0012019B"; break; // excludes create-instance
     case SecurityObject::Mapping: rights = L"0x00020006"; break; // read/write + READ_CONTROL
     case SecurityObject::Mutex: rights = L"0x00120001"; break; // synchronize/modify + READ_CONTROL
+    case SecurityObject::Event: rights = L"0x00120002"; break; // synchronize/modify + READ_CONTROL
   }
   if (!rights)
     throw Failure(Fault::System, Stage::Setup, ERROR_INVALID_PARAMETER);

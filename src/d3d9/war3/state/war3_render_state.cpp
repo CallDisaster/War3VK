@@ -1,5 +1,7 @@
 #include "war3_render_state.h"
 
+#include <windows.h>
+
 namespace dxvk::war3::state {
 
 RenderState& RenderState::instance() {
@@ -9,6 +11,40 @@ RenderState& RenderState::instance() {
 
 void RenderState::beginFrame() {
     m_frameIndex.fetch_add(1, std::memory_order_relaxed);
+    // Frame pace: one caller (the thread that presents), so plain members hold
+    // the clock; the counters are atomic for the control plane's reads.
+    LARGE_INTEGER now = {};
+    if (!m_paceFrequency) {
+        LARGE_INTEGER frequency = {};
+        QueryPerformanceFrequency(&frequency);
+        m_paceFrequency = frequency.QuadPart;
+    }
+    if (m_paceFrequency <= 0 || !QueryPerformanceCounter(&now))
+        return;
+    const int64_t last = m_paceLast;
+    m_paceLast = now.QuadPart;
+    if (last <= 0 || now.QuadPart <= last)
+        return;
+    const uint64_t us = uint64_t(now.QuadPart - last) * 1000000u / uint64_t(m_paceFrequency);
+    const uint64_t bucket = us / PaceBucketUs;
+    if (bucket < PaceBuckets) {
+        m_paceBuckets[bucket].fetch_add(1, std::memory_order_relaxed);
+    } else {
+        m_paceOver.fetch_add(1, std::memory_order_relaxed);
+        m_paceOverUs.fetch_add(us, std::memory_order_relaxed);
+    }
+    if (us > m_paceMaxUs.load(std::memory_order_relaxed))
+        m_paceMaxUs.store(us, std::memory_order_relaxed);
+    m_paceFrames.fetch_add(1, std::memory_order_relaxed);
+}
+
+void RenderState::readFramePace(FramePace& pace) const {
+    pace.frames = m_paceFrames.load(std::memory_order_relaxed);
+    pace.over = m_paceOver.load(std::memory_order_relaxed);
+    pace.overUs = m_paceOverUs.load(std::memory_order_relaxed);
+    pace.maxUs = m_paceMaxUs.load(std::memory_order_relaxed);
+    for (uint32_t i = 0; i < PaceBuckets; ++i)
+        pace.buckets[i] = m_paceBuckets[i].load(std::memory_order_relaxed);
 }
 
 void RenderState::endFrame() {

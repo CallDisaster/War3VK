@@ -147,7 +147,10 @@ class DeviceOwnedLifetimeContract(unittest.TestCase):
         device = no_comments(source("src/d3d9/d3d9_device.cpp"))
         queue = no_comments(source("src/d3d9/war3/reimpl/war3_render_queue.h"))
         self.assertIn("std::unique_ptr<war3::reimpl::War3InstanceBuffer> m_war3InstanceBuffer", device_header)
-        self.assertIn("device ? device->GetWar3InstanceBuffer() : nullptr", instance)
+        # Phase 3: reached through war3::IDeviceServices (D3D9DeviceEx is final,
+        # a call through the concrete type would link the device object).
+        self.assertIn("if (!device)\n    return nullptr;\n  IDeviceServices &services = *device;\n"
+                      "  return services.GetWar3InstanceBuffer();", instance)
         self.assertNotIn("static War3InstanceBuffer s_buffer", instance)
         self.assertNotIn("GetInstBufPtr", queue)
         self.assertNotIn("s_activeLockedPtr", header + instance)
@@ -155,7 +158,8 @@ class DeviceOwnedLifetimeContract(unittest.TestCase):
         self.assertIn("Com<D3D9VertexBuffer, false> m_buffer", header)
         self.assertIn("Com<D3D9VertexDecl, false> original", header)
         self.assertIn("Com<D3D9VertexDecl, false> instanced", header)
-        self.assertIn("s_activeBuffer->m_device == device", instance)
+        self.assertIn("const IDirect3DDevice9Ex *api = device;", instance)
+        self.assertIn("s_activeBuffer->m_device == api", instance)
         self.assertIn("if (s_activeBuffer == this)", instance)
         self.assertLess(instance.index("TextureRefPrivate(texture.ptr(), true)"),
                         instance.index("TextureRefPrivate(m_capturedTextures[i], false)"))

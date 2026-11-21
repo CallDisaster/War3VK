@@ -12,7 +12,9 @@ SHADOW_H = (ROOT / "src/d3d9/d3d9_war3_shadow.h").read_text(
 SHADOW_CPP = (ROOT / "src/d3d9/d3d9_war3_shadow.cpp").read_text(
     encoding="utf-8"
 )
-PIPELINE = (ROOT / "src/d3d9/d3d9_war3_pipeline.cpp").read_text(
+# The environment overrides of the pipeline constructor live in the settings
+# resolver, shared with proxy mode (phase 5.1-c).
+PIPELINE = (ROOT / "src/d3d9/war3/render/war3_settings_resolver.cpp").read_text(
     encoding="utf-8"
 )
 PERF_H = (

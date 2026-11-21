@@ -154,7 +154,9 @@ class CpuWitnessReaderTests(unittest.TestCase):
         self.assertEqual(m.WORKERS, {'readback-backpressure', 'clear-failure-waiting-barrier',
             'draw-own-reply', 'slot-release-before-ack', 'empty-close', 'empty-fault',
     'stale-hint-then-fault', 'settled-reply-before-fault', 'bounded-draw-batch','gpu-group-end-scene','bounded-fixed-batch',
-    'annotated-draw-batch'})
+    'annotated-draw-batch','session-reset','content-payload','ring-healthy','ring-host-exit-barrier','ring-host-exit-idle',
+    'ring-async-refused','ring-device-lost','ring-head-invalid','ring-applied-invalid','ring-reply-invalid',
+    'ring-record-damaged','ring-host-hung'})
 
     def test_notification_worker_identity_cannot_be_borrowed(self):
         for index in range(1,len(m.WORKERS)+1):

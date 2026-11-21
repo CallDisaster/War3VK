@@ -5,6 +5,9 @@
 #include "war3_frame_capture.h"
 #include "war3_frame_evidence_control.h"
 #include "war3_internal_test_api.h"
+#include "../platform/war3_proxy_status.h"
+#include "../memory/war3_emutls.h"
+#include "../state/war3_render_state.h"
 #include "../../../util/thread.h"
 
 #include "../render/war3_render_objects.h"
@@ -4581,6 +4584,34 @@ json HandleCommand(const json& request) {
     response["result"] =
         ToJson(QueryRuntimeStatusSnapshot("control-plane",
                                           payload.value("frameIndex", uint64_t(0))));
+    // Proxy mode only; in process the reply is unchanged.
+    json proxyMode = dxvk::war3::proxy::StatusJson();
+    if (!proxyMode.is_null())
+      response["result"]["proxyMode"] = std::move(proxyMode);
+    // Either mode: the time between Presents as a cumulative histogram
+    // (RenderState::beginFrame). Only the buckets that hold frames are listed.
+    {
+      using dxvk::war3::state::RenderState;
+      RenderState::FramePace pace;
+      RenderState::instance().readFramePace(pace);
+      json buckets = json::array();
+      for (uint32_t i = 0; i < RenderState::PaceBuckets; ++i)
+        if (pace.buckets[i])
+          buckets.push_back(json::array({i, pace.buckets[i]}));
+      response["result"]["framePace"] = {
+          {"bucketUs", RenderState::PaceBucketUs}, {"frames", pace.frames},
+          {"over", pace.over}, {"overUs", pace.overUs}, {"maxUs", pace.maxUs},
+          {"buckets", std::move(buckets)}};
+    }
+    // Builds with the product's emulated-TLS runtime only (clang, -femulated-tls;
+    // a native-TLS build never assigns the index: 0xFFFFFFFF, TLS_OUT_OF_INDEXES).
+    dxvk::war3::memory::EmutlsStats tls;
+    if (dxvk::war3::memory::EmutlsQueryStats(tls) && tls.tlsIndex != 0xFFFFFFFFu)
+      response["result"]["emutls"] = {
+          {"variables", tls.variables},           {"liveThreads", tls.liveThreads},
+          {"liveObjects", tls.liveObjects},       {"liveBytes", tls.liveBytes},
+          {"threadsReleased", tls.threadsReleased}, {"lateAccesses", tls.lateAccesses},
+          {"unloadReleases", tls.unloadReleases}};
     return response;
   }
 

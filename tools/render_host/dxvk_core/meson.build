@@ -73,8 +73,52 @@ render_host_ff_key_compile = executable('warvk-ff-key-compile',
   link_args: ['-municode'],
   install: false)
 
+# Effect executors: the sources the x86 in-process passes wrap, with their
+# shaders. Nothing else of src/d3d9/war3 is built here.
+host_effect_glsl = generator(glsl_compiler,
+  output: ['@BASENAME@.h'], depfile: '@BASENAME@.h.d',
+  arguments: glsl_args + ['-DWARVK_HOST_LAYER_RECEIVER=1'])
+render_host_executor_headers = host_effect_glsl.process(war3fx_executor_shaders)
+ff_shader_dir = meson.project_source_root() / 'src/d3d9/shaders'
+water_glsl = generator(glsl_compiler,
+  output: ['@BASENAME@.h'], depfile: '@BASENAME@.h.d',
+  arguments: glsl_args + ['-I' + ff_shader_dir])
+water_templates = war3fx.get_variable('war3fx_water_in_place')
+water_stages = []
+foreach stage : [['vert', 'war3_water_in_place_vert'], ['frag', 'war3_water_in_place']]
+  # The original stage supplies position, lighting, texture stages, fog and alpha test.
+  # Keep a single definition of that contract for both pipelines.
+  ff_stage = import('fs').read(ff_shader_dir / ('d3d9_fixed_function_' + stage[0] + '.' + stage[0]))
+  water_stages += [configure_file(input: water_templates[water_stages.length()],
+    output: stage[1] + '.' + stage[0],
+    configuration: {'FIXED_FUNCTION': ff_stage.replace('void main()', 'void gameFixedFunction()')})]
+endforeach
 render_host_d3d9 = executable('warvk-d3d9-host-dev',
-  ff_key_stock_headers, ff_key_skin_header,
+  ff_key_stock_headers, ff_key_skin_header, render_host_executor_headers, water_glsl.process(water_stages),
+  files('../../../src/d3d9/war3/effects/war3_snow_executor.cpp',
+        '../../../src/d3d9/war3/effects/war3_ssao_executor.cpp',
+        '../../../src/d3d9/war3/effects/war3_aa_executor.cpp',
+        '../../../src/d3d9/war3/effects/war3_bloom_executor.cpp',
+        '../../../src/d3d9/war3/render/war3_tracked_vk_pipeline.cpp'),
+  # Phase 4c: the shadow pass itself, the same sources as the x86 device, with
+  # the CPU helpers it owns. What it reads from the x86 data layer and reports
+  # to diagnostics is provided by shadow_host_services.cpp.
+  files('../../../src/d3d9/d3d9_war3_shadow.cpp',
+        '../../../src/d3d9/d3d9_war3_shadow_resources.cpp',
+        '../../../src/d3d9/d3d9_war3_shadow_outline.cpp',
+        '../../../src/d3d9/d3d9_war3_csm.cpp',
+        '../../../src/d3d9/war3/render/war3_gpu_workload_governor.cpp',
+        '../../../src/d3d9/war3/render/war3_hybrid_ray_tracing.cpp',
+        '../../../src/d3d9/war3/render/war3_point_shadow_cpu_plan.cpp',
+        '../../../src/d3d9/war3/render/war3_shadow_replay_validation.cpp',
+        '../../../src/d3d9/war3/state/war3_fog_volume.cpp',
+        'shadow_host_services.cpp', 'shadow_before_ui.cpp', 'evidence_recorder.cpp'),
+  # Phase 4d: the volumetric light pass, as is, with the CPU helper it owns. It
+  # reads the shadow pass above and nothing else of the device.
+  files('../../../src/d3d9/d3d9_war3_volumetric_light.cpp',
+        '../../../src/d3d9/war3/render/war3_volumetric_shader_work_admission.cpp'),
+  # The water surface pass: it reads the shadow pass's water images.
+  files('../../../src/d3d9/d3d9_war3_water.cpp', 'water_in_place.cpp'),
   files('../../../src/d3d9/d3d9_fixed_function.cpp','d3d9_host_main.cpp', 'd3d9_backend.cpp', 'd3d9_factory.cpp', 'host_surface_target.cpp', '../protocol.cpp',
         '../win32_transport.cpp', '../win32_security.cpp', '../process_memory_probe.cpp',
         '../../../src/d3d9/d3d9_options.cpp', '../../../src/d3d9/d3d9_adapter.cpp',
@@ -82,7 +126,10 @@ render_host_d3d9 = executable('warvk-d3d9-host-dev',
         '../../../src/d3d9/d3d9_names.cpp'),
   dependencies: [dxso_dep, dxvk_dep, vkcommon_dep, dxbc_spirv_dep, lib_gdi32,
                  cpp.find_library('bcrypt'), cpp.find_library('advapi32'),
-                 cpp.find_library('psapi'), cpp.find_library('user32'), dependency('threads')],
+                 cpp.find_library('psapi'), cpp.find_library('user32'), cpp.find_library('ole32'),
+                 dependency('threads')],
+  # The shadow pass includes war3 headers the way the x86 DLL builds them.
+  include_directories: [include_directories('../../../src/d3d9', '../../../src/d3d9/war3')],
   link_args: ['-municode'],
   install: false,
 )

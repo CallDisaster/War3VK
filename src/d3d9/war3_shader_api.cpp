@@ -13,7 +13,7 @@
 #include "war3/platform/war3_module_api.h"
 #include "d3d9_war3_pipeline.h"
 #include "d3d9_war3_scene.h"
-#include "d3d9_war3_fog_volume.h"
+#include "war3/state/war3_fog_volume.h"
 #include "d3d9_war3_light.h"
 #include "d3d9_war3_settings.h"
 #include "war3/render/war3_render_state.h"
@@ -23,6 +23,8 @@
 
 #include <vector>
 #include <array>
+#include <memory>
+#include <new>
 #include <mutex>
 #include <atomic>
 #include <unordered_map>
@@ -134,7 +136,11 @@ struct DrawCallBuffer {
     uint32_t count = 0;
 };
 
-DrawCallBuffer g_drawCallBuffers[kRingBufferSize];
+// 12 MB, written only by UpdateRenderContext, which the pipeline calls only
+// while a render listener is registered (and never in proxy mode). Allocated on
+// that first call, under g_contextMutex like every access; until then
+// GetDrawCalls answers as for an empty frame.
+std::unique_ptr<DrawCallBuffer[]> g_drawCallBuffers;
 
 // 光源缓存
 std::vector<LightData> g_pointLightBuffers[kRingBufferSize];
@@ -1203,6 +1209,12 @@ WAR3_SHADER_API const DrawCall* GetDrawCalls(uint32_t* outCount) {
     std::lock_guard<std::mutex> lock(g_contextMutex);
     // [Plan A] Read the last published (fully written) frame index
     uint32_t ringIndex = g_ringBufferIndex.load(std::memory_order_acquire);
+    if (!g_drawCallBuffers) {
+        if (outCount) {
+            *outCount = 0;
+        }
+        return nullptr;
+    }
     auto& calls = g_drawCallBuffers[ringIndex];
     if (outCount) {
         *outCount = calls.count;
@@ -1660,6 +1672,14 @@ void UpdateRenderContext(const dxvk::War3PipelineInput& input) {
     
     
     // 更新 Draw Calls
+    if (!g_drawCallBuffers) {
+        // First listener frame: the ring is allocated here, zeroed as the
+        // former static array was. Out of memory ends the update the way the
+        // dirty-data guard below does (the context stays invalid).
+        g_drawCallBuffers.reset(new (std::nothrow) DrawCallBuffer[kRingBufferSize]());
+        if (!g_drawCallBuffers)
+            return;
+    }
     auto& currentDrawCalls = g_drawCallBuffers[ringIndex];
     currentDrawCalls.count = 0;
     

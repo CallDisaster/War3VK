@@ -315,7 +315,8 @@ def normalized_path(text):
     return os.path.normcase(os.path.normpath(text.strip().strip('"')))
 
 
-def check_loader(host_text, dxvk_text, library, empty_implicit_source=None, loader_path=None):
+def check_loader(host_text, dxvk_text, library, empty_implicit_source=None, loader_path=None,
+                 loader_version=None):
     wanted = normalized_path(str(library))
     parsed = loader_records(host_text)
     layer_messages = [message for channels, message in parsed if 'LAYER' in channels]
@@ -353,7 +354,10 @@ def check_loader(host_text, dxvk_text, library, empty_implicit_source=None, load
     else:
         source_evidence = check_empty_source_trace(host_text, empty_implicit_source, (LAYER,))
         require(loader_path is not None, 'private discovery requires actual frozen loader binding')
-        source_evidence['loaderModule'] = check_loader_module_trace(host_text, loader_path)
+        # loader_version: only a gate that re-pinned the system loader passes the
+        # version read from that frozen file; everyone else keeps the 1.4.341 contract.
+        source_evidence['loaderModule'] = check_loader_module_trace(
+            host_text, loader_path, **({'version': loader_version} if loader_version else {}))
     for text in (host_text, dxvk_text):
         require(not re.search(r'Validation layers not found|Failed to create debug messenger|'
             r'LAYER SETTING.*error|not a valid option for VK_LAYER|could not be opened, falling back|'

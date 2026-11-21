@@ -96,7 +96,7 @@ class ProducerCompletenessContractTest(unittest.TestCase):
             "src/d3d9/war3/render/war3_shadow_replay_validation.h"
         ).read_text(encoding="utf-8"))
         self.assertGreaterEqual(SHADOW.count("validateShadowProducerCompleteness("), 5)
-        self.assertIn("renderedShadowMap && producerComplete", SHADOW)
+        self.assertIn("renderedShadowMap && (producerCompleteForFrame || proxySubset)", SHADOW)
         self.assertIn("!m_replayValidationFailedThisFrame", SHADOW)
         self.assertIn("!m_workloadGovernorRejectedThisFrame", SHADOW)
 

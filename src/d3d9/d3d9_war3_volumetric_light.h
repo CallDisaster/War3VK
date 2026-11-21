@@ -1,6 +1,6 @@
 #pragma once
 
-#include "d3d9_war3_fog_volume.h"
+#include "war3/state/war3_fog_volume.h"
 #include "d3d9_war3_light.h"
 #include "d3d9_war3_pipeline.h"
 #include "war3/render/war3_owned_image_layout.h"
@@ -51,6 +51,7 @@ namespace dxvk {
     QueryWar3VolumetricShaderWorkRuntimeDiagnostics() noexcept;
 
     class D3D9DeviceEx;
+    class War3ShadowReceiverPass;
 
     /**
      * @brief War3 体积光 Pass（CSM 对齐的世界空间散射）
@@ -59,12 +60,31 @@ namespace dxvk {
     public:
         explicit War3VolumetricLightPass(D3D9DeviceEx* device,
                                          bool weatherOnly = false);
+        // x64 migration 4d: the pass needs only the DXVK device and the shadow
+        // pass whose maps it reads. The x64 render host, which has no
+        // D3D9DeviceEx, constructs it through this overload.
+        War3VolumetricLightPass(const Rc<DxvkDevice>& device,
+                                War3ShadowReceiverPass* shadow,
+                                bool weatherOnly = false);
         ~War3VolumetricLightPass();
 
         War3InsertionPoint Point() const override { return War3InsertionPoint::BeforeUi; }
         void Run(const Rc<DxvkCommandList>& ctx, const War3PipelineInput& input) override;
 
+        // What the last run of the authored light did (the execution witness,
+        // kept by the pass whether or not the diagnostics are switched on),
+        // and the storage the pass owns now, its weather medium's included.
+        const War3VolumetricExecutionDiagnostics& LastRun() const { return m_lastRun; }
+        uint64_t ResourceBytes() const {
+            return resourceBytes() + (m_weatherOwner ? m_weatherOwner->resourceBytes() : 0u);
+        }
+        // The weather medium's last run, or none before the medium first ran.
+        const War3VolumetricExecutionDiagnostics* WeatherLastRun() const {
+            return m_weatherOwner ? &m_weatherOwner->m_lastRun : nullptr;
+        }
+
     private:
+        War3ShadowReceiverPass* shadowSource() const;
         void RunMedium(const Rc<DxvkCommandList>& ctx,
                        const War3PipelineInput& input,
                        const War3VolumetricLightSettings& settings);
@@ -131,6 +151,9 @@ namespace dxvk {
         D3D9DeviceEx* m_parent = nullptr;
         Rc<DxvkDevice> m_device;
         const bool m_weatherOnly;
+        // The shadow pass, where there is no D3D9 device to ask for it.
+        War3ShadowReceiverPass* m_shadowSource = nullptr;
+        War3VolumetricExecutionDiagnostics m_lastRun = {};
         // Separate resources keep authored High and weather Medium from
         // alternating image allocation sizes or aliasing the same UBO slot.
         std::unique_ptr<War3VolumetricLightPass> m_weatherOwner;

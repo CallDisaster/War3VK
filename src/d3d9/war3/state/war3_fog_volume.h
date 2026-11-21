@@ -1,6 +1,11 @@
 #pragma once
 
-#include "../util/util_vector.h"
+// Data layer (x64 migration phase 3): the map author's fog volumes are CPU
+// state written by JASS natives. The volumetric pass reads a snapshot each
+// frame; in proxy mode the snapshot is what goes to the host, and every
+// query is answered here, in the game process.
+
+#include "../../../util/util_vector.h"
 
 #include <array>
 #include <atomic>
@@ -42,6 +47,22 @@ struct War3FogVolumeFrameSnapshot {
 };
 
 /**
+ * @brief One fog volume as its author gave it, for a consumer that rebuilds
+ *        the volumes elsewhere (the FogVolumes scene record).
+ *
+ * halfSize is the manager's own form: a sphere's radius three times, a box's
+ * half extents, a cylinder's radius twice and half its height.
+ */
+struct War3FogVolumeAuthored {
+  War3FogVolumeShape shape = War3FogVolumeShape::Sphere;
+  Vector4 position = Vector4(0.0f);
+  Vector4 halfSize = Vector4(1.0f);
+  Vector4 rotationDegrees = Vector4(0.0f);
+  float density = 0.0f;
+  float edgeFeather = 0.0f;
+};
+
+/**
  * @brief 地图作者局部体积雾管理器。
  *
  * 写侧由 JASS/API 线程通过互斥锁修改；渲染侧按值取得固定上限快照，绝不
@@ -79,6 +100,10 @@ public:
   uint32_t GetVolumeCount() const;
   uint64_t GetGeneration() const;
   War3FogVolumeFrameSnapshot GetFrameSnapshot(uint64_t frameSerial);
+  // The volumes GetFrameSnapshot would return, in the same order and with the
+  // same limit, as authored. Returns how many were written.
+  uint32_t ListFrameVolumesAuthored(
+      std::array<War3FogVolumeAuthored, War3FogVolumeFrameSnapshot::kMaxVolumes>& out) const;
 
 private:
   struct Record {

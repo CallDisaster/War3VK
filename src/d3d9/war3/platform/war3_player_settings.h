@@ -28,6 +28,7 @@ using Overrides = std::map<std::string, std::string>;
 struct Extras {
   bool fpsUnlocked = false;
   uint32_t nativeShadowMode = 0;
+  bool blockNativeStaticShadows = true;
 };
 
 struct ApplyReport {
@@ -54,6 +55,9 @@ void RestoreBaseline(Overrides& overrides,
                      const War3RenderSettings& baselineSettings,
                      const Extras& baselineExtras,
                      War3RenderSettings& settings, Extras& extras);
+
+// Session-latched because UnitUI caches names during map/bootstrap loading.
+bool BlockNativeStaticShadowsAtStartup();
 
 bool IsKnownKey(const std::string& key);
 size_t KnownKeyCount();

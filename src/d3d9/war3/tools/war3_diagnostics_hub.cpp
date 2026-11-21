@@ -8,6 +8,7 @@
 #include "../memory/war3_cpu_readable_buffer_span.h"
 #include "../memory/war3_shadow_arena.h"
 #include "../platform/war3_module_api.h"
+#include "../platform/war3_proxy_status.h"
 #include "../core/war3_game_structs.h"
 #include "../core/war3_events.h"
 #include "../core/war3_memory.h"
@@ -761,7 +762,8 @@ void RecordGpuFlightFrame(uint64_t frameSerial) {
   frame.worldMinY = loadAutoTestFloat(8u);
   frame.worldMaxX = loadAutoTestFloat(9u);
   frame.worldMaxY = loadAutoTestFloat(10u);
-  const auto replay = dxvk::QueryShadowReplayDiagnostics();
+  const auto replay =
+      dxvk::war3::ProcessServices().QueryShadowReplayDiagnostics();
   const auto producer =
       dxvk::war3::render::QueryShadowProducerRuntimeDiagnostics();
   frame.csmPlannedCasterCount = replay.plannedCasterCount;
@@ -845,8 +847,9 @@ void RecordGpuFlightFrame(uint64_t frameSerial) {
         s_gpuFlightPointShadowFaceTriangleCount[index].load(
             std::memory_order_acquire);
   }
-  const auto taa = dxvk::QueryShadowTaaDiagnostics();
-  const auto csm = dxvk::QueryCsmResolutionDiagnostics();
+  const auto taa = dxvk::war3::ProcessServices().QueryShadowTaaDiagnostics();
+  const auto csm =
+      dxvk::war3::ProcessServices().QueryCsmResolutionDiagnostics();
   const auto arena = dxvk::war3::memory::ShadowArena_QueryDiagnostics();
   frame.csmRequestedResolution = csm.requestedResolution;
   frame.csmEffectiveResolution = csm.effectiveResolution;
@@ -937,14 +940,14 @@ void RecordGpuFlightFrame(uint64_t frameSerial) {
   frame.exactIndexDomainOversizeFallbackCount =
       cpuSpan.exactIndexDomainOversizeFallbackCount;
   frame.arenaFrameIncomplete = arena.frameIncomplete;
-  dxvk::war3::RunWithActiveDevice([&](D3D9DeviceEx& device) {
+  dxvk::war3::RunWithActiveDeviceServices(
+      [&](dxvk::war3::IDeviceServices& device) {
     const auto lifecycle = device.QueryWar3ShadowLifecycleDiagnostics();
     frame.shadowMapEpoch = lifecycle.currentMapEpoch;
     frame.shadowMapResetRequestedSerial = lifecycle.requestedResetSerial;
     frame.shadowMapResetAppliedSerial = lifecycle.appliedResetSerial;
     frame.shadowMapTransitionState = lifecycle.transitionState;
-    frame.queueResult = static_cast<int64_t>(
-        device.GetDXVKDevice()->getDeviceStatus());
+    frame.queueResult = device.QueryWar3DeviceStatus();
   });
   frame.queueSubmittedSerial = arena.submittedSerial;
   frame.queueCompletedSerial = arena.completedSerial;
@@ -1094,13 +1097,15 @@ War3RuntimeStatusShadowSnapshot BuildShadowSnapshot() {
   const auto bridgeSummary = dxvk::war3::render::QueryShadowRuntimeBridgeSummary();
   const auto gpuSkinVsShadow =
       dxvk::war3::render::QueryGpuSkinVsShadowRuntimeCounters();
-  const auto taaDiagnostics = dxvk::QueryShadowTaaDiagnostics();
+  const auto taaDiagnostics =
+      dxvk::war3::ProcessServices().QueryShadowTaaDiagnostics();
   const auto pointPersistentDiagnostics =
-      dxvk::QueryPointShadowPersistentDiagnostics();
+      dxvk::war3::ProcessServices().QueryPointShadowPersistentDiagnostics();
   const auto persistentPackageDiagnostics =
       dxvk::war3::gpu_skin::
           QueryPersistentGpuPackageD3D9RuntimeDiagnostics();
-  const auto csmDiagnostics = dxvk::QueryCsmResolutionDiagnostics();
+  const auto csmDiagnostics =
+      dxvk::war3::ProcessServices().QueryCsmResolutionDiagnostics();
   const auto arenaDiagnostics =
       dxvk::war3::memory::ShadowArena_QueryDiagnostics();
   summary.shadowTaaRequestedMode = taaDiagnostics.requestedMode;
@@ -1433,7 +1438,8 @@ War3RuntimeStatusShadowSnapshot BuildShadowSnapshot() {
       cpuSpanDiagnostics.exactIndexDomainOversizeFallbackCount;
   summary.queueSubmittedSerial = arenaDiagnostics.submittedSerial;
   summary.queueCompletedSerial = arenaDiagnostics.completedSerial;
-  const auto replayDiagnostics = dxvk::QueryShadowReplayDiagnostics();
+  const auto replayDiagnostics =
+      dxvk::war3::ProcessServices().QueryShadowReplayDiagnostics();
   summary.shadowStaleEpochConsumerRejectCount =
       replayDiagnostics.staleEpochConsumerRejectCount;
   summary.shadowReplayValidationRejectCount =
@@ -1479,9 +1485,9 @@ War3RuntimeStatusShadowSnapshot BuildShadowSnapshot() {
       replayDiagnostics.validatedCasterCount;
   summary.shadowReplayDrawnCasterCount = replayDiagnostics.drawnCasterCount;
   summary.shadowReplayLastRejectReason = replayDiagnostics.lastRejectReason;
-  dxvk::war3::RunWithActiveDevice([&](D3D9DeviceEx& device) {
-    summary.queueLastResult = static_cast<int64_t>(
-        device.GetDXVKDevice()->getDeviceStatus());
+  dxvk::war3::RunWithActiveDeviceServices(
+      [&](dxvk::war3::IDeviceServices& device) {
+    summary.queueLastResult = device.QueryWar3DeviceStatus();
     const auto lifecycle = device.QueryWar3ShadowLifecycleDiagnostics();
     summary.shadowMapResetRequestedSerial = lifecycle.requestedResetSerial;
     summary.shadowMapResetAppliedSerial = lifecycle.appliedResetSerial;
@@ -4223,7 +4229,12 @@ void WriteRuntimeStatusSnapshot(const War3RuntimeStatusSnapshot& snapshot) {
   if (!f.is_open())
     return;
 
-  f << BuildRuntimeStatusJson(snapshot).dump(2) << '\n';
+  json status = BuildRuntimeStatusJson(snapshot);
+  // Proxy mode only; in process the file is unchanged.
+  json proxyMode = dxvk::war3::proxy::StatusJson();
+  if (!proxyMode.is_null())
+    status["proxyMode"] = std::move(proxyMode);
+  f << status.dump(2) << '\n';
 }
 } // namespace
 

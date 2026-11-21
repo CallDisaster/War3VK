@@ -25,7 +25,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 SHADERS = ROOT / "subprojects/war3fx/shaders"
-SNOW_CPP = ROOT / "src/d3d9/d3d9_war3_weather.cpp"
+SNOW_CPP = ROOT / "src/d3d9/war3/effects/war3_snow_executor.cpp"
 VOLUME_CPP = ROOT / "src/d3d9/d3d9_war3_volumetric_light.cpp"
 MAGIC = 0x07230203
 # Verified against include/spirv/include/spirv/unified1/spirv.hpp.
@@ -259,9 +259,9 @@ def main() -> int:
     volume_cpp = VOLUME_CPP.read_text(encoding="utf-8")
 
     def viewport_source():
-        require("vp.MinZ + (vp.MinZ < 0.5f ? 0.001f : 0.0f)" in snow_cpp,
+        require("camera.minZ + (camera.minZ < 0.5f ? 0.001f : 0.0f)" in snow_cpp,
                 "weather no longer uses native minimum positive depth range")
-        require("vp.MaxZ <= vp.MinZ" in snow_cpp,
+        require("camera.maxZ <= camera.minZ" in snow_cpp,
                 "reverse/equal viewport range must remain a named refusal")
     check("narrow-positive-viewport.production-source", viewport_source)
 

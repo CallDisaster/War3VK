@@ -1,6 +1,11 @@
 // Phase 7.100 marker bump 102042
 #include "war3_hook_shadow.h"
 #include "war3_hook_install_util.h"
+#include "war3_hook_address_book.h"
+#include "../platform/war3_player_settings.h"
+#include <MinHook.h>
+#include <mutex>
+#include "../../../util/util_string.h"
 #include "war3_hook_perf.h"
 #include "war3_hook_widget_identity.h"
 #include "war3_shadow_filter_policy.h"
@@ -409,6 +414,152 @@ void DumpShadowCallbackTopStats(uint32_t calls, uint32_t mode) {
       static_cast<unsigned>(top4.rva), static_cast<unsigned>(top4.count));
 }
 
+// 1.27a GX callback 743E80 passes ECX=terrain, then tile record, outPixels,
+// outPitch on the stack. 727210 uses no incoming EDX and ends in RET 0x0C.
+using TerrainUploadFn = uintptr_t (__fastcall*)(const uint8_t*, void*, const int32_t*,
+                                                uint8_t**, uint32_t*);
+TerrainUploadFn g_trampolineTerrainUpload = nullptr;
+
+template<typename T>
+T TerrainField(const uint8_t* terrain, size_t offset) {
+  T value;
+  std::memcpy(&value, terrain + offset, sizeof(value));
+  return value;
+}
+
+// 715AE0 averages the two samples on each interior 16-sample boundary.
+// Its vertical pass precedes the horizontal pass; the rounding order matters.
+int TerrainSeamMate(int coord, int length) {
+  if ((coord & 15) == 15 && coord + 1 < length)
+    return coord + 1;
+  if ((coord & 15) == 0 && coord > 0)
+    return coord - 1;
+  return coord;
+}
+
+uintptr_t __fastcall UploadWithoutStaticShadow(const uint8_t* terrain, void* unused,
+    const int32_t* tile, uint8_t** pixels, uint32_t* pitch) {
+  const auto result = g_trampolineTerrainUpload(terrain, unused, tile, pixels, pitch);
+  if (TerrainField<uint32_t>(terrain, 0x298) || !*pixels || (*pitch != 32 && *pitch != 64))
+    return result;
+
+  const auto* fog = TerrainField<const uint8_t*>(terrain, 0x270);
+  const auto* packed = TerrainField<const uint8_t*>(terrain, 0x240);
+  const int top = TerrainField<int>(terrain, 0x258), left = TerrainField<int>(terrain, 0x25c);
+  const int bottom = TerrainField<int>(terrain, 0x260), right = TerrainField<int>(terrain, 0x264);
+  const unsigned tilesX = TerrainField<unsigned>(terrain, 0xb4);
+  const unsigned tilesY = TerrainField<unsigned>(terrain, 0xb8);
+  if (!fog || !packed || tilesX > INT32_MAX / 4 || tilesY > INT32_MAX / 4 ||
+      left < 0 || top < 0 || right <= left || bottom <= top ||
+      unsigned(right) > tilesX * 4 || unsigned(bottom) > tilesY * 4 ||
+      uint64_t(tilesX * 4) * (tilesY * 4) > TerrainField<unsigned>(terrain, 0x23c) ||
+      uint64_t(right - left) * (bottom - top) > TerrainField<unsigned>(terrain, 0x26c))
+    return result;
+
+  // GX asks for a whole 16x16 tile. Only the resident window has fog samples.
+  const int width = right - left, height = bottom - top;
+  const unsigned packedPitch = tilesX * 4;
+  const bool useBank = TerrainField<uint32_t>(terrain, 0x21e0) != 0;
+  const bool small = *pitch == 32;
+  const size_t texelBytes = small ? 2u : 4u;
+  const auto* palette = terrain + (small ? 0x19dc : 0x9dc);
+  if (tile[0] < 0 || tile[1] < 0 || tile[0] > (right - 1) / 16 ||
+      tile[1] > (bottom - 1) / 16)
+    return result;
+  const int startX = 16 * tile[0] - left, startY = 16 * tile[1] - top;
+  unsigned changed = 0;
+  for (int row = 0; row < 16; ++row) {
+    const int y = startY + row;
+    if (unsigned(y) >= unsigned(height))
+      continue;
+    const int otherY = TerrainSeamMate(y, height);
+    for (int col = 0; col < 16; ++col) {
+      const int x = startX + col;
+      if (unsigned(x) >= unsigned(width))
+        continue;
+      const int otherX = TerrainSeamMate(x, width);
+      unsigned flags = 0;
+      auto sample = [&](int sx, int sy) -> unsigned {
+        const unsigned p = packed[size_t(sy + top) * packedPitch + sx + left];
+        flags |= p;
+        const unsigned sum = fog[size_t(sy) * width + sx] + (p & 0x10u);
+        return sum > 255u ? 255u : sum;
+      };
+      auto vertical = [&](int sx) {
+        const unsigned v = sample(sx, y);
+        return otherY == y ? v : (v + sample(sx, otherY)) / 2;
+      };
+      unsigned index = vertical(x);
+      if (otherX != x)
+        index = (index + vertical(otherX)) / 2;
+      if (!(flags & 0xefu))
+        continue; // No shadow in any contributing sample: keep the native texel.
+      const auto p = packed[size_t(y + top) * packedPitch + x + left];
+      if (useBank && (p & 0x10u))
+        index += 256;
+      auto* dst = *pixels + row * *pitch + col * texelBytes;
+      const auto* color = palette + index * texelBytes;
+      if (std::memcmp(dst, color, texelBytes)) {
+        std::memcpy(dst, color, texelBytes);
+        ++changed;
+      }
+    }
+  }
+  static std::atomic<bool> reported{false};
+  if (changed && !reported.load(std::memory_order_relaxed) &&
+      !reported.exchange(true, std::memory_order_relaxed))
+    Logger::info(str::format("WarVK static shadow: TerrainShadowUpload changedPixels=", changed,
+                             " tileX=", tile[0], " tileY=", tile[1], " pitch=", *pitch));
+  return result;
+}
+
+
+bool IsStaticShadowBuild127a(uintptr_t base) {
+  // This PE32 image has e_lfanew=0x138. Check it before reading the headers.
+  // The loader writes the actual base into a relocated image's ImageBase.
+  IMAGE_DOS_HEADER dos{};
+  IMAGE_NT_HEADERS32 nt{};
+  return base && SafeCopy(&dos, reinterpret_cast<const void*>(base), sizeof(dos)) &&
+      dos.e_magic == IMAGE_DOS_SIGNATURE && dos.e_lfanew == 0x138 &&
+      SafeCopy(&nt, reinterpret_cast<const void*>(base + 0x138), sizeof(nt)) &&
+      nt.Signature == IMAGE_NT_SIGNATURE && nt.FileHeader.Machine == IMAGE_FILE_MACHINE_I386 &&
+      nt.FileHeader.TimeDateStamp == 0x56BD0E1C &&
+      nt.OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC &&
+      (nt.OptionalHeader.ImageBase == 0x6F000000 || nt.OptionalHeader.ImageBase == base) &&
+      nt.OptionalHeader.SizeOfImage == 0xCD8000;
+}
+
+// One owner per detour across both early and normal installation. A pre-existing
+// third-party hook (even if currently disabled) must not be enabled as our own.
+template<auto Detour, size_t N>
+bool InstallStaticShadowSite(uintptr_t base, LPVOID target, uintptr_t rva,
+    const uint8_t (&signature)[N], decltype(Detour)& original, const char* name) {
+  static std::mutex mutex;
+  static bool installed = false;
+  std::lock_guard<std::mutex> lock(mutex);
+  if (installed)
+    return true;
+  if (!IsStaticShadowBuild127a(base) || target != reinterpret_cast<LPVOID>(base + rva) ||
+      !IsExecutableRange(target, N) || !SafeEqualUntrustedToTrusted(target, signature, N)) {
+    Logger::warn(str::format("WarVK static shadow: signature mismatch ", name));
+    return false;
+  }
+  if (!original) {
+    LPVOID trampoline = nullptr;
+    const auto status = MH_CreateHook(target, reinterpret_cast<LPVOID>(Detour), &trampoline);
+    if (status != MH_OK) {
+      Logger::warn(str::format("WarVK static shadow: create failed ", name, " status=", int(status)));
+      return false;
+    }
+    original = reinterpret_cast<decltype(Detour)>(trampoline);
+  }
+  const auto status = MH_EnableHook(target);
+  installed = status == MH_OK || status == MH_ERROR_ENABLED;
+  RecordHookInstallState("Shadow", name, target, reinterpret_cast<LPVOID>(Detour),
+      reinterpret_cast<LPVOID>(original), installed ? "installed" : "enable-failed", installed);
+  return installed;
+}
+
 bool ShouldBlockCUnitUiBuildingShadowWrite(uint32_t mode) {
   if constexpr (
       dxvk::war3::internal::kNativeShadowBlockCUnitUiBuildingShadowByDefault) {
@@ -733,7 +884,9 @@ void __fastcall Hook_Terrain_RenderListB(void *thisPtr, void *edx, int argType,
       argType == 4 &&
       dxvk::war3::internal::kNativeShadowListBPreserveType4ByDefault;
 
-  if (preserveUiDecalByDefault) {
+  if (argType == 0 && !player::BlockNativeStaticShadowsAtStartup()) {
+    reason = "PlayerAllowsNativeStaticShadow";
+  } else if (preserveUiDecalByDefault) {
     reason = "PreserveUiDecalType1Or2";
   } else if (preserveType4ByDefault) {
     reason = "PreserveType4UberSplat";
@@ -1472,23 +1625,11 @@ int __fastcall Hook_TerrainShadow_RegisterImageEntry(void *thisPtr, void *edx,
 // =====================================================================
 // 2026-05-30: CDoodads 贴花阴影拦截（魔兽自带可见静态阴影 + path blocker 治理）
 // =====================================================================
-// TerrainShadow_ToggleStaticStampFromObject (0x74DB30) 是 CDoodads
-// （树木/装饰物/可破坏物/path blocker）的"地面贴花阴影"对象级注册入口
-// （写 RegisterImage type=0）。它由 CDoodads_CreateDoodadAndActivate /
-// EnableFeatures / SetTodAndRefreshStamp 在对象创建、特性重激活、TOD 变化时
-// 调用。历史上只拦了 ListA 直写路径（ShadowPath_StaticStamp_Toggle 0x74E420），
-// **没有拦这条 RegisterImage 贴花路径**，所以魔兽自带的树木/装饰物地面贴花
-// 阴影一直可见。
-//
-// 这是干净 __thiscall(this, doodadSlot, enable)，可安全 hook。
-// 策略：仅当 canonical runtime A/B gate 开启且 enable!=0 时跳过 enable
-// 写入（return 0），让贴花阴影不被注册。enable==0（移除）始终放行，
-// 确保已注册的 stamp 能被清除。
-//
-// 注意：姊妹函数 ToggleEmitterStamp (0x74DE40) 是 __userpurge（edi=this 作为
-// 隐式参数），不能用标准 __fastcall trampoline 安全 hook（passthrough 会丢
-// edi）。emitter stamp（type=4）主要是发光体/技能特效/腐地 puff，不是静态
-// 树木/建筑阴影本体，因此本轮不拦它，只拦 StaticStamp（type=0）这条阴影主路径。
+// 74DB30 is the optional CDoodads type-0 image branch. Its virtual +C4
+// predicate is the inverse of 74E420 (named writes into terrain +240).
+// Packed map shadows and destructible stencils reach the GX upload separately.
+// The diagnostic gate skips enables only. Cleanup always calls the original.
+// The 74DE40 emitter branch uses type 4 and shares the splat/effect renderer.
 using TerrainShadowToggleStaticStampFn = int(__fastcall *)(void *, void *, int,
                                                            int);
 TerrainShadowToggleStaticStampFn g_originalDoodadStaticStamp = nullptr;
@@ -2281,7 +2422,30 @@ bool InstallShadowHooks(const ShadowHookAddresses &addrs) {
   g_shadowRegisterRetFromTwoPointsAddr =
       reinterpret_cast<uintptr_t>(addrs.shadowRegisterRetFromTwoPointsAddr);
 
+  const uintptr_t base = GetGameDllBase();
+  const auto& book = GetWar3HookAddressBook127a();
+  const bool block = player::BlockNativeStaticShadowsAtStartup();
   bool anyInstalled = false;
+  if (block) {
+    constexpr uint8_t callSequence[] = {
+      0x55,0x8b,0xec,0x83,0xf9,0x01,0x75,0x12,0xff,0x75,0x14,0x8b,0x4d,0x10,0xff,
+      0x75,0x18,0x51,0x8b,0x49,0x0c,0xe8,0x76,0x33,0xfe,0xff,0x5d,0xc2,0x14,0x00
+    };
+    constexpr uint8_t entry[] = {
+      0x55,0x8b,0xec,0x83,0xec,0x14,0x53,0x56,0x8b,0xf1,0x57,0x83,0xbe,0xe4,0x21,0x00,0x00,0x00
+    };
+    const auto target = reinterpret_cast<LPVOID>(base + book.terrainShadowUpload);
+    const auto caller = reinterpret_cast<const void*>(base + book.terrainShadowGxCallback);
+    const bool ok = IsStaticShadowBuild127a(base) &&
+        SafeEqualUntrustedToTrusted(caller, callSequence, sizeof(callSequence)) &&
+        InstallStaticShadowSite<&UploadWithoutStaticShadow>(base, target,
+            book.terrainShadowUpload, entry, g_trampolineTerrainUpload, "TerrainShadowUpload");
+    Logger::info(str::format("WarVK static shadow: TerrainShadowUpload ",
+                             ok ? "installed" : "unavailable"));
+    anyInstalled |= ok;
+  } else {
+    Logger::info("WarVK static shadow: native ground shadows allowed by player");
+  }
   if constexpr (dxvk::war3::internal::kWar3ShadowTerrainHookEnabled) {
     // 基础阴影层入口通常最关键，优先尝试安装。
     anyInstalled |= InstallMinHook(
@@ -2334,7 +2498,7 @@ bool InstallShadowHooks(const ShadowHookAddresses &addrs) {
   if constexpr (dxvk::war3::internal::kWar3ShadowTypeRecordHookEnabled &&
                 dxvk::war3::internal::
                     kNativeShadowCUnitUiUnitShadowHookEnabled) {
-    if (addrs.cunitUiRecordSetUnitShadowAddr != nullptr) {
+    if (block && addrs.cunitUiRecordSetUnitShadowAddr != nullptr) {
       const bool ok = InstallMinHook(
           addrs.cunitUiRecordSetUnitShadowAddr,
           reinterpret_cast<LPVOID>(&Hook_CUnitUIManager_RecordSetUnitShadow),
@@ -2351,7 +2515,7 @@ bool InstallShadowHooks(const ShadowHookAddresses &addrs) {
                    ? 1
                    : 0);
       ::dxvk::Logger::info(buf);
-    } else {
+    } else if (block) {
       ::dxvk::Logger::info(
           "DXVK War3Hook[Shadow]: CUnitUI RecordSetUnitShadow install "
           "SKIPPED - nullptr");
@@ -2361,7 +2525,7 @@ bool InstallShadowHooks(const ShadowHookAddresses &addrs) {
   if constexpr (dxvk::war3::internal::kWar3ShadowTypeRecordHookEnabled &&
                 dxvk::war3::internal::
                     kNativeShadowCUnitUiBuildingShadowHookEnabled) {
-    if (addrs.cunitUiRecordSetStructureShadowAddr != nullptr) {
+    if (block && addrs.cunitUiRecordSetStructureShadowAddr != nullptr) {
       const bool ok = InstallMinHook(
           addrs.cunitUiRecordSetStructureShadowAddr,
           reinterpret_cast<LPVOID>(
@@ -2380,7 +2544,7 @@ bool InstallShadowHooks(const ShadowHookAddresses &addrs) {
                    ? 1
                    : 0);
       ::dxvk::Logger::info(buf);
-    } else {
+    } else if (block) {
       ::dxvk::Logger::info(
           "DXVK War3Hook[Shadow]: CUnitUI RecordSetStructureShadow install "
           "SKIPPED - nullptr");
@@ -2426,13 +2590,10 @@ bool InstallShadowHooks(const ShadowHookAddresses &addrs) {
 
   // CDoodads type=0 静态贴花入口始终安装为安全 pass-through，允许同一 DLL
   // 使用 DXVK_WAR3_BLOCK_NATIVE_DOODAD_STATIC_SHADOW=0/1 做运行时 A/B。
-  // ToggleStaticStampFromObject 是树木/装饰物/可破坏物/path blocker 地面贴花
-  // 阴影的对象级注册入口（RegisterImage type=0）。只有 gate=1 且 enable!=0
-  // 才跳过写入；enable==0 始终透传，保证旧 stamp 能正常清理。
-  // EmitterStamp(0x74DE40) 是 __userpurge，不安全 hook，本轮不拦（它是发光体/
-  // 特效，不是静态阴影本体）。
+  // Keep the optional type-0 registration probe separate from GX tile upload.
+  // Both the inactive gate and the player opt-out leave removal to the game.
   if constexpr (dxvk::war3::internal::kNativeShadowDoodadStampHookEnabled) {
-    if (addrs.terrainShadowToggleStaticStampFromObjectAddr != nullptr) {
+    if (block && addrs.terrainShadowToggleStaticStampFromObjectAddr != nullptr) {
       const bool ok = InstallMinHook(
           addrs.terrainShadowToggleStaticStampFromObjectAddr,
           reinterpret_cast<LPVOID>(&Hook_Doodad_ToggleStaticStampFromObject),

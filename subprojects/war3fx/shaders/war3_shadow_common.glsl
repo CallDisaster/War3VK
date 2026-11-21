@@ -63,6 +63,48 @@ vec2 rotateVec2(vec2 v, vec2 rot) {
   return vec2(v.x * rot.x - v.y * rot.y, v.x * rot.y + v.y * rot.x);
 }
 
+// Every PCF kernel is a weighted average of depth comparisons against texels
+// inside the 4x4 block around the receiver. When all of them give the same
+// answer the average is exactly 0 or 1, so the taps can be skipped: at most
+// four gathers replace the whole kernel on fully lit or fully shadowed pixels.
+bool shadowKernelIsUniform(uint cascadeIndex, vec2 uv, float refDepth,
+                           float radiusTexel, float kernel, vec2 gradient,
+                           bool gradientValid, out float visibility) {
+  visibility = 1.0;
+  // Longest per-axis tap offset: two radii for the 5x5 grid, at most 1.25
+  // radii for the others under any kernel rotation.
+  float reach = max(radiusTexel, 0.0) *
+      ((kernel >= 0.5 && kernel < 1.5) ? 2.0 : 1.25);
+  float invRes = ubo.u_params.z;
+  float margin = 3.0 * invRes;
+  // Taps outside the map count as lit, so stay clear of its border.
+  if (!(reach <= 1.0) || !(invRes > 0.0) ||
+      uv.x < margin || uv.x > 1.0 - margin ||
+      uv.y < margin || uv.y > 1.0 - margin)
+    return false;
+
+  float slack = gradientValid
+      ? (abs(gradient.x) + abs(gradient.y)) * reach * invRes * 1.01
+      : 0.0;
+  float litFrom = refDepth + slack;
+  float shadowBelow = refDepth - slack;
+  float lowest = 1.0;
+  float highest = 0.0;
+  for (int y = -1; y <= 1; y += 2) {
+    for (int x = -1; x <= 1; x += 2) {
+      vec4 depths = textureGather(
+        sampler2DArray(s_shadow, s_samplers[nonuniformEXT(p_rawShadowSampler)]),
+        vec3(uv + vec2(float(x), float(y)) * invRes, float(cascadeIndex)));
+      lowest = min(lowest, min(min(depths.x, depths.y), min(depths.z, depths.w)));
+      highest = max(highest, max(max(depths.x, depths.y), max(depths.z, depths.w)));
+      if (lowest < litFrom && highest >= shadowBelow)
+        return false;
+    }
+  }
+  visibility = lowest >= litFrom ? 1.0 : 0.0;
+  return true;
+}
+
 float computeCascadeBiasScale(int cascadeIndex, int cascadeCount, float scaleParam) {
   float t = (cascadeCount > 1) ? float(cascadeIndex) / float(cascadeCount - 1) : 0.0;
   // 远级联偏置放大过大时容易出现“接触阴影丢失（脚底缺阴影）”。

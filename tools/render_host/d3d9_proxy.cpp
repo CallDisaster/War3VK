@@ -9,12 +9,15 @@
 #include "d3d9_factory_wire.h"
 #include "d3d9_declaration_wire.h"
 #include "d3d9_ff_wire.h"
+#include "d3d9_ff_fast_encode.h"
 #include "d3d9_texture_wire.h"
 #include "d3d9_sampler_wire.h"
 #include "d3d9_effects_wire.h"
 #include "d3d9_texture_stages_wire.h"
 #include "d3d9_memory_probe.h"
 #include "d3d9_residency.h"
+#include "d3d9_upload_window.h"
+#include "../../src/d3d9/war3/core/war3_d3d9_observer.h"
 #include "../../src/util/com/com_object.h"
 #include <atomic>
 #include <cmath>
@@ -25,6 +28,9 @@
 
 static_assert(sizeof(void*)==4,"This COM compatibility proxy is x86 only");
 namespace warvk::host::d3d9proxy {
+// P0 measurement only: the API entry a sync-profile account is charged to
+// (d3d9_sync_profile.h). Nothing it names changes what is sent.
+using ApiScope=Connection::ProfileScope;using SyncApi=d9::profile::SyncApi;
 class Device;
 class Factory;
 class Surface;
@@ -95,6 +101,7 @@ static HRESULT NegotiatedCaps(Connection& connection,D3DCAPS9* output) {
   if(!output)return D3DERR_INVALIDCALL;
   d9::Header h;h.op=d9::Op::FactoryQuery;h.args[0]=uint32_t(d9::FactoryQuery::Caps);h.args[1]=D3DDEVTYPE_HAL;
   std::array<uint8_t,d9::FactoryCapsBytes> bytes{};
+  const ApiScope api(connection,SyncApi::Caps);
   const auto hr=connection.call(h,nullptr,bytes.data(),uint32_t(bytes.size()));
   if(hr!=D3D_OK)return hr;
   D3DCAPS9 physical{};
@@ -127,17 +134,40 @@ static HRESULT NegotiatedCaps(Connection& connection,D3DCAPS9* output) {
 // buffer of D32F_LOCKABLE or D16 (both D32_SFLOAT, as in WarVK native), and the
 // windowed intervals native accepts. A zero axis takes the client extent;
 // presenting needs client == back buffer.
+//
+// A full-screen request is the same swap chain behind a borderless window that
+// covers the monitor (WarVK in process does not take the screen exclusively
+// either). It is accepted when it asks for the monitor's current mode: nothing
+// here changes the display mode, and the host does not scale. `monitor` is
+// then the rectangle the window has to cover.
 struct SwapChainMode {
   UINT width=0,height=0;D3DFORMAT format=D3DFMT_A8R8G8B8;uint32_t interval=0;
+  bool fullscreen=false;RECT monitor{};
 };
+static bool ResolveFullscreen(const D3DPRESENT_PARAMETERS& p,HWND hwnd,bool presenter,SwapChainMode& mode) {
+  // The primary monitor, as D3D9's adapter 0 and WarVK in process.
+  MONITORINFO info{};info.cbSize=sizeof(info);
+  if(!presenter||!GetMonitorInfoW(MonitorFromPoint(POINT{0,0},MONITOR_DEFAULTTOPRIMARY),&info))return false;
+  const RECT& m=info.rcMonitor;
+  if(m.right<=m.left||m.bottom<=m.top||p.BackBufferWidth!=UINT(m.right-m.left)||p.BackBufferHeight!=UINT(m.bottom-m.top)
+    ||!d9::ValidTargetExtent(p.BackBufferWidth,p.BackBufferHeight)||(p.hDeviceWindow&&p.hDeviceWindow!=hwnd))return false;
+  mode.width=p.BackBufferWidth;mode.height=p.BackBufferHeight;mode.format=p.BackBufferFormat;
+  mode.interval=p.PresentationInterval==D3DPRESENT_INTERVAL_IMMEDIATE?d9::IntervalImmediate:d9::IntervalOne;
+  mode.fullscreen=true;mode.monitor=m;return true;
+}
 static bool ResolveSwapChain(const D3DPRESENT_PARAMETERS& p,HWND hwnd,bool presenter,SwapChainMode& mode) {
-  if(!p.Windowed||(p.BackBufferFormat!=D3DFMT_A8R8G8B8&&p.BackBufferFormat!=D3DFMT_X8R8G8B8)
+  if((p.BackBufferFormat!=D3DFMT_A8R8G8B8&&p.BackBufferFormat!=D3DFMT_X8R8G8B8)
     ||p.BackBufferCount>1||p.MultiSampleType!=D3DMULTISAMPLE_NONE||p.MultiSampleQuality
     ||p.SwapEffect!=D3DSWAPEFFECT_DISCARD||!p.EnableAutoDepthStencil
     ||(p.AutoDepthStencilFormat!=D3DFMT_D32F_LOCKABLE&&p.AutoDepthStencilFormat!=D3DFMT_D16)
-    ||p.Flags||p.FullScreen_RefreshRateInHz||(p.hDeviceWindow&&p.hDeviceWindow!=hwnd)
+    // The game asks for a lockable back buffer (its screenshot path). The game
+    // profile takes the flag; locking the back buffer stays unimplemented.
+    ||(p.Flags&~DWORD(d9::GameTraceEnabled()?D3DPRESENTFLAG_LOCKABLE_BACKBUFFER:0))
     ||(p.PresentationInterval!=D3DPRESENT_INTERVAL_DEFAULT&&p.PresentationInterval!=D3DPRESENT_INTERVAL_ONE
       &&p.PresentationInterval!=D3DPRESENT_INTERVAL_IMMEDIATE))return false;
+  // The refresh rate of a full-screen request is not acted on: the mode stays.
+  if(!p.Windowed)return ResolveFullscreen(p,hwnd,presenter,mode);
+  if(p.FullScreen_RefreshRateInHz||(p.hDeviceWindow&&p.hDeviceWindow!=hwnd))return false;
   RECT client{};
   if(!GetClientRect(hwnd,&client)||client.left||client.top)return false;
   mode.width=p.BackBufferWidth?p.BackBufferWidth:UINT(client.right);
@@ -161,39 +191,72 @@ template<class T> void Bind(T*& slot,T* value) {
 // application. The window thread only records the client extent; the owner
 // thread resets the swap chain at its next size-dependent call
 // (Device::followWindow). The last device on a window owns its hook.
-struct WindowSize {std::atomic<uint64_t> client{0},messages{0};};
-struct WindowHook {WNDPROC previous=nullptr;bool unicode=false;WindowSize* size=nullptr;};
+// While the device is full screen (a borderless window over the monitor) the
+// extent does not follow the window: WM_SIZE goes to the application, as in
+// the original, and the client area is the whole window whatever style the
+// application puts back. `transition` is the original's message filter: while
+// the front end itself changes the window, the application sees none of it.
+struct WindowSize {std::atomic<uint64_t> client{0},messages{0};std::atomic<bool> fullscreen{false},transition{false};};
+struct WindowHook {WNDPROC previous=nullptr;bool unicode=false;WindowSize* size=nullptr;Connection* connection=nullptr;};
 static std::mutex windowHooksMutex;
 static std::unordered_map<HWND,WindowHook> windowHooks;
 static LRESULT CALLBACK DeviceWindowProc(HWND window,UINT message,WPARAM wp,LPARAM lp){
-  WindowHook hook;
+  WindowHook hook;bool fullscreen=false,transition=false;
   {std::lock_guard<std::mutex> lock(windowHooksMutex);const auto it=windowHooks.find(window);
     if(it!=windowHooks.end()) {
-      if(message==WM_SIZE&&it->second.size) {
+      if(it->second.size) {
+        fullscreen=it->second.size->fullscreen.load(std::memory_order_acquire);
+        transition=it->second.size->transition.load(std::memory_order_acquire);
+      }
+      if(message==WM_SIZE&&it->second.size&&!fullscreen&&!transition) {
         it->second.size->messages.fetch_add(1,std::memory_order_relaxed);RECT client{};
         if(wp!=SIZE_MINIMIZED&&GetClientRect(window,&client)&&client.right>0&&client.bottom>0)
           it->second.size->client.store(uint64_t(client.right)<<32|uint32_t(client.bottom),std::memory_order_release);
       }
+      // The window and its session mark are still valid here, and a Present
+      // published ahead of the host needs both: it is waited for before they
+      // go. Under the lock, so the device cannot let go of the connection.
+      if(message==WM_DESTROY&&it->second.connection)it->second.connection->settlePresentAhead();
       hook=it->second;
       if(message==WM_NCDESTROY)windowHooks.erase(it);
     }}
   const bool unicode=hook.previous?hook.unicode:IsWindowUnicode(window)!=FALSE;
-  if(!hook.previous||message==WM_SIZE)
+  if(fullscreen&&message==WM_NCCALCSIZE&&wp==TRUE)return 0;
+  if(!hook.previous||transition||(message==WM_SIZE&&!fullscreen))
     return unicode?DefWindowProcW(window,message,wp,lp):DefWindowProcA(window,message,wp,lp);
   return unicode?CallWindowProcW(hook.previous,window,message,wp,lp):CallWindowProcA(hook.previous,window,message,wp,lp);
 }
 
-// Unset keeps the legacy full x86 copies. A decimal KiB budget (0 included)
-// requests host content authority; malformed values refuse device creation.
-static bool BackingBudget(bool& enabled,uint64_t& budget) {
-  wchar_t value[16]{};enabled=false;budget=0;
-  const auto size=GetEnvironmentVariableW(L"WARVK_D3D9_X86_BACKING_KIB",value,16);
+// A decimal KiB setting (0 included). Unset leaves it off; a malformed value
+// or one above the limit refuses device creation.
+static bool KibSetting(const wchar_t* name,uint64_t limit,bool& enabled,uint64_t& bytes) {
+  wchar_t value[16]{};enabled=false;bytes=0;
+  const auto size=GetEnvironmentVariableW(name,value,16);
   if(!size)return true;
   if(size>7)return false;
   uint64_t kib=0;
   for(DWORD i=0;i<size;++i){if(value[i]<L'0'||value[i]>L'9')return false;kib=kib*10+uint64_t(value[i]-L'0');}
-  if(kib>4194304)return false;
-  enabled=true;budget=kib*1024;return true;
+  if(kib>limit)return false;
+  enabled=true;bytes=kib*1024;return true;
+}
+// Unset keeps the legacy full x86 copies. A budget requests host content authority.
+// WARVK_D3D9_FAST_ENCODE=0 encodes and checks every fixed-function draw in full, as before
+// d3d9_ff_fast_encode.h; anything else, or no value, uses the encoder that keeps the packet.
+static bool FastFixedEncode() {
+  static const bool enabled=[]{
+    wchar_t value[4]{};const DWORD n=GetEnvironmentVariableW(L"WARVK_D3D9_FAST_ENCODE",value,4);
+    return !(n==1&&value[0]==L'0');
+  }();
+  return enabled;
+}
+static bool BackingBudget(bool& enabled,uint64_t& budget) {
+  return KibSetting(L"WARVK_D3D9_X86_BACKING_KIB",4194304,enabled,budget);
+}
+// Write-only Lock windows (d3d9_upload_window.h): the idle bytes kept for
+// reuse. They rely on the host's content authority, so without a backing
+// budget the setting refuses device creation.
+static bool UploadWindowBudget(bool backing,bool& enabled,uint64_t& budget) {
+  return KibSetting(L"WARVK_D3D9_UPLOAD_WINDOW_KIB",65536,enabled,budget)&&(backing||!enabled);
 }
 
 class Device final : public dxvk::ComObjectClamp<Unsupported<IDirect3DDevice9>> {
@@ -218,6 +281,9 @@ public:
   }
   HRESULT STDMETHODCALLTYPE Reset(D3DPRESENT_PARAMETERS*) override;
   HRESULT STDMETHODCALLTYPE GetDirect3D(IDirect3D9** out) override;
+  HRESULT STDMETHODCALLTYPE GetDisplayMode(UINT swapChain,D3DDISPLAYMODE* mode) override;
+  // "Not meant to be accurate" (DXVK): megabyte granularity, far from zero.
+  UINT STDMETHODCALLTYPE GetAvailableTextureMem() override {return 1024u<<20;}
   HRESULT STDMETHODCALLTYPE GetDeviceCaps(D3DCAPS9* out) override {return NegotiatedCaps(*conn,out);}
   HRESULT STDMETHODCALLTYPE GetCreationParameters(D3DDEVICE_CREATION_PARAMETERS* out) override {
     if(!out)return D3DERR_INVALIDCALL;*out={0,D3DDEVTYPE_HAL,window,behavior};return D3D_OK;
@@ -316,14 +382,66 @@ public:
   HRESULT STDMETHODCALLTYPE SetPixelShaderConstantF(UINT s,const float* p,UINT n) override {return constants(false,true,s,const_cast<float*>(p),n);}
   HRESULT STDMETHODCALLTYPE GetPixelShaderConstantF(UINT s,float* p,UINT n) override {return constants(false,false,s,p,n);}
   HRESULT STDMETHODCALLTYPE BeginScene() override {followWindow();if(!allowed()||scene)return D3DERR_INVALIDCALL;scene=true;return D3D_OK;}
-  HRESULT STDMETHODCALLTYPE EndScene() override {if(!allowed()||!scene)return D3DERR_INVALIDCALL;scene=false;return conn->endScene();}
+  HRESULT STDMETHODCALLTYPE EndScene() override {
+    if(!allowed()||!scene)return D3DERR_INVALIDCALL;scene=false;const ApiScope api(*conn,SyncApi::EndScene);return conn->endScene();
+  }
   HRESULT STDMETHODCALLTYPE Clear(DWORD,const D3DRECT*,DWORD,D3DCOLOR,float,DWORD) override;
   HRESULT STDMETHODCALLTYPE DrawIndexedPrimitive(D3DPRIMITIVETYPE,INT,UINT,UINT,UINT,UINT) override;
   HRESULT STDMETHODCALLTYPE DrawPrimitive(D3DPRIMITIVETYPE,UINT,UINT) override;
+  HRESULT STDMETHODCALLTYPE DrawPrimitiveUP(D3DPRIMITIVETYPE,UINT,const void*,UINT) override;
   HRESULT STDMETHODCALLTYPE Present(const RECT* src,const RECT* dst,HWND win,const RGNDATA* dirty) override {
     // A window resize is taken after the frame, where the game's own message
     // pump runs; a presenter host skips a frame drawn before it.
-    const HRESULT hr=presentFrame(src,dst,win,dirty);followWindow();return hr;
+    observePresent();
+    {const ApiScope api(*conn,SyncApi::FrameDump);dumpFrame();}
+    HRESULT hr;
+    {const ApiScope api(*conn,SyncApi::Present);hr=presentFrame(src,dst,win,dirty);}
+    followWindow();
+    if(hr!=D3D_OK&&!presentFailureTraced){presentFailureTraced=true;d9::GameTrace("Present #%llu hr=0x%08lx",presents,static_cast<unsigned long>(hr));}
+    conn->profilePresented();
+    return hr;
+  }
+  // Game profile, WARVK_D3D9_FRAME_DUMP=<directory> (WARVK_D3D9_FRAME_DUMP_EVERY,
+  // default 300): the back buffer of every Nth frame, read back before its
+  // Present, as frame-<present>-<w>x<h>.bgra. At most 64 files, from the first
+  // present, unless WARVK_D3D9_FRAME_DUMP_MAX / _FROM say otherwise.
+  void dumpFrame();
+  uint64_t presents=0;uint32_t dumps=0;bool presentFailureTraced=false;
+  // The x86 data layer's observer (war3_d3d9_observer.h). Owner thread only.
+  // A callback's own draws are not observed, nor is a window resize taken
+  // inside one (followWindow).
+  WarVKD3D9Observer observer{};bool observing=false,terminalDelivered=false;
+  HRESULT setObserver(const WarVKD3D9Observer* value) {
+    // The earlier layout, without `reset`, is still taken.
+    constexpr uint32_t earlier=offsetof(WarVKD3D9Observer,reset);
+    if(!conn->isOwner()||observing||(value&&value->size!=sizeof(WarVKD3D9Observer)&&value->size!=earlier))
+      return D3DERR_INVALIDCALL;
+    observer=WarVKD3D9Observer{};if(value)std::memcpy(&observer,value,value->size);return D3D_OK;
+  }
+  struct Observing {
+    bool& flag;const bool entered;
+    explicit Observing(bool& value):flag(value),entered(!value){flag=true;}
+    ~Observing(){if(entered)flag=false;}
+  };
+  void observeDraw(bool indexed,D3DPRIMITIVETYPE type,INT base,UINT min,UINT num,UINT start,UINT prim) {
+    if(!observer.draw||observing||!conn->isOwner())return;
+    const Observing scope{observing};
+    const WarVKD3D9DrawFacts facts{sizeof(WarVKD3D9DrawFacts),indexed?1u:0u,uint32_t(type),base,min,num,start,prim};
+    observer.draw(observer.user,this,&facts);
+  }
+  void observePresent() {
+    if(observing||!conn->isOwner())return;
+    const Observing scope{observing};
+    Connection::TerminalReport report;
+    if(observer.terminal&&!terminalDelivered&&conn->terminalReport(report)) {
+      terminalDelivered=true;
+      const auto marks=conn->sessionMarks();
+      const WarVKD3D9TerminalFacts facts{sizeof(WarVKD3D9TerminalFacts),report.result,
+        Connection::TerminalName(report.kind),report.detail,marks.hostExit!=STILL_ACTIVE?1u:0u,marks.hostExit,
+        marks.published,marks.applied,marks.hostLog};
+      observer.terminal(observer.user,this,&facts);
+    }
+    if(observer.present)observer.present(observer.user,this);
   }
   HRESULT presentFrame(const RECT* src,const RECT* dst,HWND win,const RGNDATA* dirty) {
     if(conn->isOwner()&&(!conn->healthy()||notReset))return D3DERR_DEVICELOST;
@@ -375,24 +493,31 @@ public:
   // The window's own resize (DeviceWindowProc), taken by the owner thread at
   // its next size-dependent call outside a scene: the back buffer, viewport and
   // scissor rectangle, BeginScene, Clear, state blocks, and after Present.
+  // Never inside an observer callback: `resized` is not sent from there, so
+  // the resize waits for the Present that follows (the data layer's overlay
+  // draws from the present callback).
   void followWindow(){
-    if(windowSize.client.load(std::memory_order_acquire)&&!scene&&allowed())
+    if(windowSize.client.load(std::memory_order_acquire)&&!scene&&!observing&&allowed())
       resizeToWindow(windowSize.client.exchange(0,std::memory_order_acq_rel));
   }
   // Native's losable count: DEFAULT-pool buffers, implicit back buffers and
   // state blocks. Reset succeeds only once the application released them all.
   uint32_t losable=0;
   d9::ResourceRef reserveResource(d9::Type type) {
-    return allowed()?resources.reserve(type):d9::ResourceRef{};
+    return allowed()&&(!conn->resourceFeatures()||conn->resourceUsable())?resources.reserve(type):d9::ResourceRef{};
   }
   void cancelResourceReservation(d9::ResourceRef ref,d9::Type type) noexcept {
     // Never recycle after a transport/terminal failure: the peer may already
     // own the resource even if no successful reply reached this process.
     if(!conn->healthy())return;
-    if(!conn->isOwner()||!resources.cancelReservation(ref,type))conn->failClosed();
+    if(!conn->isOwner()){conn->failClosed();return;}
+    if(conn->resourceFeatures()&&!conn->resourceUsable())return;
+    if(!resources.cancelReservation(ref,type))conn->failClosed();
   }
   bool commitResourceReservation(d9::ResourceRef ref,d9::Type type) noexcept {
+    if(conn->resourceFeatures()&&conn->isOwner()&&!conn->resourceUsable())return false;
     if(!allowed()||!resources.commitReservation(ref,type)){conn->failClosed();return false;}
+    if(conn->resourceFeatures()&d9::InitializeAsyncCreateTexture)conn->asyncResources()->quota.created(type);
     return true;
   }
   bool resourceMatches(d9::ResourceRef ref,d9::Type type) const {
@@ -404,21 +529,26 @@ public:
     if(!conn->healthy())return;
     if(!conn->isOwner()||!resources.matches(ref,type)){conn->failClosed();return;}
     d9::Header h;h.op=d9::Op::Destroy;h.id=ref.id;h.generation=ref.generation;h.args[0]=uint32_t(type);
-    const HRESULT hr=conn->call(h);
+    const ApiScope api(*conn,SyncApi::Release);
+    const HRESULT hr=(conn->resourceFeatures()&d9::InitializeAsyncDestroy)?conn->enqueueOrdered(h,nullptr):conn->call(h);
     if(hr!=D3D_OK){if(conn->healthy())conn->failClosed();return;}
-    // For GPU resources the host acknowledges only after its production GPU,
-    // resource-use and Presenter retirement. Query destruction only revokes
-    // its CPU observation identity; it does not cancel pending GPU commands.
-    if(!resources.destroy(ref,type))conn->failClosed();
+    // The FIFO owns the old generation now. Only the host can establish GPU retirement.
+    if(!resources.destroy(ref,type)){conn->failClosed();return;}
+    if(conn->resourceFeatures()&d9::InitializeAsyncCreateTexture)conn->asyncResources()->quota.destroyed(type);
   }
   std::shared_ptr<Connection> conn;
   Residency residency;
+  UploadWindows windows;
+  uint64_t windowBufferLocks=0,windowTextureLocks=0;
   // Ordered state: admitted without its reply in the asynchronous profile.
   HRESULT ordered(d9::Header h,const void* payload,bool passStaged=false) {
     return conn->asyncOrderedEnabled()?conn->enqueueOrdered(h,payload,passStaged):conn->call(h,payload);
   }
 private:
   friend class StateBlock;
+#ifdef WARVK_D3D9_CONNECTION_CPU_TEST
+  friend struct ConnectionCpuTest;
+#endif
   std::unique_ptr<CapturedState> recording;
   void capture(CapturedState&,bool preserveOffset);
   HRESULT apply(const CapturedState&);
@@ -433,6 +563,7 @@ private:
   d9::PresentationProfile profile=d9::PresentationProfile::Offscreen;
   UINT width,height; // The back buffer extent; Reset changes it.
   D3DFORMAT format;uint32_t interval; // Back buffer format and the wire interval.
+  bool requestedFullscreen=false;RECT requestedMonitor{}; // CreateDevice's mode, for initialize().
   bool notReset=false;
   bool markerSet=false;
   DWORD dither=FALSE;
@@ -440,6 +571,15 @@ private:
   std::wstring marker;
   WindowSize windowSize; // Written by the window thread through windowHooks.
   bool windowHooked=false;
+  // Full screen: the window's style and rectangle from before, to put back.
+  bool fullscreen=false;LONG windowedStyle=0,windowedExStyle=0;RECT windowedRect{};
+  bool enterFullscreen(const RECT& monitor);
+  void leaveFullscreen() noexcept;
+  // The window as `mode` needs it, before the host is told the extent.
+  bool applyWindowMode(const SwapChainMode& mode){
+    if(!mode.fullscreen){leaveFullscreen();return true;}
+    return fullscreen||enterFullscreen(mode.monitor);
+  }
   uint64_t windowResizes=0,windowResizesRefused=0;
   bool hookWindow();
   void unhookWindow() noexcept;
@@ -449,6 +589,7 @@ private:
   Surface* back=nullptr;
   dxvkcore::D3D9Backend::DrawState draw{};
   d9::FixedFunctionState fixed{};
+  d9::FixedDrawEncoder fixedEncoder;
   d9::SamplerState samplerState{},sentSamplerState{};bool samplerSent=false;
   d9::EffectsState effects{},sentEffects{};
   d9::TextureStages textureStages{},sentTextureStages{};
@@ -473,14 +614,76 @@ private:
     if(vs&&ps)return conn->submitDraw(d9::EncodeDraw(command));
     fixed.lightCount=0;
     for(const auto& light:lights)if(light.enabled)fixed.lights[fixed.lightCount++]=light.value;
+    // The data layer's world lighting replaces the game's values in what is
+    // sent, for this draw only: the game's own state stays as it set it.
+    const WorldLightingScope lighting{*this};
     // A batched refusal is terminal, so keep the host's fixed-state verdict
     // recoverable here, before anything is staged. Setters already validate.
-    if(conn->fixedBatchingEnabled()&&!d9::ValidFixedFunction(fixed))return D3DERR_INVALIDCALL;
-    return conn->submitFixedDraw(d9::EncodeFixedDraw(command,fixed));
+    if(!FastFixedEncode()) {
+      if(conn->fixedBatchingEnabled()&&!d9::ValidFixedFunction(fixed))return D3DERR_INVALIDCALL;
+      return conn->submitFixedDraw(d9::EncodeFixedDraw(command,fixed));
+    }
+    // The same packet and the same verdict, rewritten only where this draw differs from the last.
+    const auto& packet=fixedEncoder.encode(command,fixed);
+    if(conn->fixedBatchingEnabled()&&!fixedEncoder.valid())return D3DERR_INVALIDCALL;
+    return conn->submitFixedDraw(packet);
   }
+  // war3_d3d9_observer.h, WarVKD3D9WorldLighting.
+  WarVKD3D9WorldLighting worldLighting{};
+public:
+  long setWorldLighting(const WarVKD3D9WorldLighting* value) {
+    if(!conn->isOwner())return D3DERR_INVALIDCALL;
+    if(!value){worldLighting={};return D3D_OK;}
+    if(value->size!=sizeof(WarVKD3D9WorldLighting)||value->sunMode>2)return D3DERR_INVALIDCALL;
+    for(unsigned i=0;i<3;++i)
+      if(!std::isfinite(value->sunDirection[i])||!std::isfinite(value->sunColor[i])||!std::isfinite(value->sunAmbient[i]))
+        return D3DERR_INVALIDCALL;
+    if(value->sunMode==2&&value->sunDirection[0]==0&&value->sunDirection[1]==0&&value->sunDirection[2]==0)
+      return D3DERR_INVALIDCALL;
+    worldLighting=*value;return D3D_OK;
+  }
+private:
+  struct WorldLightingScope {
+    Device& device;bool applied=false;
+    D3DCOLORVALUE materialAmbient{};D3DLIGHT9 light0{};uint32_t ambient=0,ambientSource=0;
+    explicit WorldLightingScope(Device& d):device(d) {
+      const auto& w=device.worldLighting;if(!w.active)return;
+      auto& fixed=device.fixed;applied=true;
+      const auto ambientIndex=d9::FFIndex(d9::FFRenderStates,D3DRS_AMBIENT);
+      const auto sourceIndex=d9::FFIndex(d9::FFRenderStates,D3DRS_AMBIENTMATERIALSOURCE);
+      materialAmbient=fixed.material.Ambient;light0=fixed.lights[0];
+      ambient=fixed.render[ambientIndex];ambientSource=fixed.render[sourceIndex];
+      if(w.materialAmbientWhite)fixed.material.Ambient={1,1,1,1};
+      // Light 0 is first in the compacted list exactly when it is enabled.
+      if(device.lights[0].enabled) {
+        auto& light=fixed.lights[0];
+        if(w.sunMode==1) {
+          if(light.Type==D3DLIGHT_DIRECTIONAL) {
+            light.Diffuse.r=light.Diffuse.g=light.Diffuse.b=0;light.Specular.r=light.Specular.g=light.Specular.b=0;
+          }
+        } else if(w.sunMode==2) {
+          light.Type=D3DLIGHT_DIRECTIONAL;
+          light.Direction={w.sunDirection[0],w.sunDirection[1],w.sunDirection[2]};
+          light.Diffuse=light.Specular={w.sunColor[0],w.sunColor[1],w.sunColor[2],1};
+          light.Ambient={w.sunAmbient[0],w.sunAmbient[1],w.sunAmbient[2],1};
+          if(light.Range<1000)light.Range=10000;
+        }
+      }
+      if(w.ambientOverride){fixed.render[ambientIndex]=w.ambientColor;fixed.render[sourceIndex]=D3DMCS_MATERIAL;}
+    }
+    ~WorldLightingScope() {
+      if(!applied)return;
+      auto& fixed=device.fixed;
+      fixed.material.Ambient=materialAmbient;fixed.lights[0]=light0;
+      fixed.render[d9::FFIndex(d9::FFRenderStates,D3DRS_AMBIENT)]=ambient;
+      fixed.render[d9::FFIndex(d9::FFRenderStates,D3DRS_AMBIENTMATERIALSOURCE)]=ambientSource;
+    }
+  };
   // Private bindings keep resources alive without keeping the device alive
   // cyclically. External child refs keep their original COM device identity.
   class VertexBuffer* vb=nullptr;
+  // The vertices of a DrawPrimitiveUP, held like a binding.
+  class VertexBuffer* upBuffer=nullptr;
   class IndexBuffer* ib=nullptr;
   class Texture* tex=nullptr;
   std::array<class Texture*,d9::AdditionalTextureStages> additionalTextures{};
@@ -498,23 +701,44 @@ private:
   uint64_t lastMemorySequence=0;
 };
 
-// Local allocation may fail before any packet is sent. A transmitted create is
-// uncertain until its exact reply arrives: only the host's two documented
-// no-side-effect preflight refusals permit rollback. Unknown results (including
-// S_FALSE), bad payloads, disconnects and backend OOM remain fail-closed.
+// Before publication, local failure can return the reservation. After a sync
+// call only an exact preflight refusal permits rollback. Ordered admission
+// never carries that proof, including failures while flushing earlier draws.
 class ResourceReservation final {
 public:
   ResourceReservation(Device* parent,d9::Type type):parent(parent),type(type),ref(parent->reserveResource(type)){}
   ~ResourceReservation(){if(mayCancel&&ref.id)parent->cancelResourceReservation(ref,type);}
   ResourceReservation(const ResourceReservation&)=delete;
   ResourceReservation& operator=(const ResourceReservation&)=delete;
+  HRESULT preflight(uint16_t formatBit=0) const noexcept {
+    auto& c=*parent->conn;
+    if(!ref.id)return c.resourceFeatures()&&!c.healthy()?D3DERR_DEVICELOST:c.localResourceRefusal(E_OUTOFMEMORY);
+    if(c.resourceFeatures()&d9::InitializeAsyncCreateTexture) {
+      auto& state=*c.asyncResources();
+      // The host checks adapter support before texture quota. Only a proven
+      // format makes the full-pool HRESULT deterministic on this device.
+      if(state.quota.full(type)&&(type!=d9::Type::Texture||state.canCreate(formatBit)))
+        return c.localResourceRefusal(D3DERR_OUTOFVIDEOMEMORY);
+    }
+    return D3D_OK;
+  }
   HRESULT create(d9::Header h,const void* payload=nullptr) noexcept {
-    if(!ref.id)return E_OUTOFMEMORY;
     h.id=ref.id;h.generation=ref.generation;
     mayCancel=false;
-    const HRESULT hr=parent->conn->call(h,payload);
-    if(hr==D3D_OK)
-      return parent->commitResourceReservation(ref,type)?D3D_OK:D3DERR_DEVICELOST;
+    auto& c=*parent->conn;
+    auto* state=c.asyncResources();
+    const auto bit=state&&h.op==d9::Op::CreateTexture2D?d9::TextureFormatBit(h.args[3]):0;
+    if(state&&state->canCreate(bit)) {
+      if(c.enqueueOrdered(h,payload)==D3D_OK&&parent->commitResourceReservation(ref,type))return D3D_OK;
+      if(c.healthy())c.failClosed();
+      return D3DERR_DEVICELOST;
+    }
+    const HRESULT hr=c.call(h,payload);
+    if(hr==D3D_OK) {
+      if(!parent->commitResourceReservation(ref,type))return D3DERR_DEVICELOST;
+      if(state&&(state->features&d9::InitializeAsyncCreateTexture))state->proven|=bit;
+      return D3D_OK;
+    }
     if(parent->conn->healthy()&&(hr==D3DERR_INVALIDCALL||hr==D3DERR_OUTOFVIDEOMEMORY)) {
       mayCancel=true;return hr;
     }
@@ -559,7 +783,8 @@ public:
     *out=static_cast<I*>(this);AddRef();return S_OK;
   }
   HRESULT STDMETHODCALLTYPE GetDevice(IDirect3DDevice9** out) override {return Return(static_cast<IDirect3DDevice9*>(parent),out);}
-  Device* const parent;const d9::ResourceRef ref;const d9::Type type;bool remoteLive=false;
+  Device* const parent;const d9::ResourceRef ref;const d9::Type type;
+  bool remoteLive=false; // Exact sync success or ordered creation on this device FIFO.
 };
 
 template<class I> class Buffer : public Child<I>, private ContentOwner {
@@ -571,7 +796,10 @@ public:
     if(!d->residency.enabled()){bytes.resize(size);d->residency.allocated(size);}
     account(true);++d->losable;
   }
-  ~Buffer(){account(false);this->parent->residency.discard(content);--this->parent->losable;}
+  ~Buffer(){
+    if(window)this->parent->windows.release(window);
+    account(false);this->parent->residency.discard(content);--this->parent->losable;
+  }
   // Local index validation reads this copy. An evicted one is restored first,
   // and the draw refreshes its place in the LRU order on release.
   HRESULT acquireContent() noexcept {
@@ -587,6 +815,7 @@ public:
   void contentEvicted() noexcept override {account(false);account(true);}
   HRESULT STDMETHODCALLTYPE Lock(UINT offset,UINT size,void** out,DWORD flags) override {
     if(out)*out=nullptr;
+    const ApiScope api(*this->parent->conn,SyncApi::BufferLock);
     // NOSYSLOCK is a scheduling hint only, as in DXVK.
     if(!this->resourceAllowed()||!out||locked||offset>extent
       ||(flags&~DWORD(D3DLOCK_DISCARD|D3DLOCK_NOOVERWRITE|D3DLOCK_NOSYSLOCK))
@@ -594,6 +823,16 @@ public:
       ||((flags&D3DLOCK_DISCARD)&&(flags&D3DLOCK_NOOVERWRITE)))return D3DERR_INVALIDCALL;
     if(!size)size=extent-offset;
     if(!size||size>extent-offset||offset>initializedPrefix)return D3DERR_INVALIDCALL;
+    // No byte of the range is defined: a DISCARD, or an append past everything
+    // written since the last one. The write needs no old content and leaves no
+    // x86 copy, so it borrows a zero-filled window instead of a restored
+    // buffer. Index content stays resident: local validation reads it.
+    if(bytes.empty()&&this->type==d9::Type::VertexBuffer&&((flags&D3DLOCK_DISCARD)||offset>=definedEnd)
+        &&this->parent->windows.enabled()) {
+      window=this->parent->windows.acquire(size);if(!window)return E_OUTOFMEMORY;
+      ++this->parent->windowBufferLocks;
+      locked=true;lockOffset=offset;lockBytes=size;lockFlags=flags;*out=window;return D3D_OK;
+    }
     if(bytes.empty()) {
       const auto hr=restore((flags&D3DLOCK_DISCARD)&&this->type==d9::Type::VertexBuffer);if(hr!=D3D_OK)return hr;
     }
@@ -605,24 +844,32 @@ public:
   }
   HRESULT STDMETHODCALLTYPE Unlock() override {
     if(!this->resourceAllowed()||!locked)return D3DERR_INVALIDCALL;
+    const ApiScope api(*this->parent->conn,SyncApi::BufferUnlock);
     const bool discard=lockFlags&D3DLOCK_DISCARD,dynamic=discard||(lockFlags&D3DLOCK_NOOVERWRITE);
+    const uint8_t* source=window?window:bytes.data()+lockOffset;
     for(uint32_t i=0;i<lockBytes;) {
       auto h=this->command(d9::Op::UploadBuffer);h.args[0]=lockOffset+i;
       // Only the first chunk discards; the rest land in the new storage.
       h.args[1]=uint32_t(discard&&!i?d9::UploadMode::Discard:dynamic?d9::UploadMode::NoOverwrite:d9::UploadMode::Ordered);
       h.payloadBytes=std::min(d9::MaxPayload,lockBytes-i);
-      const HRESULT hr=this->parent->ordered(h,bytes.data()+lockOffset+i,h.args[1]==uint32_t(d9::UploadMode::NoOverwrite));
+      const HRESULT hr=this->parent->ordered(h,source+i,h.args[1]==uint32_t(d9::UploadMode::NoOverwrite));
       if(FAILED(hr))return hr;
       if(hr!=D3D_OK){this->parent->conn->failClosed();return D3DERR_DEVICELOST;}
       initializedPrefix=std::max(initializedPrefix,lockOffset+i+h.payloadBytes);i+=h.payloadBytes;
     }
+    // A DISCARD leaves only its own range defined.
+    definedEnd=discard?lockOffset+lockBytes:std::max(definedEnd,lockOffset+lockBytes);
     locked=false;
-    this->parent->residency.unpin(content);
+    if(window){this->parent->windows.release(window);window=nullptr;}
+    else this->parent->residency.unpin(content);
     return D3D_OK;
   }
   D3DRESOURCETYPE STDMETHODCALLTYPE GetType() override {return this->type==d9::Type::IndexBuffer?D3DRTYPE_INDEXBUFFER:D3DRTYPE_VERTEXBUFFER;}
   const uint32_t extent;
   std::vector<uint8_t> bytes;DWORD usage;bool locked=false;uint32_t lockOffset=0,lockBytes=0,initializedPrefix=0;DWORD lockFlags=0;
+  // The end of the bytes written since creation or the last DISCARD.
+  uint32_t definedEnd=0;
+  uint8_t* window=nullptr; // The locked range's storage while it is a borrowed window.
 private:
   // Only an evicted buffer gets here. The host retains every byte of its
   // initialized prefix. After a vertex DISCARD the old contents are undefined,
@@ -679,13 +926,27 @@ public:
     const auto hr=parent->conn->call(h,data);
     if(SUCCEEDED(hr)&&hr!=D3D_OK){parent->conn->failClosed();return D3DERR_DEVICELOST;}return hr;
   }
+  // WARVK_D3D9_ASYNC_UPLOADS: the same record, ordered and without a reply.
+  // What is sent passed the host's own rules here (live handle, revision + 1,
+  // region, first upload whole, no lock held), so the host accepts it; if it
+  // does not, the session ends. Anything but D3D_OK after publication began
+  // leaves the two sides' revisions apart, which no later call may paper over.
+  HRESULT send(const d9::Header& h,const void* data=nullptr) {
+    if(!parent->conn->asyncUploadsEnabled())return checkedCall(h,data);
+    const auto hr=parent->conn->enqueueOrdered(h,data);
+    if(hr!=D3D_OK&&parent->conn->healthy())parent->conn->failClosed();
+    return hr==D3D_OK?D3D_OK:D3DERR_DEVICELOST;
+  }
   Texture(Device*d,d9::ResourceRef ref,const d9::TextureLayout& l):Child(d,ref,d9::Type::Texture),layout(l){
     for(UINT i=0;i<l.levels;++i){surfaces[i].texture=this;surfaces[i].level=i;content[i].bytes=&levelBytes[i];content[i].owner=this;}
     // A budgeted level copy is created by its first LockRect.
     if(!d->residency.enabled()){for(UINT i=0;i<l.levels;++i)levelBytes[i].resize(l.level[i].bytes);d->residency.allocated(l.bytes);}
     account(true);
   }
-  ~Texture(){account(false);for(UINT i=0;i<layout.levels;++i)parent->residency.discard(content[i]);}
+  ~Texture(){
+    for(auto* window:levelWindow)if(window)parent->windows.release(window);
+    account(false);for(UINT i=0;i<layout.levels;++i)parent->residency.discard(content[i]);
+  }
   void account(bool add) noexcept {
     if(add){accountedSize=accountedCapacity=0;
       for(const auto& level:levelBytes){accountedSize+=level.size();accountedCapacity+=level.capacity();}}
@@ -698,8 +959,9 @@ public:
   DWORD STDMETHODCALLTYPE SetLOD(DWORD next)override{
     const auto old=lod;if(!resourceAllowed()||locked)return old;
     next=std::min<DWORD>(next,layout.levels-1);if(next==lod)return old;
+    const ApiScope api(*parent->conn,SyncApi::TextureLod);
     auto h=command(d9::Op::TextureLod);h.args[0]=next;
-    if(checkedCall(h)==D3D_OK)lod=next;return old;
+    if(send(h)==D3D_OK)lod=next;return old;
   }
   HRESULT STDMETHODCALLTYPE GetLevelDesc(UINT level,D3DSURFACE_DESC* p)override{
     if(level>=layout.levels||!p)return D3DERR_INVALIDCALL;const auto& s=layout.level[level];
@@ -717,28 +979,38 @@ public:
     if(rect.left<0||rect.top<0||rect.right<=rect.left||rect.bottom<=rect.top
         ||!d9::MakeManagedLockRegion(layout,level,uint32_t(rect.left),uint32_t(rect.top),uint32_t(rect.right),uint32_t(rect.bottom),selected))
       return D3DERR_INVALIDCALL;
-    if(levelBytes[level].empty()){const auto hr=restore(level);if(hr!=D3D_OK)return hr;}
-    parent->residency.pin(content[level]);
+    const ApiScope api(*parent->conn,SyncApi::TextureLock);
+    if(levelBytes[level].empty()) {
+      // A level never initialized has nothing to restore or keep: a zero-filled
+      // window stands in for the value-initialized copy until UnlockRect.
+      if(!(initializedLevels&(1u<<level))&&parent->windows.enabled()) {
+        levelWindow[level]=parent->windows.acquire(s.bytes);if(!levelWindow[level])return E_OUTOFMEMORY;
+        ++parent->windowTextureLocks;
+      } else {const auto hr=restore(level);if(hr!=D3D_OK)return hr;}
+    }
+    auto* base=levelWindow[level]?levelWindow[level]:levelBytes[level].data();
+    if(!levelWindow[level])parent->residency.pin(content[level]);
     locks[level]={selected,true,bool(flags&D3DLOCK_READONLY)};++locked;
-    p->Pitch=int(s.pitch);p->pBits=levelBytes[level].data()+d9::TextureByteOffset(layout,level,selected.x,selected.y)-s.offset;
+    p->Pitch=int(s.pitch);p->pBits=base+d9::TextureByteOffset(layout,level,selected.x,selected.y)-s.offset;
     return D3D_OK;
   }
   HRESULT STDMETHODCALLTYPE UnlockRect(UINT level)override{
     if(!resourceAllowed()||level>=layout.levels||!locks[level].active)return D3DERR_INVALIDCALL;
     auto& lock=locks[level];
-    if(lock.readOnly){lock.active=false;--locked;parent->residency.unpin(content[level]);return D3D_OK;}
+    if(lock.readOnly){lock.active=false;--locked;releaseLevel(level);return D3D_OK;}
     if(revision==UINT32_MAX)return D3DERR_INVALIDCALL;
+    const ApiScope api(*parent->conn,SyncApi::TextureUnlock);
     auto patch=lock.region;const auto& s=layout.level[level];
     // Local backing is value-initialized. The first commit initializes the
     // whole level, including otherwise undefined texels outside a partial lock.
     if(!(initializedLevels&(1u<<level)))patch={level,0,0,s.width,s.height,s.bytes};
     auto h=command(d9::Op::BeginTextureUpload);h.args[0]=revision+1;h.args[1]=level;
     h.args[2]=patch.x;h.args[3]=patch.y;h.args[4]=patch.width;h.args[5]=patch.height;
-    HRESULT hr=checkedCall(h);if(hr!=D3D_OK)return hr;++revision;
+    HRESULT hr=send(h);if(hr!=D3D_OK)return hr;++revision;
     std::array<uint8_t,d9::MaxPayload> payload{};
     const auto rowBytes=d9::TextureRowBytes(layout,patch.width);
     const auto origin=d9::TextureByteOffset(layout,level,patch.x,patch.y)-s.offset;
-    const auto* source=levelBytes[level].data();
+    const auto* source=levelWindow[level]?levelWindow[level]:levelBytes[level].data();
     for(uint32_t offset=0;offset<patch.bytes&&hr==D3D_OK;) {
       const auto count=std::min(d9::MaxPayload,patch.bytes-offset);uint32_t filled=0;
       while(filled<count) {
@@ -747,18 +1019,23 @@ public:
         std::memcpy(payload.data()+filled,source+origin+row*s.pitch+column,span);filled+=span;
       }
       h=command(d9::Op::TextureUploadChunk);h.args[0]=revision;h.args[1]=offset;h.payloadBytes=count;
-      hr=checkedCall(h,payload.data());offset+=count;
+      hr=send(h,payload.data());offset+=count;
     }
-    if(hr==D3D_OK){h=command(d9::Op::CommitTextureUpload);h.args[0]=revision;hr=checkedCall(h);}
+    if(hr==D3D_OK){h=command(d9::Op::CommitTextureUpload);h.args[0]=revision;hr=send(h);}
+    // A refused synchronous step is withdrawn; an asynchronous one already ended the session.
     if(hr!=D3D_OK){if(parent->conn->healthy()){h=command(d9::Op::AbortTextureUpload);h.args[0]=revision;(void)checkedCall(h);}return hr;}
+    parent->conn->profileTextureUpload(ref.id,ref.generation,level,s.width,s.height,uint32_t(layout.format),layout.levels,
+      patch.bytes,(patch.bytes+d9::MaxPayload-1)/d9::MaxPayload,!(initializedLevels&(1u<<level)),patch.bytes<s.bytes,
+      creator,0,D3DPOOL_MANAGED);
     initializedLevels|=1u<<level;uploaded=initializedLevels==((1u<<layout.levels)-1);lock.active=false;--locked;
-    parent->residency.unpin(content[level]);return D3D_OK;
+    releaseLevel(level);return D3D_OK;
   }
   struct LevelLock {d9::TextureRegion region;bool active=false,readOnly=false;};
   std::array<LevelLock,d9::MaxTextureLevels> locks{};
   std::array<TextureSurface,d9::MaxTextureLevels> surfaces{};
   d9::TextureLayout layout;
   uint32_t lod=0,revision=0,initializedLevels=0,locked=0;bool uploaded=false;
+  uintptr_t creator=0; // P0 measurement only: CreateTexture's return address
 private:
   // An evicted initialized level is read back from the host's retained copy;
   // an uninitialized one starts value-initialized, as at creation.
@@ -779,7 +1056,13 @@ private:
     if(calls)residency.fetched(extent,calls);
     account(false);account(true);return D3D_OK;
   }
+  // The end of a level's lock: its window goes back, or its copy is budgeted.
+  void releaseLevel(UINT level) noexcept {
+    if(levelWindow[level]){parent->windows.release(levelWindow[level]);levelWindow[level]=nullptr;}
+    else parent->residency.unpin(content[level]);
+  }
   std::array<std::vector<uint8_t>,d9::MaxTextureLevels> levelBytes{};
+  std::array<uint8_t*,d9::MaxTextureLevels> levelWindow{};
   std::array<ResidentContent,d9::MaxTextureLevels> content{};
   uint64_t accountedSize=0,accountedCapacity=0;
 };
@@ -858,6 +1141,7 @@ public:
   DWORD STDMETHODCALLTYPE GetDataSize()override{return sizeof(BOOL);}
   HRESULT STDMETHODCALLTYPE Issue(DWORD flags)override{
     if(!resourceAllowed()||flags!=D3DISSUE_END||revision==UINT64_MAX)return D3DERR_INVALIDCALL;
+    const ApiScope api(*parent->conn,SyncApi::QueryIssue);
     const uint64_t nextRevision=revision+1;
     auto h=command(d9::Op::Issue);h.args[0]=uint32_t(nextRevision);h.args[1]=uint32_t(nextRevision>>32);
     std::array<uint8_t,16> p{};const auto hr=parent->conn->call(h,nullptr,p.data(),uint32_t(p.size()));
@@ -870,6 +1154,7 @@ public:
   }
   HRESULT STDMETHODCALLTYPE GetData(void* p,DWORD n,DWORD flags)override{
     if(!resourceAllowed()||(p&&n!=sizeof(BOOL))||(!p&&n)||(flags&~DWORD(D3DGETDATA_FLUSH)))return D3DERR_INVALIDCALL;
+    const ApiScope api(*parent->conn,SyncApi::QueryGetData);
     if(!serial){const auto hr=Issue(D3DISSUE_END);if(FAILED(hr))return hr;}
     auto h=command(d9::Op::Poll);h.args[0]=uint32_t(revision);h.args[1]=uint32_t(revision>>32);
     h.args[2]=uint32_t(serial);h.args[3]=uint32_t(serial>>32);
@@ -910,7 +1195,8 @@ public:
     try {
       d9::Header h;h.op=d9::Op::FactoryQuery;h.args[0]=uint32_t(kind);
       std::copy(args.begin(),args.end(),h.args.begin()+1);
-      return connection()->call(h,nullptr,output,bytes);
+      const auto c=connection();const ApiScope api(*c,SyncApi::Factory);
+      return c->call(h,nullptr,output,bytes);
     }catch(const std::bad_alloc&){return E_OUTOFMEMORY;}catch(...){return D3DERR_NOTAVAILABLE;}
   }
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid,void** out)override{
@@ -954,7 +1240,7 @@ public:
   }
   HRESULT STDMETHODCALLTYPE CheckDeviceType(UINT a,D3DDEVTYPE t,D3DFORMAT display,D3DFORMAT back,BOOL windowed) override {
     if(a||t!=D3DDEVTYPE_HAL)return D3DERR_INVALIDCALL;
-    if(windowed!=TRUE||(back!=D3DFMT_A8R8G8B8&&back!=D3DFMT_X8R8G8B8))return D3DERR_NOTAVAILABLE;
+    if(back!=D3DFMT_A8R8G8B8&&back!=D3DFMT_X8R8G8B8)return D3DERR_NOTAVAILABLE;
     return query(d9::FactoryQuery::DeviceType,{uint32_t(t),uint32_t(display),uint32_t(back),uint32_t(windowed)});
   }
   HRESULT STDMETHODCALLTYPE CheckDeviceFormat(UINT a,D3DDEVTYPE t,D3DFORMAT display,DWORD usage,D3DRESOURCETYPE type,D3DFORMAT format) override {
@@ -984,32 +1270,49 @@ public:
   HRESULT STDMETHODCALLTYPE CreateDevice(UINT a,D3DDEVTYPE t,HWND hwnd,DWORD flags,D3DPRESENT_PARAMETERS* p,IDirect3DDevice9** out)override{
     if(out)*out=nullptr;
     DWORD pid=0;const DWORD windowThread=GetWindowThreadProcessId(hwnd,&pid);
+    if(p)d9::GameTrace("CreateDevice adapter=%u type=%u hwnd=%p flags=0x%lx windowThread=%lu thread=%lu "
+      "back=%ux%u format=%u count=%u ms=%u swap=%u deviceWindow=%p windowed=%d autoDepth=%d depth=%u ppFlags=0x%lx hz=%u interval=0x%x",
+      a,unsigned(t),static_cast<void*>(hwnd),flags,windowThread,GetCurrentThreadId(),p->BackBufferWidth,p->BackBufferHeight,
+      unsigned(p->BackBufferFormat),p->BackBufferCount,unsigned(p->MultiSampleType),unsigned(p->SwapEffect),
+      static_cast<void*>(p->hDeviceWindow),int(p->Windowed),int(p->EnableAutoDepthStencil),unsigned(p->AutoDepthStencilFormat),
+      p->Flags,p->FullScreen_RefreshRateInHz,p->PresentationInterval);
     if(!out||!p||a||t!=D3DDEVTYPE_HAL||!IsWindow(hwnd)||pid!=GetCurrentProcessId()
-      ||flags!=(D3DCREATE_HARDWARE_VERTEXPROCESSING|D3DCREATE_FPU_PRESERVE))return D3DERR_INVALIDCALL;
+      ||flags!=(D3DCREATE_HARDWARE_VERTEXPROCESSING|D3DCREATE_FPU_PRESERVE)) {
+      d9::GameTrace("CreateDevice refused: arguments");return D3DERR_INVALIDCALL;
+    }
     try{
       const auto profile=PresenterProfile();
       // Windowed D3D9: the chosen extent is written back.
       SwapChainMode mode;
-      if(!ResolveSwapChain(*p,hwnd,profile!=d9::PresentationProfile::Offscreen,mode))return D3DERR_INVALIDCALL;
+      if(!ResolveSwapChain(*p,hwnd,profile!=d9::PresentationProfile::Offscreen,mode)) {
+        RECT client{};GetClientRect(hwnd,&client);
+        d9::GameTrace("CreateDevice refused: swap chain (client %ldx%ld)",client.right,client.bottom);return D3DERR_INVALIDCALL;
+      }
       if(profile!=d9::PresentationProfile::Offscreen) {
-        if(windowThread==GetCurrentThreadId())return D3DERR_INVALIDCALL;
+        // The laboratory owner never pumps, so its window lives on another
+        // thread. The game creates its device on its window thread.
+        if(windowThread==GetCurrentThreadId()&&!d9::GameSandboxProfile())return D3DERR_INVALIDCALL;
         const auto desktop=d9::RequireIsolatedDesktop();
         if(d9::ObjectName(GetThreadDesktop(windowThread))!=d9::CurrentDesktop())return D3DERR_INVALIDCALL;
         (void)desktop;
       }
       auto device=std::make_unique<Device>(this,hwnd,flags,profile,mode);const auto hr=device->initialize();
+      d9::GameTrace("CreateDevice initialize hr=0x%08lx extent=%ux%u profile=%u",static_cast<unsigned long>(hr),mode.width,mode.height,unsigned(profile));
       if(FAILED(hr))return hr;p->BackBufferWidth=mode.width;p->BackBufferHeight=mode.height;
       device->AddRef();*out=device.release();return D3D_OK;
     }catch(const std::bad_alloc&){return E_OUTOFMEMORY;}catch(...){return D3DERR_NOTAVAILABLE;}
   }
 private:
+#ifdef WARVK_D3D9_CONNECTION_CPU_TEST
+  friend struct ConnectionCpuTest; // Supply a CPU peer through the usual device constructor.
+#endif
   std::shared_ptr<Connection> pending;
   std::weak_ptr<Connection> active;
 };
 Device::Device(Factory*f,HWND hwnd,DWORD flags,d9::PresentationProfile selected,const SwapChainMode& mode):
   conn(f->acquireDeviceConnection()),
   factory(f),window(hwnd),behavior(flags),profile(selected),width(mode.width),height(mode.height),
-  format(mode.format),interval(mode.interval){
+  format(mode.format),interval(mode.interval),requestedFullscreen(mode.fullscreen),requestedMonitor(mode.monitor){
   if(profile==d9::PresentationProfile::IsolatedPresenterReadback)
     presented.resize(8+size_t(width)*height*4);
   if(!presented.empty())accountPayload(d9::memory::Kind::PresentedReadback,presented.size(),presented.size(),presented.capacity(),true);
@@ -1018,8 +1321,8 @@ Device::Device(Factory*f,HWND hwnd,DWORD flags,d9::PresentationProfile selected,
   effects.scissor={0,0,int32_t(width),int32_t(height)};
 }
 HRESULT Device::initialize(){
-  bool retain=false;uint64_t budget=0;
-  if(!BackingBudget(retain,budget))return D3DERR_NOTAVAILABLE;
+  bool retain=false,lockWindows=false;uint64_t budget=0,lockWindowBudget=0;
+  if(!BackingBudget(retain,budget)||!UploadWindowBudget(retain,lockWindows,lockWindowBudget))return D3DERR_NOTAVAILABLE;
   auto surface=std::make_unique<Surface>(this,false);
   d9::Header h;h.op=d9::Op::Initialize;h.args[0]=width;h.args[1]=height;
   h.args[6]=(retain?d9::InitializeRetainContent:0)|(conn->annotationsEnabled()?d9::InitializeAnnotations:0);
@@ -1035,22 +1338,72 @@ HRESULT Device::initialize(){
   }
   // Every profile, as the original hooks every windowed swap chain.
   if(!hookWindow())return D3DERR_INVALIDCALL;
+  // A full-screen device: the window covers the monitor before the host
+  // compares its client extent with the back buffer.
+  if(requestedFullscreen&&!enterFullscreen(requestedMonitor))return D3DERR_INVALIDCALL;
+  const ApiScope api(*conn,SyncApi::Initialize);
   const auto hr=conn->call(h);if(FAILED(hr))return hr;
   // Before any resource exists: budgeted copies need the host's retained ones.
   if(retain)residency.configure(budget);
+  if(lockWindows)windows.configure(lockWindowBudget);
   back=surface.release();back->AddRefPrivate();return D3D_OK;
 }
 bool Device::hookWindow(){
   std::lock_guard<std::mutex> lock(windowHooksMutex);
   const auto it=windowHooks.find(window);
-  if(it!=windowHooks.end()){it->second.size=&windowSize;windowHooked=true;return true;}
+  if(it!=windowHooks.end()){it->second.size=&windowSize;it->second.connection=conn.get();windowHooked=true;return true;}
   // The window thread waits on the lock, so no message misses the entry.
-  auto& hook=windowHooks[window];hook.unicode=IsWindowUnicode(window)!=FALSE;hook.size=&windowSize;
+  auto& hook=windowHooks[window];hook.unicode=IsWindowUnicode(window)!=FALSE;hook.size=&windowSize;hook.connection=conn.get();
   const auto proc=reinterpret_cast<LONG_PTR>(DeviceWindowProc);
   hook.previous=reinterpret_cast<WNDPROC>(hook.unicode?SetWindowLongPtrW(window,GWLP_WNDPROC,proc)
     :SetWindowLongPtrA(window,GWLP_WNDPROC,proc));
   if(!hook.previous){windowHooks.erase(window);return false;}
   windowHooked=true;return true;
+}
+// WarVK's EnterFullscreenMode without the display mode change: the frame
+// styles go, the window covers the monitor on top. The window's own messages
+// about it are kept from the application (the original's message filter).
+bool Device::enterFullscreen(const RECT& monitor){
+  if(fullscreen)return true;
+  windowedStyle=GetWindowLongW(window,GWL_STYLE);windowedExStyle=GetWindowLongW(window,GWL_EXSTYLE);
+  if(!GetWindowRect(window,&windowedRect))return false;
+  windowSize.transition.store(true,std::memory_order_release);
+  windowSize.fullscreen.store(true,std::memory_order_release);
+  SetWindowLongW(window,GWL_STYLE,windowedStyle&~LONG(WS_OVERLAPPEDWINDOW));
+  SetWindowLongW(window,GWL_EXSTYLE,windowedExStyle&~LONG(WS_EX_OVERLAPPEDWINDOW));
+  const BOOL moved=SetWindowPos(window,HWND_TOPMOST,monitor.left,monitor.top,monitor.right-monitor.left,
+    monitor.bottom-monitor.top,SWP_FRAMECHANGED|SWP_SHOWWINDOW|SWP_NOACTIVATE);
+  windowSize.transition.store(false,std::memory_order_release);
+  RECT client{};
+  fullscreen=true;
+  if(!moved||!GetClientRect(window,&client)||client.left||client.top
+    ||client.right!=monitor.right-monitor.left||client.bottom!=monitor.bottom-monitor.top) {
+    d9::GameTrace("full screen refused: client %ldx%ld for monitor %ldx%ld",client.right,client.bottom,
+      monitor.right-monitor.left,monitor.bottom-monitor.top);
+    leaveFullscreen();return false;
+  }
+  windowSize.client.store(0,std::memory_order_release);
+  d9::GameTrace("full screen: borderless window %ldx%ld at %ld,%ld",client.right,client.bottom,monitor.left,monitor.top);
+  return true;
+}
+// WarVK's LeaveFullscreenMode: the styles come back unless the application
+// changed them meanwhile, and the window returns to its rectangle.
+void Device::leaveFullscreen() noexcept {
+  if(!fullscreen)return;
+  fullscreen=false;
+  if(!IsWindow(window)){windowSize.fullscreen.store(false,std::memory_order_release);return;}
+  windowSize.transition.store(true,std::memory_order_release);
+  windowSize.fullscreen.store(false,std::memory_order_release);
+  const LONG style=GetWindowLongW(window,GWL_STYLE)&~LONG(WS_VISIBLE);
+  const LONG exStyle=GetWindowLongW(window,GWL_EXSTYLE)&~LONG(WS_EX_TOPMOST);
+  if(style==(windowedStyle&~LONG(WS_VISIBLE|WS_OVERLAPPEDWINDOW))
+    &&exStyle==(windowedExStyle&~LONG(WS_EX_TOPMOST|WS_EX_OVERLAPPEDWINDOW))) {
+    SetWindowLongW(window,GWL_STYLE,windowedStyle);SetWindowLongW(window,GWL_EXSTYLE,windowedExStyle);
+  }
+  SetWindowPos(window,(windowedExStyle&WS_EX_TOPMOST)?HWND_TOPMOST:HWND_NOTOPMOST,windowedRect.left,windowedRect.top,
+    windowedRect.right-windowedRect.left,windowedRect.bottom-windowedRect.top,SWP_FRAMECHANGED|SWP_NOACTIVATE);
+  windowSize.transition.store(false,std::memory_order_release);
+  d9::GameTrace("full screen left: window restored");
 }
 void Device::unhookWindow() noexcept {
   if(!windowHooked)return;
@@ -1059,15 +1412,19 @@ void Device::unhookWindow() noexcept {
   const auto proc=reinterpret_cast<LONG_PTR>(DeviceWindowProc);
   const auto current=it->second.unicode?GetWindowLongPtrW(window,GWLP_WNDPROC):GetWindowLongPtrA(window,GWLP_WNDPROC);
   // A later subclass still calls through the entry, which keeps forwarding.
-  if(current!=proc){it->second.size=nullptr;return;}
+  if(current!=proc){it->second.size=nullptr;it->second.connection=nullptr;return;}
   const auto previous=reinterpret_cast<LONG_PTR>(it->second.previous);
   if(it->second.unicode)SetWindowLongPtrW(window,GWLP_WNDPROC,previous);else SetWindowLongPtrA(window,GWLP_WNDPROC,previous);
   windowHooks.erase(it);
 }
 Device::~Device(){
+  if(observer.released&&!observing){const Observing scope{observing};observer.released(observer.user,this);}
+  observer=WarVKD3D9Observer{};
+  leaveFullscreen();
   unhookWindow();
   recording.reset(); // Destroy recorded resources before Finish closes the host.
   Bind(vb,static_cast<VertexBuffer*>(nullptr));Bind(ib,static_cast<IndexBuffer*>(nullptr));Bind(tex,static_cast<Texture*>(nullptr));
+  Bind(upBuffer,static_cast<VertexBuffer*>(nullptr));
   for(auto& texture:additionalTextures)Bind(texture,static_cast<Texture*>(nullptr));
   Bind(vs,static_cast<VertexShader*>(nullptr));Bind(ps,static_cast<PixelShader*>(nullptr));Bind(decl,static_cast<Declaration*>(nullptr));
   const auto fvfCached=fvfDeclarations.size();
@@ -1083,13 +1440,24 @@ Device::~Device(){
     "\"fetches\":%llu,\"fetchCalls\":%llu,\"fetchedBytes\":%llu,\"discardMisses\":%llu}\n",
     enabled?"true":"false",budget,r.residentBytes,r.peakResidentBytes,r.listedBytes,r.peakPinnedBytes,
     r.maxListedAfterTrim,r.allocations,r.evictions,r.evictedBytes,r.fetches,r.fetchCalls,r.fetchedBytes,r.discardMisses);
+  // Only a session that asked for write-only Lock windows prints their account.
+  bool lockWindows=false;uint64_t lockWindowBudget=0;const auto lw=windows.snapshot(lockWindowBudget,lockWindows);
+  if(lockWindows)
+    std::fprintf(stderr,"D3D9 upload-window-proxy: {\"schema\":\"warvk-d3d9-upload-window-proxy/v1\",\"budgetBytes\":%llu,"
+      "\"acquires\":%llu,\"allocations\":%llu,\"reuses\":%llu,\"releases\":%llu,\"trims\":%llu,\"trimmedBytes\":%llu,"
+      "\"requestedBytes\":%llu,\"idleBytes\":%llu,\"peakIdleBytes\":%llu,\"outstandingBytes\":%llu,"
+      "\"peakOutstandingBytes\":%llu,\"outstanding\":%u,\"peakOutstanding\":%u,\"bufferLocks\":%llu,\"textureLocks\":%llu}\n",
+      lockWindowBudget,lw.acquires,lw.allocations,lw.reuses,lw.releases,lw.trims,lw.trimmedBytes,lw.requestedBytes,lw.idleBytes,
+      lw.peakIdleBytes,lw.outstandingBytes,lw.peakOutstandingBytes,lw.outstanding,lw.peakOutstanding,
+      static_cast<unsigned long long>(windowBufferLocks),static_cast<unsigned long long>(windowTextureLocks));
   std::fprintf(stderr,"D3D9 fvf-proxy: {\"schema\":\"warvk-d3d9-fvf-proxy/v1\",\"cached\":%llu,\"evictions\":%llu}\n",
     static_cast<unsigned long long>(fvfCached),static_cast<unsigned long long>(fvfEvictions));
   std::fprintf(stderr,"D3D9 window-proxy: {\"schema\":\"warvk-d3d9-window-proxy/v1\",\"hooked\":%s,\"sizeMessages\":%llu,"
     "\"resizes\":%llu,\"refused\":%llu}\n",windowHooked?"true":"false",
     static_cast<unsigned long long>(windowSize.messages.load()),static_cast<unsigned long long>(windowResizes),
     static_cast<unsigned long long>(windowResizesRefused));
-  d9::Header h;h.op=d9::Op::Finish;conn->call(h);
+  d9::Header h;h.op=d9::Op::Finish;
+  {const ApiScope api(*conn,SyncApi::DeviceRelease);conn->call(h);}
   if(markerSet&&GetPropW(window,marker.c_str())==reinterpret_cast<HANDLE>(uintptr_t(1)))
     RemovePropW(window,marker.c_str());
   factory->Release();
@@ -1114,6 +1482,7 @@ HRESULT Device::diagnosticCheckpoint(UINT phase,UINT ordinal,d9::memory::Checkpo
     sample.workerBatchPayloadBytes=commands::MaxBatchBytes;
     sample.tickBegin=GetTickCount64();sample.before=lab::ProbeOwnProcessMemory();sample.beforeEnd=GetTickCount64();
     d9::Header h;h.op=d9::Op::DiagnosticCheckpoint;h.args[0]=phase;h.args[1]=ordinal;
+    const ApiScope api(*conn,SyncApi::Checkpoint);
     HostWire encoded{};const HRESULT hr=conn->call(h,nullptr,encoded.data(),uint32_t(encoded.size()));
     if(hr!=D3D_OK)return hr;
     Connection::DiagnosticIdentity expected;
@@ -1147,16 +1516,32 @@ void Device::resetState(){
 HRESULT Device::Reset(D3DPRESENT_PARAMETERS* p){
   if(!conn->isOwner())return D3DERR_INVALIDCALL;
   if(!conn->healthy())return D3DERR_DEVICELOST;
+  // The data layer's own DEFAULT-pool buffers go first, as the in-process
+  // Reset has its panel release them; they count as losable below.
+  if(observer.reset&&!observing){const Observing scope{observing};observer.reset(observer.user,this);}
   // Refused parameters (native validation, or this profile's limits) leave the
   // device and its state untouched; so does Reset while recording a block.
   SwapChainMode mode;
-  try{if(!p||recording||!ResolveSwapChain(*p,window,profile!=d9::PresentationProfile::Offscreen,mode))return D3DERR_INVALIDCALL;}
-  catch(...){return D3DERR_INVALIDCALL;}
+  const bool presenter=profile!=d9::PresentationProfile::Offscreen;
+  try{
+    if(!p||recording)return D3DERR_INVALIDCALL;
+    // Back to a window from full screen: the window returns first, so the
+    // request is resolved against the client extent it then has. The format
+    // and flags are checked before the window is touched.
+    if(fullscreen&&p->Windowed) {
+      if(!ResolveSwapChain(*p,window,false,mode))return D3DERR_INVALIDCALL;
+      leaveFullscreen();
+    }
+    if(!ResolveSwapChain(*p,window,presenter,mode)||!applyWindowMode(mode))return D3DERR_INVALIDCALL;
+  }catch(...){return D3DERR_INVALIDCALL;}
   // From here native clears the state and releases its implicit surfaces
   // whether or not the Reset succeeds; the scene ends.
   resetState();
   if(back){back->ReleasePrivate();back=nullptr;}
+  // The device's own DEFAULT-pool buffer is not the application's to release.
+  Bind(upBuffer,static_cast<VertexBuffer*>(nullptr));
   if(losable){notReset=true;return D3DERR_INVALIDCALL;}
+  const ApiScope api(*conn,SyncApi::Reset);
   d9::Header h;h.op=d9::Op::Reset;h.args[0]=mode.width;h.args[1]=mode.height;h.args[5]=mode.interval;
   h.args[7]=mode.format==D3DFMT_X8R8G8B8?d9::OpaqueBackBuffer:0;
   HRESULT hr=conn->call(h);
@@ -1195,10 +1580,12 @@ void Device::resizeToWindow(uint64_t client){
   const uint32_t w=uint32_t(client>>32),h=uint32_t(client);
   if(!client||(w==width&&h==height))return;
   if(!d9::ValidTargetExtent(w,h)){++windowResizesRefused;return;}
+  const ApiScope api(*conn,SyncApi::WindowResize,true);
   d9::Header r;r.op=d9::Op::Reset;r.args[0]=w;r.args[1]=h;r.args[5]=interval;r.args[6]=d9::ResetKeepResources;
   r.args[7]=format==D3DFMT_X8R8G8B8?d9::OpaqueBackBuffer:0;
   const HRESULT hr=conn->call(r);
   if(hr!=D3D_OK){if(SUCCEEDED(hr))conn->failClosed();else if(conn->healthy())++windowResizesRefused;return;}
+  const uint32_t previousWidth=width,previousHeight=height;
   width=w;height=h;
   try{
     if(!presented.empty()) {
@@ -1211,18 +1598,73 @@ void Device::resizeToWindow(uint64_t client){
   }catch(...){conn->failClosed();return;}
   draw.viewport={0,0,width,height,0,1};effects.scissor={0,0,int32_t(width),int32_t(height)};
   ++windowResizes;
+  if(observer.resized&&!observing){const Observing scope{observing};observer.resized(observer.user,this,previousWidth,previousHeight,width,height);}
+}
+void Device::dumpFrame(){
+  const uint64_t index=presents++;
+  if(!d9::GameTraceEnabled()||!allowed()||scene)return;
+  // WARVK_D3D9_FRAME_DUMP_FROM (default 0): the first present dumped; WARVK_D3D9_FRAME_DUMP_MAX (default 64).
+  static const auto number=[](const wchar_t* name,unsigned long fallback){wchar_t value[16]{};
+    const DWORD size=GetEnvironmentVariableW(name,value,16);
+    return size&&size<16?std::wcstoul(value,nullptr,10):fallback;};
+  static const uint64_t from=number(L"WARVK_D3D9_FRAME_DUMP_FROM",0);
+  static const uint32_t most=uint32_t(std::min<unsigned long>(number(L"WARVK_D3D9_FRAME_DUMP_MAX",64),8192));
+  if(index<from||dumps>=most)return;
+  static const std::wstring directory=[]{wchar_t value[512]{};
+    const DWORD size=GetEnvironmentVariableW(L"WARVK_D3D9_FRAME_DUMP",value,512);return size&&size<512?std::wstring(value):std::wstring();}();
+  static const uint64_t every=[]{wchar_t value[16]{};
+    const DWORD size=GetEnvironmentVariableW(L"WARVK_D3D9_FRAME_DUMP_EVERY",value,16);
+    const unsigned long n=size&&size<16?std::wcstoul(value,nullptr,10):0;return uint64_t(n?n:300);}();
+  if(directory.empty()||(index-from)%every)return;
+  try{
+    std::vector<uint8_t> image(size_t(width)*height*4);
+    const HRESULT hr=readRows(d9::ReadbackSource::Target,0,image.data());
+    if(hr!=D3D_OK){d9::GameTrace("frame dump #%llu readback hr=0x%08lx",index,static_cast<unsigned long>(hr));return;}
+    const auto path=directory+L"\\frame-"+std::to_wstring(index)+L"-"+std::to_wstring(width)+L"x"+std::to_wstring(height)+L".bgra";
+    const HANDLE file=CreateFileW(path.c_str(),GENERIC_WRITE,0,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr);
+    if(file==INVALID_HANDLE_VALUE){d9::GameTrace("frame dump #%llu create win32=%lu",index,GetLastError());return;}
+    DWORD written=0;const BOOL ok=WriteFile(file,image.data(),DWORD(image.size()),&written,nullptr);CloseHandle(file);
+    ++dumps;d9::GameTrace("frame dump #%llu %ux%u written=%lu ok=%d",index,width,height,written,int(ok));
+  }catch(...){d9::GameTrace("frame dump #%llu failed",index);}
 }
 HRESULT Device::GetDirect3D(IDirect3D9** p){return Return(static_cast<IDirect3D9*>(factory),p);}
+// The implicit swap chain's: the adapter's current mode, as native answers.
+HRESULT Device::GetDisplayMode(UINT swapChain,D3DDISPLAYMODE* mode){
+  return swapChain?D3DERR_INVALIDCALL:factory->GetAdapterDisplayMode(0,mode);
+}
+// WarVKD3D9RetainPrivate / WarVKD3D9ReleasePrivate: a vertex buffer, index
+// buffer or texture of this device, on its owner thread.
+template<class F>static HRESULT WithOwnResource(Device* d,IUnknown* resource,F&& f){
+  if(!d||!resource||!d->conn->isOwner())return D3DERR_INVALIDCALL;
+  if(auto* r=dynamic_cast<VertexBuffer*>(resource))return r->parent==d?f(*r):D3DERR_INVALIDCALL;
+  if(auto* r=dynamic_cast<IndexBuffer*>(resource))return r->parent==d?f(*r):D3DERR_INVALIDCALL;
+  if(auto* r=dynamic_cast<Texture*>(resource))return r->parent==d?f(*r):D3DERR_INVALIDCALL;
+  return D3DERR_INVALIDCALL;
+}
+// The caller's one public reference becomes a private one: the resource no
+// longer keeps the device alive (Child::Release drops the device's public
+// reference with the last public one), and the device's destructor still finds
+// it alive at its `released` callback, where the caller releases it.
+HRESULT RetainPrivate(Device* d,IUnknown* resource){
+  return WithOwnResource(d,resource,[](auto& r)->HRESULT{
+    if(r.publicReferencesZero())return D3DERR_INVALIDCALL;
+    r.AddRefPrivate();r.Release();return D3D_OK;});
+}
+HRESULT ReleasePrivate(Device* d,IUnknown* resource){
+  return WithOwnResource(d,resource,[](auto& r)->HRESULT{r.ReleasePrivate();return D3D_OK;});
+}
 template<class T,class I>static HRESULT MakeBuffer(Device* d,UINT n,DWORD usage,D3DPOOL pool,I** out,HANDLE* shared,bool index){
   if(out)*out=nullptr;
   if(!d->allowed()||!out||shared||!n||n>d9::MaxBuffer||pool!=D3DPOOL_DEFAULT
-    ||(usage&~DWORD(D3DUSAGE_DYNAMIC|D3DUSAGE_WRITEONLY))||!(usage&D3DUSAGE_WRITEONLY)||(index&&(n&1)))return D3DERR_INVALIDCALL;
+    ||(usage&~DWORD(D3DUSAGE_DYNAMIC|D3DUSAGE_WRITEONLY))||!(usage&D3DUSAGE_WRITEONLY)||(index&&(n&1)))return d->conn->localResourceRefusal(D3DERR_INVALIDCALL);
+  const ApiScope api(*d->conn,SyncApi::CreateBuffer);
   try{ResourceReservation reservation(d,index?d9::Type::IndexBuffer:d9::Type::VertexBuffer);
-    if(!reservation.ref.id)return E_OUTOFMEMORY;auto o=std::make_unique<T>(d,reservation.ref,n,usage);
+    if(const auto hr=reservation.preflight();hr!=D3D_OK)return hr;
+    auto o=std::make_unique<T>(d,reservation.ref,n,usage);
     d9::Header h;h.op=d9::Op::CreateBuffer;h.args[0]=n;h.args[1]=index?1:0;h.args[2]=(usage&D3DUSAGE_DYNAMIC)?1:0;
     const auto hr=reservation.create(h);if(hr!=D3D_OK)return hr;
     o->remoteLive=true;o->AddRef();*out=o.release();return D3D_OK;
-  }catch(const std::bad_alloc&){return E_OUTOFMEMORY;}catch(...){return D3DERR_INVALIDCALL;}
+  }catch(const std::bad_alloc&){return d->conn->localResourceRefusal(E_OUTOFMEMORY);}catch(...){return d->conn->localResourceRefusal(D3DERR_INVALIDCALL);}
 }
 HRESULT Device::CreateVertexBuffer(UINT n,DWORD u,DWORD f,D3DPOOL p,IDirect3DVertexBuffer9** o,HANDLE* s){
   const auto hr=MakeBuffer<VertexBuffer>(this,n,u,p,o,s,false);
@@ -1230,17 +1672,20 @@ HRESULT Device::CreateVertexBuffer(UINT n,DWORD u,DWORD f,D3DPOOL p,IDirect3DVer
   return hr;
 }
 HRESULT Device::CreateIndexBuffer(UINT n,DWORD u,D3DFORMAT f,D3DPOOL p,IDirect3DIndexBuffer9** o,HANDLE* s){
-  if(f!=D3DFMT_INDEX16){if(o)*o=nullptr;return D3DERR_INVALIDCALL;}return MakeBuffer<IndexBuffer>(this,n,u,p,o,s,true);
+  if(f!=D3DFMT_INDEX16){if(o)*o=nullptr;return conn->localResourceRefusal(D3DERR_INVALIDCALL);}return MakeBuffer<IndexBuffer>(this,n,u,p,o,s,true);
 }
 HRESULT Device::CreateTexture(UINT w,UINT h,UINT levels,DWORD usage,D3DFORMAT format,D3DPOOL pool,IDirect3DTexture9** out,HANDLE* shared){
   if(out)*out=nullptr;
   d9::TextureLayout layout;
-  if(!allowed()||!out||shared||!d9::MakeTextureLayout(w,h,levels,layout,format)||usage||pool!=D3DPOOL_MANAGED)return D3DERR_INVALIDCALL;
+  if(!allowed()||!out||shared||!d9::MakeTextureLayout(w,h,levels,layout,format)||usage||pool!=D3DPOOL_MANAGED)return conn->localResourceRefusal(D3DERR_INVALIDCALL);
+  const ApiScope api(*conn,SyncApi::CreateTexture);
   try{ResourceReservation reservation(this,d9::Type::Texture);
-    if(!reservation.ref.id)return E_OUTOFMEMORY;auto o=std::make_unique<Texture>(this,reservation.ref,layout);
+    if(const auto hr=reservation.preflight(conn->resourceFeatures()?d9::TextureFormatBit(format):0);hr!=D3D_OK)return hr;
+    auto o=std::make_unique<Texture>(this,reservation.ref,layout);
+    o->creator=reinterpret_cast<uintptr_t>(__builtin_return_address(0)); // P0 measurement only: the game's call site
     d9::Header hd;hd.op=d9::Op::CreateTexture2D;hd.args[0]=w;hd.args[1]=h;hd.args[2]=layout.levels;hd.args[3]=format;
     const auto hr=reservation.create(hd);if(hr!=D3D_OK)return hr;o->remoteLive=true;o->AddRef();*out=o.release();return D3D_OK;
-  }catch(const std::bad_alloc&){return E_OUTOFMEMORY;}catch(...){return D3DERR_INVALIDCALL;}
+  }catch(const std::bad_alloc&){return conn->localResourceRefusal(E_OUTOFMEMORY);}catch(...){return conn->localResourceRefusal(D3DERR_INVALIDCALL);}
 }
 HRESULT Device::CreateOffscreenPlainSurface(UINT w,UINT h,D3DFORMAT f,D3DPOOL pool,IDirect3DSurface9** out,HANDLE* shared){
   // Only a GetRenderTargetData destination: exactly the back buffer extent and format.
@@ -1257,10 +1702,16 @@ HRESULT Device::GetRenderTargetData(IDirect3DSurface9* src,IDirect3DSurface9* ds
   // A surface made before a Reset keeps its old extent and format.
   if(!allowed()||src!=back||!target||target->parent!=this||!target->system||target->locked
     ||target->width!=width||target->height!=height||target->format!=format)return D3DERR_INVALIDCALL;
+  const ApiScope api(*conn,SyncApi::GetRenderTargetData);
   return readRows(d9::ReadbackSource::Target,0,target->bytes.data());
 }
+// Reads through a pointer the game passed in; an unreadable one is refused, not followed. This
+// used to be ReadProcessMemory on the own process, a system call per SetTransform / SetMaterial /
+// SetLight: 14% of the game thread on a heavy map (profile of 2026-11-18). IsBadReadPtr probes
+// the same range in user mode under the system's own exception handler.
 static bool ReadSelf(const void* source,void* target,size_t bytes){
-  SIZE_T done=0;return source&&ReadProcessMemory(GetCurrentProcess(),source,target,bytes,&done)&&done==bytes;
+  if(!source||IsBadReadPtr(source,bytes))return false;
+  std::memcpy(target,source,bytes);return true;
 }
 HRESULT Device::SetTransform(D3DTRANSFORMSTATETYPE type,const D3DMATRIX* value) {
   const auto index=d9::FFTransformIndex(type);D3DMATRIX matrix{};
@@ -1345,29 +1796,31 @@ static bool ReadShader(const DWORD* data,std::vector<uint32_t>& words){
   }return false;
 }
 template<class T,class I>HRESULT MakeShader(Device*d,const DWORD* tokens,I** out,d9::Type type){
-  if(out)*out=nullptr;if(!d->allowed()||!out)return D3DERR_INVALIDCALL;
-  try{std::vector<uint32_t> words;if(!ReadShader(tokens,words))return D3DERR_INVALIDCALL;
+  if(out)*out=nullptr;if(!d->allowed()||!out)return d->conn->localResourceRefusal(D3DERR_INVALIDCALL);
+  const ApiScope api(*d->conn,SyncApi::CreateShader);
+  try{std::vector<uint32_t> words;if(!ReadShader(tokens,words))return d->conn->localResourceRefusal(D3DERR_INVALIDCALL);
     const bool vertex=type==d9::Type::VertexShader;
-    if(d3d9tokens::Scan(words.data(),words.size()).stage!=(vertex?d3d9tokens::Stage::Vertex:d3d9tokens::Stage::Pixel))return D3DERR_INVALIDCALL;
-    ResourceReservation reservation(d,type);if(!reservation.ref.id)return E_OUTOFMEMORY;
+    if(d3d9tokens::Scan(words.data(),words.size()).stage!=(vertex?d3d9tokens::Stage::Vertex:d3d9tokens::Stage::Pixel))return d->conn->localResourceRefusal(D3DERR_INVALIDCALL);
+    ResourceReservation reservation(d,type);if(const auto hr=reservation.preflight();hr!=D3D_OK)return hr;
     auto o=std::make_unique<T>(d,reservation.ref,std::move(words));
     d9::Header h;h.op=d9::Op::CreateShader;h.args[0]=vertex?0:1;h.payloadBytes=uint32_t(o->tokens.size()*4);
     d9::Packet payload{};for(size_t i=0;i<o->tokens.size();++i)d9::P32(payload.data()+i*4,o->tokens[i]);
     const auto hr=reservation.create(h,payload.data());if(hr!=D3D_OK)return hr;o->remoteLive=true;o->AddRef();*out=o.release();return D3D_OK;
-  }catch(const std::bad_alloc&){return E_OUTOFMEMORY;}catch(...){return D3DERR_INVALIDCALL;}
+  }catch(const std::bad_alloc&){return d->conn->localResourceRefusal(E_OUTOFMEMORY);}catch(...){return d->conn->localResourceRefusal(D3DERR_INVALIDCALL);}
 }
 HRESULT Device::CreateVertexShader(const DWORD*p,IDirect3DVertexShader9**o){return MakeShader<VertexShader>(this,p,o,d9::Type::VertexShader);}
 HRESULT Device::CreatePixelShader(const DWORD*p,IDirect3DPixelShader9**o){return MakeShader<PixelShader>(this,p,o,d9::Type::PixelShader);}
 HRESULT Device::CreateVertexDeclaration(const D3DVERTEXELEMENT9* data,IDirect3DVertexDeclaration9** out){
-  if(out)*out=nullptr;if(!allowed()||!out||!data)return D3DERR_INVALIDCALL;
+  if(out)*out=nullptr;if(!allowed()||!out||!data)return conn->localResourceRefusal(D3DERR_INVALIDCALL);
+  const ApiScope api(*conn,SyncApi::CreateDeclaration);
   try{
     std::vector<D3DVERTEXELEMENT9> elems;
-    for(size_t i=0;i<17;++i){D3DVERTEXELEMENT9 e;if(!ReadSelf(data+i,&e,sizeof(e)))return D3DERR_INVALIDCALL;elems.push_back(e);if(e.Stream==0xff)break;}
+    for(size_t i=0;i<17;++i){D3DVERTEXELEMENT9 e;if(!ReadSelf(data+i,&e,sizeof(e)))return conn->localResourceRefusal(D3DERR_INVALIDCALL);elems.push_back(e);if(e.Stream==0xff)break;}
     const D3DVERTEXELEMENT9 end=D3DDECL_END();
     uint32_t extent=0;
     if(elems.empty()||std::memcmp(&elems.back(),&end,sizeof(end))
-      ||!d9::ValidDeclaration(elems.data(),uint32_t(elems.size()-1),extent))return D3DERR_INVALIDCALL;
-    ResourceReservation reservation(this,d9::Type::Declaration);if(!reservation.ref.id)return E_OUTOFMEMORY;
+      ||!d9::ValidDeclaration(elems.data(),uint32_t(elems.size()-1),extent))return conn->localResourceRefusal(D3DERR_INVALIDCALL);
+    ResourceReservation reservation(this,d9::Type::Declaration);if(const auto hr=reservation.preflight();hr!=D3D_OK)return hr;
     auto o=std::make_unique<Declaration>(this,reservation.ref,std::move(elems));
     o->extent=extent;
     o->fvf=dxvk::FvfMapping::MapD3D9VertexElementsToFvf(o->elements.data(),uint32_t(o->elements.size()-1));
@@ -1375,16 +1828,17 @@ HRESULT Device::CreateVertexDeclaration(const D3DVERTEXELEMENT9* data,IDirect3DV
     for(size_t i=0;i+1<o->elements.size();++i)d9::EncodeDeclarationElement(p.data()+i*8,o->elements[i]);
     d9::Header h;h.op=d9::Op::CreateDeclaration;h.payloadBytes=uint32_t(o->elements.size()-1)*8;
     const auto hr=reservation.create(h,p.data());if(hr!=D3D_OK)return hr;o->remoteLive=true;o->AddRef();*out=o.release();return D3D_OK;
-  }catch(const std::bad_alloc&){return E_OUTOFMEMORY;}catch(...){return D3DERR_INVALIDCALL;}
+  }catch(const std::bad_alloc&){return conn->localResourceRefusal(E_OUTOFMEMORY);}catch(...){return conn->localResourceRefusal(D3DERR_INVALIDCALL);}
 }
 HRESULT Device::CreateQuery(D3DQUERYTYPE type,IDirect3DQuery9** out){
-  if(out)*out=nullptr;if(!allowed()||type!=D3DQUERYTYPE_EVENT)return D3DERR_NOTAVAILABLE;
+  if(out)*out=nullptr;if(!allowed()||type!=D3DQUERYTYPE_EVENT)return conn->localResourceRefusal(D3DERR_NOTAVAILABLE);
   if(!out)return D3D_OK;
-  try{ResourceReservation reservation(this,d9::Type::EventQuery);if(!reservation.ref.id)return E_OUTOFMEMORY;
+  const ApiScope api(*conn,SyncApi::CreateQuery);
+  try{ResourceReservation reservation(this,d9::Type::EventQuery);if(const auto hr=reservation.preflight();hr!=D3D_OK)return hr;
     auto q=std::make_unique<Query>(this,reservation.ref);d9::Header h;h.op=d9::Op::CreateQuery;
     const auto hr=reservation.create(h);if(hr!=D3D_OK)return hr;
     q->remoteLive=true;q->AddRef();*out=q.release();return D3D_OK;
-  }catch(const std::bad_alloc&){return E_OUTOFMEMORY;}catch(...){return D3DERR_INVALIDCALL;}
+  }catch(const std::bad_alloc&){return conn->localResourceRefusal(E_OUTOFMEMORY);}catch(...){return conn->localResourceRefusal(D3DERR_INVALIDCALL);}
 }
 
 #define D9_BIND_METHOD(Set,Get,I,T,field) \
@@ -1506,6 +1960,7 @@ HRESULT Device::Clear(DWORD count,const D3DRECT* rects,DWORD flags,D3DCOLOR colo
   if(conn->isOwner()&&!conn->healthy())return D3DERR_DEVICELOST;
   followWindow();
   if(!allowed())return D3DERR_INVALIDCALL;
+  const ApiScope api(*conn,SyncApi::Clear);
   // Same no-op/null-rectangle conventions as the original D3D9DeviceEx::Clear.
   if(!count&&rects)return D3D_OK;
   if((flags&~DWORD(D3DCLEAR_TARGET|D3DCLEAR_ZBUFFER))||stencil||!std::isfinite(depth)||depth<0||depth>1)
@@ -1516,6 +1971,11 @@ HRESULT Device::Clear(DWORD count,const D3DRECT* rects,DWORD flags,D3DCOLOR colo
   std::array<uint8_t,d9::MaxClearRegions*d9::ClearRegionBytes> payload{};
   uint32_t used=0;
   const auto append=[&](d9::ClearRegion r) {
+    // The host checks every region against the target, and a region it
+    // refuses ends the session when the clear is published without waiting.
+    // The viewport is kept inside the target (SetViewport, Device::apply),
+    // so this changes nothing today: it is the last place to hold the rule.
+    r=d9::IntersectClear(D3DVIEWPORT9{r.x,r.y,r.width,r.height,0,1},D3DRECT{0,0,LONG(width),LONG(height)});
     if(effects.get(D3DRS_SCISSORTESTENABLE)) {
       const auto& clip=effects.scissor;
       const D3DVIEWPORT9 view{r.x,r.y,r.width,r.height,0,1};
@@ -1534,7 +1994,8 @@ HRESULT Device::Clear(DWORD count,const D3DRECT* rects,DWORD flags,D3DCOLOR colo
     h.op=d9::Op::Clear;return conn->enqueueClear(h);
   }
   h.op=d9::Op::ClearRegions;h.args[3]=used;h.payloadBytes=used*d9::ClearRegionBytes;
-  return conn->call(h,payload.data());
+  // The rectangles were clipped to the target above, as the host requires.
+  return conn->asyncFlushEnabled()?conn->enqueueOrdered(h,payload.data()):conn->call(h,payload.data());
 }
 // Next-draw annotations belong to exactly one draw call, submitted or not.
 struct NextDrawAnnotations {
@@ -1543,6 +2004,8 @@ struct NextDrawAnnotations {
 };
 HRESULT Device::DrawPrimitive(D3DPRIMITIVETYPE type,UINT start,UINT prim){
   const NextDrawAnnotations scope{*conn};
+  observeDraw(false,type,0,0,0,start,prim);
+  const ApiScope api(*conn,SyncApi::Draw);
   if(!allowed()||!scene||!vb||!decl||vb->locked||(tex&&(tex->locked||!tex->uploaded))
     ||!d9::ValidDrawTopology(type,prim)||!draw.stride||decl->extent>draw.stride
     ||uint64_t(draw.streamOffset)+(uint64_t(start)+d9::DrawElementCount(type,prim)-1)*draw.stride+decl->extent>vb->initializedPrefix)
@@ -1554,8 +2017,38 @@ HRESULT Device::DrawPrimitive(D3DPRIMITIVETYPE type,UINT start,UINT prim){
   s.startIndex=start;s.primitiveCount=prim;s.primitiveType=type;
   return submit(command);
 }
+// A draw from the caller's memory (the data layer's lightning ribbons). The
+// vertices go through a dynamic buffer of the device's own, as in DXVK: each
+// draw discards it, so an earlier draw keeps the bytes it was recorded with.
+// Stream 0 is unset afterwards, as D3D9 defines.
+HRESULT Device::DrawPrimitiveUP(D3DPRIMITIVETYPE type,UINT prim,const void* data,UINT stride){
+  if(!allowed()||recording||!data||!stride||stride>256||!d9::ValidDrawTopology(type,prim))return D3DERR_INVALIDCALL;
+  const ApiScope api(*conn,SyncApi::DrawUP);
+  const uint64_t bytes=d9::DrawElementCount(type,prim)*stride;
+  if(!bytes||bytes>d9::MaxBuffer)return D3DERR_INVALIDCALL;
+  if(!upBuffer||upBuffer->extent<bytes){
+    IDirect3DVertexBuffer9* created=nullptr;
+    const UINT size=UINT(std::min<uint64_t>(d9::MaxBuffer,std::max<uint64_t>(bytes*2,65536)));
+    const auto made=CreateVertexBuffer(size,D3DUSAGE_DYNAMIC|D3DUSAGE_WRITEONLY,0,D3DPOOL_DEFAULT,&created,nullptr);
+    if(made!=D3D_OK)return made;
+    // Held privately: the device's own buffer must not keep the device alive.
+    Bind(upBuffer,static_cast<VertexBuffer*>(created));created->Release();
+  }
+  void* target=nullptr;
+  auto hr=upBuffer->Lock(0,UINT(bytes),&target,D3DLOCK_DISCARD);
+  if(hr!=D3D_OK)return hr;
+  std::memcpy(target,data,size_t(bytes));
+  hr=upBuffer->Unlock();
+  if(hr!=D3D_OK)return hr;
+  Bind(vb,upBuffer);draw.streamOffset=0;draw.stride=stride;
+  hr=DrawPrimitive(type,0,prim);
+  Bind(vb,static_cast<VertexBuffer*>(nullptr));
+  return hr;
+}
 HRESULT Device::DrawIndexedPrimitive(D3DPRIMITIVETYPE type,INT base,UINT min,UINT num,UINT start,UINT prim){
   const NextDrawAnnotations scope{*conn};
+  observeDraw(true,type,base,min,num,start,prim);
+  const ApiScope api(*conn,SyncApi::Draw);
   if(!allowed()||!scene||!vb||!ib||!decl||vb->locked||ib->locked||(tex&&(tex->locked||!tex->uploaded))
     ||!d9::ValidDrawTopology(type,prim)||base<0||!num||start>ib->initializedPrefix/2
     ||d9::DrawElementCount(type,prim)>ib->initializedPrefix/2-start
@@ -1577,8 +2070,13 @@ HRESULT Device::DrawIndexedPrimitive(D3DPRIMITIVETYPE type,INT base,UINT min,UIN
 } // namespace warvk::host::d3d9proxy
 
 extern "C" IDirect3D9* WINAPI Direct3DCreate9(UINT version){
-  if(version!=D3D_SDK_VERSION||GetModuleHandleW(L"Game.dll"))return nullptr;
-  try{auto* f=new warvk::host::d3d9proxy::Factory();f->AddRef();return f;}catch(...){return nullptr;}
+  if(version!=D3D_SDK_VERSION)return nullptr;
+  try{
+    // Never in a game process, except the sandbox game profile (phase 5.1).
+    if(GetModuleHandleW(L"Game.dll")&&!warvk::host::d9::GameSandboxProfile())return nullptr;
+    warvk::host::d9::GameTrace("Direct3DCreate9 sdk=%u thread=%lu",version,GetCurrentThreadId());
+    auto* f=new warvk::host::d3d9proxy::Factory();f->AddRef();return f;
+  }catch(...){return nullptr;}
 }
 // Laboratory-only diagnostic, not a D3D9/JASS/game API. The returned bytes came
 // from the actual acquired swapchain image, before presentation transferred its
@@ -1603,9 +2101,62 @@ extern "C" HRESULT WINAPI WarVKD3D9AnnotateNextDraw(IDirect3DDevice9* input,UINT
 }
 extern "C" HRESULT WINAPI WarVKD3D9SetFrameScene(IDirect3DDevice9* input,UINT schema,const void* data,UINT bytes){
   auto* device=dynamic_cast<warvk::host::d3d9proxy::Device*>(input);
-  return device?device->conn->frameScene(schema,data,bytes):D3DERR_INVALIDCALL;
+  if(!device)return D3DERR_INVALIDCALL;
+  using namespace warvk::host::d3d9proxy;const ApiScope api(*device->conn,SyncApi::FrameScene,true);
+  return device->conn->frameScene(schema,data,bytes);
+}
+// The x86 data layer's callbacks (war3_d3d9_observer.h).
+extern "C" long WINAPI WarVKD3D9SetObserver(IDirect3DDevice9* input,const WarVKD3D9Observer* observer){
+  auto* device=dynamic_cast<warvk::host::d3d9proxy::Device*>(input);
+  return device?device->setObserver(observer):D3DERR_INVALIDCALL;
+}
+// The data layer's own resources on the device (its settings panel,
+// war3_d3d9_observer.h): private references that do not keep the device alive.
+extern "C" HRESULT WINAPI WarVKD3D9RetainPrivate(IDirect3DDevice9* input,IUnknown* resource){
+  return warvk::host::d3d9proxy::RetainPrivate(dynamic_cast<warvk::host::d3d9proxy::Device*>(input),resource);
+}
+extern "C" HRESULT WINAPI WarVKD3D9ReleasePrivate(IDirect3DDevice9* input,IUnknown* resource){
+  return warvk::host::d3d9proxy::ReleasePrivate(dynamic_cast<warvk::host::d3d9proxy::Device*>(input),resource);
+}
+extern "C" long WINAPI WarVKD3D9SetWorldLighting(IDirect3DDevice9* input,const WarVKD3D9WorldLighting* lighting){
+  auto* device=dynamic_cast<warvk::host::d3d9proxy::Device*>(input);
+  return device?device->setWorldLighting(lighting):D3DERR_INVALIDCALL;
 }
 extern "C" HRESULT WINAPI WarVKD3D9MarkStage(IDirect3DDevice9* input,UINT stage){
   auto* device=dynamic_cast<warvk::host::d3d9proxy::Device*>(input);
-  return device?device->conn->stageMarker(stage):D3DERR_INVALIDCALL;
+  if(!device)return D3DERR_INVALIDCALL;
+  using namespace warvk::host::d3d9proxy;const ApiScope api(*device->conn,SyncApi::StageMarker,true);
+  return device->conn->stageMarker(stage);
+}
+// The map changed (reason 1) or the game ended (2); generation is the data
+// layer's own ascending transition count. Callable from any thread that holds
+// the device: nothing is sent until the render thread's next Present.
+extern "C" HRESULT WINAPI WarVKD3D9RequestSessionReset(IDirect3DDevice9* input,UINT reason,UINT generationLow,UINT generationHigh){
+  auto* device=dynamic_cast<warvk::host::d3d9proxy::Device*>(input);
+  return device?device->conn->requestSessionReset(reason,uint64_t(generationLow)|(uint64_t(generationHigh)<<32)):D3DERR_INVALIDCALL;
+}
+// Content payloads (d3d9_content_wire.h): the data layer uploads a blob once
+// under its own key and receives the revision that draw records then name
+// (GeometryRef / BonesRef through WarVKD3D9AnnotateNextDraw). The host keeps
+// the only copy; a session reset drops them all.
+extern "C" HRESULT WINAPI WarVKD3D9UploadContent(IDirect3DDevice9* input,UINT kind,UINT keyLow,UINT keyHigh,
+    const void* data,UINT bytes,UINT64* revision){
+  auto* device=dynamic_cast<warvk::host::d3d9proxy::Device*>(input);
+  if(!device)return D3DERR_INVALIDCALL;
+  using namespace warvk::host::d3d9proxy;const ApiScope api(*device->conn,SyncApi::ContentUpload,true);
+  return device->conn->uploadContent(kind,uint64_t(keyLow)|(uint64_t(keyHigh)<<32),data,bytes,revision);
+}
+extern "C" HRESULT WINAPI WarVKD3D9ReleaseContent(IDirect3DDevice9* input,UINT keyLow,UINT keyHigh,UINT revisionLow,UINT revisionHigh){
+  auto* device=dynamic_cast<warvk::host::d3d9proxy::Device*>(input);
+  if(!device)return D3DERR_INVALIDCALL;
+  using namespace warvk::host::d3d9proxy;const ApiScope api(*device->conn,SyncApi::ContentRelease,true);
+  return device->conn->releaseContent(uint64_t(keyLow)|(uint64_t(keyHigh)<<32),uint64_t(revisionLow)|(uint64_t(revisionHigh)<<32));
+}
+extern "C" HRESULT WINAPI WarVKD3D9ReadContent(IDirect3DDevice9* input,UINT keyLow,UINT keyHigh,UINT revisionLow,UINT revisionHigh,
+    UINT offset,void* data,UINT bytes){
+  auto* device=dynamic_cast<warvk::host::d3d9proxy::Device*>(input);
+  if(!device)return D3DERR_INVALIDCALL;
+  using namespace warvk::host::d3d9proxy;const ApiScope api(*device->conn,SyncApi::ContentRead,true);
+  return device->conn->readContent(uint64_t(keyLow)|(uint64_t(keyHigh)<<32),
+    uint64_t(revisionLow)|(uint64_t(revisionHigh)<<32),offset,data,bytes);
 }

@@ -48,7 +48,9 @@ uniform push_block {
 
 void applyTerrainDepthBias(inout vec4 clipPos) {
   if ((p_flags & WAR3_SHADOW_CASTER_FLAG_STAGE1_TERRAIN) != 0u && p_terrainDepthBias > 0.0 && clipPos.w > 0.0) {
-    clipPos.z = min(clipPos.z + p_terrainDepthBias * clipPos.w, clipPos.w);
+    // No clamp here: clamping one vertex of a large triangle would tilt the
+    // depth across it. The pipeline clamps depth per fragment.
+    clipPos.z += p_terrainDepthBias * clipPos.w;
   }
 }
 

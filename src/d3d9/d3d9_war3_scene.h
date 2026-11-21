@@ -5,6 +5,7 @@
 #include "war3/render/war3_shadow_bounds_policy.h"
 #include "war3/render/war3_shadow_palette_storage.h"
 #include "war3/render/war3_shadow_replay_binding_policy.h"
+#include "war3/render/war3_shadow_pinned_upload_policy.h"
 #include "war3/gpu_skin/war3_gpu_skin_types.h"
 #include "war3/render/war3_palette_object_diagnostics.h"
 #include "war3/render/war3_skin_palette_selection.h"
@@ -257,6 +258,30 @@ namespace dxvk {
         }
     };
 
+    // The part [localOffset, localOffset + requestedBytes) of a buffer's
+    // current storage, as a slice of that exact allocation. A producer that
+    // hands a caster the buffer itself (static geometry, no copy) pins the
+    // allocation and records this slice.
+    inline DxvkResourceBufferInfo War3PinnedAllocationSliceInfo(
+        const Rc<DxvkResourceAllocation>& allocation,
+        VkDeviceSize localOffset, VkDeviceSize requestedBytes) {
+      if (allocation == nullptr)
+        return {};
+      const DxvkResourceBufferInfo whole = allocation->getBufferInfo();
+      const auto range = war3::render::MakeWar3PinnedUploadRange(
+          uint64_t(whole.size), uint64_t(localOffset), uint64_t(requestedBytes));
+      if (!range.valid || whole.buffer == VK_NULL_HANDLE)
+        return {};
+      DxvkResourceBufferInfo result = whole;
+      result.offset += VkDeviceSize(range.offset);
+      result.size = VkDeviceSize(range.length);
+      if (result.mapPtr != nullptr)
+        result.mapPtr = reinterpret_cast<uint8_t*>(result.mapPtr) + range.offset;
+      if (result.gpuAddress != 0u)
+        result.gpuAddress += VkDeviceAddress(range.offset);
+      return result;
+    }
+
 struct War3ShadowCasterDraw {
         bool indexed = true;
 
@@ -472,6 +497,14 @@ struct War3ShadowCasterDraw {
         bool boundsSourceWasSkinned = false;
         bool boundsFrameLocalDynamic = false;
         bool boundsAnimatedAttachment = false;
+#ifdef _WIN64
+        // Only the host record executor owns this box. A zero frame means
+        // its geometry had no current world bound. Keep the wire sphere
+        // separate for the other consumers of this draw.
+        bool proxyCaster = false;
+        uint64_t proxyBoundsFrame = 0;
+        std::array<float, 6> proxyWorldBounds{};
+#endif
     };
 
     inline uint64_t War3ShadowReplaySourceGeneration(
@@ -1989,11 +2022,23 @@ struct War3ShadowCasterDraw {
         War3WorldCameraState worldCamera;
         War3ShadowCaptureStats shadowStats;
         War3ShadowProducerCompleteness producerCompleteness;
+#ifdef _WIN64
+        // Only the host executor records budget refusals whose frozen bounds
+        // belong to this frame. The ordinary producer seal still counts them.
+        bool proxyRecordFrame = false, proxyBudgetOmission = false;
+        uint64_t proxyPictureSerial = 0;
+        std::vector<std::array<float, 6>> proxyOmittedBounds;
+#endif
         War3ShadowPersistentGeometryPool shadowPersistentPool;
         std::vector<War3ShadowMatrixPalette> shadowPalettes;
         std::vector<War3ShadowInstanceRef> shadowInstances;
         std::vector<War3ShadowFallbackDraw> shadowFallbacks;
         std::vector<War3ShadowCasterDraw> shadowCasters;
+        // The game's water draws (records scene::IsWaterSurfaceRecord names):
+        // they cast nothing; the shadow pass replays them for the water's
+        // surface depth. Their object-to-world matrices, in the same order.
+        std::vector<War3ShadowCasterDraw> waterSurfaces;
+        std::vector<Matrix4> waterWorlds;
     };
 
 } // namespace dxvk

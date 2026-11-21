@@ -17,6 +17,10 @@ TARGET_SOURCES = (
     ROOT / "src/d3d9/d3d9_war3_shadow.cpp",
     SHADOW_RESOURCES,
     ROOT / "src/d3d9/d3d9_war3_ssao.cpp",
+    ROOT / "src/d3d9/war3/effects/war3_ssao_executor.cpp",
+    ROOT / "src/d3d9/war3/effects/war3_snow_executor.cpp",
+    ROOT / "src/d3d9/war3/effects/war3_aa_executor.cpp",
+    ROOT / "src/d3d9/war3/effects/war3_bloom_executor.cpp",
     ROOT / "src/d3d9/d3d9_war3_volumetric_light.cpp",
     SHADERPACK,
 )

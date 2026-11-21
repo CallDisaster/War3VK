@@ -2,6 +2,7 @@
 
 #include "d3d9_war3_scene.h"
 #include "d3d9_war3_settings.h"
+#include "war3/render/war3_settings_resolver.h"
 #include "d3d9_war3_light.h"
 #include "war3/render/war3_render_state.h"
 #include "war3/render/war3_weather_runtime.h"
@@ -218,11 +219,9 @@ namespace dxvk {
         bool m_insertedBeforeUi = false;
         bool m_armedBeforeUi = false;
         bool m_hadWorldDraw = false;
-        float m_lastAutoExposure = 0.0f;
-        bool m_hasAutoExposure = false;
-        uint64_t m_lightingClockRevision = 0u;
-        float m_lightingClockTime01 = 0.5f;
-        std::chrono::steady_clock::time_point m_lightingClockLastUpdate;
+        // Mailbox, lighting clock and day/night resolution of a frame start
+        // (war3/render/war3_settings_resolver.h), shared with proxy mode.
+        War3SettingsFrameResolver m_settingsResolver;
 
         // 旁路开关（每帧 OnFrameStart 刷新）
         bool m_wantsBeforeUiInsertion = true;

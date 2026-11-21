@@ -13,7 +13,12 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CPP = ROOT / "src/d3d9/d3d9_war3_weather.cpp"
+# The draw lives in the shared executor (also compiled into the x64 host);
+# the in-process pass is a thin adapter around it.
+CPP = ROOT / "src/d3d9/war3/effects/war3_snow_executor.cpp"
+EXECUTOR_HEADER = ROOT / "src/d3d9/war3/effects/war3_snow_executor.h"
+FRAME_HEADER = ROOT / "src/d3d9/war3/effects/war3_effect_frame.h"
+ADAPTER = ROOT / "src/d3d9/d3d9_war3_weather.cpp"
 HEADER = ROOT / "src/d3d9/d3d9_war3_weather.h"
 SHADERS = ROOT / "subprojects/war3fx/shaders"
 VERT = SHADERS / "war3_weather_snow_vert.vert"
@@ -72,7 +77,10 @@ class WeatherShaderContracts(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.cpp = CPP.read_text(encoding="utf-8")
-        cls.header = HEADER.read_text(encoding="utf-8")
+        cls.adapter = ADAPTER.read_text(encoding="utf-8")
+        cls.frame = FRAME_HEADER.read_text(encoding="utf-8")
+        cls.header = (EXECUTOR_HEADER.read_text(encoding="utf-8") +
+                      HEADER.read_text(encoding="utf-8"))
         cls.vert = VERT.read_text(encoding="utf-8")
         cls.frag = FRAG.read_text(encoding="utf-8")
         cls.density = DENSITY.read_text(encoding="utf-8")
@@ -94,8 +102,7 @@ class WeatherShaderContracts(unittest.TestCase):
     def test_real_abi_has_complete_eye_and_bounded_media(self):
         self.assertIn("cameraH.z / cameraH.w", self.cpp)
         self.assertIn("vec3(pc.windAnchor.zw, pc.cameraZ)", self.frag)
-        for parameter in ("region.edgeFeather", "params.haze",
-                          "params.lowSnow", "params.gust"):
+        for parameter in ("edgeFeather", "haze", "lowSnow", "gust"):
             self.assertIn(f"Quantize(weather.{parameter}", self.cpp)
         for shift in (8, 16, 24):
             self.assertRegex(self.cpp, rf"<<\s*{shift}\b")
@@ -107,7 +114,12 @@ class WeatherShaderContracts(unittest.TestCase):
             self.assertNotIn(forbidden, self.cpp)
         self.assertNotIn("buffer ", self.vert)
         self.assertNotIn("WeatherRuntime::instance", self.cpp)
-        self.assertIn("const auto& weather = input.weather", self.cpp)
+        self.assertNotIn("WeatherRuntime::instance", self.adapter)
+        for forbidden in ("createBuffer(", "cmdDispatch(", "mapPtr(",
+                          "cmdCopyImageToBuffer(", "ctx->cmd"):
+            self.assertNotIn(forbidden, self.adapter)
+        self.assertIn("const auto& weather = input.weather", self.adapter)
+        self.assertIn("const auto& weather = input.snow", self.cpp)
 
     def test_depth_copy_is_bounded_lazy_and_transactional(self):
         self.assertIn("kMaxDepthCopyBytes = 32u * 1024u * 1024u", self.header)
@@ -118,14 +130,14 @@ class WeatherShaderContracts(unittest.TestCase):
         self.assertIn("m_depthCopyView = std::move(candidateView)", self.cpp)
         self.assertIn("m_depthCopyLayout.reset()", self.cpp)
         # No new backing is created when the current copy matches exactly.
-        ensure = self.cpp[self.cpp.index("bool War3WeatherPass::ensureDepthCopy"):
-                          self.cpp.index("void War3WeatherPass::copyDepth")]
+        ensure = self.cpp[self.cpp.index("bool SnowExecutor::ensureDepthCopy"):
+                          self.cpp.index("void SnowExecutor::copyDepth")]
         self.assertLess(ensure.index("return true;"),
                         ensure.index("createImage("))
 
     def test_depth_copy_previous_read_write_dependency_is_explicit(self):
-        copy = self.cpp[self.cpp.index("void War3WeatherPass::copyDepth"):
-                        self.cpp.index("void War3WeatherPass::Run")]
+        copy = self.cpp[self.cpp.index("void SnowExecutor::copyDepth"):
+                        self.cpp.index("SnowResult SnowExecutor::run")]
         write = copy.index("m_depthCopyLayout.plan(transferWrite")
         commit_write = copy.index("CommitWar3OwnedImageLayout", write)
         transfer = copy.index("ctx->cmdCopyImage", commit_write)
@@ -142,11 +154,21 @@ class WeatherShaderContracts(unittest.TestCase):
         self.assertIn("ctx->track(sampledDepthImage, DxvkAccess::Read)", self.cpp)
 
     def test_disabled_branch_precedes_gpu_objects_and_perf_scope(self):
-        enabled_check = self.cpp.index("if (!weather.enabled || weather.id == 0)")
-        finish_disabled = self.cpp.index("m_wasEnabled = true;", enabled_check)
-        self.assertIn("return;", self.cpp[enabled_check:finish_disabled])
-        self.assertLess(finish_disabled,
-                        self.cpp.index("ensurePipeline(input.colorView"))
+        adapter = self.adapter
+        enabled_check = adapter.index("if (!weather.enabled || weather.id == 0)")
+        finish_disabled = adapter.index("m_wasEnabled = true;", enabled_check)
+        self.assertIn("return;", adapter[enabled_check:finish_disabled])
+        # The executor (GPU objects) and the perf scope are only reachable
+        # after the disabled branch returned.
+        self.assertEqual(1, adapter.count("m_executor.run("))
+        self.assertLess(finish_disabled, adapter.index("m_executor.run("))
+        self.assertLess(finish_disabled, adapter.index("SnowPerfScope perfScope;"))
+        self.assertIn("m_executor.release();",
+                      adapter[enabled_check:finish_disabled])
+        # Inside the executor a record without snowfall is refused before
+        # any object is created.
+        self.assertLess(self.cpp.index("if (!(weather.snowfall > 0.0f))"),
+                        self.cpp.index("ensurePipeline(frame.colorView"))
 
     def test_fixed_draw_budget_matches_lattice(self):
         cap = re.search(r"kMaxParticles\s*=\s*(\d+)", self.header)
@@ -219,23 +241,33 @@ class WeatherShaderContracts(unittest.TestCase):
         self.assertIn("sampledDepthImage->trackLayout(sampledDepthRange, sampledDepthOriginal)",
                       self.cpp)
         self.assertIn("colorImage->trackLayout(colorRange, colorOriginal)", self.cpp)
-        self.assertIn("VK_QUEUE_FAMILY_IGNORED", self.cpp)
+        barrier = self.frame[self.frame.index("ImageBarrier("):]
+        self.assertIn("VK_QUEUE_FAMILY_IGNORED", barrier)
+        self.assertNotIn("VkImageMemoryBarrier2 barrier", self.cpp)
 
     def test_divergent_layout_sentinel_is_rejected_before_recording(self):
-        guard = self.cpp.index("depthOriginal == VK_IMAGE_LAYOUT_UNDEFINED")
-        refusal = self.cpp.index("reject(War3WeatherDrawStage::UndefinedLayout)", guard)
+        known = self.frame[self.frame.index("inline bool LayoutKnown("):]
+        known = known[:known.index("}") + 1]
+        self.assertIn("layout != VK_IMAGE_LAYOUT_UNDEFINED", known)
+        self.assertIn("layout != VK_IMAGE_LAYOUT_MAX_ENUM", known)
+        guard = self.cpp.index("!LayoutKnown(depthOriginal)")
+        refusal = self.cpp.index("reject(SnowStage::UndefinedLayout)", guard)
         predicate = self.cpp[guard:refusal]
-        self.assertIn("depthOriginal == VK_IMAGE_LAYOUT_MAX_ENUM", predicate)
-        self.assertIn("colorOriginal == VK_IMAGE_LAYOUT_MAX_ENUM", predicate)
-        self.assertLess(refusal, self.cpp.index("copyDepth(ctx, input.depthView"))
+        self.assertIn("!LayoutKnown(colorOriginal)", predicate)
+        self.assertLess(refusal, self.cpp.index("copyDepth(ctx, frame.depthView"))
         self.assertLess(refusal, self.cpp.index("ctx->cmdBeginRendering"))
 
     def test_precise_camera_and_epoch_pairing(self):
-        for predicate in ("weather.frameSerial != input.frameSerial",
-                          "weather.mapEpoch != input.mapEpoch",
-                          "weather.deviceEpoch != input.deviceEpoch",
-                          "camera.frameSerial != input.frameSerial"):
+        for predicate in ("input.frameSerial != frame.frameSerial",
+                          "input.mapEpoch != frame.mapEpoch",
+                          "input.deviceEpoch != frame.deviceEpoch",
+                          "camera.frameSerial != frame.frameSerial"):
             self.assertIn(predicate, self.cpp)
+        # The adapter hands over the snapshot's own serial and epochs.
+        for carried in ("frame.frameSerial = weather.frameSerial",
+                        "frame.mapEpoch = weather.mapEpoch",
+                        "frame.deviceEpoch = weather.deviceEpoch"):
+            self.assertIn(carried, self.adapter)
         self.assertLess(self.cpp.index("EpochMismatch);"),
                         self.cpp.index("ctx->cmdBeginRendering"))
 
@@ -248,10 +280,10 @@ class WeatherShaderContracts(unittest.TestCase):
             self.assertIn(ownership, self.cpp)
         # Only a newly created, never-adopted handle may be destroyed here.
         # Cached/in-flight pipelines continue using command-list ownership.
-        ensure = self.cpp[self.cpp.index("bool War3WeatherPass::ensurePipeline"):
-                          self.cpp.index("void War3WeatherPass::clearDepthCopy")]
+        ensure = self.cpp[self.cpp.index("bool SnowExecutor::ensurePipeline"):
+                          self.cpp.index("void SnowExecutor::clearDepthCopy")]
         self.assertEqual(self.cpp.count("vkDestroyPipeline("), 1)
-        self.assertIn("candidateOwner = war3::render::AdoptWar3TrackedVkPipeline", ensure)
+        self.assertIn("candidateOwner = render::AdoptWar3TrackedVkPipeline", ensure)
         self.assertIn("} catch (...) {", ensure)
         self.assertIn("device(), candidate, nullptr)", ensure)
         self.assertNotIn("m_pipeline->handle()", ensure)
@@ -259,15 +291,15 @@ class WeatherShaderContracts(unittest.TestCase):
                         ensure.index("m_pipeline = std::move(candidateOwner)"))
 
     def test_all_resource_failures_are_pre_record_and_have_frame_backoff(self):
-        run = self.cpp[self.cpp.index("void War3WeatherPass::Run"):]
-        copy_index = run.index("copyDepth(ctx, input.depthView")
+        run = self.cpp[self.cpp.index("SnowResult SnowExecutor::run"):]
+        copy_index = run.index("copyDepth(ctx, frame.depthView")
         prepare, recording = run[:copy_index], run[copy_index:]
-        for call in ("m_resourceRetry.ready(resourceKey, input.frameSerial)",
-                     "m_resourceRetry.failed(resourceKey, input.frameSerial)",
-                     "ensurePipeline(input.colorView->info().format)",
+        for call in ("m_resourceRetry.ready(resourceKey, frame.frameSerial)",
+                     "m_resourceRetry.failed(resourceKey, frame.frameSerial)",
+                     "ensurePipeline(frame.colorView->info().format)",
                      "ensureDepthCopy(extent, depthInfo.format)",
                      "m_depthSampleView->getDescriptor()",
-                     "input.colorView->getDescriptor()"):
+                     "frame.colorView->getDescriptor()"):
             self.assertIn(call, prepare)
         for failure in ("ResourceRetryWait", "ResourceAllocationFailed",
                         "ResourceHostAllocationFailed"):
@@ -277,8 +309,15 @@ class WeatherShaderContracts(unittest.TestCase):
         self.assertIn("catch (const std::bad_alloc&)", prepare)
         self.assertEqual(prepare.count("m_device->getDeviceStatus() == VK_ERROR_DEVICE_LOST"), 2)
         self.assertNotIn("catch (", recording)
+        # The perf scope opens through the recording hook, which is called
+        # once, after every allocation succeeded and before the first command.
+        self.assertEqual(1, run.count("recording->beginRecording(ctx)"))
         self.assertLess(prepare.index("m_resourceRetry.clear();"),
-                        prepare.index('scope("Weather/Snow", ctx)'))
+                        prepare.index("recording->beginRecording(ctx)"))
+        self.assertNotIn("ctx->cmd", prepare)
+        self.assertEqual(1, self.adapter.count('scope("Weather/Snow", ctx)'))
+        hook = self.adapter[self.adapter.index("void beginRecording("):]
+        self.assertLess(hook.index('scope("Weather/Snow", ctx)'), hook.index("}"))
         self.assertIn("WeatherResourceRetry m_resourceRetry", self.header)
         # Caller-local guard does not change adoption for other render passes.
         self.assertIn("new raw handle", self.cpp)
@@ -293,15 +332,16 @@ class WeatherShaderContracts(unittest.TestCase):
         self.assertIn("smoothstep(0.0, depthSoftness, separation)", self.frag)
 
     def test_depth_polarity_uses_shared_production_inference(self):
-        self.assertIn("InferWar3FarClearRaw(camera, farClearRaw)", self.cpp)
+        self.assertIn("InferFarClearRaw(camera.proj, camera.minZ, camera.maxZ, "
+                      "farClearRaw)", self.cpp)
         self.assertIn("reversedDepth ? 0x80000000u : 0u", self.cpp)
         self.assertIn("pc.depthSampler & 65535u", self.frag)
         self.assertIn("pc.depthSampler & 0x80000000u", self.frag)
         self.assertIn("separation = -separation", self.frag)
-        self.assertIn("vp.MaxZ <= vp.MinZ", self.cpp)
+        self.assertIn("camera.maxZ <= camera.minZ", self.cpp)
 
     def test_actual_raster_viewport_matches_native_half_texel(self):
-        self.assertIn("float(vp.X) + 0.5f, float(vp.Y) + 0.5f", self.cpp)
+        self.assertIn("float(camera.x) + 0.5f, float(camera.y) + 0.5f", self.cpp)
         self.assertIn("clip.y = -clip.y", self.vert)
         # Negative native viewport vs positive weather viewport + flipped clip.
         for x, y, width, height in ((0, 0, 2560, 1440),
@@ -315,8 +355,8 @@ class WeatherShaderContracts(unittest.TestCase):
                 self.assertAlmostEqual(native_y, weather_y)
 
     def test_narrow_positive_depth_range_uses_native_bias(self):
-        self.assertIn("vp.MinZ + (vp.MinZ < 0.5f ? 0.001f : 0.0f)", self.cpp)
-        self.assertIn("vp.MaxZ <= vp.MinZ", self.cpp)
+        self.assertIn("camera.minZ + (camera.minZ < 0.5f ? 0.001f : 0.0f)", self.cpp)
+        self.assertIn("camera.maxZ <= camera.minZ", self.cpp)
         # For this legal positive range the original native mapping expands
         # MaxZ, whereas copying the raw D3D9 range mismatches scene depth.
         minimum, requested_maximum = 0.2, 0.2001
@@ -337,9 +377,9 @@ class WeatherShaderContracts(unittest.TestCase):
 
     def test_diagnostics_carries_exact_frozen_input(self):
         self.assertIn("WeatherFrameSnapshot frozenInput = {}", self.header)
-        self.assertIn("diagnostics.frozenInput = weather", self.cpp)
-        disabled = self.cpp[self.cpp.index("if (!weather.enabled"):
-                            self.cpp.index("m_wasEnabled = true")]
+        self.assertIn("diagnostics.frozenInput = weather", self.adapter)
+        disabled = self.adapter[self.adapter.index("if (!weather.enabled"):
+                                self.adapter.index("m_wasEnabled = true")]
         self.assertIn("War3WeatherDiagnostics disabled", disabled)
         self.assertIn("disabled.frozenInput = weather", disabled)
         self.assertIn("disabled.id = weather.id", disabled)
@@ -382,12 +422,14 @@ class WeatherShaderContracts(unittest.TestCase):
         for prohibited in ("shadowCasters", "Stage11", "Arena", "vkQueueWaitIdle",
                            "vkDeviceWaitIdle", "waitForIdle", "readback"):
             self.assertNotIn(prohibited, self.cpp)
+            self.assertNotIn(prohibited, self.adapter)
 
     def test_diagnostics_distinguishes_recording_from_gpu_completion(self):
         self.assertIn("CommandsRecorded", self.header)
         self.assertIn("UnsupportedSamples", self.header)
         self.assertIn("UnsupportedDepth", self.header)
-        self.assertIn("submitted = true", self.cpp)
+        self.assertIn("result.submitted = true", self.cpp)
+        self.assertIn("diagnostics.submitted = result.submitted", self.adapter)
         self.assertIn("CPU estimate before frustum/depth/region tests", self.header)
         self.assertIn("not GPU completion", self.header)
 

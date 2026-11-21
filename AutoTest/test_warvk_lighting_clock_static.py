@@ -18,6 +18,14 @@ class WarVKLightingClockStaticTests(unittest.TestCase):
         cls.shadow = (ROOT / "src/d3d9/d3d9_war3_shadow.cpp").read_text(
             encoding="utf-8"
         )
+        # Phase 5.1-c: the frame-start settings resolution and the sun of the
+        # day/night cycle are single implementations shared with proxy mode.
+        cls.resolver = (
+            ROOT / "src/d3d9/war3/render/war3_settings_resolver.cpp"
+        ).read_text(encoding="utf-8")
+        cls.sun_cycle = (
+            ROOT / "src/d3d9/war3/effects/war3_sun_cycle.h"
+        ).read_text(encoding="utf-8")
         cls.japi = (ROOT / "src/d3d9/war3/japi/war3_japi_v1.cpp").read_text(
             encoding="utf-8"
         )
@@ -34,22 +42,32 @@ class WarVKLightingClockStaticTests(unittest.TestCase):
         self.assertIn("independentDayLengthSeconds = 480.0f", self.settings)
 
     def test_independent_clock_is_render_only_and_advances_without_shadows(self):
-        on_frame_start = re.search(
+        pipeline_frame_start = re.search(
             r"void War3RenderPipeline::OnFrameStart\(\) \{(.*?)"
             r"// ={20,}",
             self.pipeline,
             re.DOTALL,
         ).group(1)
+        # Before the bypass decision, whether or not shadows are wanted.
+        self.assertIn(
+            "m_settingsResolver.BeginFrame(*m_settingsMailbox, m_settings);",
+            pipeline_frame_start,
+        )
+        on_frame_start = self.resolver.split(
+            "void War3SettingsFrameResolver::BeginFrame(", 1
+        )[1].split("void War3SettingsFrameResolver::FinishFrame(", 1)[0]
         self.assertIn("War3LightingClockMode::Independent", on_frame_start)
         self.assertIn("lightingClock.renderTimeHours", on_frame_start)
         self.assertNotIn("War3RenderState::SetGameTime", on_frame_start)
 
     def test_manual_sun_values_are_not_written_by_disabled_cycles(self):
-        self.assertIn("if (!dayNightSettings.celestialMotionEnabled)", self.shadow)
-        self.assertIn("finalLightDir = settings->sun.direction", self.shadow)
-        self.assertIn("finalShadowStrength = settings->shadows.strength", self.shadow)
-        self.assertIn("if (!dayNightSettings.timeColorGradingEnabled)", self.shadow)
-        self.assertIn("finalLightColor = settings->sun.color", self.shadow)
+        self.assertIn("if (!dayNightSettings.celestialMotionEnabled)", self.sun_cycle)
+        self.assertIn("finalLightDir = settings->sun.direction", self.sun_cycle)
+        self.assertIn("finalShadowStrength = settings->shadows.strength", self.sun_cycle)
+        self.assertIn("if (!dayNightSettings.timeColorGradingEnabled)", self.sun_cycle)
+        self.assertIn("finalLightColor = settings->sun.color", self.sun_cycle)
+        self.assertIn("m_sunCycle.Resolve(&*settings,", self.shadow)
+        self.assertIn("Vector4 finalLightDir = sunCycle.direction;", self.shadow)
         self.assertRegex(
             self.shadow,
             r"if \(dayNightSettings\.celestialMotionEnabled\)\s+"
@@ -68,8 +86,8 @@ class WarVKLightingClockStaticTests(unittest.TestCase):
         self.assertIn("customColorTemperatureProfile", self.settings)
         for key in ("midnightKelvin", "dawnKelvin", "noonKelvin", "duskKelvin"):
             self.assertIn(key, self.settings)
-        self.assertIn("std::clamp(value, 1000.0f, 20000.0f)", self.shadow)
-        self.assertIn("const uint32_t next = (segment + 1u) & 3u", self.shadow)
+        self.assertIn("std::clamp(value, 1000.0f, 20000.0f)", self.sun_cycle)
+        self.assertIn("const uint32_t next = (segment + 1u) & 3u", self.sun_cycle)
         self.assertIn("LightingCycleSetColorTemperatureProfile", self.japi)
         self.assertIn("a[index].real > 20000.0f", self.japi)
 

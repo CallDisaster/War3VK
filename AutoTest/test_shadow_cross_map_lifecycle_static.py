@@ -226,7 +226,7 @@ class ShadowCrossMapLifecycleStaticTests(unittest.TestCase):
         )
         self.assertIn("s_activePublicationMutex", fallback)
         self.assertIn("device->War3RequestShadowMapEpochReset()", fallback)
-        self.assertIn("D3D9DeviceEx::War3ResetCpuSemanticMapSession()", fallback)
+        self.assertIn("ProcessServices().War3ResetCpuSemanticMapSession()", fallback)
 
         cpu_reset = body(BOOTSTRAP, "void ResetRuntimeCore()", "void BindNativeShadowDevice")
         for forbidden in (

@@ -63,10 +63,15 @@ class VisualApiContracts(unittest.TestCase):
     def test_execution_diagnostics_are_opt_in_and_record_actual_backend(self):
         cpp = read("src/d3d9/d3d9_war3_volumetric_light.cpp")
         self.assertIn('env::getEnvVar("DXVK_WAR3_VISUAL_API_DIAGNOSTICS") == "1"', cpp)
-        witness = cpp[cpp.index("class VolumetricExecutionWitness"):cpp.index("class VolumetricExecutionWitness") + 700]
+        witness = cpp[cpp.index("class VolumetricExecutionWitness"):]
+        witness = witness[:witness.index("\n};\n")]
         self.assertLess(witness.index("if (!enabled && !m_weatherOnly)"), witness.index("std::lock_guard"))
         self.assertIn("g_volumetricExecutionDiagnostics", witness)
         self.assertIn("g_weatherVolumeDiagnostics", witness)
+        # x64 migration 4d-2: the pass keeps its own last run (LastRun(), the
+        # run facts of the two-mode gate) whether or not the diagnostics are
+        # on; that copy is the pass's, takes no lock and publishes nothing.
+        self.assertLess(witness.index("*m_last = value;"), witness.index("if (!enabled && !m_weatherOnly)"))
         self.assertIn("outEffectiveBackend = static_cast<int32_t>(settings.quality)", cpp)
         self.assertIn("outEffectiveBackend = 0;", cpp)
         self.assertIn("execution.compositeSubmitted = true", cpp)

@@ -68,6 +68,18 @@ public:
      */
     uint32_t getFrameIndex() const;
 
+    // Frame pace: the time between successive beginFrame() calls, which is
+    // the time between Presents in either mode (in process and proxy mode
+    // both call it once per Present). Cumulative since the first frame.
+    // Frames shorter than PaceBuckets * PaceBucketUs are counted in buckets;
+    // longer ones in `over` with their total time.
+    static constexpr uint32_t PaceBuckets = 400, PaceBucketUs = 250;
+    struct FramePace {
+        uint64_t frames = 0, over = 0, overUs = 0, maxUs = 0;
+        uint32_t buckets[PaceBuckets] = {};
+    };
+    void readFramePace(FramePace& pace) const;
+
 private:
     RenderState() = default;
 
@@ -75,6 +87,11 @@ private:
     std::atomic<bool> m_isInGame = { false };
     std::atomic<bool> m_isLoading = { false };
     std::atomic<uint32_t> m_frameIndex = { 0 };
+
+    // Written by the render thread in beginFrame(), read by the control plane.
+    int64_t m_paceFrequency = 0, m_paceLast = 0;
+    std::atomic<uint64_t> m_paceFrames = { 0 }, m_paceOver = { 0 }, m_paceOverUs = { 0 }, m_paceMaxUs = { 0 };
+    std::atomic<uint32_t> m_paceBuckets[PaceBuckets] = {};
 };
 
 } // namespace dxvk::war3::state

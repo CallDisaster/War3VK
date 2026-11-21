@@ -27,6 +27,7 @@
 #include "../render/war3_shadow_runtime_bridge.h"
 #include "../render/war3_visible_renderables.h"
 #include "../state/war3_render_state.h"
+#include "../platform/war3_proxy_mode.h"
 #include "../../util/util_env.h"
 
 #include <emmintrin.h>
@@ -37,6 +38,7 @@
 #include <chrono>
 #include <cstring>
 #include <mutex>
+#include <new>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
@@ -298,10 +300,52 @@ struct BlendedPaletteEntry {
   uint64_t writeSerial = 0u;
   bool valid = false;
 };
+
+// The two producer-side palette caches below take 38.7 MB. Every reader is in
+// the in-process renderer (GPU skin, shadows, live palette selection, and the
+// current-draw publication that feeds them). In proxy mode no in-process
+// device exists, so there the tables are not allocated: writers skip, and every
+// query answers as an empty table does (a miss). If an automatically found proxy
+// cannot start, AllocateProducerPaletteTables supplies them before the first
+// device (war3_proxy_auto.h). In process they are allocated during static
+// initialisation, when the former static arrays were constructed, and released
+// by static destruction, when the image that held the arrays went away: the
+// DLL is loaded and freed more than once in a game process (an in-process run
+// kept three copies of each table before this destructor existed). Static
+// destruction runs at that unload or at process exit, when no other thread
+// runs this code; a reader after it sees an empty table.
+template <typename Entry, size_t Count>
+class ProducerPaletteTable {
+public:
+  ProducerPaletteTable()
+      : m_entries(dxvk::war3::proxy::Requested()
+                      ? nullptr
+                      : new (std::nothrow) Entry[Count]()) {}
+  ~ProducerPaletteTable() {
+    Entry* entries = m_entries;
+    m_entries = nullptr;
+    delete[] entries;
+  }
+  ProducerPaletteTable(const ProducerPaletteTable&) = delete;
+  ProducerPaletteTable& operator=(const ProducerPaletteTable&) = delete;
+
+  void allocateIfMissing() {
+    if (m_entries == nullptr)
+      m_entries = new (std::nothrow) Entry[Count]();
+  }
+  explicit operator bool() const { return m_entries != nullptr; }
+  Entry& operator[](size_t index) const { return m_entries[index]; }
+  Entry* begin() const { return m_entries; }
+  Entry* end() const { return m_entries ? m_entries + Count : nullptr; }
+
+private:
+  Entry* m_entries;
+};
+
 // 64K entries × (64 + 8 + 1) ≈ 4.6 MB 常驻，换来热路径 O(1) 写。
 static constexpr uint32_t kSlotBlendedPaletteCacheSize = 65536u;
-static std::array<BlendedPaletteEntry, kSlotBlendedPaletteCacheSize>
-    s_slotBlendedPaletteCache = {};
+static ProducerPaletteTable<BlendedPaletteEntry, kSlotBlendedPaletteCacheSize>
+    s_slotBlendedPaletteCache;
 static std::atomic<uint64_t> s_slotBlendedPaletteWriteSerial{0u};
 
 enum class RuntimeGroupPaletteProducerKind : uint32_t {
@@ -336,9 +380,9 @@ struct RenderablePartPaletteBindingEntry {
 
 static constexpr size_t kRenderablePartPaletteBindingCacheSize = 8192u;
 static constexpr uint32_t kRenderablePartPaletteSnapshotMaxCount = 64u;
-static std::array<RenderablePartPaletteBindingEntry,
-                  kRenderablePartPaletteBindingCacheSize>
-    s_renderablePartPaletteBindings = {};
+static ProducerPaletteTable<RenderablePartPaletteBindingEntry,
+                            kRenderablePartPaletteBindingCacheSize>
+    s_renderablePartPaletteBindings;
 static std::atomic<uint64_t> s_renderablePartPaletteBindingSerial{0u};
 static std::atomic<uint64_t> s_renderablePartPaletteSnapshotSerial{0u};
 static std::atomic<uint64_t> s_skinPalettePublicationTicket{0u};
@@ -2373,7 +2417,7 @@ bool CaptureBlendedPaletteSlotRange(uint32_t startSlotIndex,
                                     std::atomic<uint64_t>* capturedCounter,
                                     std::atomic<uint64_t>* overflowCounter,
                                     std::atomic<uint64_t>* unreadableCounter) {
-  if (srcBase == nullptr || rawCount == 0u ||
+  if (!s_slotBlendedPaletteCache || srcBase == nullptr || rawCount == 0u ||
       startSlotIndex >= kSlotBlendedPaletteCacheSize)
     return false;
 
@@ -2487,8 +2531,8 @@ void RecordRenderablePartPaletteBinding(
     uint32_t paletteCount = 0u,
     void* runtimeModel = nullptr,
     uint64_t ownerEpochWitness = 0u) {
-  if (renderablePart == nullptr || paletteSlotIndex == 0xFFFFFFFFu ||
-      paletteSlotIndex >= 0x3A98u)
+  if (!s_renderablePartPaletteBindings || renderablePart == nullptr ||
+      paletteSlotIndex == 0xFFFFFFFFu || paletteSlotIndex >= 0x3A98u)
     return;
 
   const uintptr_t partValue = reinterpret_cast<uintptr_t>(renderablePart);
@@ -2581,7 +2625,8 @@ void CaptureRuntimeGroupPaletteBindings(
     int runtimeModel,
     RuntimeGroupPaletteProducerKind producerKind,
     bool captureSimpleFallbackSlots) {
-  if (runtimeModel == 0 || !g_config.enabled)
+  // Proxy mode: no binding table, nothing to capture (see ProducerPaletteTable).
+  if (runtimeModel == 0 || !g_config.enabled || !s_renderablePartPaletteBindings)
     return;
 
   // Capture before reading any native identity; a concurrent map reset must
@@ -9018,6 +9063,8 @@ bool QueryBlendedPaletteBySlotIndex(uint32_t slotIndex,
   const bool hasCurrentFrameTag = TryReadCurrentPaletteFrameTag(currentFrameTag);
   uint32_t expectedFrameTag = 0u;
   uint64_t previousWriteSerial = 0u;
+  if (!s_slotBlendedPaletteCache)
+    return false;
   // 每次写只存了 1 个矩阵，需要遍历连续槽位收集整个 geoset 的调色板
   constexpr uint32_t kMaxSlots = 256u;
   for (uint32_t s = slotIndex; s < slotIndex + kMaxSlots; ++s) {
@@ -9077,6 +9124,12 @@ bool ValidateBlendedPaletteBySlotIndexExact(uint32_t slotIndex,
     return false;
   if (slotIndex + expectedCount > kSlotBlendedPaletteCacheSize) {
     g_queryBlendedPaletteRejectedSlotOverflowCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    return false;
+  }
+  if (!s_slotBlendedPaletteCache) {
+    // As an empty table answers: the first entry is not valid.
+    g_queryBlendedPaletteRejectedInvalidEntryCount.fetch_add(
         1u, std::memory_order_relaxed);
     return false;
   }
@@ -9171,7 +9224,8 @@ bool QueryBlendedPaletteBySlotIndexBestEffort(uint32_t slotIndex,
   outPalette.clear();
   if (expectedCount == 0u || expectedCount > 256u)
     return false;
-  if (slotIndex + expectedCount > kSlotBlendedPaletteCacheSize)
+  if (slotIndex + expectedCount > kSlotBlendedPaletteCacheSize ||
+      !s_slotBlendedPaletteCache)
     return false;
   outPalette.reserve(expectedCount);
   for (uint32_t i = 0u; i < expectedCount; ++i) {
@@ -9210,7 +9264,8 @@ bool QueryBlendedPaletteFrameTagRange(uint32_t slotIndex,
     outMissingCount = expectedCount;
     return false;
   }
-  if (slotIndex + expectedCount > kSlotBlendedPaletteCacheSize) {
+  if (slotIndex + expectedCount > kSlotBlendedPaletteCacheSize ||
+      !s_slotBlendedPaletteCache) {
     outMissingCount = expectedCount;
     return false;
   }
@@ -9246,7 +9301,7 @@ bool QueryRenderablePartPaletteSlot(void* renderablePart,
     *outGroupCount = 0u;
   if (outFrameTag != nullptr)
     *outFrameTag = 0u;
-  if (renderablePart == nullptr) {
+  if (renderablePart == nullptr || !s_renderablePartPaletteBindings) {
     g_renderablePartPaletteBindingQueryMissCount.fetch_add(
         1u, std::memory_order_relaxed);
     return false;
@@ -9303,7 +9358,8 @@ bool QueryRenderablePartPaletteSnapshot(void* renderablePart,
 
   if (!RenderablePartPaletteSnapshotEnabled() || renderablePart == nullptr ||
       expectedCount == 0u ||
-      expectedCount > kRenderablePartPaletteSnapshotMaxCount) {
+      expectedCount > kRenderablePartPaletteSnapshotMaxCount ||
+      !s_renderablePartPaletteBindings) {
     return noteMiss();
   }
 
@@ -9370,6 +9426,8 @@ bool IsSkinPaletteSelectionCurrent(const render::skin::Selection& selected) {
   if (!render::skin::OwnedSnapshotMatches(selected, selected.runtimeModel, selected.part,
       s_skinPaletteOwnerEpoch.load(std::memory_order_acquire), slot, frame, 1u))
     return false;
+  if (!s_renderablePartPaletteBindings)
+    return false;
   const auto& entry=s_renderablePartPaletteBindings[(selected.part>>4u)%kRenderablePartPaletteBindingCacheSize];
   render::skin::TryCell guard(entry.cellBusy);
   if (!guard) return false;
@@ -9386,7 +9444,8 @@ bool QueryOwnedRenderablePartPaletteSnapshot(void* runtimeModel,void* part,uint3
   selected={};
   if (!outPaletteVec) return false;
   auto& out=*static_cast<std::vector<Matrix4>*>(outPaletteVec);out.clear();
-  if(!RenderablePartPaletteSnapshotEnabled()||!runtimeModel||!part||!required||required>64)return false;
+  if(!RenderablePartPaletteSnapshotEnabled()||!runtimeModel||!part||!required||required>64||
+     !s_renderablePartPaletteBindings)return false;
   uint32_t currentSlot=UINT32_MAX,currentFrame=0;
   if(!SafeReadU32Fast(part,kRenderablePartPaletteSlotOffset,currentSlot)||
      !TryReadCurrentPaletteFrameTag(currentFrame))return false;
@@ -9415,7 +9474,8 @@ bool QueryRenderablePartOwnerRuntimeModel(void* renderablePart,
                                           void** outRuntimeModelPtr) {
   if (outRuntimeModelPtr != nullptr)
     *outRuntimeModelPtr = nullptr;
-  if (renderablePart == nullptr || outRuntimeModelPtr == nullptr)
+  if (renderablePart == nullptr || outRuntimeModelPtr == nullptr ||
+      !s_renderablePartPaletteBindings)
     return false;
 
   const uintptr_t partValue = reinterpret_cast<uintptr_t>(renderablePart);
@@ -11427,6 +11487,11 @@ bool QueryRuntimeParentLink(void* childRuntimeModelPtr,
   out.bucketIndex = it->second.bucketIndex;
   out.lastSeenFrame = it->second.lastSeenFrame;
   return true;
+}
+
+void AllocateProducerPaletteTables() {
+  s_slotBlendedPaletteCache.allocateIfMissing();
+  s_renderablePartPaletteBindings.allocateIfMissing();
 }
 
 } // namespace model

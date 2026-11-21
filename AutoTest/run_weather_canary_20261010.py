@@ -1,8 +1,21 @@
 """Prepare/check/run an isolated real-JASS weather fixture.
 
-Preparation creates only new files beneath this night-specific artifact tree.
+Preparation creates only new files beneath this night-specific artifact tree
+(or beneath --artifact-root, a new folder directly under AutoTest/artifacts).
 Run requires an explicit candidate DLL hash, successful pjass receipt and the
-existing AutoTest sandbox. No player installation writes or global input.
+existing AutoTest sandbox. No player installation writes or global input. The
+player's d3d9.dll is absent and must stay absent: checked before and after the
+run, never created; the sandbox instance loads exactly the candidate DLL.
+
+--mode proxy (x64_proxy_gate_mode.py) runs the same JASS timeline with the
+product's device in the x64 render host. The JASS receipts and the weather
+runtime's own clock are the data layer's and are judged as in process. The
+render / frozenInput / volumetric sections of weather-status come from the
+in-process renderer, which does not draw in proxy mode; every assertion that
+needs them is recorded as not applicable (the host-side witnesses N4/N5 are
+not written yet), never as a pass. Captures are taken when the runtime phase
+of the stage is live; the window resize must reach the front end
+(window-proxy resizes >= 1, refused 0) and the transport must end clean.
 """
 
 from __future__ import annotations
@@ -17,6 +30,8 @@ import re
 import struct
 import subprocess
 import time
+
+import x64_proxy_gate_mode as x64mode
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,6 +56,19 @@ QUERY_DIAGNOSTIC = re.compile(
     r'WEATHER_QUERY_DIAGNOSTIC=scientific:([-+\d.eE]+);decimal:([-+\d.eE]+);playRaw:([^"\r\n]*)'
 )
 STAGE_COUNT = 15
+# Classification keys that read the in-process renderer's weather witnesses
+# (render, frozenInput, volumetric): not measurable in proxy mode yet.
+PROXY_NOT_APPLICABLE = (
+    "snowOnlyCommandsRecordedAtFrozenInput", "snowOnlyMediumNotSubmitted",
+    "hazeOnlyVolumeAtFrozenInput", "lowSnowOnlyVolumeAtFrozenInput", "fullWeatherAtFrozenInput",
+    "pausedRenderInputObserved", "seekPausedRenderInputObserved", "resumedClockProgressAtFrozenInput",
+    "disabledRenderAndVolumeObserved", "reenabledClockProgressAtFrozenInput",
+    "timelineInterpolationAtFrozenInput", "timelineFullAtFrozenInput",
+    "destroyedRenderAndVolumeObserved", "capturePhasesBracketed")
+PROXY_NOT_APPLICABLE_REASON = (
+    "weather-status render/frozenInput/volumetric are the in-process renderer's "
+    "(ProcessServices().QueryWar3Weather*Diagnostics); in proxy mode the host draws the "
+    "weather and its per-frame witnesses (x86 N5, host N4) are not written yet")
 EXPECTED_CHECKS = (9, 10, 11, 12, 13, 14, 20, 21, 23, 25, 28, 31, 32, 34, 35)
 CAPTURES = {0: "baseline", 1: "held-snow-only", 2: "held-haze-only",
             3: "held-low-snow-only", 4: "held-full-weather", 5: "paused",
@@ -490,6 +518,19 @@ def phase_matches(observation: dict, stage: int, stages: dict) -> bool:
     return True
 
 
+def proxy_capture_ready(observation: dict, stage: int, stages: dict, seconds_in_stage: float) -> bool:
+    """Proxy arm: the stage's runtime phase is live (the data layer's
+    WeatherRuntime), for long enough that the host has drawn it."""
+    runtime = observation.get("runtime", {})
+    if seconds_in_stage < 1.0 or runtime.get("observationKind") != "owner-control-live-state-not-render-input":
+        return False
+    if stage in (0, 8, 13):
+        return runtime.get("enabled") is False
+    start = stages.get(stage)
+    return (bool(start) and runtime.get("enabled") is True and int(runtime.get("id", 0)) == start["id"]
+            and (stage not in (5, 6) or runtime.get("paused") is True))
+
+
 def active_capture_matches(observation: dict, stage: int, stages: dict) -> bool:
     if not phase_matches(observation, stage, stages):
         return False
@@ -767,9 +808,16 @@ def save_final_run_receipt(out: Path, receipt: dict, protected: dict,
 
 def run(args: argparse.Namespace, suite=None) -> int:
     # Lazy import: --prepare/--check-jass do not initialize game control tools.
+    import contextlib
     import war3_autotest_mcp as war3
     import winreg
     out = artifact_dir(args.name)
+    player_dll_before = x64mode.require_player_dll_absent("before")
+    arm = None
+    if args.mode == "proxy":
+        if suite:
+            raise ValueError("--mode proxy runs the functional suite only")
+        arm = x64mode.ProxyArm(args.front, args.host, out / "proxy", args.proxy_env)
     prepared = json.loads((out / "prepare.json").read_text(encoding="utf-8"))
     checked = json.loads((out / "jass-check.json").read_text(encoding="utf-8"))
     if (out / "run.json").exists() or (out / "captures").exists() or (out / "game").exists():
@@ -799,7 +847,7 @@ def run(args: argparse.Namespace, suite=None) -> int:
         if any(str(row.get("exeName", "")).lower() == name.lower()
                for row in war3._snapshot_process_entries()):
             raise RuntimeError(f"process conflict: {name}")
-    protected = {str(p): sha256(p) for p in (SOURCE_MAP, PLAYER_DLL, PLAYER_GAME)}
+    protected = {str(p): sha256(p) for p in (SOURCE_MAP, PLAYER_GAME)}
     run_id = "weather-20261010-" + args.name
     session_id = "weather-" + args.name
     game_root = out / "game"
@@ -820,21 +868,29 @@ def run(args: argparse.Namespace, suite=None) -> int:
         "protectedInputs": protected, "globalInputUsed": False,
         "videoRegistryBefore": dimensions,
         "videoRegistryChanged": False, "snapshots": [], "captures": [],
-        "stageReceipts": [], "runtimeAcceptance": False}
+        "stageReceipts": [], "runtimeAcceptance": False,
+        "mode": args.mode, "playerDllBefore": player_dll_before}
+    overrides = {"DXVK_WAR3_INTERNAL_TEST_API": "1",
+        **({"DXVK_WAR3_VISUAL_API_DIAGNOSTICS": "1"} if suite else {}),
+        "DXVK_WAR3_AUTOTEST_DISABLE_BACKGROUND_THROTTLE": "1",
+        "DXVK_WAR3_AUTOTEST_DISABLE_GAME_PAUSE": "1",
+        "DXVK_WAR3_PERF_RECORD_ON_START": "0",
+        "DISABLE_VULKAN_OBS_CAPTURE": "1"}
+    if arm is not None:
+        overrides.update(arm.env())
+        receipt["proxyArm"] = arm.receipt()
+        receipt["proxySamples"] = []
+    stage_seen_at = {}
     try:
         for key in old_env:
             os.environ.pop(key, None)
         try:
-            launch = war3.launch_war3_instance(sandbox_root=str(SANDBOX),
-                map_path=prepared["map"]["path"], run_id=run_id, session_id=session_id,
-                artifact_root=str(game_root), windowed=True, use_isolated_desktop=True,
-                deploy_d3d9_before_launch=True, build_d3d9_path=str(dll), profile="full_default",
-                env_overrides_json=json.dumps({"DXVK_WAR3_INTERNAL_TEST_API": "1",
-                    **({"DXVK_WAR3_VISUAL_API_DIAGNOSTICS": "1"} if suite else {}),
-                    "DXVK_WAR3_AUTOTEST_DISABLE_BACKGROUND_THROTTLE": "1",
-                    "DXVK_WAR3_AUTOTEST_DISABLE_GAME_PAUSE": "1",
-                    "DXVK_WAR3_PERF_RECORD_ON_START": "0",
-                    "DISABLE_VULKAN_OBS_CAPTURE": "1"}))
+            with (war3.game_stdio_capture(arm.staging) if arm is not None else contextlib.nullcontext()):
+                launch = war3.launch_war3_instance(sandbox_root=str(SANDBOX),
+                    map_path=prepared["map"]["path"], run_id=run_id, session_id=session_id,
+                    artifact_root=str(game_root), windowed=True, use_isolated_desktop=True,
+                    deploy_d3d9_before_launch=True, build_d3d9_path=str(dll), profile="full_default",
+                    env_overrides_json=json.dumps(overrides))
         finally:
             os.environ.update(old_env)
         receipt["launch"] = launch
@@ -912,8 +968,16 @@ def run(args: argparse.Namespace, suite=None) -> int:
                 and draw.get("stage") == "disabled" and draw.get("commandsRecorded") is False
                 and observation.get("frozenInput", {}).get("id") == 0
                 and observation.get("volumetric", {}).get("compositeSubmitted") is False)
-            ready_to_capture = (suite.capture_ready(observation, stage, stage_map) if suite
-                else off_capture_ready or active_capture_matches(observation, stage, stage_map))
+            stage_seen_at.setdefault(stage, elapsed)
+            if arm is not None:
+                ready_to_capture = proxy_capture_ready(observation, stage, stage_map,
+                                                       elapsed - stage_seen_at[stage])
+                plane = war3._control_plane_request(pid=pid, command="get_runtime_status",
+                                                    payload={}, timeout_sec=2.0)
+                receipt["proxySamples"].append(x64mode.proxy_status(dict(plane.get("result") or {})))
+            else:
+                ready_to_capture = (suite.capture_ready(observation, stage, stage_map) if suite
+                    else off_capture_ready or active_capture_matches(observation, stage, stage_map))
             if (stage in capture_labels and stage not in captured and stage == stage_after_status
                     and ready_to_capture):
                 path = capture_root / (capture_labels[stage] + ".bmp")
@@ -943,6 +1007,8 @@ def run(args: argparse.Namespace, suite=None) -> int:
         receipt["classification"] = suite.classify(receipt) if suite else classify(receipt)
         non_acceptance = (suite.NON_ACCEPTANCE if suite else (
             "captureExactWeatherFrameCertified", "gpuCompletionCertified", "pixelOrArtisticAcceptance"))
+        if arm is not None:
+            return run_proxy_verdict(war3, receipt, arm, launch, instance, pid, non_acceptance)
         required = [key for key in receipt["classification"]
                     if key not in non_acceptance]
         receipt["runtimeAcceptance"] = all(receipt["classification"][key] for key in required)
@@ -966,7 +1032,40 @@ def run(args: argparse.Namespace, suite=None) -> int:
                     force=True, avoid_foreground_switch=True)
             except Exception as cleanup_error:
                 receipt["stop"] = {"ok": False, "error": str(cleanup_error)}
+        receipt["playerDllAfter"] = x64mode.player_dll_state()
+        if receipt["playerDllAfter"]["exists"]:
+            receipt["runtimeAcceptance"] = False
         save_final_run_receipt(out, receipt, protected, dimensions, winreg, war3.WAR3_VIDEO_REG_KEY)
+        if receipt["playerDllAfter"]["exists"]:
+            raise RuntimeError("player d3d9.dll appeared during the run")
+
+
+def run_proxy_verdict(war3, receipt: dict, arm, launch: dict, instance: Path, pid: int,
+                      non_acceptance) -> int:
+    """Proxy arm: the measurable part of the classification, the window
+    resize as the front end saw it, and the transport account."""
+    classification = receipt["classification"]
+    measured = {key: value for key, value in classification.items()
+                if key not in non_acceptance and key not in PROXY_NOT_APPLICABLE}
+    receipt["proxyNotApplicable"] = {key: {**x64mode.not_applicable(PROXY_NOT_APPLICABLE_REASON),
+                                           "inProcessValueWouldBe": classification.get(key)}
+                                     for key in PROXY_NOT_APPLICABLE}
+    receipt["naturalExit"] = war3.natural_exit_owned_game(
+        pid, instance, str(launch.get("desktop", {}).get("name", "")))
+    evidence = x64mode.collect_evidence(arm.staging, [Path(launch["artifactDir"])], instance)
+    receipt["proxyEvidence"] = evidence
+    window = x64mode.last(evidence.get("frontAccounts") or {}, "window-proxy")
+    resized = bool(receipt.get("ownedClientResize"))
+    measured["windowResizeReachedFrontEnd"] = (not resized) or (
+        int(window.get("resizes", 0) or 0) >= 1 and window.get("refused") == 0)
+    world = x64mode.world_progress([row for row in receipt.get("proxySamples", []) if row])
+    acceptance = x64mode.proxy_acceptance(evidence, receipt["naturalExit"], world)
+    receipt["proxyAcceptance"] = acceptance
+    receipt["proxyMeasured"] = measured
+    receipt["runtimeAcceptance"] = all(measured.values()) and acceptance["ok"]
+    print(json.dumps({"mode": "proxy", "measured": measured, "proxy": acceptance["checks"],
+                      "notApplicable": sorted(PROXY_NOT_APPLICABLE)}, ensure_ascii=False))
+    return 0 if receipt["runtimeAcceptance"] else 2
 
 
 def main() -> int:
@@ -982,7 +1081,16 @@ def main() -> int:
     parser.add_argument("--expected-dll-sha")
     parser.add_argument("--resize-owned-client", action="store_true",
         help="Resize only this owned isolated HWND to 2560x1440 without changing video registry")
+    parser.add_argument("--artifact-root", default="",
+        help="a new folder directly under AutoTest/artifacts instead of weather-night-20261010")
+    x64mode.add_mode_arguments(parser)
     args = parser.parse_args()
+    if args.artifact_root:
+        global ARTIFACTS
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,80}", args.artifact_root):
+            raise ValueError("invalid --artifact-root")
+        ARTIFACTS = ROOT / "AutoTest/artifacts" / args.artifact_root
+        ARTIFACTS.mkdir(parents=True, exist_ok=True)
     if args.suite == "stress":
         import weather_stress_contract_20261010 as suite
     else:

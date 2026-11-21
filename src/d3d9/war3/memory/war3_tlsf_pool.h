@@ -22,7 +22,8 @@ namespace dxvk::war3::memory {
 /**
  * @brief 初始化 TLSF 内存池。
  *
- * 默认配置：64 MB 初始大小，16 MB 扩展粒度，1 GB 上限。
+ * 默认配置：64 MB 初始大小，16 MB 扩展粒度，1 GB 上限。现有池放不下的
+ * 超大请求（> 8 MB）不开扩展池，单独成“直接块”，释放即归还系统。
  * 必须在 Storm Hook 安装前调用（DllMain / D3D9 初始化路径）。
  *
  * @return 初始化成功返回 true。
@@ -105,6 +106,9 @@ struct TlsfPoolStats {
   size_t freeCount;   ///< 累计释放次数
   size_t extendCount; ///< 扩展池次数
   size_t trimCount;   ///< Trim 操作次数
+  size_t directBlocks;     ///< 现存直接块个数（超大请求单独成块，释放即归还）
+  size_t directBytes;      ///< 现存直接块字节数（已计入 totalSize/usedSize）
+  size_t directAllocCount; ///< 累计直接块分配次数
 };
 
 TlsfPoolStats TlsfPool_GetStats();

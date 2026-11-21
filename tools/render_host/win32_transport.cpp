@@ -73,6 +73,20 @@ Handle OpenPeer(DWORD pid,uint64_t creation) {
     throw Failure(Fault::PeerIdentity,Stage::Setup);
   return result;
 }
+Handle AdoptPeer(uint64_t inherited,DWORD pid,uint64_t creation) {
+  if(!inherited||inherited>UINT32_MAX)throw Failure(Fault::PeerIdentity,Stage::Setup);
+  Handle result(reinterpret_cast<HANDLE>(static_cast<uintptr_t>(inherited)));
+  if(GetProcessId(result.get())!=pid||!pid)throw Failure(Fault::PeerIdentity,Stage::Setup,GetLastError());
+  if(CreationTime(result.get())!=creation||WaitForSingleObject(result.get(),0)!=WAIT_TIMEOUT)
+    throw Failure(Fault::PeerIdentity,Stage::Setup);
+  return result;
+}
+Handle ShareSelf() {
+  HANDLE self=nullptr;
+  if(!DuplicateHandle(GetCurrentProcess(),GetCurrentProcess(),GetCurrentProcess(),&self,
+      SYNCHRONIZE|PROCESS_QUERY_LIMITED_INFORMATION,TRUE,0))System(Stage::Setup);
+  return Handle(self);
+}
 ipc::Nonce RandomNonce() {
   ipc::Nonce nonce;
   if(BCryptGenRandom(nullptr,reinterpret_cast<PUCHAR>(&nonce),sizeof(nonce),
@@ -185,7 +199,8 @@ void ReadFirstByteAfterIdle(HANDLE pipe,HANDLE peer,uint8_t* byte,IoStats& stats
 const char* StageName(Stage s) noexcept {
   switch(s){case Stage::Setup:return "setup";case Stage::Connect:return "connect";
     case Stage::Header:return "header";case Stage::Body:return "body";case Stage::Write:return "write";
-    case Stage::SlotMutex:return "slot-mutex";case Stage::SlotCopy:return "slot-copy";}
+    case Stage::SlotMutex:return "slot-mutex";case Stage::SlotCopy:return "slot-copy";
+    case Stage::ExitWait:return "exit-wait";}
   return "unknown";
 }
 const char* FaultName(Fault f) noexcept {

@@ -3,9 +3,14 @@
 #include "d3d9_batch_state.h"
 #include "d3d9_fixed_state.h"
 #include "host_surface_target.h"
+#include "before_ui_effects.h"
+#include "shadow_before_ui.h"
+#include "water_in_place.h"
+#include "evidence_recorder.h"
 #include "../d3d9_shader_tokens.h"
 #include "../d3d9_declaration_wire.h"
 #include "../d3d9_topology.h"
+#include "../d3d9_sync_profile.h"
 
 #include <algorithm>
 #include <atomic>
@@ -13,12 +18,16 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
+#include <deque>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 
 #include "../../../src/dxvk/dxvk_device.h"
 #include "../../../src/dxvk/dxvk_instance.h"
 #include "../../../src/dxvk/dxvk_presenter.h"
+#include "../../../src/dxvk/dxvk_staging.h"
 #include "../../../src/dxvk/dxvk_swapchain_blitter.h"
 #include "../../../src/dxso/dxso_module.h"
 #include "../../../src/dxso/dxso_modinfo.h"
@@ -49,6 +58,151 @@ namespace {
   private:
     uint64_t* m_destination;
     Clock::time_point m_start{};
+  };
+  // P0 measurement only (host-profile/v1): charges a wait that began at
+  // `begin` to the current call site, and names that site for a scope.
+  using WaitSite = D3D9Backend::WaitSite;
+  using WaitKind = D3D9Backend::WaitKind;
+  void ChargeWait(D3D9Backend::Stats& stats, WaitKind kind, int64_t begin, uint64_t polls = 0) noexcept {
+    static const uint64_t frequency = uint64_t(d9::profile::Frequency());
+    static const uint64_t slow[3] = { frequency / 1000u, frequency / 200u, frequency / 50u };
+    const auto ticks = uint64_t(d9::profile::Ticks() - begin);
+    auto& cell = stats.waitProfile.waits[size_t(stats.waitProfile.site)][size_t(kind)];
+    ++cell.count;
+    cell.ticks += ticks;
+    cell.maxTicks = std::max(cell.maxTicks, ticks);
+    cell.polls += polls;
+    for (size_t i = 0; i < 3; ++i)
+      cell.slow[i] += ticks >= slow[i];
+  }
+  class WaitAt {
+  public:
+    WaitAt(D3D9Backend::Stats& stats, WaitSite site) noexcept
+      : m_site(stats.waitProfile.site), m_previous(m_site) { m_site = site; }
+    ~WaitAt() { m_site = m_previous; }
+    WaitAt(const WaitAt&) = delete;
+    WaitAt& operator=(const WaitAt&) = delete;
+    void set(WaitSite site) noexcept { m_site = site; }
+  private:
+    WaitSite& m_site;
+    WaitSite m_previous;
+  };
+  // The three host switches reviewed on 2026-11-18 are on by default
+  // (docs/research/2026-11-18-x64-switch-review.md). Each still takes its
+  // `off` word, for a control arm, and alternate:N (1..1000000), the same-run
+  // A/B in turns of N presents. Unset or any other value: on.
+  struct HostSwitch { uint32_t setting = 1, every = 0; };
+  HostSwitch ReadHostSwitch(const wchar_t* name, const wchar_t* off) noexcept {
+    HostSwitch s;
+    wchar_t v[32]{};
+    const DWORD n = GetEnvironmentVariableW(name, v, 32);
+    if (!n || n >= 32)
+      return s;
+    if (!std::wcscmp(v, off)) {
+      s.setting = 0;
+      return s;
+    }
+    if (!std::wcsncmp(v, L"alternate:", 10)) {
+      uint64_t every = 0;
+      const wchar_t* c = v + 10;
+      for (; *c >= L'0' && *c <= L'9' && every <= 1000000; ++c)
+        every = every * 10 + uint64_t(*c - L'0');
+      if (!*c && c != v + 10 && every >= 1 && every <= 1000000) {
+        s.setting = 2;
+        s.every = uint32_t(every);
+      }
+    }
+    return s;
+  }
+  // E0, see D3D9Backend::PresentWaitProfile. WARVK_D3D9_PRESENT_WAIT: "poll"
+  // keeps the Sleep(1) poll.
+  D3D9Backend::PresentWaitProfile ReadPresentWait() noexcept {
+    D3D9Backend::PresentWaitProfile p;
+    const auto s = ReadHostSwitch(L"WARVK_D3D9_PRESENT_WAIT", L"poll");
+    p.setting = s.setting;
+    p.every = s.every;
+    return p;
+  }
+  // Item 4, see D3D9Backend::DynamicReadProfile. WARVK_D3D9_DYNAMIC_CPU_COPY:
+  // "0" reads the mapping as before. Read once.
+  using DynamicCpuCopySetting = HostSwitch;
+  DynamicCpuCopySetting ReadDynamicCpuCopy() noexcept {
+    static const HostSwitch value = ReadHostSwitch(L"WARVK_D3D9_DYNAMIC_CPU_COPY", L"0");
+    return value;
+  }
+  // P1 batch 1, see D3D9Backend::UploadSliceProfile. WARVK_D3D9_UPLOAD_SLICES:
+  // "0" keeps settle + copy + submit(true) per upload. Read once.
+  DynamicCpuCopySetting ReadUploadSlices() noexcept {
+    static const HostSwitch value = ReadHostSwitch(L"WARVK_D3D9_UPLOAD_SLICES", L"0");
+    return value;
+  }
+  // See D3D9Backend::Stats::presentsPipelined. WARVK_D3D9_PRESENT_PIPELINE:
+  // "0" keeps every Present waiting for its own frame. Read once.
+  HostSwitch ReadPresentPipeline() noexcept {
+    static const HostSwitch value = ReadHostSwitch(L"WARVK_D3D9_PRESENT_PIPELINE", L"0");
+    return value;
+  }
+  // WARVK_D3D9_STREAM_FLUSH_DRAWS=N (16..MaxStreamDraws; unset or anything
+  // else: off). In stream mode the open list is submitted once it holds N
+  // draws, not only at EndScene, Present or the draw cap: the GPU then works
+  // on the first part of a frame while the rest is still being recorded,
+  // instead of starting when the frame ends. Frame boundaries are unchanged
+  // (Present still settles); a list submitted mid-frame is what the draw cap
+  // and the upload credit already produce. Read once.
+  uint32_t ReadStreamFlushDraws() noexcept {
+    static const uint32_t value = [] {
+      wchar_t text[8]{};
+      const DWORD length = GetEnvironmentVariableW(L"WARVK_D3D9_STREAM_FLUSH_DRAWS", text, 8);
+      if (!length || length >= 8)
+        return 0u;
+      uint32_t draws = 0;
+      for (const wchar_t* c = text; *c; ++c) {
+        if (*c < L'0' || *c > L'9')
+          return 0u;
+        draws = draws * 10 + uint32_t(*c - L'0');
+      }
+      return draws >= 16 && draws <= D3D9Backend::MaxStreamDraws ? draws : 0u;
+    }();
+    return value;
+  }
+  // P1 in-flight staging credit. The in-process device bounds its staging the
+  // same way (D3D9DeviceEx::ThrottleAllocation); these are the host's own
+  // values, not a product memory budget: 4 MiB chunks, at most 16 MiB and
+  // 4096 slices in flight, and an eager list submission at a third of either.
+  constexpr VkDeviceSize UploadStagingChunk = VkDeviceSize(4) << 20;
+  constexpr uint64_t UploadInFlightBytes = uint64_t(16) << 20, UploadInFlightSlices = 4096;
+  constexpr uint64_t UploadBytesPerList = UploadInFlightBytes / 3, UploadSlicesPerList = UploadInFlightSlices / 3;
+  // A blocking E0 wait wakes on its notification at once; the slice only
+  // bounds how late healthy() and the unchanged deadline are rechecked.
+  constexpr auto PresentWaitSlice = std::chrono::milliseconds(10);
+  // E0's 1 ms timer-resolution request, held while blocking waits are in use.
+  // winmm is loaded from System32 only when E0 is enabled.
+  class TimerResolution {
+  public:
+    using Period = UINT (WINAPI*)(UINT);
+    void set(bool want) noexcept {
+      if (want == m_held)
+        return;
+      if (!m_loaded) {
+        m_loaded = true;
+        if (const HMODULE winmm = LoadLibraryExW(L"winmm.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32)) {
+          m_begin = reinterpret_cast<Period>(reinterpret_cast<void*>(GetProcAddress(winmm, "timeBeginPeriod")));
+          m_end = reinterpret_cast<Period>(reinterpret_cast<void*>(GetProcAddress(winmm, "timeEndPeriod")));
+        }
+      }
+      if (!m_begin || !m_end)
+        return;
+      if ((want ? m_begin(1) : m_end(1)) == 0) {
+        m_held = want;
+        m_requests += want;
+      }
+    }
+    uint64_t requests() const noexcept { return m_requests; }
+    ~TimerResolution() { set(false); }
+  private:
+    Period m_begin = nullptr, m_end = nullptr;
+    bool m_loaded = false, m_held = false;
+    uint64_t m_requests = 0;
   };
   constexpr VkMemoryPropertyFlags CoherentMemory =
     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
@@ -190,10 +344,106 @@ struct D3D9Backend::Owner {
     Rc<DxvkBuffer> object;
     uint32_t size = 0, initializedPrefix = 0;
     bool index16 = false, dynamic = false;
+    uint64_t contentGeneration = 0;
     // Only the x64 IB has a bounded CPU shadow for validating addressed vertex
-    // ranges. VB bytes and textures are not retained as parallel CPU mirrors.
+    // ranges. VB bytes and textures are not retained as parallel CPU mirrors,
+    // except a dynamic VB's when WARVK_D3D9_DYNAMIC_CPU_COPY is set (item 4).
     std::vector<uint8_t> indexBytes;
+    std::vector<uint8_t> vertexBytes;
   };
+  // Item 4: whether the CPU reads of dynamic storage take the CPU copy now.
+  bool dynamicReadsFromCopy(const D3D9Backend::DynamicReadProfile& p) const noexcept {
+    if (p.setting == 1)
+      return true;
+    return p.setting == 2 && p.every && (lastPresentFrame / p.every) % 2 == 1;
+  }
+  // P1 batch 1: staging slices for texture uploads and their
+  // in-flight credit. A mark is the cumulative allocation when a stream list
+  // that carried slices was submitted; the mark retires with its serial.
+  std::unique_ptr<DxvkStagingBuffer> uploadStaging;
+  struct UploadMark { uint64_t serial = 0, bytes = 0, slices = 0; };
+  std::deque<UploadMark> uploadMarks;
+  uint64_t uploadBytes = 0, uploadSliceCount = 0, uploadMarkedBytes = 0, uploadMarkedSlices = 0;
+  uint64_t uploadRetiredBytes = 0, uploadRetiredSlices = 0;
+  bool uploadSlicesNow(const D3D9Backend::UploadSliceProfile& p) const noexcept {
+    if (!streamMode)
+      return false;
+    if (p.setting == 1)
+      return true;
+    return p.setting == 2 && p.every && (lastPresentFrame / p.every) % 2 == 1;
+  }
+  void markUploadList() {
+    if (uploadBytes == uploadMarkedBytes && uploadSliceCount == uploadMarkedSlices)
+      return;
+    uploadMarks.push_back({ lastSerial, uploadBytes, uploadSliceCount });
+    uploadMarkedBytes = uploadBytes;
+    uploadMarkedSlices = uploadSliceCount;
+  }
+  void retireUploadMarks(uint64_t completed) noexcept {
+    while (!uploadMarks.empty() && uploadMarks.front().serial <= completed) {
+      uploadRetiredBytes = uploadMarks.front().bytes;
+      uploadRetiredSlices = uploadMarks.front().slices;
+      uploadMarks.pop_front();
+    }
+  }
+  // Before a new slice of `bytes`: keep in-flight staging within the credit.
+  // Unsubmitted slices cannot retire, so they are submitted first; then the
+  // oldest marks are waited for on the completion timeline (bounded, as every
+  // other GPU wait here). A single upload larger than the credit is let
+  // through alone.
+  void throttleUploads(D3D9Backend::Stats& stats, uint64_t bytes) {
+    auto& p = stats.uploadSlices;
+    const auto over = [&] {
+      return uploadBytes + bytes - uploadRetiredBytes > UploadInFlightBytes
+          || uploadSliceCount + 1 - uploadRetiredSlices > UploadInFlightSlices;
+    };
+    retireUploadMarks(stats.gpuCompleted);
+    if (!over())
+      return;
+    // As settle(): a device already known lost is not queried or waited on.
+    healthy();
+    uint64_t value = 0;
+    VkResult result = device->vkd()->vkGetSemaphoreCounterValue(device->handle(), completion->handle(), &value);
+    if (result != VK_SUCCESS) {
+      device->notifyDeviceErrorFromDriverResult(result);
+      throw std::runtime_error("DXVK D3D9 upload credit timeline query failed");
+    }
+    require(value <= lastSerial, "DXVK D3D9 unexpected timeline value");
+    stats.gpuCompleted = std::max(stats.gpuCompleted, value);
+    retireUploadMarks(stats.gpuCompleted);
+    if (!over())
+      return;
+    if (uploadBytes != uploadMarkedBytes || uploadSliceCount != uploadMarkedSlices) {
+      flushStream(stats);
+      ++p.listFlushes;
+    }
+    const auto waitBegin = d9::profile::Ticks();
+    // One GpuWaitNs for the whole credit wait, however many marks it takes.
+    const auto deadline = Clock::now() + std::chrono::nanoseconds(GpuWaitNs);
+    while (over() && !uploadMarks.empty()) {
+      healthy();
+      const uint64_t target = uploadMarks.front().serial;
+      const VkSemaphore semaphore = completion->handle();
+      VkSemaphoreWaitInfo wait = { VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
+      wait.semaphoreCount = 1; wait.pSemaphores = &semaphore; wait.pValues = &target;
+      const auto left = std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - Clock::now()).count();
+      result = device->vkd()->vkWaitSemaphores(device->handle(), &wait, left > 0 ? uint64_t(left) : 0);
+      if (result != VK_SUCCESS) {
+        device->notifyDeviceErrorFromDriverResult(result);
+        throw std::runtime_error("DXVK D3D9 upload credit wait failed");
+      }
+      stats.gpuCompleted = std::max(stats.gpuCompleted, target);
+      retireUploadMarks(stats.gpuCompleted);
+      ++p.creditWaits;
+    }
+    p.creditWaitTicks += uint64_t(d9::profile::Ticks() - waitBegin);
+  }
+  // The CPU copy of a dynamic buffer's bytes, or null when it has none.
+  static const uint8_t* dynamicCopy(const Buffer& slot) noexcept {
+    if (slot.index16)
+      return slot.indexBytes.size() == slot.size ? slot.indexBytes.data() : nullptr;
+    return slot.vertexBytes.size() == slot.size ? slot.vertexBytes.data() : nullptr;
+  }
   struct Texture {
     Rc<DxvkImage> image;
     Rc<DxvkImageView> view;
@@ -231,6 +481,9 @@ struct D3D9Backend::Owner {
   Rc<DxvkContext> context;
   std::array<Buffer, BufferSlots> buffers;
   std::array<Texture, TextureSlots> textures;
+  // The highest texture slot ever created: every scan of `textures` stops
+  // there (slots are handed out lowest first, so this is the peak live count).
+  uint32_t textureLimit = 0;
   std::array<Shader, ShaderSlots> vertexShaders, pixelShaders;
   std::array<Declaration, DeclarationSlots> declarations;
   Rc<DxvkImage> color, depth, acquiredImage;
@@ -246,6 +499,7 @@ struct D3D9Backend::Owner {
   std::unique_ptr<D3D9Options> d3d9Options;
   Rc<DxvkBuffer> staging, readback, presentedReadback, vertexConstants, pixelConstants, sharedConstants, specConstants, clipPlanes;
   Rc<DxvkBuffer> fixedVertexConstants,fixedPixelConstants,nullVertex;
+  FixedTransformCache fixedTransforms;
   D3D9SpecializationInfo specialization;
   std::unique_ptr<D3D9FFShader> fixedVertexShader,fixedPixelShader;
   Rc<DxvkBuffer> batchVertexConstants, batchPixelConstants;
@@ -265,6 +519,14 @@ struct D3D9Backend::Owner {
   };
   ConstantRing streamVertex, streamPixel, streamFixedVertex, streamFixedPixel;
   bool streamMode = false, streamOpen = false;
+  // presentPipeline: the switch. presentLagging: a queued Present whose lists
+  // nobody has waited for on the GPU yet; the next Present's frame-signal wait
+  // or any settle() closes it.
+  bool presentPipeline = false, presentLagging = false;
+  // Whether the open list holds anything but texture upload slices: draws, a
+  // Discard rename, effects. A list of slices alone is submitted work in
+  // waiting, not draws the client still has to flush (hasPendingDraws).
+  bool streamHoldsWork = false;
   uint32_t streamListDraws = 0;
   // Allocated only for the explicit diagnostic WSI profile. This is a frozen
   // CPU copy, not a borrowed mapping or an offscreen-source fallback.
@@ -274,7 +536,21 @@ struct D3D9Backend::Owner {
   DxvkSubmitStatus submission;
   Rc<Presenter> presenter;
   Rc<DxvkSwapchainBlitter> blitter;
-  Rc<sync::Fence> presentSignal;
+  Rc<sync::Signal> presentSignal;
+  // E0 only (WARVK_D3D9_PRESENT_WAIT set): the same object as presentSignal,
+  // and the auto-reset event its frame callbacks set. Callbacks own the event
+  // with them, so a late callback never touches a closed handle.
+  Rc<sync::CallbackFence> presentCallback;
+  std::shared_ptr<void> presentWake;
+  TimerResolution timerResolution;
+  int64_t presentWaitLastBegin = 0;
+  bool presentBlocking(const D3D9Backend::PresentWaitProfile& p, uint64_t frame) const noexcept {
+    if (presentCallback == nullptr)
+      return false;
+    if (p.setting == 1)
+      return true;
+    return p.setting == 2 && p.every && ((frame - 1) / p.every) % 2 == 1;
+  }
   // Asynchronous queue feedback must never point at a present() stack frame.
   DxvkSubmitStatus presentSubmission;
   DxsoModuleInfo moduleInfo;
@@ -293,6 +569,57 @@ struct D3D9Backend::Owner {
   // this host owns the separate HWND used by the production WSI surface.
   std::unique_ptr<surface::HostSurfaceTarget> surfaceTarget;
   bool pending = false, diagnosticPresentedReadback = false;
+  // Created by the first BeforeUi run; a session without effects owns none.
+  std::unique_ptr<BeforeUiEffects> beforeUi;
+  // Created by the first caster draw or Lighting record.
+  std::unique_ptr<ShadowBeforeUi> shadow;
+  std::optional<WaterInPlace> water;
+  // Counts every colour/depth pair: the executors' device epoch.
+  uint64_t targetGeneration = 0;
+  // Frame evidence and the performance log (evidence_recorder.h). The facts
+  // are those of the frame being drawn; BeforeUi fills them, Present takes them.
+  std::unique_ptr<EvidenceRecorder> evidence;
+  EvidenceFrame evidenceFacts;
+  shadowhost::CasterBoundsCounts evidenceBounds;
+  uint64_t evidenceDraws = 0, evidenceBatches = 0;
+  std::array<uint64_t, size_t(WaitKind::Count)> evidenceWaitTicks{};
+
+  // At Present, with the frame's list open and the target complete.
+  void evidenceCapture(Stats& stats, uint64_t frame) {
+    if (!evidence)
+      return;
+    static const uint64_t frequency = uint64_t(d9::profile::Frequency());
+    EvidenceFrame facts = evidenceFacts;
+    evidenceFacts = EvidenceFrame{};
+    evidenceBounds.timingId = stats.presentAttempts;
+    if (shadow) shadow->readPresentedCounters(stats.presentAttempts, evidenceBounds);
+    shadowhost::PublishPresentedBounds(evidenceBounds);
+    evidenceBounds = {};
+    facts.hostFrame = frame;
+    facts.width = width;
+    facts.height = height;
+    facts.draws = uint32_t(stats.draws - evidenceDraws);
+    facts.drawBatches = uint32_t(stats.drawBatches - evidenceBatches);
+    evidenceDraws = stats.draws;
+    evidenceBatches = stats.drawBatches;
+    std::array<const char*, size_t(WaitKind::Count)> names{};
+    for (size_t kind = 0; kind < size_t(WaitKind::Count); ++kind) {
+      uint64_t ticks = 0;
+      for (const auto& site : stats.waitProfile.waits)
+        ticks += site[kind].ticks;
+      facts.waitUs[kind] = uint32_t(std::min<uint64_t>((ticks - evidenceWaitTicks[kind]) * 1000000u / frequency, UINT32_MAX));
+      evidenceWaitTicks[kind] = ticks;
+      names[kind] = D3D9Backend::WaitKindName(kind);
+    }
+    // Nothing of the evidence may cost the frame.
+    try {
+      evidence->frame(*context, color, facts, names.data(), uint32_t(names.size()));
+      ShadowBeforeUi::setCasterAudit(evidence->wantsAudit());
+    } catch (...) {
+      evidence->stop();
+      ShadowBeforeUi::setCasterAudit(false);
+    }
+  }
 
   void healthy() const {
     const VkResult result = device->getDeviceStatus();
@@ -361,8 +688,8 @@ struct D3D9Backend::Owner {
     for (const auto& buffer : buffers)
       if (buffer.object != nullptr && buffer.object->isInUse(DxvkAccess::Read))
         return true;
-    for (const auto& texture : textures)
-      if (texture.image != nullptr && texture.image->isInUse(DxvkAccess::Read))
+    for (uint32_t i = 0; i < textureLimit; ++i)
+      if (textures[i].image != nullptr && textures[i].image->isInUse(DxvkAccess::Read))
         return true;
     return false;
   }
@@ -405,6 +732,17 @@ struct D3D9Backend::Owner {
     healthy();
   }
 
+  bool presentPipelined() const noexcept {
+    return presentPipeline && streamMode && !diagnosticPresentedReadback;
+  }
+  // Call only where every submitted list is known complete on the GPU.
+  void completeLaggingPresent(Stats& stats) noexcept {
+    if (!presentLagging)
+      return;
+    stats.presentGpuCompleted = lastPresentFrame;
+    presentLagging = false;
+  }
+
   uint64_t pollTimeline(Stats& stats) {
     const bool submissionsReady = checkFlightSubmissions(false);
     uint64_t value = 0;
@@ -423,6 +761,7 @@ struct D3D9Backend::Owner {
       commands = nullptr;
       pending = false;
       releaseSettledFlights(stats);
+      completeLaggingPresent(stats);
     }
     return value;
   }
@@ -433,13 +772,18 @@ struct D3D9Backend::Owner {
     // In particular, do not issue a new Vulkan wait after a failed WSI call
     // has already latched terminal device status on the production queue.
     healthy();
+    const auto settleBegin = d9::profile::Ticks();
     {
       WaitTimer timer(reuseProfile ? &stats.reuseWait.cpuSubmissionNs : nullptr);
       checkFlightSubmissions(true);
     }
     if (!pending) {
+      ChargeWait(stats, WaitKind::SettleIdle, settleBegin);
+      const auto retireBegin = d9::profile::Ticks();
       WaitTimer timer(reuseProfile ? &stats.reuseWait.retirementNs : nullptr);
       waitRetired();
+      ChargeWait(stats, WaitKind::Retire, retireBegin);
+      completeLaggingPresent(stats);
       return;
     }
     const VkSemaphore semaphore = completion->handle();
@@ -454,6 +798,7 @@ struct D3D9Backend::Owner {
         ++stats.reuseWait.gpuCalls;
       result = device->vkd()->vkWaitSemaphores(device->handle(), &wait, GpuWaitNs);
     }
+    ChargeWait(stats, WaitKind::SettleGpu, settleBegin);
     if (result != VK_SUCCESS) {
       device->notifyDeviceErrorFromDriverResult(result);
       throw std::runtime_error("DXVK D3D9 GPU wait failed: " + std::to_string(static_cast<int>(result)));
@@ -461,13 +806,16 @@ struct D3D9Backend::Owner {
     stats.gpuCompleted = lastSerial;
     // Semaphore completion alone is not DXVK finish-thread resource retirement.
     {
+      const auto retireBegin = d9::profile::Ticks();
       WaitTimer timer(reuseProfile ? &stats.reuseWait.retirementNs : nullptr);
       waitRetired();
+      ChargeWait(stats, WaitKind::Retire, retireBegin);
     }
     stats.retired = lastSerial;
     commands = nullptr;
     pending = false;
     releaseSettledFlights(stats);
+    completeLaggingPresent(stats);
   }
 
   DrawFlight& beginDrawFlight(Stats& stats) {
@@ -492,6 +840,7 @@ struct D3D9Backend::Owner {
     checkFlightSubmissions(false);
     auto& flight = drawFlights[nextFlight];
     if (flight.serial) {
+      const auto reuseBegin = d9::profile::Ticks();
       ++stats.flightReuses;
       const bool measure = stats.reuseWaitProfile;
       WaitTimer totalTimer(measure ? &stats.reuseWait.totalNs : nullptr);
@@ -527,6 +876,7 @@ struct D3D9Backend::Owner {
       // GPU-completed != fully retired prefix. Only settle/poll may publish
       // retired after checking ALL author/internal resources.
       flight.serial = 0; ++stats.flightRetirements;
+      ChargeWait(stats, WaitKind::FlightReuse, reuseBegin);
     }
     if (flight.vertex == nullptr) {
       const auto uniform = [&](uint32_t bytes, const char* name) {
@@ -586,6 +936,7 @@ struct D3D9Backend::Owner {
     // Production queue takes the command-list reference. No GPU completion is
     // inferred from its bounded CPU enqueue, and every status lives in Owner.
     device->submitCommandList(commands, nullptr, serial, &flight.status);
+    ++stats.waitProfile.submits[size_t(stats.waitProfile.site)];
     flight.serial = serial; lastSerial = serial; stats.submitted = serial;
     pending = true; commands = nullptr;
     ++stats.flightSubmissions;
@@ -597,8 +948,9 @@ struct D3D9Backend::Owner {
 
   bool recording() const noexcept { return recordedGroupCount != 0 || streamOpen; }
 
-  void beginStream() {
+  void beginStream(bool work = true) {
     healthy();
+    streamHoldsWork |= work;
     if (streamOpen)
       return;
     // Unlike begin(), opening a stream list never settles earlier GPU work.
@@ -629,6 +981,8 @@ struct D3D9Backend::Owner {
     submit(stats, false);
     commands = nullptr;
     streamOpen = false;
+    streamHoldsWork = false;
+    markUploadList();
     ++stats.streamSubmissions;
     stats.largestStreamList = std::max(stats.largestStreamList, streamListDraws);
     streamListDraws = 0;
@@ -641,10 +995,12 @@ struct D3D9Backend::Owner {
     VkResult result = device->vkd()->vkGetSemaphoreCounterValue(device->handle(), completion->handle(), &value);
     if (result == VK_SUCCESS && value < target) {
       ++stats.streamLatencyWaits;
+      const auto latencyBegin = d9::profile::Ticks();
       const VkSemaphore semaphore = completion->handle();
       VkSemaphoreWaitInfo wait = { VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
       wait.semaphoreCount = 1; wait.pSemaphores = &semaphore; wait.pValues = &target;
       result = device->vkd()->vkWaitSemaphores(device->handle(), &wait, GpuWaitNs);
+      ChargeWait(stats, WaitKind::StreamLatency, latencyBegin);
       value = target;
     }
     if (result != VK_SUCCESS) {
@@ -655,20 +1011,35 @@ struct D3D9Backend::Owner {
     stats.gpuCompleted = std::max(stats.gpuCompleted, value);
   }
 
-  void waitPresentRetired(Stats& stats) {
+  // blocking: E0, sleep on the frame's own callback instead of Sleep(1); the
+  // checks, deadline and errors are the same.
+  void waitPresentRetired(Stats& stats, bool blocking = false, uint64_t* sleeps = nullptr) {
     if (!lastPresentFrame)
       return;
     require(presentSignal != nullptr, "DXVK D3D9 WSI frame signal is absent");
+    const auto retireBegin = d9::profile::Ticks();
+    uint64_t polls = 0;
     const auto deadline = Clock::now() + CpuWait;
+    if (blocking && presentCallback != nullptr && presentSignal->value() < lastPresentFrame)
+      presentCallback->setCallback(lastPresentFrame, [wake = presentWake] { SetEvent(wake.get()); });
     for (;;) {
       healthy();
       const uint64_t value = presentSignal->value();
       require(value <= lastPresentFrame, "DXVK D3D9 WSI frame signal exceeded its owner");
       if (value == lastPresentFrame)
         break;
-      require(Clock::now() < deadline, "DXVK D3D9 WSI frame did not retire in 5 seconds");
-      Sleep(1);
+      const auto now = Clock::now();
+      require(now < deadline, "DXVK D3D9 WSI frame did not retire in 5 seconds");
+      if (blocking && presentCallback != nullptr)
+        WaitForSingleObject(presentWake.get(), DWORD(std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::min<Clock::duration>(deadline - now, PresentWaitSlice)).count()) + 1);
+      else
+        Sleep(1);
+      ++polls;
     }
+    if (sleeps)
+      *sleeps += polls;
+    ChargeWait(stats, WaitKind::PresentRetire, retireBegin, polls);
     // The production finish queue (and optional present-wait worker) advanced
     // this signal. It is deliberately not called a display/pixel completion.
     stats.presentRetired = lastPresentFrame;
@@ -693,22 +1064,30 @@ struct D3D9Backend::Owner {
     lastSerial = serial;
     stats.submitted = serial;
     pending = true;
+    ++stats.waitProfile.submits[size_t(stats.waitProfile.site)];
+    if (waitForGpu) ++stats.waitProfile.gpuSubmits[size_t(stats.waitProfile.site)];
+    const auto submitBegin = d9::profile::Ticks();
     const VkResult result = device->waitForSubmissionUntil(&submission, Clock::now() + CpuWait);
+    ChargeWait(stats, WaitKind::SubmitCpu, submitBegin);
     if (result != VK_SUCCESS)
       throw std::runtime_error("DXVK D3D9 submit failed or timed out: " + std::to_string(static_cast<int>(result)));
     if (waitForGpu)
       settle(stats);
   }
 
+  // `cached` is for the buffers the CPU reads back. The others are written by the CPU and read by the
+  // GPU, which uncached memory serves well; reading a band back from such a mapping was measured at
+  // 7-9 ms instead of 0.5 ms. DXVK falls back to the uncached type where a device has no cached one.
   Rc<DxvkBuffer> coherentBuffer(uint32_t bytes, VkBufferUsageFlags usage,
-      VkPipelineStageFlags stages, VkAccessFlags access, const char* name) {
+      VkPipelineStageFlags stages, VkAccessFlags access, const char* name, bool cached = false) {
     DxvkBufferCreateInfo info;
     info.size = bytes;
     info.usage = usage;
     info.stages = stages | VK_PIPELINE_STAGE_HOST_BIT;
     info.access = access;
     info.debugName = name;
-    Rc<DxvkBuffer> buffer = device->createBuffer(info, CoherentMemory);
+    Rc<DxvkBuffer> buffer = device->createBuffer(info,
+      CoherentMemory | (cached ? VK_MEMORY_PROPERTY_HOST_CACHED_BIT : VkMemoryPropertyFlags(0)));
     require((buffer->memFlags() & CoherentMemory) == CoherentMemory,
       "DXVK D3D9 internal buffer is not coherent host-visible memory");
     require(buffer->mapPtr(0) != nullptr, "DXVK D3D9 internal mapping unavailable");
@@ -830,6 +1209,7 @@ struct D3D9Backend::Owner {
   // The color/depth pair at the current extent. An opaque target keeps the
   // BGRA8 storage, as native X8R8G8B8 does; its presented view reads alpha as one.
   void createTargets() {
+    ++targetGeneration;
     color = image(width, height, VK_FORMAT_B8G8R8A8_UNORM, true, false);
     depth = image(width, height, VK_FORMAT_D32_SFLOAT, true, true);
     colorView = color->createView(viewKey(VK_FORMAT_B8G8R8A8_UNORM,
@@ -892,7 +1272,8 @@ struct D3D9Backend::Owner {
         || presentSignal->value() != lastPresentFrame)
       return false;
     for (const auto& b : buffers) if (b.object != nullptr) return false;
-    for (const auto& t : textures) if (t.image != nullptr || t.view != nullptr) return false;
+    for (uint32_t i = 0; i < textureLimit; ++i)
+      if (textures[i].image != nullptr || textures[i].view != nullptr) return false;
     for (const auto& s : vertexShaders) if (s.object != nullptr) return false;
     for (const auto& s : pixelShaders) if (s.object != nullptr) return false;
     for (const auto& d : declarations) if (d.count) return false;
@@ -912,6 +1293,11 @@ struct D3D9Backend::Owner {
     device->waitForIdle();
     healthy();
     stats.shutdownQueueDrained = true;
+    if (water) {
+      water->collectTiming(stats.gpuCompleted, stats.water);
+      water.reset();
+    }
+    evidence.reset();
     unbindAuthorResources();
     // finish() has already observed the real GPU/resource/frame milestones.
     // Let production Presenter own WSI fence/swapchain destruction. Its driver
@@ -928,9 +1314,12 @@ struct D3D9Backend::Owner {
       surfaceTarget->closeAfterSurfaceRetired(operationDeadline, allowWindowFault);
     blitter = nullptr;
     presentSignal = nullptr;
+    presentCallback = nullptr;
     acquiredView = nullptr;
     acquiredImage = nullptr;
     colorSampleView = nullptr;
+    beforeUi.reset();
+    shadow.reset();
     context = nullptr;
     commands = nullptr;
     completion = nullptr;
@@ -940,6 +1329,8 @@ struct D3D9Backend::Owner {
     color = nullptr;
     depth = nullptr;
     staging = nullptr;
+    uploadStaging.reset();
+    uploadMarks.clear();
     readback = nullptr;
     presentedReadback = nullptr;
     vertexConstants = nullptr;
@@ -988,6 +1379,12 @@ void D3D9Backend::quarantine() noexcept {
       // WndProc never logs; quarantining must not silently lose known faults.
       m_owner->surfaceTarget->report("owner-quarantine-snapshot");
     }
+    // The owner's GPU objects are kept as they are; its timer-resolution
+    // request is process state and is returned now.
+    m_owner->timerResolution.set(false);
+    // A performance log in progress is still the player's.
+    if (m_owner->evidence)
+      m_owner->evidence->flushLogs();
     (void)m_owner.release();
   }
 }
@@ -1000,6 +1397,7 @@ void D3D9Backend::initialize(uint32_t width, uint32_t height, HWND window,
   try {
     Owner& owner = active();
     require(!m_stats.initialized && owner.instance == nullptr, "DXVK D3D9 duplicate initialize");
+    const WaitAt at(m_stats, WaitSite::Initialize);
     require(d9::ValidTargetExtent(width, height), "DXVK D3D9 target dimensions out of profile");
     // Host-owned surface windows are still created at the 64x64 lab extent.
     require(surfaceMode == surface::Mode::Peer || (width == d9::Width && height == d9::Height),
@@ -1034,6 +1432,9 @@ void D3D9Backend::initialize(uint32_t width, uint32_t height, HWND window,
     require(!streamLength || (streamLength == 1 && stream[0] == L'1' && !owner.flightMode && !m_stats.reuseWaitProfile),
       "DXVK D3D9 stream profile excludes flights, groups and the flight wait profile");
     owner.streamMode = m_stats.streamMode = streamLength != 0;
+    owner.presentPipeline = ReadPresentPipeline().setting != 0;
+    m_stats.presentPipelineSetting = owner.presentPipeline ? 1 : 0;
+    m_stats.streamFlushDraws = owner.streamMode ? ReadStreamFlushDraws() : 0;
     wchar_t admission[8]{};
     const DWORD admissionLength = GetEnvironmentVariableW(L"WARVK_D3D9_ADMISSION_PROFILE", admission, 8);
     require(!admissionLength || (admissionLength == 1 && admission[0] == L'1'),
@@ -1128,7 +1529,8 @@ void D3D9Backend::initialize(uint32_t width, uint32_t height, HWND window,
     owner.staging = owner.coherentBuffer(MaxBufferBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
       VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT, "x64-d3d9-staging");
     owner.readback = owner.coherentBuffer(ReadbackBandBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, "x64-d3d9-readback");
+      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, "x64-d3d9-readback",
+      true);
     const auto uniform = [&](uint32_t size, const char* name) {
       return owner.coherentBuffer(size, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
         VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
@@ -1176,7 +1578,20 @@ void D3D9Backend::initialize(uint32_t width, uint32_t height, HWND window,
     owner.context->bindResourceSampler(VK_SHADER_STAGE_FRAGMENT_BIT, PixelSamplerSlot, Rc<DxvkSampler>(owner.samplers[0]));
     owner.createTargets();
     if (window != nullptr) {
-      owner.presentSignal = new sync::Fence(0);
+      // E0: the poll setting keeps the plain fence.
+      m_stats.presentWait = ReadPresentWait();
+      if (m_stats.presentWait.setting) {
+        owner.presentWake = std::shared_ptr<void>(CreateEventW(nullptr, FALSE, FALSE, nullptr),
+          [](void* event) { if (event) CloseHandle(event); });
+        require(owner.presentWake.get() != nullptr, "DXVK D3D9 E0 present wake event");
+        owner.presentCallback = new sync::CallbackFence(0);
+        owner.presentSignal = owner.presentCallback;
+      } else
+        owner.presentSignal = new sync::Fence(0);
+      std::fprintf(stderr, "D3D9 host present-wait setting=%s every=%u\n",
+        m_stats.presentWait.setting == 1 ? "block" : m_stats.presentWait.setting == 2 ? "alternate" : "poll",
+        m_stats.presentWait.every);
+      std::fflush(stderr);
       PresenterDesc desc{};
       desc.diagnosticReadback = diagnosticPresentedReadback;
       owner.validateWindow();
@@ -1207,7 +1622,7 @@ void D3D9Backend::initialize(uint32_t width, uint32_t height, HWND window,
       if (diagnosticPresentedReadback) {
         owner.presentedReadback = owner.coherentBuffer(owner.presentedSize(), VK_BUFFER_USAGE_TRANSFER_DST_BIT,
           VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
-          "x64-d3d9-presented-readback");
+          "x64-d3d9-presented-readback", true);
         owner.presentedBytes.resize(owner.presentedSize());
       }
     }
@@ -1222,6 +1637,8 @@ void D3D9Backend::initialize(uint32_t width, uint32_t height, HWND window,
     m_stats.opaqueTarget = opaqueTarget;
     m_stats.syncInterval = interval;
     m_stats.presenterImplemented = owner.presenter != nullptr;
+    if (window != nullptr && windowProcessId)
+      owner.evidence = std::make_unique<EvidenceRecorder>(owner.device, windowProcessId);
     m_stats.initialized = true;
   } catch (...) { quarantine(); throw; }
 }
@@ -1235,6 +1652,7 @@ void D3D9Backend::reset(uint32_t width, uint32_t height, uint32_t interval, bool
       "DXVK D3D9 reset outside profile");
     for (const auto& buffer : owner.buffers)
       require(keepResources || buffer.object == nullptr, "DXVK D3D9 reset with a live DEFAULT-pool buffer");
+    const WaitAt at(m_stats, WaitSite::Reset);
     // Every earlier draw, clear, readback and frame retires before the old
     // targets are released; the next clear or draw binds the new ones.
     owner.settle(m_stats);
@@ -1243,6 +1661,9 @@ void D3D9Backend::reset(uint32_t width, uint32_t height, uint32_t interval, bool
       "DXVK D3D9 reset while a WSI image is owned");
     owner.unbindAuthorResources();
     owner.context->bindRenderTargets(DxvkRenderTargets{}, 0);
+    if (owner.water) owner.water->resetTargets(owner.context);
+    if (owner.evidence)
+      owner.evidence->dropRing();
     owner.colorSampleView = nullptr;
     owner.colorView = nullptr;
     owner.depthView = nullptr;
@@ -1263,7 +1684,7 @@ void D3D9Backend::reset(uint32_t width, uint32_t height, uint32_t interval, bool
       if (owner.diagnosticPresentedReadback) {
         owner.presentedReadback = owner.coherentBuffer(owner.presentedSize(), VK_BUFFER_USAGE_TRANSFER_DST_BIT,
           VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
-          "x64-d3d9-presented-readback");
+          "x64-d3d9-presented-readback", true);
         owner.presentedBytes.assign(owner.presentedSize(), 0);
       }
     }
@@ -1301,8 +1722,26 @@ void D3D9Backend::createBuffer(uint32_t id, uint32_t size, bool index16, bool dy
     slot.size = size;
     slot.index16 = index16;
     slot.dynamic = dynamic;
-    if (dynamic)
+    if (dynamic) {
       ++m_stats.dynamicBuffers;
+      auto& d = m_stats.dynamicRead;
+      const auto setting = ReadDynamicCpuCopy();
+      d.setting = setting.setting;
+      d.every = setting.every;
+      // The memory type actually allocated (memFlags() is the requested set).
+      const auto flags = slot.object->storage()->getMemoryProperties();
+      d.flagsSeen |= uint32_t(flags);
+      ++d.created;
+      d.createdDeviceLocal += (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+      d.createdCached += (flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0;
+      d.liveBytes += size;
+      d.peakBytes = std::max(d.peakBytes, d.liveBytes);
+      if (d.setting && !index16) {
+        slot.vertexBytes.resize(size);
+        d.copyBytes += size;
+        d.peakCopyBytes = std::max(d.peakCopyBytes, d.copyBytes);
+      }
+    }
     if (index16)
       slot.indexBytes.resize(size);
     addResource(m_stats, size);
@@ -1321,6 +1760,7 @@ void D3D9Backend::uploadBuffer(uint32_t id, uint32_t offset, const uint8_t* byte
     require(offset <= slot.initializedPrefix, "DXVK D3D9 noncontiguous first buffer upload is unsupported");
     require(slot.dynamic || mode == d9::UploadMode::Ordered, "DXVK D3D9 dynamic Lock mode on a static buffer");
     canAdd(m_stats.uploadedBytes, count);
+    WaitAt at(m_stats, slot.dynamic ? WaitSite::BufferDynamic : WaitSite::BufferStaticBefore);
     if (slot.dynamic) {
       // NoOverwrite writes bytes no earlier draw reads. Discard in a stream
       // list renames the storage: the list keeps the old allocation for the
@@ -1329,22 +1769,38 @@ void D3D9Backend::uploadBuffer(uint32_t id, uint32_t offset, const uint8_t* byte
       // write first settles every earlier use.
       if (mode == d9::UploadMode::Discard && owner.streamMode) {
         owner.beginStream();
+        const auto carryBegin = d9::profile::Ticks();
+        // Item 4: the same prefix bytes from the cached CPU copy instead of
+        // reading the old host-visible (write-combined) storage.
+        const uint8_t* copy = owner.dynamicReadsFromCopy(m_stats.dynamicRead) ? Owner::dynamicCopy(slot) : nullptr;
         const auto* old = static_cast<const uint8_t*>(slot.object->mapPtr(0));
         owner.context->invalidateBuffer(slot.object, slot.object->allocateStorage());
-        std::memcpy(slot.object->mapPtr(0), old, slot.initializedPrefix);
+        std::memcpy(slot.object->mapPtr(0), copy ? copy : old, slot.initializedPrefix);
+        ChargeWait(m_stats, WaitKind::DiscardCarry, carryBegin);
+        {
+          auto& m = m_stats.dynamicRead.modes[copy ? 1 : 0];
+          ++m[0];
+          m[1] += slot.initializedPrefix;
+          m[2] += uint64_t(d9::profile::Ticks() - carryBegin);
+        }
         ++m_stats.discardRenames;
         m_stats.discardCarriedBytes += slot.initializedPrefix;
       } else if (mode != d9::UploadMode::NoOverwrite) {
         owner.settle(m_stats);
         ++m_stats.uploadSettles;
       }
+      const auto copyBegin = d9::profile::Ticks();
       std::memcpy(static_cast<uint8_t*>(slot.object->mapPtr(0)) + offset, bytes, count);
+      if (!slot.vertexBytes.empty())
+        std::memcpy(slot.vertexBytes.data() + offset, bytes, count);
+      ChargeWait(m_stats, WaitKind::UploadCopy, copyBegin);
       ++(mode == d9::UploadMode::Discard ? m_stats.discardUploads
         : mode == d9::UploadMode::NoOverwrite ? m_stats.noOverwriteUploads : m_stats.orderedDynamicUploads);
     } else {
       owner.settle(m_stats);
       ++m_stats.uploadSettles;
       std::memcpy(owner.staging->mapPtr(0), bytes, count);
+      at.set(WaitSite::BufferStaticAfter);
       owner.begin(m_stats);
       owner.context->copyBuffer(slot.object, offset, owner.staging, 0, count);
       owner.submit(m_stats, true);
@@ -1353,6 +1809,10 @@ void D3D9Backend::uploadBuffer(uint32_t id, uint32_t offset, const uint8_t* byte
       std::memcpy(slot.indexBytes.data() + offset, bytes, count);
     slot.initializedPrefix = std::max(slot.initializedPrefix, offset + count);
     m_stats.uploadedBytes += count;
+    // All VB/IB uploads pass here, including ordered writes, DISCARD renames
+    // and NOOVERWRITE. The byte total grows by a checked, nonzero count and
+    // belongs to the owner, so reusing a slot cannot repeat its generation.
+    slot.contentGeneration = m_stats.uploadedBytes;
     ++m_stats.uploads;
   } catch (...) { quarantine(); throw; }
 }
@@ -1376,11 +1836,13 @@ void D3D9Backend::createTexture2D(uint32_t id,const d9::TextureLayout& layout) {
     require(mapping.IsValid()&&mapping.Aspect==VK_IMAGE_ASPECT_COLOR_BIT
         &&mapping.ConversionFormatInfo.FormatType==D3D9ConversionFormat_None,"texture format requires unsupported conversion");
     slot.image = owner.image(checked.width,checked.height,mapping.FormatColor,false,false,checked.levels,mapping.FormatSrgb);
+    owner.textureLimit = std::max(owner.textureLimit, id);
     auto key=viewKey(mapping.FormatColor,VK_IMAGE_USAGE_SAMPLED_BIT,VK_IMAGE_ASPECT_COLOR_BIT,VK_IMAGE_LAYOUT_GENERAL);
     key.packedSwizzle=DxvkImageViewKey::packSwizzle(mapping.Swizzle);slot.mapping=mapping;
     key.mipCount=checked.levels;slot.view=slot.image->createView(key);
     if(mapping.FormatSrgb!=VK_FORMAT_UNDEFINED){key.format=mapping.FormatSrgb;slot.srgbView=slot.image->createView(key);}
     slot.width=checked.width;slot.height=checked.height;slot.layout=checked;
+    const WaitAt at(m_stats, WaitSite::CreateTexture);
     owner.begin(m_stats);
     owner.context->initImage(slot.image, VK_IMAGE_LAYOUT_UNDEFINED);
     owner.submit(m_stats, true);
@@ -1403,16 +1865,61 @@ void D3D9Backend::uploadTextureRegion(uint32_t id,const d9::TextureRegion& regio
         &&checked.bytes==region.bytes,"texture subresource upload domain");
     const auto count=checked.bytes;
     canAdd(m_stats.uploadedBytes, count);
-    owner.settle(m_stats);
-    if(owner.staging->info().size<count)
-      owner.staging=owner.coherentBuffer(count,VK_BUFFER_USAGE_TRANSFER_SRC_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_ACCESS_HOST_WRITE_BIT|VK_ACCESS_TRANSFER_READ_BIT,"x64-d3d9-texture-upload");
-    std::memcpy(owner.staging->mapPtr(0), bgra, count);
-    owner.begin(m_stats);
+    auto& slices = m_stats.uploadSlices;
+    {
+      const auto setting = ReadUploadSlices();
+      slices.setting = setting.setting;
+      slices.every = setting.every;
+    }
     const VkImageSubresourceLayers layer={VK_IMAGE_ASPECT_COLOR_BIT,checked.level,0,1};
-    owner.context->copyBufferToImage(slot.image, layer, {int32_t(checked.x),int32_t(checked.y),0}, {checked.width,checked.height,1},
-      owner.staging, 0, 0, 0, slot.mapping.FormatColor);
-    owner.submit(m_stats, true);
+    const bool sliced = owner.uploadSlicesNow(slices);
+    const auto uploadBegin = d9::profile::Ticks();
+    if (sliced) {
+      // P1: a staging slice and a copy recorded in the open
+      // stream list, after the draws already recorded and before later ones.
+      // No settle and no wait for this upload; the credit bounds staging.
+      WaitAt at(m_stats, WaitSite::TextureUploadSlice);
+      const uint64_t aligned = (uint64_t(count) + 255u) & ~uint64_t(255);
+      owner.throttleUploads(m_stats, aligned);
+      owner.beginStream(false);
+      if (!owner.uploadStaging)
+        owner.uploadStaging = std::make_unique<DxvkStagingBuffer>(owner.device, UploadStagingChunk);
+      const DxvkBufferSlice staged = owner.uploadStaging->alloc(count);
+      require(staged.mapPtr(0) != nullptr, "DXVK D3D9 upload staging slice is not mapped");
+      std::memcpy(staged.mapPtr(0), bgra, count);
+      owner.context->copyBufferToImage(slot.image, layer, {int32_t(checked.x),int32_t(checked.y),0}, {checked.width,checked.height,1},
+        staged.buffer(), staged.offset(), 0, 0, slot.mapping.FormatColor);
+      owner.uploadBytes += aligned;
+      ++owner.uploadSliceCount;
+      ++slices.recorded;
+      slices.recordedBytes += count;
+      slices.peakInFlightBytes = std::max(slices.peakInFlightBytes, owner.uploadBytes - owner.uploadRetiredBytes);
+      slices.peakInFlightSlices = std::max(slices.peakInFlightSlices, owner.uploadSliceCount - owner.uploadRetiredSlices);
+      // Eager submission keeps staging recycling soon, as in-process does.
+      if (owner.uploadBytes - owner.uploadMarkedBytes > UploadBytesPerList
+          || owner.uploadSliceCount - owner.uploadMarkedSlices > UploadSlicesPerList) {
+        owner.flushStream(m_stats);
+        ++slices.listFlushes;
+      }
+    } else {
+      WaitAt at(m_stats, WaitSite::TextureUploadBefore);
+      owner.settle(m_stats);
+      if(owner.staging->info().size<count)
+        owner.staging=owner.coherentBuffer(count,VK_BUFFER_USAGE_TRANSFER_SRC_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,
+          VK_ACCESS_HOST_WRITE_BIT|VK_ACCESS_TRANSFER_READ_BIT,"x64-d3d9-texture-upload");
+      std::memcpy(owner.staging->mapPtr(0), bgra, count);
+      at.set(WaitSite::TextureUploadAfter);
+      owner.begin(m_stats);
+      owner.context->copyBufferToImage(slot.image, layer, {int32_t(checked.x),int32_t(checked.y),0}, {checked.width,checked.height,1},
+        owner.staging, 0, 0, 0, slot.mapping.FormatColor);
+      owner.submit(m_stats, true);
+    }
+    {
+      auto& m = slices.modes[sliced ? 1 : 0];
+      ++m[0];
+      m[1] += uint64_t(d9::profile::Ticks() - uploadBegin);
+    }
+    // Published only after the copy was recorded (sliced) or completed.
     if(d9::FullTextureLevel(slot.layout,checked))slot.initializedLevels|=1u<<checked.level;
     slot.uploaded=slot.initializedLevels==((1u<<slot.layout.levels)-1);
     m_stats.uploadedBytes += count;
@@ -1424,6 +1931,7 @@ void D3D9Backend::setTextureLod(uint32_t id,uint32_t lod) {
   try {
     auto& owner=active();auto& slot=owner.at(owner.textures,id);
     require(slot.image!=nullptr&&lod<slot.layout.levels,"texture LOD domain");
+    const WaitAt at(m_stats, WaitSite::TextureLod);
     owner.settle(m_stats);
     auto key=viewKey(slot.mapping.FormatColor,VK_IMAGE_USAGE_SAMPLED_BIT,VK_IMAGE_ASPECT_COLOR_BIT,VK_IMAGE_LAYOUT_GENERAL);
     key.packedSwizzle=DxvkImageViewKey::packSwizzle(slot.mapping.Swizzle);
@@ -1524,7 +2032,14 @@ void D3D9Backend::clearRegions(const d9::ClearRegions& command) {
       "DXVK D3D9 clear rectangle outside target");
   try {
     Owner& owner = active();
-    owner.begin(m_stats);
+    const auto& first = command.regions[0];
+    const bool full = command.count == 1 && !first.x && !first.y && first.width == m_stats.width
+      && first.height == m_stats.height;
+    WaitAt at(m_stats, full ? WaitSite::ClearFullBefore : WaitSite::ClearRectsBefore);
+    // Pipelined: the clear is recorded where it stands in the stream list,
+    // after the draws before it; nothing waits for the GPU.
+    const bool pipelined = owner.presentPipelined();
+    if (pipelined) owner.beginStream(); else owner.begin(m_stats);
     owner.bindTargets();
     const auto clearView=[&](const Rc<DxvkImageView>& view,VkImageAspectFlags aspect,VkClearValue value) {
       for(uint32_t i=0;i<command.count;++i) {
@@ -1548,7 +2063,8 @@ void D3D9Backend::clearRegions(const d9::ClearRegions& command) {
       value.depthStencil.depth = command.depth;
       clearView(owner.depthView,VK_IMAGE_ASPECT_DEPTH_BIT,value);
     }
-    owner.submit(m_stats, true);
+    at.set(full ? WaitSite::ClearFullAfter : WaitSite::ClearRectsAfter);
+    if (pipelined) ++m_stats.clearsPipelined; else owner.submit(m_stats, true);
     ++m_stats.clears;
   } catch (...) { quarantine(); throw; }
 }
@@ -1566,7 +2082,7 @@ struct D3D9Backend::PreparedDraw {
   D3D9FFShaderKeyFS fixedPS;
 };
 
-D3D9Backend::PreparedDraw D3D9Backend::prepareDraw(const DrawState& state,const d9::FixedFunctionState* fixed) {
+D3D9Backend::PreparedDraw D3D9Backend::prepareDraw(const DrawState& state,const d9::FixedFunctionState* fixed, CasterIndexSpan* outputSpan) {
   Owner& owner = active();
   // Owner/thread/initialization errors are internal terminal failures, not
   // unsupported draw inputs. Keep them outside the recoverable category.
@@ -1653,14 +2169,23 @@ D3D9Backend::PreparedDraw D3D9Backend::prepareDraw(const DrawState& state,const 
       &&uint64_t(state.streamOffset)+(uint64_t(state.startIndex)+indexCount-1)*state.stride+extent<=vb.initializedPrefix,
       "DXVK D3D9 nonindexed fetch outside initialized VB");
   }
-  for (uint64_t i = 0; ib && i < indexCount; ++i) {
-    uint16_t index = 0;
-    std::memcpy(&index, ib->indexBytes.data() + size_t(firstIndexByte + i * 2), 2);
-    requireProfile(index >= state.minVertexIndex && uint64_t(index) < uint64_t(state.minVertexIndex) + state.numVertices,
+  if (ib) {
+    CasterIndexSpan span;
+    for (uint64_t i = 0; i < indexCount; ++i) {
+      uint16_t index;
+      std::memcpy(&index, ib->indexBytes.data() + size_t(firstIndexByte + i * 2), 2);
+      span.include(index);
+    }
+    requireProfile(span.min >= state.minVertexIndex && uint64_t(span.max) < uint64_t(state.minVertexIndex) + state.numVertices,
       "DXVK D3D9 index outside declared min/num vertices");
-    const int64_t vertex = int64_t(state.baseVertexIndex) + index;
-    requireProfile(vertex >= 0 && uint64_t(state.streamOffset) + uint64_t(vertex) * state.stride + extent <= vb.initializedPrefix,
+    const int64_t first = int64_t(state.baseVertexIndex) + span.min;
+    const int64_t last = int64_t(state.baseVertexIndex) + span.max;
+    requireProfile(first >= 0 && uint64_t(state.streamOffset) + uint64_t(last) * state.stride + extent <= vb.initializedPrefix,
       "DXVK D3D9 vertex fetch outside initialized VB");
+    if (outputSpan)
+      *outputSpan = span;
+  } else if (outputSpan) {
+    *outputSpan = {};
   }
   const auto& vp = state.viewport;
   requireProfile(vp.Width != 0 && vp.Height != 0 && vp.X <= owner.width && vp.Y <= owner.height
@@ -1728,7 +2253,7 @@ D3D9Backend::PreparedDraw D3D9Backend::prepareDraw(const DrawState& state,const 
 }
 
 void D3D9Backend::recordDraw(const DrawState& state, const PreparedDraw& prepared,
-    uint32_t constantSlot, bool batched, const DrawState* previous,const d9::FixedFunctionState* fixed) {
+    uint32_t constantSlot, bool batched, const DrawState* previous,const d9::FixedFunctionState* fixed, bool waterDraw) {
   Owner& owner = *m_owner;
   const auto& vb = owner.at(owner.buffers, state.vertexBuffer);
   const auto* vs = state.vertexShader?&owner.at(owner.vertexShaders,state.vertexShader):nullptr;
@@ -1749,7 +2274,8 @@ void D3D9Backend::recordDraw(const DrawState& state, const PreparedDraw& prepare
     if(!vs) {
       auto target=owner.fixedVertexConstants;uint32_t offset=0;
       if(owner.streamMode){offset=owner.ringSlice(owner.streamFixedVertex,m_stats);target=owner.streamFixedVertex.buffer;}
-      FillFixedVertex(target->mapPtr(offset),*fixed,prepared.fixedVS,vp,state.render.zEnable!=D3DZB_FALSE);
+      FillFixedVertex(target->mapPtr(offset),*fixed,prepared.fixedVS,vp,state.render.zEnable!=D3DZB_FALSE,
+        &owner.fixedTransforms);
       owner.context->bindUniformBuffer(VK_SHADER_STAGE_VERTEX_BIT,
         computeResourceSlotId(DxsoProgramType::VertexShader,DxsoBindingType::ConstantBuffer,VSFixedFunction),
         DxvkBufferSlice(target,offset,sizeof(D3D9FixedFunctionVS)));
@@ -1812,8 +2338,12 @@ void D3D9Backend::recordDraw(const DrawState& state, const PreparedDraw& prepare
     +unsigned(!update.assembly)+unsigned(!update.raster)+unsigned(!update.multisample)
     +unsigned(!update.depth)+unsigned(!update.blend);
   if(update.targets)owner.bindTargets();
-  owner.context->bindShader<VK_SHADER_STAGE_VERTEX_BIT>(vs?Rc<DxvkShader>(vs->object):owner.fixedVertexShader->GetShader());
-  owner.context->bindShader<VK_SHADER_STAGE_FRAGMENT_BIT>(ps?Rc<DxvkShader>(ps->object):owner.fixedPixelShader->GetShader());
+  const auto bindGameShaders = [&] {
+    owner.context->bindShader<VK_SHADER_STAGE_VERTEX_BIT>(vs?Rc<DxvkShader>(vs->object):owner.fixedVertexShader->GetShader());
+    owner.context->bindShader<VK_SHADER_STAGE_FRAGMENT_BIT>(ps?Rc<DxvkShader>(ps->object):owner.fixedPixelShader->GetShader());
+  };
+  waterDraw = waterDraw && owner.water && owner.water->enabled();
+  if (!waterDraw) bindGameShaders();
   {
     WaitTimer timer(m_stats.admissionProfile ? &m_stats.admissionSamplerNs : nullptr);
     for(uint32_t i=0;i<d9::PixelTextureStages;++i) {
@@ -1866,26 +2396,76 @@ void D3D9Backend::recordDraw(const DrawState& state, const PreparedDraw& prepare
     m_stats.admissionBindNs+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-bindBegin).count());
   // The DXVK draw commits dirty descriptors, pipeline and dynamic state.
   WaitTimer drawTimer(m_stats.admissionProfile ? &m_stats.admissionDrawNs : nullptr);
-  if(state.indexBuffer) {
-    const VkDrawIndexedIndirectCommand command = {prepared.indexCount, 1, state.startIndex, state.baseVertexIndex, 0};
-    owner.context->drawIndexed(1, &command);
-  } else {
-    const VkDrawIndirectCommand command={prepared.indexCount,1,state.startIndex,0};
-    owner.context->draw(1,&command);
+  const auto drawGeometry = [&] {
+    if(state.indexBuffer) {
+      const VkDrawIndexedIndirectCommand command = {prepared.indexCount, 1, state.startIndex, state.baseVertexIndex, 0};
+      owner.context->drawIndexed(1, &command);
+    } else {
+      const VkDrawIndirectCommand command={prepared.indexCount,1,state.startIndex,0};
+      owner.context->draw(1,&command);
+    }
+  };
+  if (waterDraw) {
+    // Preserve even the original depth-buffer side effect in the reference image.
+    const bool referenceWritesDepth = owner.water->referenceStyle() && prepared.depth.depthWrite();
+    const bool premultiply = !owner.water->referenceStyle();
+    const bool sourceOver = prepared.blend.blendEnable() && prepared.blend.colorBlendOp() == VK_BLEND_OP_ADD &&
+        prepared.blend.colorSrcFactor() == VK_BLEND_FACTOR_SRC_ALPHA &&
+        prepared.blend.colorDstFactor() == VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    const bool supported = fixed && !vs && !ps && state.texture &&
+        !prepared.fixedVS.Data.Contents.VertexHasPositionT && !referenceWritesDepth && (!premultiply || sourceOver);
+    const auto stockVS = vs ? vs->object : owner.fixedVertexShader->GetShader();
+    const auto stockFS = ps ? ps->object : owner.fixedPixelShader->GetShader();
+    owner.water->beginTiming(owner.device, owner.commands, owner.lastSerial + 1);
+    auto reason = owner.water->bind(owner.device, owner.context, owner.color, owner.depth,
+        supported ? fixed : nullptr, vp, owner.fixedTransforms.inverseView, stockVS, stockFS, m_stats.water);
+    if (reason == WaterFallback::None) {
+      // The fragment supplies covered body colour plus reflected light. Blend
+      // it over the live destination so overlapping tiles retain draw order.
+      if (premultiply) {
+        auto blend = prepared.blend;
+        blend.setColorOp(VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_OP_ADD);
+        owner.context->setBlendMode(0, blend);
+      }
+      // Keep the test and compare op; only the water surface is read-only.
+      if (prepared.depth.depthWrite()) {
+        auto readOnly = prepared.depth;
+        readOnly.setDepthWrite(false);
+        owner.context->setDepthStencilState(readOnly);
+      }
+      const auto& counters = owner.commands->statCounters();
+      const auto before = counters.getCtr(DxvkStatCounter::CmdDrawCalls);
+      try { drawGeometry(); }
+      catch (...) { owner.healthy(); }
+      // The next draw may reuse the native state without rebinding it.
+      if (premultiply) owner.context->setBlendMode(0, prepared.blend);
+      if (prepared.depth.depthWrite()) owner.context->setDepthStencilState(prepared.depth);
+      // DXVK can decline a pipeline without throwing. Its command-list counter
+      // advances immediately after vkCmdDraw[Indexed], before any submission.
+      if (counters.getCtr(DxvkStatCounter::CmdDrawCalls) == before) reason = WaterFallback::Pipeline;
+    }
+    owner.water->endTiming(owner.commands);
+    owner.water->finishDraw(reason, m_stats.water);
+    if (reason == WaterFallback::None) return;
+    owner.healthy();
+    bindGameShaders();
   }
+  drawGeometry();
 }
 
-void D3D9Backend::draw(const DrawState& state) {
-  drawBatch(&state, 1);
+void D3D9Backend::draw(const DrawState& state, CasterIndexSpan* span) {
+  drawBatch(&state, 1, span);
 }
 
-void D3D9Backend::drawFixed(const DrawState& state,const d9::FixedFunctionState& fixed) {
-  drawFixedBatch(&state,&fixed,1);
+void D3D9Backend::drawFixed(const DrawState& state,const d9::FixedFunctionState& fixed, CasterIndexSpan* span) {
+  drawFixedBatch(&state,&fixed,1,span);
 }
 
-void D3D9Backend::drawFixedBatch(const DrawState* states,const d9::FixedFunctionState* fixed,uint32_t count) {
+void D3D9Backend::drawFixedBatch(const DrawState* states,const d9::FixedFunctionState* fixed,uint32_t count,
+    CasterIndexSpan* spans, uint32_t waterMask) {
   try {
     Owner& owner=active();
+    const WaitAt at(m_stats,owner.streamMode?WaitSite::DrawStream:WaitSite::DrawFixed);
     requireProfile(states&&fixed&&count&&count<=MaxFixedDrawBatch,"DXVK D3D9 invalid fixed batch extent");
     std::array<PreparedDraw,MaxFixedDrawBatch> prepared{};
     // As drawBatch: every entry passes before any shader creation, recording,
@@ -1893,7 +2473,7 @@ void D3D9Backend::drawFixedBatch(const DrawState* states,const d9::FixedFunction
     {
       WaitTimer timer(m_stats.admissionProfile ? &m_stats.admissionPrepareNs : nullptr);
       for(uint32_t i=0;i<count;++i) {
-        prepared[i]=prepareDraw(states[i],&fixed[i]);
+        prepared[i]=prepareDraw(states[i],&fixed[i], spans ? spans + i : nullptr);
         requireProfile(!states[i].vertexShader||!states[i].pixelShader,"fixed draw needs a fixed stage");
       }
     }
@@ -1911,9 +2491,13 @@ void D3D9Backend::drawFixedBatch(const DrawState* states,const d9::FixedFunction
             owner.fixedPixelShader=std::make_unique<D3D9FFShader>(owner.device,DxsoProgramType::PixelShader);
         }
         if(owner.streamListDraws>MaxStreamDraws-count){owner.flushStream(m_stats);++m_stats.streamCapSubmissions;}
+        else if(const uint32_t cadence=m_stats.streamFlushDraws;cadence&&owner.streamListDraws>=cadence) {
+          owner.flushStream(m_stats);++m_stats.streamCadenceSubmissions;
+        }
         owner.beginStream();
         // Each draw takes its own FF ring slices, so the whole batch shares one list.
-        for(uint32_t i=0;i<count;++i)recordDraw(states[i],prepared[i],0,false,i?&states[i-1]:nullptr,&fixed[i]);
+        for(uint32_t i=0;i<count;++i)
+          recordDraw(states[i],prepared[i],0,false,i?&states[i-1]:nullptr,&fixed[i],waterMask & (1u << i));
         owner.streamListDraws+=count;m_stats.streamDraws+=count;m_stats.streamFixedDraws+=count;
       } else for(uint32_t i=0;i<count;++i) {
         // The single coherent FF UBO is rewritten per draw: keep one GPU
@@ -1929,7 +2513,9 @@ void D3D9Backend::drawFixedBatch(const DrawState* states,const d9::FixedFunction
           owner.fixedPixelConstants=owner.coherentBuffer(sizeof(D3D9FixedFunctionPS),VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,VK_ACCESS_HOST_WRITE_BIT|VK_ACCESS_UNIFORM_READ_BIT,"x64-d3d9-fixed-ps");
         }
-        owner.begin(m_stats);recordDraw(states[i],prepared[i],0,false,nullptr,&fixed[i]);owner.submit(m_stats,true);
+        owner.begin(m_stats);
+        recordDraw(states[i],prepared[i],0,false,nullptr,&fixed[i],waterMask & (1u << i));
+        owner.submit(m_stats,true);
       }
       m_stats.draws+=count;++m_stats.drawBatches;
       if(count>1)m_stats.batchedDraws+=count;
@@ -1940,16 +2526,18 @@ void D3D9Backend::drawFixedBatch(const DrawState* states,const d9::FixedFunction
   catch(...) {quarantine();throw;}
 }
 
-void D3D9Backend::drawBatch(const DrawState* states, uint32_t count) {
+void D3D9Backend::drawBatch(const DrawState* states, uint32_t count, CasterIndexSpan* spans, uint32_t waterMask) {
   try {
     Owner& owner = active();
+    const WaitAt at(m_stats, owner.streamMode ? WaitSite::DrawStream
+      : owner.flightMode ? WaitSite::DrawFlight : WaitSite::DrawBatch);
     requireProfile(states && count && count <= MaxDrawBatch, "DXVK D3D9 invalid batch extent");
     std::array<PreparedDraw, MaxDrawBatch> prepared{};
     // No command recording, buffer allocation/writes or counters until ALL
     // entries pass. A bad final draw cannot leave a rendered prefix behind.
     {
       WaitTimer timer(m_stats.admissionProfile ? &m_stats.admissionPrepareNs : nullptr);
-      for (uint32_t i = 0; i < count; ++i) prepared[i] = prepareDraw(states[i]);
+      for (uint32_t i = 0; i < count; ++i) prepared[i] = prepareDraw(states[i], nullptr, spans ? spans + i : nullptr);
     }
     WaitTimer recordTimer(m_stats.admissionProfile ? &m_stats.admissionRecordNs : nullptr);
     canAdd(m_stats.draws, count);
@@ -1961,14 +2549,19 @@ void D3D9Backend::drawBatch(const DrawState* states, uint32_t count) {
         if (owner.streamListDraws > MaxStreamDraws - count) {
           owner.flushStream(m_stats);
           ++m_stats.streamCapSubmissions;
+        } else if (const uint32_t cadence = m_stats.streamFlushDraws; cadence && owner.streamListDraws >= cadence) {
+          owner.flushStream(m_stats);
+          ++m_stats.streamCadenceSubmissions;
         }
         owner.beginStream();
-        for (uint32_t i = 0; i < count; ++i) recordDraw(states[i], prepared[i], 0, false, i?&states[i-1]:nullptr);
+        for (uint32_t i = 0; i < count; ++i)
+          recordDraw(states[i], prepared[i], 0, false, i?&states[i-1]:nullptr, nullptr, waterMask & (1u << i));
         owner.streamListDraws += count;
         m_stats.streamDraws += count;
       } else if (owner.flightMode) {
         auto& flight = owner.beginDrawFlight(m_stats);
-        for (uint32_t i = 0; i < count; ++i) recordDraw(states[i], prepared[i], i, true,i?&states[i-1]:nullptr);
+        for (uint32_t i = 0; i < count; ++i)
+          recordDraw(states[i], prepared[i], i, true,i?&states[i-1]:nullptr, nullptr, waterMask & (1u << i));
         owner.submitDrawFlight(m_stats, flight);
       } else {
         owner.settle(m_stats);
@@ -1982,7 +2575,8 @@ void D3D9Backend::drawBatch(const DrawState* states, uint32_t count) {
           m_stats.batchConstantBytes = uint64_t(owner.batchVertexStride + owner.batchPixelStride) * MaxDrawBatch;
         }
         owner.begin(m_stats);
-        for (uint32_t i = 0; i < count; ++i) recordDraw(states[i], prepared[i], i, count > 1,i?&states[i-1]:nullptr);
+        for (uint32_t i = 0; i < count; ++i)
+          recordDraw(states[i], prepared[i], i, count > 1,i?&states[i-1]:nullptr, nullptr, waterMask & (1u << i));
         owner.submit(m_stats, false);
       }
       m_stats.draws += count;
@@ -1998,12 +2592,181 @@ void D3D9Backend::drawBatch(const DrawState* states, uint32_t count) {
 void D3D9Backend::flushDraws() {
   try {
     auto& owner=active();
+    const WaitAt at(m_stats,WaitSite::FlushDraws);
     owner.flushRecordedGroup(m_stats);
     owner.flushStream(m_stats);
   } catch(...) { quarantine();throw; }
 }
+void D3D9Backend::addShadowCaster(const DrawState& state, const dxvk::war3::effects::scene::ShadowCaster& record,
+    const dxvk::war3::effects::scene::ShadowCasterAlpha* alpha, uint64_t frameSerial, uint64_t mapEpoch, const CasterIndexSpan& span) {
+  requireProfile(m_stats.initialized && frameSerial && mapEpoch, "DXVK D3D9 shadow caster outside a frame");
+  // The draw was accepted, so its slots are live; a caster of another shape
+  // is the executor's refusal, counted in the frame's outcome.
+  requireProfile(state.vertexBuffer && state.vertexBuffer <= BufferSlots && state.indexBuffer <= BufferSlots
+    && state.declaration && state.declaration <= DeclarationSlots, "DXVK D3D9 shadow caster draw");
+  try {
+    Owner& owner = active();
+    if (!owner.shadow)
+      owner.shadow = std::make_unique<ShadowBeforeUi>(owner.device, owner.windowProcessId);
+    const auto& vb = owner.buffers[state.vertexBuffer - 1];
+    const auto& decl = owner.declarations[state.declaration - 1];
+    ShadowCasterSource source;
+    source.vertexBuffer = vb.object;
+    source.readableVertexBytes = vb.initializedPrefix;
+    source.vertexSlot = state.vertexBuffer;
+    source.vertexGeneration = vb.contentGeneration;
+    // A dynamic buffer is host memory written in place (uploadBuffer), and no
+    // later upload has been applied yet: its bytes are the draw's. An index
+    // buffer has its bytes on the CPU as well, kept with every upload.
+    source.vertexDynamic = vb.dynamic;
+    if (vb.dynamic)
+      source.vertexData = static_cast<const uint8_t*>(vb.object->mapPtr(0));
+    // Item 4: the cached CPU copy holds the same bytes.
+    const bool fromCopy = vb.dynamic && owner.dynamicReadsFromCopy(m_stats.dynamicRead) && Owner::dynamicCopy(vb);
+    if (fromCopy) {
+      source.vertexLive = source.vertexData;
+      source.vertexData = Owner::dynamicCopy(vb);
+    }
+    if (state.indexBuffer) {
+      const auto& ib = owner.buffers[state.indexBuffer - 1];
+      source.indexBuffer = ib.object;
+      source.indexSlot = state.indexBuffer;
+      source.indexGeneration = ib.contentGeneration;
+      source.indexDynamic = ib.dynamic;
+      if (ib.dynamic && ib.indexBytes.size() == ib.size)
+        source.indexData = ib.indexBytes.data();
+    }
+    // An alpha-tested caster samples the texture its draw bound at the
+    // record's stage; the draw was accepted, so that slot is live.
+    if (alpha) {
+      source.alphaTest = true;
+      source.alphaRef = alpha->alphaRef;
+      source.texcoord = alpha->texcoord;
+      const uint32_t texture = alpha->stage ? state.additionalTextures[alpha->stage - 1] : state.texture;
+      if (texture)
+        source.alphaTexture = owner.at(owner.textures, texture).view;
+    }
+    source.elements = decl.elements.data();
+    source.elementCount = decl.count;
+    source.streamOffset = state.streamOffset;
+    source.stride = state.stride;
+    source.triangleList = state.primitiveType == D3DPT_TRIANGLELIST;
+    source.baseVertexIndex = state.baseVertexIndex;
+    // A static IB remains bound directly. A later ordered upload can change
+    // its contents in place, so only trim against indices frozen at this draw.
+    if (source.indexDynamic)
+      source.frozenIndices = span;
+    source.minVertexIndex = state.minVertexIndex;
+    source.numVertices = state.numVertices;
+    source.startIndex = state.startIndex;
+    source.primitiveCount = state.primitiveCount;
+    const WaitAt at(m_stats, WaitSite::ShadowCaster);
+    const auto casterBegin = d9::profile::Ticks();
+    owner.shadow->addCaster(record, source, frameSerial, mapEpoch, owner.targetGeneration);
+    ChargeWait(m_stats, WaitKind::CasterCopy, casterBegin);
+    {
+      auto& m = m_stats.dynamicRead.modes[fromCopy ? 1 : 0];
+      ++m[3];
+      m[4] += uint64_t(d9::profile::Ticks() - casterBegin);
+      m[5] += vb.dynamic;
+    }
+    ++m_stats.shadowCasterDraws;
+  } catch (...) { quarantine(); throw; }
+}
+void D3D9Backend::beginWaterScene() {
+  auto& owner = *m_owner;
+  if (!owner.water) owner.water.emplace();
+  owner.water->beginScene(owner.device, owner.windowProcessId, m_stats.gpuCompleted, m_stats.water);
+}
+
+bool D3D9Backend::waterSceneEnabled() const {
+  return m_owner && m_owner->water && m_owner->water->enabled();
+}
+
+void D3D9Backend::endShadowFrame() {
+  if (m_owner && m_owner->water) m_owner->water->endFrame();
+  if (m_owner && m_owner->shadow)
+    m_owner->shadow->endFrame();
+}
+D3D9Backend::BeforeUiOutcome D3D9Backend::runBeforeUi(const dxvk::war3::effects::scene::FramePacket& packet,
+    const dxvk::war3::effects::scene::ShadowPacket& shadow, uint64_t frameSerial, uint64_t mapEpoch) {
+  requireProfile(m_stats.initialized && frameSerial && mapEpoch, "DXVK D3D9 BeforeUi outside a frame");
+  requireProfile(!shadow.work() || ShadowBeforeUi::layoutAgrees(), "DXVK D3D9 Lighting layout");
+  try {
+    Owner& owner = active();
+    const WaitAt at(m_stats, WaitSite::Effects);
+    const auto begin = Clock::now();
+    if (!owner.beforeUi)
+      owner.beforeUi = std::make_unique<BeforeUiEffects>(owner.device);
+    if (shadow.work() && !owner.shadow)
+      owner.shadow = std::make_unique<ShadowBeforeUi>(owner.device, owner.windowProcessId);
+    // Stream: the open list, so the effects sit between the world draws
+    // already recorded and the UI draws that follow. Otherwise one list of
+    // their own, settled like a clear.
+    if (owner.streamMode) owner.beginStream();
+    else owner.begin(m_stats);
+    // Ends the context's own pass and hands over its list; the context
+    // re-applies all of its state at the next draw.
+    const auto list = owner.context->beginExternalRendering();
+    // The device's registration order: shadows, then the effects over them.
+    ShadowOutcome shadowOutcome;
+    shadowhost::CasterBoundsCounts boundsCounts;
+    if (owner.shadow) {
+      shadowOutcome = owner.shadow->run(list, owner.colorView, owner.depthView, packet, shadow,
+        owner.water && owner.water->drewThisFrame(), m_stats.water.skippedOldPasses,
+        frameSerial, mapEpoch, owner.targetGeneration, m_stats.presentAttempts,
+        owner.evidence && owner.evidence->wantsAudit(), boundsCounts);
+      if (shadowOutcome.ran) ++m_stats.shadowRuns;
+    }
+    const auto stages = owner.beforeUi->run(list, owner.colorView, owner.depthView, packet,
+      frameSerial, mapEpoch, owner.targetGeneration);
+    if (!owner.streamMode) owner.submit(m_stats, true);
+    ++m_stats.beforeUiRuns;
+    m_stats.effectResourceBytes = stages.resourceBytes;
+    m_stats.beforeUiNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - begin).count());
+    BeforeUiOutcome outcome;
+    outcome.shadow = shadowOutcome;
+    const auto& memory = owner.device->adapter()->memoryProperties();
+    for (uint32_t heap = 0; heap < memory.memoryHeapCount; ++heap) {
+      const auto stats = owner.device->getMemoryStats(heap);
+      outcome.deviceUsedBytes += stats.memoryUsed;
+      outcome.deviceAllocatedBytes += stats.memoryAllocated;
+    }
+    if (owner.evidence) {
+      EvidenceFrame& facts = owner.evidenceFacts;
+      facts.beforeUi = true;
+      facts.hasCamera = packet.hasCamera;
+      if (packet.hasCamera) { facts.view = packet.camera.view; facts.projection = packet.camera.projection; }
+      facts.hasLighting = shadow.hasLighting;
+      if (shadow.hasLighting) facts.sunDirection = shadow.lighting.sunDirection;
+      facts.hasShadowFrame = shadow.hasFrame;
+      if (shadow.hasFrame) {
+        facts.timeOfDay = shadow.frame.timeOfDay;
+        facts.recordCasters = shadow.frame.casters;
+        facts.recordOmitted = shadow.frame.omittedCasters;
+        facts.recordOmissionReasons = shadow.frame.omissionReasons;
+      }
+      facts.shadow = shadowOutcome;
+      owner.evidenceBounds = boundsCounts;
+      facts.deviceUsedBytes = outcome.deviceUsedBytes;
+      facts.deviceAllocatedBytes = outcome.deviceAllocatedBytes;
+    }
+    outcome.ssaoStage = uint32_t(stages.ssao); outcome.snowStage = uint32_t(stages.snow);
+    outcome.aaStage = uint32_t(stages.aa); outcome.bloomStage = uint32_t(stages.bloom);
+    outcome.ssaoRecorded = stages.ssao == fx::SsaoStage::CommandsRecorded;
+    outcome.snowRecorded = stages.snow == fx::SnowStage::CommandsRecorded;
+    outcome.aaRecorded = stages.aa == fx::AaStage::FxaaRecorded || stages.aa == fx::AaStage::SmaaRecorded;
+    outcome.bloomRecorded = stages.bloom == fx::BloomStage::CommandsRecorded;
+    if (owner.evidence) {
+      owner.evidenceFacts.effectsRecorded = (outcome.ssaoRecorded ? 1u : 0u) | (outcome.snowRecorded ? 2u : 0u)
+          | (outcome.aaRecorded ? 4u : 0u) | (outcome.bloomRecorded ? 8u : 0u);
+      owner.evidenceFacts.effectBytes = stages.resourceBytes;
+    }
+    return outcome;
+  } catch (...) { quarantine(); throw; }
+}
 bool D3D9Backend::hasPendingDraws() const {
-  return m_owner && m_owner->recording();
+  return m_owner && (m_owner->recordedGroupCount != 0 || (m_owner->streamOpen && m_owner->streamHoldsWork));
 }
 
 std::vector<uint8_t> D3D9Backend::readback(uint32_t first, uint32_t rows) {
@@ -2012,6 +2775,7 @@ std::vector<uint8_t> D3D9Backend::readback(uint32_t first, uint32_t rows) {
     require(m_stats.initialized, "DXVK D3D9 is not initialized");
     require(rows != 0 && first < owner.height && rows <= owner.height - first
       && uint64_t(owner.width) * rows * 4 <= ReadbackBandBytes, "DXVK D3D9 readback band outside target");
+    const WaitAt at(m_stats, WaitSite::Readback);
     owner.begin(m_stats);
     owner.context->copyImageToBuffer(owner.readback, 0, 0, 0, VK_FORMAT_B8G8R8A8_UNORM,
       owner.color, ColorLayer, {0, int32_t(first), 0}, {owner.width, rows, 1});
@@ -2053,6 +2817,7 @@ uint64_t D3D9Backend::issueEvent() {
   try {
     Owner& owner = active();
     require(m_stats.initialized, "DXVK D3D9 is not initialized");
+    const WaitAt at(m_stats, WaitSite::IssueEvent);
     owner.flushRecordedGroup(m_stats);
     owner.flushStream(m_stats);
     // Each prior command has its own production timeline signal. An event is
@@ -2081,7 +2846,10 @@ void D3D9Backend::waitEvent(uint64_t serial) {
     const VkSemaphore semaphore = owner.completion->handle();
     VkSemaphoreWaitInfo wait = { VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
     wait.semaphoreCount = 1; wait.pSemaphores = &semaphore; wait.pValues = &serial;
+    const WaitAt at(m_stats, WaitSite::WaitEvent);
+    const auto eventBegin = d9::profile::Ticks();
     const auto result = owner.device->vkd()->vkWaitSemaphores(owner.device->handle(), &wait, GpuWaitNs);
+    ChargeWait(m_stats, WaitKind::Event, eventBegin);
     if (result != VK_SUCCESS) {
       owner.device->notifyDeviceErrorFromDriverResult(result);
       throw std::runtime_error("DXVK D3D9 event completion wait failed");
@@ -2116,6 +2884,15 @@ HRESULT D3D9Backend::present() noexcept {
       owner.validateWindow(&resized);
     } catch (...) {
       m_stats.windowPreflightFailed = true;
+      // A pipelined Present left its GPU completion and its frame signal to
+      // the Present after it. Nothing on the GPU side has failed: take those
+      // two waits now, as that Present would have, so that the witnesses
+      // below describe the same quiescent owner as before.
+      if (owner.presentLagging) {
+        owner.settle(m_stats);
+        owner.waitPresentRetired(m_stats);
+        ++m_stats.presentPipelineDrains;
+      }
       if (!owner.canCleanWindowFault(m_stats))
         throw;
       const auto cleanupStart = Clock::now();
@@ -2137,8 +2914,58 @@ HRESULT D3D9Backend::present() noexcept {
       return HRESULT(d9::PresentSkipped);
     }
     owner.healthy();
-    owner.settle(m_stats);
-    owner.waitPresentRetired(m_stats);
+    // E0 mode of this whole Present (WARVK_D3D9_PRESENT_WAIT; block by default).
+    auto& wait = m_stats.presentWait;
+    const bool blocking = owner.presentBlocking(wait, owner.lastPresentFrame + 1);
+    if (wait.setting)
+      owner.timerResolution.set(blocking);
+    auto& mode = wait.modes[blocking ? 1 : 0];
+    ++mode[0];
+    // The frame this Present ends, by the phase of the alternate:N switch in
+    // use (E0, item 4 or P1; the first one set), for same-run A/B frame times.
+    uint32_t abPhase = blocking ? 1u : 0u;
+    {
+      const auto phase = [&](uint32_t every) { return uint32_t((owner.lastPresentFrame / every) % 2); };
+      const auto copy = ReadDynamicCpuCopy();
+      const auto sliced = ReadUploadSlices();
+      if (wait.setting == 2) m_stats.abPhaseSwitch = 1;
+      else if (copy.setting == 2) { m_stats.abPhaseSwitch = 2; abPhase = phase(copy.every); }
+      else if (sliced.setting == 2) { m_stats.abPhaseSwitch = 3; abPhase = phase(sliced.every); }
+    }
+    if (const auto begin = d9::profile::Ticks()) {
+      static const int64_t frequency = d9::profile::Frequency();
+      if (owner.presentWaitLastBegin) {
+        const auto ticks = uint64_t(begin - owner.presentWaitLastBegin);
+        mode[5] += ticks;
+        ++mode[6];
+        ++wait.intervalMs[blocking ? 1 : 0][std::min<uint64_t>(ticks * 1000u / uint64_t(frequency), 100)];
+        ++m_stats.abFrames[abPhase];
+        m_stats.abIntervalTicks[abPhase] += ticks;
+        ++m_stats.abIntervalMs[abPhase][std::min<uint64_t>(ticks * 1000u / uint64_t(frequency), 100)];
+      }
+      owner.presentWaitLastBegin = begin;
+    }
+    WaitAt at(m_stats, WaitSite::PresentBefore);
+    // Pipelined: this frame's lists go to the queue and the only GPU wait is
+    // for the frame before it, the frame signal below. The finish queue raises
+    // that signal after every list submitted before that Present completed.
+    const bool pipelined = owner.presentPipelined();
+    if (pipelined) {
+      owner.flushRecordedGroup(m_stats);
+      owner.flushStream(m_stats);
+    } else {
+      owner.settle(m_stats);
+    }
+    {
+      const auto retireBegin = d9::profile::Ticks();
+      owner.waitPresentRetired(m_stats, blocking, &mode[4]);
+      mode[3] += uint64_t(d9::profile::Ticks() - retireBegin);
+    }
+    if (pipelined) {
+      owner.completeLaggingPresent(m_stats);
+      owner.pollTimeline(m_stats); // upload marks and flights retire by this value
+    }
+    at.set(WaitSite::Present);
     require(owner.acquiredImage == nullptr && owner.acquiredView == nullptr,
       "DXVK D3D9 WSI image is still owned by an earlier present");
     canAdd(owner.lastPresentFrame, 1);
@@ -2150,7 +2977,9 @@ HRESULT D3D9Backend::present() noexcept {
     PresenterSync sync{};
     // Production Presenter can wait inside the driver while acquiring. The
     // external watchdog bounds that wait; do not claim this call is cancellable.
+    const auto acquireBegin = d9::profile::Ticks();
     const VkResult acquired = owner.presenter->acquireNextImage(sync, owner.acquiredImage);
+    ChargeWait(m_stats, WaitKind::Acquire, acquireBegin);
     m_stats.lastAcquireVkResult = static_cast<int32_t>(acquired);
     require(acquired == VK_SUCCESS && owner.acquiredImage != nullptr,
       "DXVK D3D9 WSI acquire was not strictly successful");
@@ -2164,7 +2993,8 @@ HRESULT D3D9Backend::present() noexcept {
     owner.acquiredView = owner.acquiredImage->createView(viewKey(imageInfo.format,
       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL));
 
-    owner.begin(m_stats);
+    if (pipelined) owner.beginStream(); else owner.begin(m_stats);
+    owner.evidenceCapture(m_stats, frame);
     // A CPU deferred Clear is not made real by a submission/timeline alone.
     // The blitter records raw commands outside DxvkContext, so explicitly
     // materialize/synchronize this exact source before handing it over. Merely
@@ -2180,7 +3010,7 @@ HRESULT D3D9Backend::present() noexcept {
     // command-list lifetime tracking alone is not that dependency.
     owner.context->acquireExternalResource(owner.color, owner.color->info().layout);
     owner.context->synchronizeWsi(sync);
-    owner.submit(m_stats, false);
+    if (pipelined) owner.flushStream(m_stats); else owner.submit(m_stats, false);
 
     // A distinct owner-resident status covers present, separate from command
     // submission/timeline completion. Queue order is the production DXVK order.
@@ -2189,6 +3019,8 @@ HRESULT D3D9Backend::present() noexcept {
     owner.lastPresentFrame = frame;
     owner.device->presentImage(owner.presenter, nullptr, frame, &owner.presentSubmission);
     ++m_stats.presentQueued;
+    const auto queueBegin = d9::profile::Ticks();
+    uint64_t queuePolls = 0;
     const auto deadline = Clock::now() + CpuWait;
     for (;;) {
       const VkResult result = owner.presentSubmission.result.load(std::memory_order_acquire);
@@ -2198,13 +3030,31 @@ HRESULT D3D9Backend::present() noexcept {
         break;
       }
       owner.healthy();
-      require(Clock::now() < deadline, "DXVK D3D9 WSI present result did not settle in 5 seconds");
-      Sleep(1);
+      const auto now = Clock::now();
+      require(now < deadline, "DXVK D3D9 WSI present result did not settle in 5 seconds");
+      // E0: sleep on the submission queue's own notification, bounded by the
+      // same deadline; the loop rereads the status either way.
+      if (blocking)
+        (void)owner.device->waitForSubmissionUntil(&owner.presentSubmission, std::min(deadline, now + PresentWaitSlice));
+      else
+        Sleep(1);
+      ++queuePolls;
     }
+    ChargeWait(m_stats, WaitKind::PresentQueue, queueBegin, queuePolls);
+    mode[1] += uint64_t(d9::profile::Ticks() - queueBegin);
+    mode[2] += queuePolls;
     ++m_stats.presentApiSucceeded;
-    owner.settle(m_stats);
-    m_stats.presentGpuCompleted = frame;
-    owner.waitPresentRetired(m_stats);
+    at.set(WaitSite::PresentAfter);
+    if (pipelined) {
+      owner.presentLagging = true;
+      ++m_stats.presentsPipelined;
+    } else {
+      owner.settle(m_stats);
+      m_stats.presentGpuCompleted = frame;
+      const auto retireBegin = d9::profile::Ticks();
+      owner.waitPresentRetired(m_stats, blocking, &mode[4]);
+      mode[3] += uint64_t(d9::profile::Ticks() - retireBegin);
+    }
     // A resize after the queued present only affects the next frame.
     bool resizedAfter = false;
     owner.validateWindow(&resizedAfter);
@@ -2223,6 +3073,14 @@ HRESULT D3D9Backend::present() noexcept {
     }
     owner.acquiredView = nullptr;
     owner.acquiredImage = nullptr;
+    // A saved package is read back here, once, like any readback.
+    if (owner.evidence && owner.evidence->exportDue()) {
+      at.set(WaitSite::Readback);
+      owner.begin(m_stats);
+      owner.evidence->recordExport(*owner.context);
+      owner.submit(m_stats, true);
+      owner.evidence->exportReady();
+    }
     return D3D_OK;
   } catch (...) {
     // Never release a queue-owned status, acquired swapchain image, blitter or
@@ -2236,6 +3094,7 @@ void D3D9Backend::destroy(ResourceType type, uint32_t id) {
   try {
     Owner& owner = active();
     require(m_stats.initialized, "DXVK D3D9 is not initialized");
+    const WaitAt at(m_stats, WaitSite::Destroy);
     owner.settle(m_stats);
     owner.waitPresentRetired(m_stats);
     // Remove context-held references as well as the author's typed slot. The
@@ -2247,6 +3106,10 @@ void D3D9Backend::destroy(ResourceType type, uint32_t id) {
         auto& slot = owner.liveBuffer(id);
         require(slot.index16 == (type == ResourceType::IndexBuffer), "DXVK D3D9 destroy buffer type mismatch");
         removeResource(m_stats, slot.size);
+        if (slot.dynamic) {
+          m_stats.dynamicRead.liveBytes -= std::min<uint64_t>(m_stats.dynamicRead.liveBytes, slot.size);
+          m_stats.dynamicRead.copyBytes -= std::min<uint64_t>(m_stats.dynamicRead.copyBytes, slot.vertexBytes.size());
+        }
         slot = Owner::Buffer{};
       } break;
       case ResourceType::Texture: {
@@ -2281,6 +3144,7 @@ void D3D9Backend::finish() {
       owner.validateWindow(); // A faulted owned HWND is never normalTeardown.
     require(m_stats.initialized && m_stats.liveResources == 0 && m_stats.liveLogicalBytes == 0,
       "DXVK D3D9 finish requires all author resources destroyed");
+    const WaitAt at(m_stats, WaitSite::Finish);
     owner.settle(m_stats);
     owner.waitPresentRetired(m_stats);
     owner.healthy();
@@ -2337,9 +3201,9 @@ d9::memory::HostSample D3D9Backend::diagnosticMemory() const {
   for(const auto& b:owner.buffers) {
     const bool live=b.object!=nullptr;
     result.cpu.observe(b.index16?Kind::IndexBuffer:Kind::VertexBuffer,live,
-      live?b.size:0,b.indexBytes.size(),b.indexBytes.capacity());
+      live?b.size:0,b.indexBytes.size()+b.vertexBytes.size(),b.indexBytes.capacity()+b.vertexBytes.capacity());
   }
-  for(const auto& t:owner.textures)if(t.image!=nullptr)
+  for(uint32_t i=0;i<owner.textureLimit;++i)if(const auto& t=owner.textures[i];t.image!=nullptr)
     result.cpu.add(Kind::Texture,t.layout.bytes,0,0);
   const auto shaders=[&](const auto& slots,Kind kind){for(const auto& s:slots) {
     const bool live=s.object!=nullptr;

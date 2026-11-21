@@ -8,7 +8,6 @@
 #include "war3_jass_native_invoke_x86.h"
 #include "war3_hook_ui.h"
 #include "war3_queue_takeover_policy.h"
-#include "../../d3d9_war3_branding.h"
 #include "../../d3d9_war3_debug.h"
 #include "../../d3d9_war3_hook.h"
 #include "../../d3d9_device.h"
@@ -109,6 +108,7 @@ using GxDeviceD3dDynamicVertexUploadFn =
                      const void *, uint32_t, const void *, uint32_t);
 using GxDeviceD3dSkinCopyKernelFn = void(__thiscall *)(void *, void *);
 using TerrainRenderAllTilesFn = void(__fastcall *)(void *, void *);
+using WaterSubmitDrawFn = void(__thiscall *)(void *, void *, int32_t);
 using FlushSortedItemsFn = int(__cdecl *)();
 using FlushTransparentFn = int(__cdecl *)();
 using TransparentDispatchType0Fn = void(__fastcall *)(uint32_t, void *);
@@ -180,6 +180,9 @@ static GxDeviceD3dSkinCopyKernelFn
 
 static TerrainRenderAllTilesFn g_originalTerrainAllTiles = nullptr;
 static TerrainRenderAllTilesFn g_trampolineTerrainAllTiles = nullptr;
+
+static WaterSubmitDrawFn g_originalWaterSubmitDraw = nullptr;
+static WaterSubmitDrawFn g_trampolineWaterSubmitDraw = nullptr;
 
 static FlushSortedItemsFn g_originalFlushSortedItems = nullptr;
 static FlushSortedItemsFn g_trampolineFlushSortedItems = nullptr;
@@ -2477,7 +2480,8 @@ static void TryNativeSemanticWorldStageValidation(int stage, int a3, int a4,
       if constexpr (dxvk::war3::internal::
         kShadowSemanticCoreSceneSubmissionEnabled) {
         if (dxvk::war3::internal::IsSemanticSceneSubmissionRuntimeEnabled()) {
-          dxvk::war3::RunWithActiveDevice([&](D3D9DeviceEx& device) {
+          dxvk::war3::RunWithActiveDeviceServices(
+              [&](dxvk::war3::IDeviceServices& device) {
             device.War3PopulateSemanticShadowSceneForValidation(
                 dxvk::war3::internal::kShadowSemanticCoreSceneUnitsOnly,
                 false);
@@ -2598,7 +2602,8 @@ int __fastcall Hook_WorldFrameUpdateAndPreparePasses(void *thisPtr, void *edx,
 }
 
 static void SetDeviceWorldLightingScope(bool inWorld) {
-  dxvk::war3::RunWithActiveDevice([inWorld](D3D9DeviceEx &device) {
+  dxvk::war3::RunWithActiveDeviceServices(
+      [inWorld](dxvk::war3::IDeviceServices &device) {
     device.War3SetWorldLightingScope(inWorld);
   });
 }
@@ -2806,13 +2811,13 @@ int __fastcall Hook_WorldDispatch(void *thisPtr, void *edx, int stage, int a3,
 
         if (gameTime >= 0.0f) {
           War3RenderState::SetGameTime(gameTime);
-          War3VKBranding::TryShowBrandingMessage(gameTime);
+          dxvk::war3::ProcessServices().TryShowBrandingMessage(gameTime);
           war3::ShaderManager::get().setGlobalFloat4(
               "Time", Vector4(gameTime, 0.0f, 0.0f, 0.0f));
         } else {
           War3RenderState::SetGameTime(-1.0f);
           if (dxvk::war3::War3Events::get().isGameStarted()) {
-            War3VKBranding::TryShowBrandingMessage(elapsedSeconds);
+            dxvk::war3::ProcessServices().TryShowBrandingMessage(elapsedSeconds);
             war3::ShaderManager::get().setGlobalFloat4(
                 "Time", Vector4(elapsedSeconds, 0.0f, 0.0f, 0.0f));
           }
@@ -5003,6 +5008,19 @@ void __fastcall Hook_Terrain_RenderAllTiles(void *thisPtr, void * /*edx*/) {
   War3RenderState::OnTerrainExit();
 }
 
+void __fastcall Hook_Water_SubmitDraw(void *terrain, void * /*edx*/,
+                                      void *cacheNode, int32_t waterLevel) {
+  struct WaterDrawScope {
+    WaterDrawScope() { War3RenderState::OnWaterEnter(); }
+    ~WaterDrawScope() { War3RenderState::OnWaterExit(); }
+  } waterScope;
+  if (g_trampolineWaterSubmitDraw) {
+    g_trampolineWaterSubmitDraw(terrain, cacheNode, waterLevel);
+  } else if (g_originalWaterSubmitDraw) {
+    g_originalWaterSubmitDraw(terrain, cacheNode, waterLevel);
+  }
+}
+
 static void RegisterRenderPerfHookCatalog(
     const War3HookAddressBook& book) {
   const War3HookActivationGate deepGate = {
@@ -5142,6 +5160,7 @@ void War3HookRender::Install(uintptr_t gameBase) {
   LPVOID flushSortedAddr = resolveCode(book.flushSortedItems);
   LPVOID flushTransparentAddr = resolveCode(book.rqFlushTransparent);
   LPVOID terrainAllTilesAddr = resolveCode(book.terrainRenderAllTiles);
+  LPVOID waterSubmitDrawAddr = resolveCode(book.waterSubmitDraw);
   LPVOID worldPrepareCameraBuildFrustumAddr =
       resolveCode(book.worldPrepareCameraBuildFrustum);
   LPVOID worldPrepareTerrainShadowFlushAddr =
@@ -5320,6 +5339,8 @@ void War3HookRender::Install(uintptr_t gameBase) {
       reinterpret_cast<FlushTransparentFn>(flushTransparentAddr);
   g_originalTerrainAllTiles =
       reinterpret_cast<TerrainRenderAllTilesFn>(terrainAllTilesAddr);
+  g_originalWaterSubmitDraw =
+      reinterpret_cast<WaterSubmitDrawFn>(waterSubmitDrawAddr);
   g_transparentArrayBasePtr =
       reinterpret_cast<void **>(transparentArrayBaseAddr);
   g_transparentSortedPtrs = reinterpret_cast<void **>(transparentSortedPtrsAddr);
@@ -5645,6 +5666,12 @@ void War3HookRender::Install(uintptr_t gameBase) {
                  reinterpret_cast<LPVOID>(&Hook_Terrain_RenderAllTiles),
                  reinterpret_cast<LPVOID *>(&g_trampolineTerrainAllTiles),
                  "Render", "Terrain_RenderAllTiles", false, false);
+  if (waterSubmitDrawAddr) {
+    InstallMinHook(waterSubmitDrawAddr,
+                   reinterpret_cast<LPVOID>(&Hook_Water_SubmitDraw),
+                   reinterpret_cast<LPVOID *>(&g_trampolineWaterSubmitDraw),
+                   "Render", "Water_SubmitDraw", false, false);
+  }
 
   if (nativeBridgeInstallEligible && dispatchCommonHookInstalled &&
       flushSortedHookInstalled) {
@@ -5694,7 +5721,8 @@ void War3HookRender::Install(uintptr_t gameBase) {
           gxDeviceD3dDynamicVertexUploadAddr,
           gxDeviceD3dSkinCopyKernelAddr);
       ::dxvk::Logger::info(gpuSkinHookLine);
-      dxvk::war3::RunWithActiveDevice([&](D3D9DeviceEx& activeDevice) {
+      dxvk::war3::RunWithActiveDeviceServices(
+          [&](dxvk::war3::IDeviceServices& activeDevice) {
         activeDevice.War3AttachGpuSkinNativeBridge(gameBase);
       });
     } else {

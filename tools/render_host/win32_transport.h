@@ -31,7 +31,8 @@ public:
 private:
   HANDLE m_value;
 };
-enum class Stage { Setup, Connect, Header, Body, Write, SlotMutex, SlotCopy };
+// ExitWait: waiting for an owned child process to exit (OwnedChild::wait), not setup.
+enum class Stage { Setup, Connect, Header, Body, Write, SlotMutex, SlotCopy, ExitWait };
 enum class Fault { System, Timeout, PeerExited, PeerIdentity, HeaderInvalid, EndOfStream, Abandoned, SlotLease };
 enum class Channel { Echo0, Slots1, Gpu2, Present3, Buffers4, D3D9Dev5 };
 struct Failure : std::runtime_error {
@@ -53,6 +54,13 @@ std::wstring NonceText(ipc::Nonce nonce);
 ipc::Nonce ParseNonce(const std::wstring& text);
 std::wstring PipeName(ipc::Nonce nonce, Channel channel = Channel::Echo0);
 Handle OpenPeer(DWORD pid,uint64_t creation);
+// The same identity check on a handle the peer let this process inherit
+// (SYNCHRONIZE|PROCESS_QUERY_LIMITED_INFORMATION): no OpenProcess, which a
+// process with a restrictive DACL (the game) refuses. Takes ownership.
+Handle AdoptPeer(uint64_t inherited,DWORD pid,uint64_t creation);
+// This process, for a child to inherit and adopt. Inheritable; the owner
+// closes it once the child exists.
+Handle ShareSelf();
 Handle CreateServer(ipc::Nonce nonce, Channel channel = Channel::Echo0);
 void Accept(HANDLE pipe,HANDLE peer,IoStats& stats);
 Handle Connect(ipc::Nonce nonce,HANDLE peer,DWORD expectedPid,Channel channel = Channel::Echo0);

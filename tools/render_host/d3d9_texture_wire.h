@@ -21,6 +21,14 @@ inline TextureFormat TextureFormatInfo(uint32_t format) {
     default:return {};
   }
 }
+// Bits are local evidence within one device nonce, never wire format numbers.
+inline uint16_t TextureFormatBit(uint32_t format) {
+  constexpr uint32_t formats[]={D3DFMT_A8R8G8B8,D3DFMT_X8R8G8B8,D3DFMT_A8B8G8R8,D3DFMT_X8B8G8R8,
+    D3DFMT_R5G6B5,D3DFMT_A1R5G5B5,D3DFMT_X1R5G5B5,D3DFMT_A4R4G4B4,D3DFMT_A8L8,D3DFMT_A8,D3DFMT_L8,
+    D3DFMT_DXT1,D3DFMT_DXT2,D3DFMT_DXT3,D3DFMT_DXT4,D3DFMT_DXT5};
+  for(unsigned i=0;i<16;++i)if(format==formats[i])return uint16_t(1u<<i);
+  return 0;
+}
 struct TextureLevel { uint32_t width=0,height=0,pitch=0,offset=0,bytes=0; };
 struct TextureLayout {
   uint32_t width=0,height=0,levels=0,bytes=0;

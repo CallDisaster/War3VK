@@ -9,6 +9,7 @@
 #include "../tools/render_host/d3d9_effects_wire.h"
 #include "../tools/render_host/d3d9_texture_stages_wire.h"
 #include "../tools/render_host/d3d9_annotation_wire.h"
+#include "../tools/render_host/d3d9_content_wire.h"
 #include <limits>
 int wmain(int argc,wchar_t** argv) {
   try {
@@ -322,10 +323,28 @@ int wmain(int argc,wchar_t** argv) {
     const auto scene=d9::EncodeFrameCamera(camera);const auto sceneSchema=uint32_t(d9::AnnotationSchema::FrameCamera);
     auto sceneHeader=[&](){auto c=Raw::Header(d9::Op::FrameScene);c.args[0]=sceneSchema;c.payloadBytes=d9::FrameCameraBytes;return c;};
     auto stageHeader=[&](uint32_t stage){auto c=Raw::Header(d9::Op::StageMarker);c.args[0]=stage;return c;};
+    auto resetHeader=[&](uint32_t reason,uint64_t generation){auto c=Raw::Header(d9::Op::SessionReset);
+      c.args[0]=reason;c.args[1]=uint32_t(generation);c.args[2]=uint32_t(generation>>32);return c;};
+    const auto sceneEnter=uint32_t(d9::Stage::WorldSceneEnter),sceneExit=uint32_t(d9::Stage::WorldSceneExit);
+    // Content payloads ride on the same negotiation. Chunk and release
+    // refusals are terminal under async batches, like AnnotateDraws.
+    unsigned payloadRejected=0,payloadDraws=0,payloadUploads=0,payloadChunks=0,payloadReads=0,payloadReleases=0;
+    unsigned payloadRefs=0,payloadRefusedRefs=0,payloadAborted=0;
+    uint64_t payloadChunkBytes=0,payloadReadBytes=0,payloadRevision=0;
+    auto refusedPayload=[&](d9::Header c,const void* data=nullptr){
+      Require(r.connection->call(c,data)==D3DERR_INVALIDCALL&&r.connection->healthy(),"content payload was not recoverably refused");
+      ++payloadRejected;};
     if(!annotate) {
       const auto one=records({{0,1}});
       if(!asyncBatches)refusedAnnotation(annotateHeader(1,1,d9::Op::DrawFixed,one.size()),one.data());
       refusedAnnotation(sceneHeader(),scene.data());refusedAnnotation(stageHeader(1));
+      refusedAnnotation(resetHeader(1,1));
+      const std::array<uint8_t,8> blob{};
+      if(!asyncBatches) {
+        refusedPayload(d9::EncodeContentUpload({uint32_t(d9::ContentKind::Geometry),7,1,8,0,8}),blob.data());
+        refusedPayload(d9::EncodeContentRelease({7,1}));
+      }
+      refusedPayload(d9::EncodeContentRead({7,1},0,8));
     } else {
       state.stages[1][d9::FFIndex(d9::FFStageStates,D3DTSS_COLOROP)]=D3DTOP_DISABLE;
       state.stages[1][d9::FFIndex(d9::FFStageStates,D3DTSS_ALPHAOP)]=D3DTOP_DISABLE;
@@ -342,19 +361,32 @@ int wmain(int argc,wchar_t** argv) {
         ++expected.annotatedDraws;};
       r.call(sceneHeader(),scene.data());expected.scene(sceneSchema,scene.data(),d9::FrameCameraBytes);
       r.call(stageHeader(uint32_t(d9::Stage::WorldBegin)));expected.stage(uint32_t(d9::Stage::WorldBegin));
+      // World scene markers pair strictly, and a session never changes inside one.
+      refusedAnnotation(stageHeader(sceneExit));
+      r.call(resetHeader(1,5));expected.reset(1,5);
+      r.call(stageHeader(sceneEnter));expected.stage(sceneEnter);
+      refusedAnnotation(stageHeader(sceneEnter));refusedAnnotation(resetHeader(1,6));
       const auto one=records({{0,1}});
       r.call(annotateHeader(1,1,d9::Op::DrawFixed,one.size()),one.data());drawFixed();expectDraw(1,draw);
       const auto pair=records({{0,2},{2,3}});
       r.call(annotateHeader(2,3,d9::Op::DrawFixedBatch,pair.size()),pair.data());r.call(batchHeader(3),batched.data());
       annotationDraws+=3;expectDraw(2,shapes[0]);expectDraw(3,shapes[2]);
+      r.call(stageHeader(sceneExit));expected.stage(sceneExit);
       r.call(stageHeader(uint32_t(d9::Stage::BeforeUi)));expected.stage(uint32_t(d9::Stage::BeforeUi));
+      // Session reset refusals: reason, generation, shape, and a generation that does not ascend.
+      refusedAnnotation(resetHeader(0,6));refusedAnnotation(resetHeader(3,6));refusedAnnotation(resetHeader(1,0));
+      {auto c=resetHeader(1,6);c.id=c.generation=1;refusedAnnotation(c);}
+      {auto c=resetHeader(1,6);c.payloadBytes=4;refusedAnnotation(c,scene.data());}
+      {auto c=resetHeader(1,6);c.args[3]=1;refusedAnnotation(c);}
+      refusedAnnotation(resetHeader(1,5));refusedAnnotation(resetHeader(2,4));
+      {const uint64_t next=(uint64_t(1)<<32)|1;r.call(resetHeader(2,next));expected.reset(2,next);}
       // Scene and stage refusals.
       {auto c=sceneHeader();c.payloadBytes=159;refusedAnnotation(c,scene.data());}
       {auto c=sceneHeader();c.args[0]=tagSchema;refusedAnnotation(c,scene.data());}
       {auto bad=scene;d9::P32(bad.data()+4,0x7fc00000u);refusedAnnotation(sceneHeader(),bad.data());}
       {auto c=sceneHeader();c.args[1]=1;refusedAnnotation(c,scene.data());}
       {auto c=sceneHeader();c.id=c.generation=1;refusedAnnotation(c,scene.data());}
-      refusedAnnotation(stageHeader(0));refusedAnnotation(stageHeader(5));
+      refusedAnnotation(stageHeader(0));refusedAnnotation(stageHeader(7));
       {auto c=stageHeader(1);c.payloadBytes=4;refusedAnnotation(c,scene.data());}
       {auto c=stageHeader(1);c.args[1]=1;refusedAnnotation(c);}
       // Malformed records leave nothing pending for the plain draw after them.
@@ -389,6 +421,113 @@ int wmain(int argc,wchar_t** argv) {
       const auto last=records({{0,4}});
       r.call(annotateHeader(1,1,d9::Op::DrawFixed,last.size()),last.data());drawFixed();expectDraw(4,draw);
       r.call(stageHeader(uint32_t(d9::Stage::FrameEnd)));expected.stage(uint32_t(d9::Stage::FrameEnd));
+      // Content payloads. A blob arrives in consecutive chunks under an
+      // ascending revision; draw records name it; it is read back, replaced,
+      // released, and dropped with its session.
+      const auto geometry=uint32_t(d9::ContentKind::Geometry),bones=uint32_t(d9::ContentKind::BoneMatrices);
+      const auto geometryRef=uint16_t(d9::AnnotationSchema::GeometryRef),bonesRef=uint16_t(d9::AnnotationSchema::BonesRef);
+      const uint64_t mesh=0x1000000000000007ull,palette=0x2000000000000009ull;const uint32_t meshBytes=150000;
+      std::vector<uint8_t> big(meshBytes),small(40),floats(96);
+      for(size_t i=0;i<big.size();++i)big[i]=uint8_t(i*7+3);
+      for(size_t i=0;i<small.size();++i)small[i]=uint8_t(200-i);
+      for(uint32_t i=0;i<24;++i)d9::P32(floats.data()+4*i,d9::FloatBits(float(i)*.25f-1));
+      auto chunk=[&](uint32_t kind,uint64_t key,uint64_t revision,uint32_t total,uint32_t offset,uint32_t count){
+        return d9::EncodeContentUpload({kind,key,revision,total,offset,count});};
+      auto accepted=[&](d9::Header c,const void* data){r.call(c,data);++payloadChunks;payloadChunkBytes+=c.payloadBytes;};
+      auto upload=[&](uint32_t kind,uint64_t key,const std::vector<uint8_t>& bytes){
+        const auto revision=++payloadRevision;const auto total=uint32_t(bytes.size());
+        for(uint32_t at=0;at<total;){const auto count=std::min(d9::MaxPayload,total-at);
+          accepted(chunk(kind,key,revision,total,at,count),bytes.data()+at);at+=count;}
+        expected.content(kind,key,revision,bytes.data(),total);++payloadUploads;return revision;};
+      using Refs=std::vector<std::pair<uint16_t,d9::ContentRef>>;
+      auto refRecords=[&](const Refs& entries){
+        std::vector<uint8_t> out(entries.size()*d9::RecordBytes(d9::ContentRefBytes));uint32_t at=0;
+        for(const auto& [schema,ref]:entries){const auto bytes=d9::EncodeContentRef(ref);
+          at+=d9::AppendDrawRecord(out.data()+at,uint32_t(out.size()-at),0,schema,bytes.data(),d9::ContentRefBytes);}
+        Require(at==out.size(),"content reference encoding");return out;};
+      auto plainDraw=[&](){auto c=Raw::Header(d9::Op::DrawFixed);c.payloadBytes=uint32_t(plain.size());r.call(c,plain.data());++payloadDraws;};
+      // A draw whose records name live blobs of the right kind is delivered with them.
+      auto boundDraw=[&](const Refs& entries){
+        const auto recs=refRecords(entries);
+        r.call(annotateHeader(uint32_t(entries.size()),1,d9::Op::DrawFixed,recs.size()),recs.data());plainDraw();
+        for(const auto& [schema,ref]:entries){const auto bytes=d9::EncodeContentRef(ref);
+          expected.draw(schema,bytes.data(),d9::ContentRefBytes,uint32_t(draw.state.primitiveType),draw.state.primitiveCount,
+            draw.state.numVertices,draw.state.startIndex);++payloadRefs;}
+        ++expected.annotatedDraws;};
+      // One that names content which is not there is refused whole, and the
+      // plain draw after it shows that nothing stayed pending.
+      auto unboundDraw=[&](const Refs& entries){
+        const auto recs=refRecords(entries);
+        r.call(annotateHeader(uint32_t(entries.size()),1,d9::Op::DrawFixed,recs.size()),recs.data());
+        {auto c=Raw::Header(d9::Op::DrawFixed);c.payloadBytes=uint32_t(plain.size());refusedPayload(c,plain.data());}
+        ++payloadRefusedRefs;plainDraw();};
+      const auto meshRevision=upload(geometry,mesh,big),paletteRevision=upload(bones,palette,floats);
+      boundDraw({{geometryRef,{mesh,meshRevision}},{bonesRef,{palette,paletteRevision}}});
+      {
+        std::array<uint8_t,8> out{};r.call(d9::EncodeContentRead({palette,paletteRevision},4,8),nullptr,out.data(),8);
+        Require(!std::memcmp(out.data(),floats.data()+4,8),"content read bytes");
+        std::vector<uint8_t> wide(d9::MaxPayload);
+        r.call(d9::EncodeContentRead({mesh,meshRevision},60000,d9::MaxPayload),nullptr,wide.data(),d9::MaxPayload);
+        Require(!std::memcmp(wide.data(),big.data()+60000,d9::MaxPayload),"content read across chunks");
+        payloadReads+=2;payloadReadBytes+=8+d9::MaxPayload;
+      }
+      // Read refusals: identity, range, shape.
+      refusedPayload(d9::EncodeContentRead({mesh+1,meshRevision},0,8));
+      refusedPayload(d9::EncodeContentRead({mesh,meshRevision+5},0,8));
+      refusedPayload(d9::EncodeContentRead({mesh,meshRevision},meshBytes-4,8));
+      refusedPayload(d9::EncodeContentRead({mesh,meshRevision},meshBytes+1,1));
+      {auto c=d9::EncodeContentRead({mesh,meshRevision},0,8);c.args[5]=0;refusedPayload(c);c.args[5]=d9::MaxPayload+1;refusedPayload(c);}
+      {auto c=d9::EncodeContentRead({mesh,meshRevision},0,8);c.args[6]=1;refusedPayload(c);}
+      {auto c=d9::EncodeContentRead({mesh,meshRevision},0,8);c.id=c.generation=1;refusedPayload(c);}
+      {auto c=d9::EncodeContentRead({mesh,meshRevision},0,8);c.payloadBytes=4;refusedPayload(c,small.data());}
+      // References: an unknown key, another blob's revision, the wrong kind
+      // either way, and one bad reference beside a good one.
+      unboundDraw({{geometryRef,{mesh+1,meshRevision}}});
+      unboundDraw({{geometryRef,{mesh,paletteRevision}}});
+      unboundDraw({{geometryRef,{palette,paletteRevision}}});
+      unboundDraw({{bonesRef,{mesh,meshRevision}}});
+      unboundDraw({{geometryRef,{mesh,meshRevision}},{bonesRef,{palette,paletteRevision+7}}});
+      if(!asyncBatches) {
+        // A refused first chunk consumes no revision.
+        const auto next=payloadRevision+1;
+        refusedPayload(chunk(geometry,mesh,payloadRevision,40,0,40),small.data());
+        refusedPayload(chunk(geometry,mesh,next,40,8,32),small.data());
+        refusedPayload(chunk(0,mesh,next,40,0,40),small.data());refusedPayload(chunk(3,mesh,next,40,0,40),small.data());
+        refusedPayload(chunk(geometry,0,next,40,0,40),small.data());
+        refusedPayload(chunk(geometry,mesh,0,40,0,40),small.data());
+        refusedPayload(chunk(geometry,mesh,next,d9::MaxContentBlobBytes+1,0,40),small.data());
+        refusedPayload(chunk(geometry,mesh,next,30,0,40),small.data());
+        {auto c=chunk(geometry,mesh,next,40,0,40);c.args[7]=1;refusedPayload(c,small.data());}
+        {auto c=chunk(geometry,mesh,next,40,0,40);c.id=c.generation=1;refusedPayload(c,small.data());}
+        {auto c=chunk(geometry,mesh,next,40,0,40);c.payloadBytes=0;refusedPayload(c);}
+        {auto bad=floats;d9::P32(bad.data()+8,0x7fc00000u);refusedPayload(chunk(bones,palette,next,96,0,96),bad.data());}
+        refusedPayload(chunk(bones,palette,next,94,0,94),floats.data());
+        // A chunk that is not the open blob's next one is refused and drops
+        // the blob; so is any other message. The right chunk then finds nothing open.
+        {const auto revision=++payloadRevision;accepted(chunk(geometry,mesh,revision,100,0,40),small.data());
+          refusedPayload(chunk(geometry,mesh,revision,100,41,40),small.data());++payloadAborted;
+          refusedPayload(chunk(geometry,mesh,revision,100,40,40),small.data());}
+        {const auto revision=++payloadRevision;accepted(chunk(geometry,mesh,revision,100,0,40),small.data());
+          refusedPayload(Raw::Header(d9::Op::Readback));++payloadAborted;
+          refusedPayload(chunk(geometry,mesh,revision,100,40,40),small.data());}
+        // A dropped upload changed nothing: the first blob still binds.
+        boundDraw({{geometryRef,{mesh,meshRevision}}});
+        // Release takes the exact live identity and nothing else.
+        refusedPayload(d9::EncodeContentRelease({mesh+1,meshRevision}));refusedPayload(d9::EncodeContentRelease({mesh,meshRevision+1}));
+        {auto c=d9::EncodeContentRelease({mesh,meshRevision});c.args[4]=1;refusedPayload(c);}
+        {auto c=d9::EncodeContentRelease({mesh,meshRevision});c.payloadBytes=4;refusedPayload(c,small.data());}
+        {auto c=d9::EncodeContentRelease({mesh,meshRevision});c.args[0]=c.args[1]=0;refusedPayload(c);}
+      }
+      // Replacement under a newer revision: the old one never binds or reads again.
+      const auto replaced=upload(geometry,mesh,small);
+      unboundDraw({{geometryRef,{mesh,meshRevision}}});refusedPayload(d9::EncodeContentRead({mesh,meshRevision},0,8));
+      boundDraw({{geometryRef,{mesh,replaced}},{bonesRef,{palette,paletteRevision}}});
+      r.call(d9::EncodeContentRelease({palette,paletteRevision}));expected.release(palette,paletteRevision);++payloadReleases;
+      unboundDraw({{bonesRef,{palette,paletteRevision}}});
+      // A session reset drops every blob; revisions keep ascending.
+      {const uint64_t later=(uint64_t(1)<<32)|2;r.call(resetHeader(1,later));expected.reset(1,later);}
+      unboundDraw({{geometryRef,{mesh,replaced}}});refusedPayload(d9::EncodeContentRead({mesh,replaced},0,8));
+      const auto fresh=upload(bones,palette,floats);boundDraw({{bonesRef,{palette,fresh}}});
     }
     for(unsigned i=0;i<6;++i)r.destroy(r.refs[i],Types[i]);
     r.call(Raw::Header(d9::Op::Finish));r.connection.reset();Desktop(options);
@@ -398,12 +537,19 @@ int wmain(int argc,wchar_t** argv) {
       "\"fixedBatchAsync\":%s,\"fixedBatchRejected\":%u,\"fixedBatchRecoveries\":%u,\"fixedBatchDraws\":%u,\"fixedBatchUnchangedPixels\":%llu,"
       "\"contentRetain\":%s,\"contentRejected\":%u,\"contentReads\":%u,\"contentReadBytes\":%llu,"
       "\"annotate\":%s,\"annotationRejected\":%u,\"annotationDraws\":%u,\"annotatedDraws\":%llu,\"annotationRecords\":%llu,"
-      "\"frameScenes\":%llu,\"stageMarkers\":%llu,\"annotationDigest\":\"%016llx\","
+      "\"frameScenes\":%llu,\"stageMarkers\":%llu,\"sessionResets\":%llu,\"annotationDigest\":\"%016llx\","
+      "\"payloadRejected\":%u,\"payloadDraws\":%u,\"payloadUploads\":%u,\"payloadChunks\":%u,\"payloadChunkBytes\":%llu,"
+      "\"payloadReads\":%u,\"payloadReadBytes\":%llu,\"payloadReleases\":%u,\"payloadRefs\":%u,\"payloadRefusedRefs\":%u,"
+      "\"payloadAborted\":%u,\"payloadRevision\":%llu,"
       "\"memoryMeasured\":false,\"gameTouched\":false}\n",rejected,recovered,unchanged,evidence.pixels,evidence.failures,textureRejected,textureRecoveries,samplerRejected,samplerRecoveries,effectsRejected,effectsRecoveries,stagesRejected,stagesDraws,
       asyncBatches?"true":"false",batchRejected,batchRecovered,batchDraws,batchUnchanged,
       retain?"true":"false",contentRejected,contentReads,contentReadBytes,
       annotate?"true":"false",annotationRejected,annotationDraws,(unsigned long long)expected.annotatedDraws,(unsigned long long)expected.drawRecords,
-      (unsigned long long)expected.frameScenes,(unsigned long long)expected.stageMarkers,(unsigned long long)expected.digest);
+      (unsigned long long)expected.frameScenes,(unsigned long long)expected.stageMarkers,
+      (unsigned long long)expected.sessionResets,(unsigned long long)expected.digest,
+      payloadRejected,payloadDraws,payloadUploads,payloadChunks,(unsigned long long)payloadChunkBytes,payloadReads,
+      (unsigned long long)payloadReadBytes,payloadReleases,payloadRefs,payloadRefusedRefs,payloadAborted,
+      (unsigned long long)payloadRevision);
     return 0;
   }catch(const std::exception& error){std::fprintf(stderr,"fixed rejection: %s\n",error.what());return 1;}
 }

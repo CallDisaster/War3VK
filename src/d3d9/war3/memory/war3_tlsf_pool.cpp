@@ -9,6 +9,10 @@
 //   5. 扩池尺寸按 TLSF 真实 size class 计算，空扩展池即时归还
 //   6. 所有返回给 Storm/Game 的范围必须完整位于低 2 GiB
 //   7. 整合进 dxvk::war3::memory 命名空间
+//   8. 现有池放不下的超大请求（> 8 MB）单独 VirtualAlloc 成“直接块”：
+//      不进 TLSF 空闲链，别的分配落不进去，释放即整块归还系统。
+//      旧做法给它开一个专用扩展池，池尾余量被别的分配占住后，大块释放了
+//      池也退不掉（生与死上 4 个池共 82.5 MB 空闲块退不回系统）。
 
 #include "war3_tlsf_pool.h"
 #include "../../d3d9_war3_debug.h" // war3dbg::Print
@@ -21,6 +25,7 @@
 #include <atomic>
 #include <cassert>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <vector>
@@ -41,6 +46,10 @@ constexpr size_t kAddressPageShift = 16;
 constexpr size_t kAddressPageSize = size_t{1} << kAddressPageShift;
 constexpr size_t kAddressPageCount = size_t{1} << (32 - kAddressPageShift);
 constexpr uintptr_t kStormSignedAddressLimit = 0x80000000u;
+// Requests above this size that the existing pools cannot serve get a direct
+// block (their own VirtualAlloc range) instead of a growth pool.
+constexpr size_t kDirectBlockThreshold = kExtendGranularity / 2; // 8 MB
+constexpr size_t kSystemPageSize = 4096;
 
 // ============================================================================
 // 内部状态
@@ -54,6 +63,14 @@ struct ExtraPool {
   pool_t handle = nullptr;
 };
 
+// One allocation in its own committed range; the block starts at base and
+// owns all of it. Nothing else is ever placed there, so freeing the block
+// releases the range. Sorted by base.
+struct DirectBlock {
+  void *base = nullptr;
+  size_t size = 0; // committed bytes, a multiple of the system page
+};
+
 struct ArenaBlock {
   void *base = nullptr;
   size_t size = 0;
@@ -62,6 +79,7 @@ struct ArenaBlock {
 tlsf_t g_tlsf = nullptr;
 void *g_mainPool = nullptr;
 std::vector<ExtraPool> g_extraPools;
+std::vector<DirectBlock> g_directBlocks;
 std::vector<ArenaBlock> g_arenaBlocks;
 std::array<std::atomic<uint8_t>, kAddressPageCount> g_addressDirectory{};
 
@@ -85,6 +103,9 @@ std::atomic<size_t> g_allocCount{0};
 std::atomic<size_t> g_freeCount{0};
 std::atomic<size_t> g_extendCount{0};
 std::atomic<size_t> g_trimCount{0};
+std::atomic<size_t> g_directLiveBlocks{0};
+std::atomic<size_t> g_directLiveBytes{0};
+std::atomic<size_t> g_directAllocCount{0};
 
 // ---- 辅助 ----
 
@@ -223,12 +244,93 @@ auto FindExtraPoolLocked(const void *ptr) {
              : g_extraPools.end();
 }
 
+// The direct block that starts exactly at ptr, or end().
+auto FindDirectBlockLocked(const void *ptr) {
+  const uintptr_t address = reinterpret_cast<uintptr_t>(ptr);
+  const auto found = std::lower_bound(
+      g_directBlocks.begin(), g_directBlocks.end(), address,
+      [](const DirectBlock &block, uintptr_t value) {
+        return reinterpret_cast<uintptr_t>(block.base) < value;
+      });
+  return found != g_directBlocks.end() && found->base == ptr
+             ? found
+             : g_directBlocks.end();
+}
+
+bool IsDirectBlockLocked(const void *ptr) {
+  return ptr && FindDirectBlockLocked(ptr) != g_directBlocks.end();
+}
+
+void *AllocDirectBlockLocked(size_t size) {
+  if (size > SIZE_MAX - (kSystemPageSize - 1))
+    return nullptr;
+  const size_t bytes = (size + kSystemPageSize - 1) & ~(kSystemPageSize - 1);
+  const size_t total = g_totalSize.load(std::memory_order_relaxed);
+  if (total >= kMaxPoolSize || bytes > kMaxPoolSize - total)
+    return nullptr;
+  // VirtualAlloc bases are 64 KiB aligned, which covers every alignment the
+  // direct path accepts (callers check align <= kAddressPageSize).
+  void *mem = AllocateLowRange(bytes, "direct");
+  if (!mem) {
+    war3dbg::Print("DXVK War3[TlsfPool]: 直接块 VirtualAlloc 失败 size=%zu err=%lu\n",
+                   bytes, GetLastError());
+    return nullptr;
+  }
+  if (!RegisterAddressRangeLocked(mem, bytes)) {
+    war3dbg::Print("DXVK War3[TlsfPool]: 直接块页目录登记失败 base=%p size=%zu\n",
+                   mem, bytes);
+    VirtualFree(mem, 0, MEM_RELEASE);
+    return nullptr;
+  }
+  try {
+    const uintptr_t address = reinterpret_cast<uintptr_t>(mem);
+    const auto insertion = std::lower_bound(
+        g_directBlocks.begin(), g_directBlocks.end(), address,
+        [](const DirectBlock &block, uintptr_t value) {
+          return reinterpret_cast<uintptr_t>(block.base) < value;
+        });
+    g_directBlocks.insert(insertion, DirectBlock{mem, bytes});
+  } catch (...) {
+    UnregisterAddressRangeLocked(mem, bytes);
+    VirtualFree(mem, 0, MEM_RELEASE);
+    return nullptr;
+  }
+  g_totalSize.fetch_add(bytes, std::memory_order_relaxed);
+  g_directLiveBlocks.fetch_add(1, std::memory_order_relaxed);
+  g_directLiveBytes.fetch_add(bytes, std::memory_order_relaxed);
+  const size_t count =
+      g_directAllocCount.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (count <= 32 || (count & (count - 1)) == 0)
+    war3dbg::Print("DXVK War3[TlsfPool]: 直接块 #%zu +%zu KB base=%p，当前直接块 %zu 个\n",
+                   count, bytes >> 10, mem,
+                   g_directLiveBlocks.load(std::memory_order_relaxed));
+  return mem;
+}
+
+void ReleaseDirectBlockLocked(std::vector<DirectBlock>::iterator block) {
+  const size_t bytes = block->size;
+  UnregisterAddressRangeLocked(block->base, bytes);
+  VirtualFree(block->base, 0, MEM_RELEASE);
+  g_directBlocks.erase(block);
+  g_totalSize.fetch_sub(bytes, std::memory_order_relaxed);
+  g_directLiveBlocks.fetch_sub(1, std::memory_order_relaxed);
+  g_directLiveBytes.fetch_sub(bytes, std::memory_order_relaxed);
+}
+
+// Block size for an exact block of either kind.
+size_t BlockSizeLocked(void *ptr) {
+  const auto direct = FindDirectBlockLocked(ptr);
+  return direct != g_directBlocks.end() ? direct->size : tlsf_block_size(ptr);
+}
+
 bool IsExactAllocatedBlockLocked(void *ptr) {
   if (!ptr)
     return false;
   if (InRange(ptr, g_mainPool, kInitialPoolSize))
     return tlsf_block_is_valid_in_range(ptr, g_mainPool,
                                         kInitialPoolSize) != 0;
+  if (IsDirectBlockLocked(ptr))
+    return true;
   const auto owner = FindExtraPoolLocked(ptr);
   return owner != g_extraPools.end() &&
          tlsf_block_is_valid_in_range(ptr, owner->base, owner->size) != 0;
@@ -270,6 +372,10 @@ void *AllocWithExtendLocked(size_t size, size_t align) {
   // 扩展后重试
   if (g_totalSize.load(std::memory_order_relaxed) >= kMaxPoolSize)
     return nullptr;
+
+  // 超大请求不开专用扩展池：单独成块，释放即归还。
+  if (size > kDirectBlockThreshold && effectiveAlignment <= kAddressPageSize)
+    return AllocDirectBlockLocked(size);
 
   constexpr size_t kGrowthSlack = 64 * 1024;
   const size_t allocationAlignment = align ? align : tlsf_align_size();
@@ -377,6 +483,13 @@ void TlsfPool_Shutdown() {
       VirtualFree(ep.base, 0, MEM_RELEASE);
   }
   g_extraPools.clear();
+  for (auto &db : g_directBlocks) {
+    UnregisterAddressRangeLocked(db.base, db.size);
+    VirtualFree(db.base, 0, MEM_RELEASE);
+  }
+  g_directBlocks.clear();
+  g_directLiveBlocks.store(0u, std::memory_order_relaxed);
+  g_directLiveBytes.store(0u, std::memory_order_relaxed);
   for (auto &ab : g_arenaBlocks) {
     if (ab.base)
       VirtualFree(ab.base, 0, MEM_RELEASE);
@@ -408,11 +521,11 @@ void *TlsfPool_Alloc(size_t size) {
     std::lock_guard<sync::Spinlock> lock(g_poolLock);
     ptr = AllocWithExtendLocked(size, 0);
     if (ptr)
-      blockSize = tlsf_block_size(ptr);
+      blockSize = BlockSizeLocked(ptr);
   } else {
     ptr = AllocWithExtendLocked(size, 0);
     if (ptr)
-      blockSize = tlsf_block_size(ptr);
+      blockSize = BlockSizeLocked(ptr);
   }
 
   if (ptr) {
@@ -443,11 +556,11 @@ void *TlsfPool_AllocAligned(size_t size, size_t alignment) {
     std::lock_guard<sync::Spinlock> lock(g_poolLock);
     ptr = AllocWithExtendLocked(size, alignment);
     if (ptr)
-      blockSize = tlsf_block_size(ptr);
+      blockSize = BlockSizeLocked(ptr);
   } else {
     ptr = AllocWithExtendLocked(size, alignment);
     if (ptr)
-      blockSize = tlsf_block_size(ptr);
+      blockSize = BlockSizeLocked(ptr);
   }
 
   if (ptr) {
@@ -474,10 +587,28 @@ void *TlsfPool_Realloc(void *ptr, size_t newSize) {
   size_t newBlockSize = 0;
   void *newPtr = nullptr;
 
+  // A direct block stays in place while the new size fits; otherwise it
+  // moves (to a pool or a new direct block) and its range is released.
+  const auto reallocDirectLocked = [&]() -> void * {
+    const size_t directSize = FindDirectBlockLocked(ptr)->size;
+    if (newSize <= directSize)
+      return ptr;
+    void *moved = AllocWithExtendLocked(newSize, 0);
+    if (!moved)
+      return nullptr;
+    std::memcpy(moved, ptr, directSize);
+    ApplyUsedSizeDelta(directSize, BlockSizeLocked(moved));
+    // AllocWithExtendLocked may have inserted a direct block: find it again.
+    ReleaseDirectBlockLocked(FindDirectBlockLocked(ptr));
+    return moved;
+  };
+
   if (g_lockEnabled.load(std::memory_order_acquire)) {
     std::lock_guard<sync::Spinlock> lock(g_poolLock);
     if (!IsExactAllocatedBlockLocked(ptr))
       return nullptr;
+    if (IsDirectBlockLocked(ptr))
+      return reallocDirectLocked();
     const auto oldPool = FindExtraPoolLocked(ptr);
     void *oldPoolBase =
         oldPool != g_extraPools.end() ? oldPool->base : nullptr;
@@ -492,6 +623,8 @@ void *TlsfPool_Realloc(void *ptr, size_t newSize) {
   } else {
     if (!IsExactAllocatedBlockLocked(ptr))
       return nullptr;
+    if (IsDirectBlockLocked(ptr))
+      return reallocDirectLocked();
     oldSize = tlsf_block_size(ptr);
     newPtr = tlsf_realloc(g_tlsf, ptr, newSize);
     if (newPtr) {
@@ -511,21 +644,30 @@ void *TlsfPool_ReallocInPlace(void *ptr, size_t newSize) {
   size_t oldSize = 0;
   size_t newBlockSize = 0;
   void *result = nullptr;
+  // A direct block resizes in place within its committed range (its size,
+  // and so the used-size accounting, does not change); beyond it, the
+  // caller moves the block.
+  const auto reallocInPlaceLocked = [&]() -> void * {
+    const auto direct = FindDirectBlockLocked(ptr);
+    if (direct != g_directBlocks.end()) {
+      oldSize = newBlockSize = direct->size;
+      return newSize <= direct->size ? ptr : nullptr;
+    }
+    oldSize = tlsf_block_size(ptr);
+    void *resized = tlsf_realloc_in_place(g_tlsf, ptr, newSize);
+    if (resized)
+      newBlockSize = tlsf_block_size(resized);
+    return resized;
+  };
   if (g_lockEnabled.load(std::memory_order_acquire)) {
     std::lock_guard<sync::Spinlock> lock(g_poolLock);
     if (!IsExactAllocatedBlockLocked(ptr))
       return nullptr;
-    oldSize = tlsf_block_size(ptr);
-    result = tlsf_realloc_in_place(g_tlsf, ptr, newSize);
-    if (result)
-      newBlockSize = tlsf_block_size(result);
+    result = reallocInPlaceLocked();
   } else {
     if (!IsExactAllocatedBlockLocked(ptr))
       return nullptr;
-    oldSize = tlsf_block_size(ptr);
-    result = tlsf_realloc_in_place(g_tlsf, ptr, newSize);
-    if (result)
-      newBlockSize = tlsf_block_size(result);
+    result = reallocInPlaceLocked();
   }
 
   if (result) {
@@ -547,25 +689,41 @@ bool TlsfPool_Free(void *ptr) {
 
   size_t blockSize = 0;
 
+  // A direct block gives its whole range back to the system.
+  const auto freeDirectLocked = [&]() {
+    const auto direct = FindDirectBlockLocked(ptr);
+    blockSize = direct->size;
+    ReleaseDirectBlockLocked(direct);
+    g_usedSize.fetch_sub(blockSize, std::memory_order_relaxed);
+  };
+
   if (g_lockEnabled.load(std::memory_order_acquire)) {
     std::lock_guard<sync::Spinlock> lock(g_poolLock);
     if (!IsExactAllocatedBlockLocked(ptr))
       return false;
-    const auto owner = FindExtraPoolLocked(ptr);
-    void *ownerBase = owner != g_extraPools.end() ? owner->base : nullptr;
-    blockSize = tlsf_block_size(ptr);
-    tlsf_free(g_tlsf, ptr);
-    if (blockSize)
-      g_usedSize.fetch_sub(blockSize, std::memory_order_relaxed);
-    if (ownerBase)
-      RemoveEmptyExtraPoolLocked(ownerBase);
+    if (IsDirectBlockLocked(ptr)) {
+      freeDirectLocked();
+    } else {
+      const auto owner = FindExtraPoolLocked(ptr);
+      void *ownerBase = owner != g_extraPools.end() ? owner->base : nullptr;
+      blockSize = tlsf_block_size(ptr);
+      tlsf_free(g_tlsf, ptr);
+      if (blockSize)
+        g_usedSize.fetch_sub(blockSize, std::memory_order_relaxed);
+      if (ownerBase)
+        RemoveEmptyExtraPoolLocked(ownerBase);
+    }
   } else {
     if (!IsExactAllocatedBlockLocked(ptr))
       return false;
-    blockSize = tlsf_block_size(ptr);
-    tlsf_free(g_tlsf, ptr);
-    if (blockSize)
-      g_usedSize.fetch_sub(blockSize, std::memory_order_relaxed);
+    if (IsDirectBlockLocked(ptr)) {
+      freeDirectLocked();
+    } else {
+      blockSize = tlsf_block_size(ptr);
+      tlsf_free(g_tlsf, ptr);
+      if (blockSize)
+        g_usedSize.fetch_sub(blockSize, std::memory_order_relaxed);
+    }
   }
 
   g_freeCount.fetch_add(1, std::memory_order_relaxed);
@@ -599,9 +757,9 @@ size_t TlsfPool_BlockSize(void *ptr) {
     return 0;
   if (g_lockEnabled.load(std::memory_order_acquire)) {
     std::lock_guard<sync::Spinlock> lock(g_poolLock);
-    return IsExactAllocatedBlockLocked(ptr) ? tlsf_block_size(ptr) : 0u;
+    return IsExactAllocatedBlockLocked(ptr) ? BlockSizeLocked(ptr) : 0u;
   }
-  return IsExactAllocatedBlockLocked(ptr) ? tlsf_block_size(ptr) : 0u;
+  return IsExactAllocatedBlockLocked(ptr) ? BlockSizeLocked(ptr) : 0u;
 }
 
 // ---- Arena 预留 ----
@@ -675,16 +833,21 @@ TlsfPoolStats TlsfPool_GetStats() {
   s.freeCount = g_freeCount.load(std::memory_order_relaxed);
   s.extendCount = g_extendCount.load(std::memory_order_relaxed);
   s.trimCount = g_trimCount.load(std::memory_order_relaxed);
+  s.directBlocks = g_directLiveBlocks.load(std::memory_order_relaxed);
+  s.directBytes = g_directLiveBytes.load(std::memory_order_relaxed);
+  s.directAllocCount = g_directAllocCount.load(std::memory_order_relaxed);
   return s;
 }
 
 void TlsfPool_PrintStats() {
   auto s = TlsfPool_GetStats();
   war3dbg::Print("DXVK War3[TlsfPool]: 总=%zuMB 用=%zuMB 峰值=%zuMB 空闲=%zuMB "
-                 "alloc=%zu free=%zu extend=%zu trim=%zu\n",
+                 "alloc=%zu free=%zu extend=%zu trim=%zu "
+                 "direct=%zu(%zuMB) directAlloc=%zu\n",
                  s.totalSize >> 20, s.usedSize >> 20, s.peakUsed >> 20,
                  s.freeSize >> 20, s.allocCount, s.freeCount, s.extendCount,
-                 s.trimCount);
+                 s.trimCount, s.directBlocks, s.directBytes >> 20,
+                 s.directAllocCount);
 }
 
 // ---- 线程安全控制 ----

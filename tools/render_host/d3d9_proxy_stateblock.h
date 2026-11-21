@@ -103,7 +103,15 @@ HRESULT Device::apply(const CapturedState& s) {
   for(unsigned shader=0;shader<2;++shader)for(unsigned i=0;i<32;++i)if(s.constantMask[shader][i])
     std::copy_n(s.constants[shader].data()+i*4,4,(shader?draw.pixelFloatConstants:draw.vertexFloatConstants).data()+i*4);
   if(s.materialMask)fixed.material=s.fixed.material;
-  if(s.viewportMask)draw.viewport=s.viewport;
+  // A viewport is checked against the target when it is set, and the target
+  // may have changed since the block took it: the window's own resize keeps
+  // state blocks alive, and Apply follows the window before it comes here (an
+  // overlay's save/draw/restore block around a resize does exactly this). A
+  // viewport that no longer fits describes a target that is gone; the current
+  // one, which the resize set to the whole new target, stays. Restoring it
+  // would hand the host a clear or a draw it must refuse.
+  if(s.viewportMask&&s.viewport.X<=width&&s.viewport.Y<=height
+    &&s.viewport.Width<=width-s.viewport.X&&s.viewport.Height<=height-s.viewport.Y)draw.viewport=s.viewport;
   if(s.scissorMask)effects.scissor={s.scissor.left,s.scissor.top,s.scissor.right,s.scissor.bottom};
   if(s.vbMask){const auto hr=SetStreamSource(0,s.vb,s.offset,s.stride);if(!accept(hr))return hr;}
   if(s.ibMask){const auto hr=SetIndices(s.ib);if(!accept(hr))return hr;}

@@ -365,17 +365,36 @@ void ExerciseTextureLevels(Owner& o) {
 // written out here rather than taken from the production header.
 bool annotationsRun=false;
 unsigned annotationDraws=0,annotatedDraws=0,annotationScenes=0,annotationStages=0,annotationRefusals=0;
+unsigned annotationRemoteRefusals=0,annotationResetRequests=0,annotationRecords=0;
+// Content payloads through the same exports (d3d9_content_wire.h).
+unsigned contentUploads=0,contentChunks=0,contentReleases=0,contentReads=0,contentRefs=0,contentRefusals=0;
+uint64_t contentBytes=0,contentReadBytes=0;
 uint64_t annotationDigest=FnvOffset;
 void ExerciseAnnotations(Owner& o) {
   if(o.options.reference)return;
   o.stage="data-layer-annotations";
   using RecordFn=HRESULT(WINAPI*)(IDirect3DDevice9*,UINT,const void*,UINT);
   using StageFn=HRESULT(WINAPI*)(IDirect3DDevice9*,UINT);
+  using ResetFn=HRESULT(WINAPI*)(IDirect3DDevice9*,UINT,UINT,UINT);
   const auto annotate=reinterpret_cast<RecordFn>(GetProcAddress(o.renderer,"WarVKD3D9AnnotateNextDraw"));
   const auto scene=reinterpret_cast<RecordFn>(GetProcAddress(o.renderer,"WarVKD3D9SetFrameScene"));
   const auto mark=reinterpret_cast<StageFn>(GetProcAddress(o.renderer,"WarVKD3D9MarkStage"));
-  Require(annotate&&scene&&mark,"annotation exports");
-  constexpr UINT DrawTag=1,FrameCamera=2,WorldBegin=1,BeforeUi=2,FrameEnd=4;
+  const auto sessionReset=reinterpret_cast<ResetFn>(GetProcAddress(o.renderer,"WarVKD3D9RequestSessionReset"));
+  Require(annotate&&scene&&mark&&sessionReset,"annotation exports");
+  using UploadFn=HRESULT(WINAPI*)(IDirect3DDevice9*,UINT,UINT,UINT,const void*,UINT,UINT64*);
+  using ReleaseFn=HRESULT(WINAPI*)(IDirect3DDevice9*,UINT,UINT,UINT,UINT);
+  using ReadFn=HRESULT(WINAPI*)(IDirect3DDevice9*,UINT,UINT,UINT,UINT,UINT,void*,UINT);
+  const auto upload=reinterpret_cast<UploadFn>(GetProcAddress(o.renderer,"WarVKD3D9UploadContent"));
+  const auto release=reinterpret_cast<ReleaseFn>(GetProcAddress(o.renderer,"WarVKD3D9ReleaseContent"));
+  const auto read=reinterpret_cast<ReadFn>(GetProcAddress(o.renderer,"WarVKD3D9ReadContent"));
+  Require(upload&&release&&read,"content exports");
+  constexpr UINT Geometry=1,BoneMatrices=2,GeometryRef=3,BonesRef=4,MeshLow=0x51,MeshHigh=7,PaletteLow=0x52,PaletteHigh=9;
+  auto contentRefused=[&](HRESULT hr,const char* what){Require(hr==D3DERR_INVALIDCALL,what);++contentRefusals;};
+  std::vector<uint8_t> mesh(150000),smaller(40);std::array<float,24> matrices{};UINT64 revision=77;
+  for(size_t i=0;i<mesh.size();++i)mesh[i]=uint8_t(i*5+1);
+  for(size_t i=0;i<smaller.size();++i)smaller[i]=uint8_t(90+i);
+  for(size_t i=0;i<matrices.size();++i)matrices[i]=float(i)*.125f-1;
+  constexpr UINT DrawTag=1,FrameCamera=2,WorldBegin=1,BeforeUi=2,FrameEnd=4,WorldSceneEnter=5,WorldSceneExit=6;
   auto refused=[&](HRESULT hr,const char* what){Require(hr==D3DERR_INVALIDCALL,what);++annotationRefusals;};
   std::array<uint32_t,40> camera{}; // view, projection, viewport, depth range, frame, game time
   auto bits=[](float v){uint32_t u;std::memcpy(&u,&v,4);return u;};
@@ -389,6 +408,11 @@ void ExerciseAnnotations(Owner& o) {
     refused(annotate(o.device.get(),DrawTag,tag.data(),16),"annotation without negotiation");
     refused(scene(o.device.get(),FrameCamera,camera.data(),sizeof(camera)),"scene without negotiation");
     refused(mark(o.device.get(),WorldBegin),"stage without negotiation");
+    refused(sessionReset(o.device.get(),1,1,0),"session reset without negotiation");
+    contentRefused(upload(o.device.get(),Geometry,MeshLow,MeshHigh,mesh.data(),40,&revision),"content upload without negotiation");
+    contentRefused(release(o.device.get(),MeshLow,MeshHigh,1,0),"content release without negotiation");
+    contentRefused(read(o.device.get(),MeshLow,MeshHigh,1,0,0,smaller.data(),8),"content read without negotiation");
+    Require(revision==77,"refused upload wrote a revision");
     return;
   }
   auto word=[&](uint32_t v){annotationDigest=Hash(&v,4,annotationDigest);};
@@ -399,7 +423,14 @@ void ExerciseAnnotations(Owner& o) {
   refused(scene(o.device.get(),DrawTag,camera.data(),sizeof(camera)),"scene schema accepted");
   refused(scene(o.device.get(),FrameCamera,camera.data(),sizeof(camera)-4),"scene size accepted");
   {auto nan=camera;nan[3]=0x7fc00000u;refused(scene(o.device.get(),FrameCamera,nan.data(),sizeof(nan)),"NaN scene accepted");}
-  refused(mark(o.device.get(),0),"stage 0 accepted");refused(mark(o.device.get(),FrameEnd+1),"stage past FrameEnd accepted");
+  refused(mark(o.device.get(),0),"stage 0 accepted");refused(mark(o.device.get(),WorldSceneExit+1),"stage past WorldSceneExit accepted");
+  // A session reset request is checked here and sent only ahead of a Present,
+  // which this offscreen fixture never issues: one request, nothing delivered.
+  refused(sessionReset(o.device.get(),0,1,0),"session reset reason 0 accepted");
+  refused(sessionReset(o.device.get(),3,1,0),"session reset reason 3 accepted");
+  refused(sessionReset(o.device.get(),1,0,0),"session reset generation 0 accepted");
+  Check(sessionReset(o.device.get(),1,7,0),"session reset request");++annotationResetRequests;
+  refused(sessionReset(o.device.get(),2,7,0),"repeated session generation accepted");
   refused(annotate(o.device.get(),FrameCamera,tag.data(),16),"draw record schema accepted");
   refused(annotate(o.device.get(),DrawTag,tag.data(),12),"draw record size accepted");
   refused(annotate(o.device.get(),DrawTag,nullptr,16),"draw record without data accepted");
@@ -412,7 +443,12 @@ void ExerciseAnnotations(Owner& o) {
   Check(o.device->CreateVertexBuffer(sizeof(vertices),D3DUSAGE_WRITEONLY,D3DFVF_XYZRHW|D3DFVF_DIFFUSE|D3DFVF_TEX1,D3DPOOL_DEFAULT,vb.put(),nullptr),"annotation VB");
   void* data=nullptr;Check(vb->Lock(0,0,&data,0),"annotation VB lock");std::memcpy(data,vertices.data(),sizeof(vertices));Check(vb->Unlock(),"annotation VB upload");
   Check(o.device->SetStreamSource(0,vb.get(),0,sizeof(Screen)),"annotation stream");
+  // The host, not the proxy, knows whether a world scene is open: these two
+  // refusals travel and come back, and leave its recorder untouched.
+  auto remoteRefused=[&](UINT value,const char* what){Require(mark(o.device.get(),value)==D3DERR_INVALIDCALL,what);++annotationRemoteRefusals;};
   Check(o.device->BeginScene(),"annotation begin");stage(WorldBegin);
+  remoteRefused(WorldSceneExit,"world scene exit without enter accepted");
+  stage(WorldSceneEnter);remoteRefused(WorldSceneEnter,"nested world scene accepted");
   // A refused draw drops its records rather than lending them to the next.
   tagFor(99);Check(annotate(o.device.get(),DrawTag,tag.data(),16),"record for a refused draw");
   Require(o.device->DrawPrimitive(D3DPT_TRIANGLELIST,0,0)==D3DERR_INVALIDCALL,"empty draw accepted");
@@ -420,16 +456,70 @@ void ExerciseAnnotations(Owner& o) {
   // Draw 5 carries none; BeforeUi splits the draws into two batches.
   constexpr std::array<std::array<UINT,2>,8> shapes{{{0,1},{3,2},{9,1},{0,3},{12,4},{6,1},{15,3},{21,1}}};
   for(unsigned i=0;i<shapes.size();++i) {
-    if(i==4)stage(BeforeUi);
+    if(i==4){stage(WorldSceneExit);stage(BeforeUi);}
     const UINT start=shapes[i][0],primitives=shapes[i][1];
     if(i!=5) {
       tagFor(i);Check(annotate(o.device.get(),DrawTag,tag.data(),16),"annotate next draw");
       if(!i)refused(annotate(o.device.get(),DrawTag,tag.data(),16),"repeated record schema accepted");
       word(1);word(DrawTag);word(16);annotationDigest=Hash(tag.data(),16,annotationDigest);
-      word(D3DPT_TRIANGLELIST);word(primitives);word(primitives*3);word(start);++annotatedDraws;
+      word(D3DPT_TRIANGLELIST);word(primitives);word(primitives*3);word(start);++annotatedDraws;++annotationRecords;
     }
     Check(o.device->DrawPrimitive(D3DPT_TRIANGLELIST,start,primitives),"annotated draw");++annotationDraws;
   }
+  // Content payloads: a blob is uploaded once under the data layer's own key
+  // and draws name {key, revision}. Refusals here are local: nothing is sent.
+  std::array<uint8_t,16> named{};
+  auto nameBlob=[&](UINT low,UINT high,UINT64 rev){std::memcpy(named.data(),&low,4);std::memcpy(named.data()+4,&high,4);std::memcpy(named.data()+8,&rev,8);};
+  auto foldBlob=[&](UINT kind,UINT low,UINT high,UINT64 rev,const void* bytes,UINT size){
+    word(5);word(kind);word(low);word(high);word(uint32_t(rev));word(uint32_t(rev>>32));word(size);
+    annotationDigest=Hash(bytes,size,annotationDigest);++contentUploads;contentBytes+=size;contentChunks+=(size+65407)/65408;};
+  // One record of the next draw, folded as the host will deliver it.
+  auto record=[&](UINT schema,const std::array<uint8_t,16>& payload,UINT start,UINT primitives){
+    Check(annotate(o.device.get(),schema,payload.data(),16),"content draw record");
+    word(1);word(schema);word(16);annotationDigest=Hash(payload.data(),16,annotationDigest);
+    word(D3DPT_TRIANGLELIST);word(primitives);word(primitives*3);word(start);++annotationRecords;if(schema!=DrawTag)++contentRefs;};
+  auto contentDraw=[&](UINT start,UINT primitives){
+    Check(o.device->DrawPrimitive(D3DPT_TRIANGLELIST,start,primitives),"content draw");++annotationDraws;++annotatedDraws;};
+  auto nonfinite=matrices;{const uint32_t infinity=0x7f800000u;std::memcpy(&nonfinite[5],&infinity,4);}
+  contentRefused(upload(o.device.get(),0,MeshLow,MeshHigh,mesh.data(),40,&revision),"content kind 0 accepted");
+  contentRefused(upload(o.device.get(),Geometry,0,0,mesh.data(),40,&revision),"content key 0 accepted");
+  contentRefused(upload(o.device.get(),Geometry,MeshLow,MeshHigh,mesh.data(),0,&revision),"empty content accepted");
+  contentRefused(upload(o.device.get(),Geometry,MeshLow,MeshHigh,nullptr,40,&revision),"content without data accepted");
+  contentRefused(upload(o.device.get(),Geometry,MeshLow,MeshHigh,mesh.data(),40,nullptr),"content without a revision slot accepted");
+  contentRefused(upload(o.device.get(),BoneMatrices,PaletteLow,PaletteHigh,nonfinite.data(),96,&revision),"nonfinite bone matrices accepted");
+  contentRefused(upload(o.device.get(),BoneMatrices,PaletteLow,PaletteHigh,matrices.data(),94,&revision),"partial bone float accepted");
+  contentRefused(release(o.device.get(),MeshLow,MeshHigh,1,0),"release of unknown content accepted");
+  contentRefused(read(o.device.get(),MeshLow,MeshHigh,1,0,0,smaller.data(),8),"read of unknown content accepted");
+  nameBlob(MeshLow,MeshHigh,1);
+  contentRefused(annotate(o.device.get(),GeometryRef,named.data(),16),"reference to unknown content accepted");
+  contentRefused(annotate(o.device.get(),GeometryRef,named.data(),12),"short content reference accepted");
+  Require(revision==77,"refused upload wrote a revision");
+  Check(upload(o.device.get(),Geometry,MeshLow,MeshHigh,mesh.data(),UINT(mesh.size()),&revision),"geometry upload");
+  Require(revision==1,"first content revision");foldBlob(Geometry,MeshLow,MeshHigh,1,mesh.data(),UINT(mesh.size()));
+  Check(upload(o.device.get(),BoneMatrices,PaletteLow,PaletteHigh,matrices.data(),96,&revision),"bone upload");
+  Require(revision==2,"second content revision");foldBlob(BoneMatrices,PaletteLow,PaletteHigh,2,matrices.data(),96);
+  nameBlob(MeshLow,MeshHigh,1);
+  contentRefused(annotate(o.device.get(),BonesRef,named.data(),16),"geometry named as bones accepted");
+  // A tagged draw naming both blobs, then one naming the geometry alone.
+  tagFor(40);record(DrawTag,tag,0,2);nameBlob(MeshLow,MeshHigh,1);record(GeometryRef,named,0,2);
+  nameBlob(PaletteLow,PaletteHigh,2);record(BonesRef,named,0,2);contentDraw(0,2);
+  nameBlob(MeshLow,MeshHigh,1);record(GeometryRef,named,3,1);contentDraw(3,1);
+  // The host's copy is the only one: read part of it back.
+  {
+    std::array<uint8_t,8> back{};Check(read(o.device.get(),PaletteLow,PaletteHigh,2,0,4,back.data(),8),"content read");
+    Require(!std::memcmp(back.data(),reinterpret_cast<const uint8_t*>(matrices.data())+4,8),"content read bytes");
+    ++contentReads;contentReadBytes+=8;
+    contentRefused(read(o.device.get(),PaletteLow,PaletteHigh,2,0,90,back.data(),8),"content read past the end accepted");
+  }
+  // A replacement takes a new revision; the old one names nothing.
+  Check(upload(o.device.get(),Geometry,MeshLow,MeshHigh,smaller.data(),UINT(smaller.size()),&revision),"geometry replacement");
+  Require(revision==3,"replacement revision");foldBlob(Geometry,MeshLow,MeshHigh,3,smaller.data(),UINT(smaller.size()));
+  nameBlob(MeshLow,MeshHigh,1);contentRefused(annotate(o.device.get(),GeometryRef,named.data(),16),"replaced revision accepted");
+  nameBlob(MeshLow,MeshHigh,3);record(GeometryRef,named,6,1);contentDraw(6,1);
+  Check(release(o.device.get(),PaletteLow,PaletteHigh,2,0),"content release");
+  word(6);word(PaletteLow);word(PaletteHigh);word(2);word(0);++contentReleases;
+  nameBlob(PaletteLow,PaletteHigh,2);contentRefused(annotate(o.device.get(),BonesRef,named.data(),16),"released content accepted");
+  contentRefused(release(o.device.get(),PaletteLow,PaletteHigh,2,0),"second release accepted");
   Check(o.device->EndScene(),"annotation end");stage(FrameEnd);
   Check(o.device->SetStreamSource(0,o.vb.get(),0,sizeof(Screen)),"restore texture-level stream");
 }
@@ -460,8 +550,13 @@ int wmain(int argc,wchar_t** argv) {
     std::printf("{\"schema\":\"warvk-d3d9-factory-clear/v1\",\"ok\":true,\"factoryChecks\":%u,\"clearCases\":%u,\"fixedCases\":%u,\"vertexInputChecks\":%u,\"fixedStateChecks\":%u,\"topologyCases\":%u,\"lineImages\":%u,\"textureCases\":%u,\"pixelChecks\":%u,\"pixelHash\":\"%016llx\",\"normalTeardown\":true,\"memoryMeasured\":false}\n",factoryChecks,clearCases,fixedCases,vertexInputChecks,fixedStateChecks,topologyCases,lineImages,textureCases,pixelChecks,clearHash);
     if(!owner->options.reference)
       std::printf("{\"schema\":\"warvk-d3d9-annotation-fixture/v1\",\"annotate\":%s,\"draws\":%u,\"annotatedDraws\":%u,\"frameScenes\":%u,"
-        "\"stageMarkers\":%u,\"localRefusals\":%u,\"digest\":\"%016llx\"}\n",JsonBool(annotationsRun),annotationDraws,annotatedDraws,
-        annotationScenes,annotationStages,annotationRefusals,(unsigned long long)annotationDigest);
+        "\"stageMarkers\":%u,\"localRefusals\":%u,\"remoteRefusals\":%u,\"sessionResetRequests\":%u,\"records\":%u,"
+        "\"contentUploads\":%u,\"contentChunks\":%u,\"contentBytes\":%llu,\"contentReleases\":%u,\"contentReads\":%u,"
+        "\"contentReadBytes\":%llu,\"contentRefs\":%u,\"contentRefusals\":%u,\"digest\":\"%016llx\"}\n",
+        JsonBool(annotationsRun),annotationDraws,annotatedDraws,annotationScenes,annotationStages,annotationRefusals,
+        annotationRemoteRefusals,annotationResetRequests,annotationRecords,contentUploads,contentChunks,
+        (unsigned long long)contentBytes,contentReleases,contentReads,(unsigned long long)contentReadBytes,contentRefs,
+        contentRefusals,(unsigned long long)annotationDigest);
     std::printf("FORMAT_SURFACE_EVIDENCE formats=%u surfaces=%u\n",formatCases,surfaceChecks);
     Require(formatCases==16&&surfaceChecks==16*19,"format/surface coverage");
     std::printf("SAMPLER_EVIDENCE images=%u\n",samplerCases);Require(samplerCases==18,"sampler coverage");

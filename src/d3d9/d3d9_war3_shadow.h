@@ -1,7 +1,10 @@
 #pragma once
 
+#include "war3/effects/war3_shadow_scene.h"
+
 #include "d3d9_war3_pipeline.h"
 #include "d3d9_war3_csm.h"
+#include "war3/effects/war3_sun_cycle.h"
 #include "war3/render/war3_outline_mask_layout.h"
 #include "war3/render/war3_gpu_workload_governor.h"
 #include "war3/render/war3_point_shadow_cpu_plan.h"
@@ -272,9 +275,36 @@ namespace dxvk {
     void PublishPointShadowPersistentDiagnostics(
         const PointShadowPersistentDiagnostics& diagnostics);
 
+    // The caster vertex shader's declared inputs that a draw does not feed
+    // alias its position attribute (d3d9_war3_shadow.cpp). The caster, outline
+    // mask and unit outline pipelines all run that input layout.
+    void War3AliasUnusedShadowCasterInputs(
+        std::array<VkVertexInputAttributeDescription, 4>& attributes,
+        uint32_t& attributeCount);
+
     class War3ShadowReceiverPass final : public War3RenderPass {
     public:
+#ifdef _WIN64
+        const war3::effects::scene::CasterCascadeFootprints& proxyFootprints() const { return m_proxyFootprints; }
+        // Six timestamps: directional layers, visibility, fullscreen receiver.
+        using TimestampProc = void (*)(void*, const Rc<DxvkCommandList>&, unsigned);
+        void setProxyTimestampWriter(void* owner, TimestampProc proc) {
+          m_timestampOwner = owner;
+          m_timestampProc = proc;
+        }
+        auto& proxyOmittedParts() { return m_omittedParts; }
+        float proxyAdmissionBase(war3::effects::scene::CasterClass cls,
+                war3::effects::scene::CasterPartBase part) const {
+          return size_t(cls) < m_heightScales.size() && m_heightScales[size_t(cls)] < 1
+              ? std::min(part.origin, m_objectBases.resolve(part, war3::effects::scene::CasterBasePrefersOrigin(cls)))
+              : war3::effects::scene::CasterPartBase::unknown;
+        }
+        void setProxyExactCull(bool enabled) { m_proxyExactCull = enabled; }
+#endif
         explicit War3ShadowReceiverPass(D3D9DeviceEx* device);
+        // x64 migration 4c: the pass needs only the DXVK device. The x64 render
+        // host, which has no D3D9DeviceEx, constructs it through this overload.
+        explicit War3ShadowReceiverPass(const Rc<DxvkDevice>& device);
         ~War3ShadowReceiverPass();
 
         War3InsertionPoint Point() const override { return War3InsertionPoint::BeforeUi; }
@@ -283,6 +313,10 @@ namespace dxvk {
         // point-shadow images remain cached and may be reused by the new map
         // after fresh content has been rendered.
         void InvalidateMapEpoch(uint64_t mapEpoch, uint64_t deviceEpoch);
+        // The storage of every image and buffer this pass owns: what an
+        // executor's memory account charges to shadows. On the thread that
+        // runs the pass, or with that thread idle.
+        uint64_t ResourceBytes() const;
         
         Rc<DxvkSampler> getFallbackSampler(bool useMip, float mipLodBias);
         bool GetVolumetricShadowSnapshot(uint64_t expectedFrameSerial,
@@ -306,12 +340,46 @@ namespace dxvk {
             War3VolumetricPointShadowSnapshot& outSnapshot) const;
         uint32_t GetShadowSamplerIndex() const;
 
+        // The water of the frame, after Run (x64 render host: the water draws
+        // arrive as records; in process there are none and valid stays false).
+        // Every view is readable by fragment shaders when Run returns.
+        struct WaterFrame {
+          // Water was drawn this frame and its surface depth rendered.
+          bool valid = false;
+          uint32_t drawCount = 0;
+          // VK_FORMAT_D32_SFLOAT, 2D, depth aspect, in
+          // DEPTH_STENCIL_READ_ONLY_OPTIMAL: the nearest water surface's raw
+          // depth on the same pixel grid as sceneDepth; 1.0 without water.
+          Rc<DxvkImageView> waterDepth;
+          // VK_FORMAT_R16G16_SFLOAT, 2D, in GENERAL: x = the sun's visibility
+          // on the water's surface (0 shadowed .. 1 lit), y = the depth of the
+          // water under the surface in world units; (1, 0) without water.
+          Rc<DxvkImageView> waterInfo;
+          // The frame's colour before the shadow receiver and its depth (the
+          // ground under the water), 2D array views, layer 0, sampled.
+          Rc<DxvkImageView> sceneColor;
+          Rc<DxvkImageView> sceneDepth;
+          // As the receiver's uniforms (war3_shadow_receiver.frag): row
+          // vectors, D3D clip space; viewport x, y, w, h in pixels; viewportZ
+          // x = MinZ, y = MaxZ; depthContract x = the far clear's raw depth,
+          // y = 1 when known; sunDir as u_sunDir; sunColor rgb = the sun's
+          // colour times its intensity; ambient rgb.
+          Matrix4 view, proj, invViewProj;
+          Vector4 viewport, viewportZ, depthContract;
+          Vector4 sunDir, sunColor, ambient;
+        };
+        const WaterFrame& waterFrame() const { return m_waterFrame; }
+
         // Phase 7.2: submitted / replay / executed 对账
         // Run() 每帧会刷新这些字段，调用方在 Run() 返回后可读取并写入 War3ShadowCaptureStats
         struct ShadowReconciliationCounters {
           uint32_t shadowCastersCount = 0;
           uint32_t replayDrawsCount = 0;
           uint32_t shadowMapDrawnCasters = 0;
+#ifdef _WIN64
+          std::array<uint32_t, 4> proxyCsmRemoved{};
+          uint32_t proxyComplete = 0, proxyHeld = 0, proxyUnavailable = 0;
+#endif
           uint32_t cascadeCulledCount = 0;
           uint32_t shadowMapPreparedDrawCount = 0;
           uint32_t shadowMapAlphaTestPreparedCount = 0;
@@ -637,6 +705,25 @@ namespace dxvk {
         std::vector<uint32_t> m_shadowDrawIndicesScratch;
         std::vector<uint32_t> m_shadowTerrainMaskDrawIndicesScratch;
 
+        // The water's surface (renderWaterDepth): its depth, what the
+        // receiver found on it, and the frame's snapshot for the water pass.
+        Rc<DxvkImage> m_waterDepth;
+        Rc<DxvkImageView> m_waterDepthView;           // sampled
+        Rc<DxvkImageView> m_waterDepthAttachmentView; // rendered into
+        Rc<DxvkImage> m_waterInfo;
+        Rc<DxvkImageView> m_waterInfoView;        // sampled: the water pass
+        Rc<DxvkImageView> m_waterInfoStorageView; // storage: the receiver writes
+        war3::render::War3OwnedImageLayoutState m_waterDepthLayoutState;
+        war3::render::War3OwnedImageLayoutState m_waterInfoLayoutState;
+        const DxvkPipelineLayout* m_waterDepthLayout = nullptr;
+        std::unordered_map<uint64_t, Rc<war3::render::War3TrackedVkPipeline>> m_waterDepthPipelines;
+        WaterFrame m_waterFrame;
+        void ensureWaterResources(VkExtent3D extent);
+        Rc<war3::render::War3TrackedVkPipeline> getWaterDepthPipeline(const War3ShadowCasterDraw& draw);
+        bool renderWaterDepth(const Rc<DxvkCommandList>& ctx, const War3PipelineInput& input,
+                              const War3WorldCameraState& camera, const War3RenderSettings& settings);
+        void publishWaterInfo(const Rc<DxvkCommandList>& ctx);
+
         // VS-S1 跨帧累计账本；Run() 的 per-frame reconciliation 只发布快照，
         // 不得把 clean-pair 所需的单调累计值清零。
         uint64_t m_gpuSkinVsShadowDirectAttempts = 0u;
@@ -889,6 +976,28 @@ namespace dxvk {
         float m_volumeSunReceiverBias = 0.0001f;
         // renderShadowMap 临时路径：跳过 terrain mask、使用 volume 目标
         bool m_volumeSunRenderPathActive = false;
+        War3CasterClasses m_directionalClasses{};
+        std::array<float, 5> m_heightScales{1, 1, 1, 1, 1};
+        war3::effects::scene::CasterBases m_objectBases;
+        struct CasterTransform { float k, z0; bool cast; };
+        std::vector<CasterTransform> m_casterTransforms;
+#ifdef _WIN64
+        std::vector<war3::effects::scene::OmittedCasterPart> m_omittedParts;
+        std::vector<war3::effects::scene::CasterBox> m_omittedFootprints;
+#endif
+#ifdef _WIN64
+        void proxyTimestamp(const Rc<DxvkCommandList>& list, unsigned index) {
+          if (m_timestampProc) m_timestampProc(m_timestampOwner, list, index);
+        }
+        void* m_timestampOwner = nullptr;
+        TimestampProc m_timestampProc = nullptr;
+        bool m_proxyExactCull = false;
+        war3::effects::scene::CasterCascadeFootprints m_proxyFootprints;
+        war3::effects::scene::CasterLayerPublication m_proxyLayers;
+        uint32_t m_proxyWriteMask = 0xf, m_proxyAvailable = 0, m_proxyHeld = 0;
+        bool m_proxyPartial = false;
+        bool m_proxySubsetProven = false;
+#endif
         
         // [NEW] Point Light Cube Shadow Map
         static constexpr uint32_t kMaxPointShadowLights = 4;  // 限制投射阴影的点光源数量
@@ -1062,31 +1171,14 @@ namespace dxvk {
         
         // 日夜循环状态（只在 worldCamera.valid 时初始化）
         bool m_timeInitialized = false;
-        std::chrono::steady_clock::time_point m_timeStart;
+        // 时间平滑、太阳轨迹与主光源（war3/effects/war3_sun_cycle.h）。
+        War3SunCycle m_sunCycle;
 
         // 上一帧相机矩阵（用于 motion vector / Shadow TAA 重投影）
         Matrix4 m_prevViewMatrix;
         Matrix4 m_prevProjMatrix;
         Matrix4 m_prevViewProj;
         bool m_hasPrevFrameData = false;
-
-        // 时间平滑：将 JASS/Hook 侧“台阶式”的 TIME_OF_DAY 变为逐帧连续值
-        // 说明：Hook 侧通常 100ms 更新一次 TIME_OF_DAY，会导致太阳方向/CSM 以 10Hz 抖动。
-        // 这里保持 Hook 采样频率不变，但渲染侧做一个轻量 PLL 平滑（积分 + 误差回正）。
-        bool m_timeSmoothingInitialized = false;
-        float m_time01Smoothed = 0.0f;
-        float m_time01LastRaw = 0.0f;
-        float m_time01Speed = 0.0f;  // time01 每秒变化量（约等于 1 / dayLengthSeconds）
-        std::chrono::steady_clock::time_point m_time01LastUpdate;
-        std::chrono::steady_clock::time_point m_time01LastRawSample;
-
-        // 配置参数 (可根据需求调整或暴露给 Config)
-        float m_dayLengthSeconds = 480.0f;       // 8分钟 = 24小时
-        float m_startTime01 = 0.22f;             // 进游戏起始时间 (0.25=日出, 0.5=正午)
-        
-        // 阴影限制参数
-        float m_minSunAltitudeDeg = 35.0f;       // 最小高度角 (保证阴影不拉太长, ~1.43x)
-        float m_maxSunAltitudeDeg = 55.0f;       // 最大高度角 (防止自阴影过多 0.7x)
 
     public:
         // [事件系统] 日夜阶段定义
@@ -1111,9 +1203,6 @@ namespace dxvk {
         
         // 缓存的 worldUp
         Vector4 m_cachedWorldUp = Vector4(0.0f, 0.0f, 1.0f, 0.0f);  
-
-        // 辅助：从开尔文色温计算 RGB
-        static Vector4 kelvinToRgb(float k);
 
         Pipeline getPipeline(VkFormat format, VkSampleCountFlagBits samples);
         const DxvkPipelineLayout* createPipelineLayout() const;

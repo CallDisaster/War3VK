@@ -5,3 +5,11 @@ EXPORTS
   WarVKD3D9AnnotateNextDraw@16
   WarVKD3D9SetFrameScene@16
   WarVKD3D9MarkStage@8
+  WarVKD3D9RequestSessionReset@16
+  WarVKD3D9UploadContent@28
+  WarVKD3D9ReleaseContent@20
+  WarVKD3D9ReadContent@32
+  WarVKD3D9SetObserver@8
+  WarVKD3D9SetWorldLighting@8
+  WarVKD3D9RetainPrivate@8
+  WarVKD3D9ReleasePrivate@8

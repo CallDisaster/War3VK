@@ -4,8 +4,6 @@
 // #include "../core/war3_file_manager.h" // 已改用 ShaderManager::loadResource
 
 #include <d3dcompiler.h>
-#include "../../../dxso/dxso_module.h"
-#include "../../../dxso/dxso_modinfo.h"
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -424,29 +422,6 @@ namespace dxvk::war3 {
             setError("DXBC 中未找到 SHDR/SHEX 块");
             return false;
         }
-
-        std::string DiagnoseDxsoFailure(D3D9DeviceEx* device, const void* shaderData, size_t shaderSize, const std::string& path, bool isVertex) {
-            if (!device || !shaderData || shaderSize < sizeof(uint32_t))
-                return std::string();
-            const uint32_t token0 = reinterpret_cast<const uint32_t*>(shaderData)[0];
-            const uint32_t headerMask = token0 & 0xFFFF0000u;
-            if (headerMask != 0xFFFF0000u && headerMask != 0xFFFE0000u) {
-                return str::format("DXSO Header 无效 token0=0x", std::hex, token0, std::dec);
-            }
-            try {
-                DxsoModuleInfo moduleInfo;
-                moduleInfo.options = DxsoOptions(device->GetDXVKDevice(),
-                    *device->GetOptions(), device->GetVertexConstantLayout().floatSize());
-                DxsoReader reader(reinterpret_cast<const char*>(shaderData));
-                DxsoModule module(reader);
-                DxsoAnalysisInfo info = module.analyze();
-                const D3D9ConstantLayout& layout = isVertex ? device->GetVertexConstantLayout() : device->GetPixelConstantLayout();
-                module.compile(moduleInfo, path, info, layout);
-            } catch (const DxvkError& e) {
-                return e.message();
-            }
-            return std::string();
-        }
     }
 
     template <typename T>
@@ -608,45 +583,21 @@ namespace dxvk::war3 {
             shaderSize = dxsoDwords.size() * sizeof(uint32_t);
         }
 
-        // DXSO 解析预检（提前捕获具体失败原因）
-        if (shaderData) {
-            try {
-                DxsoReader reader(reinterpret_cast<const char*>(shaderData));
-                DxsoModule module(reader);
-                module.analyze();
-            } catch (const DxvkError& e) {
-                const std::string message = str::format("DXSO 解析失败: ", e.message());
-                Logger::err("War3Material: " + message);
-                setError(message);
-                if (error) error->Release();
-                if (code) code->Release();
-                return false;
-            }
-        }
-
-        // 创建 D3D9 着色器对象
-        if constexpr (std::is_same_v<T, IDirect3DVertexShader9>) {
-            hr = device->CreateVertexShader((DWORD*)shaderData, &outShader);
-        } else {
-            hr = device->CreatePixelShader((DWORD*)shaderData, &outShader);
-        }
+        // DXSO 解析与着色器对象的创建在执行端（IDeviceServices）。
+        std::string createError;
+        war3::IDeviceServices& services = *device;
+        const auto* tokens = reinterpret_cast<const uint32_t*>(shaderData);
+        bool created;
+        if constexpr (std::is_same_v<T, IDirect3DVertexShader9>)
+            created = services.War3CreateMaterialVertexShader(tokens, shaderSize, path, &outShader, &createError);
+        else
+            created = services.War3CreateMaterialPixelShader(tokens, shaderSize, path, &outShader, &createError);
 
         code->Release();
         if (error) error->Release();
 
-        if (FAILED(hr)) {
-            const bool isVS = std::is_same_v<T, IDirect3DVertexShader9>;
-            const std::string stageName = isVS ? "VS" : "PS";
-            const std::string message = str::format(stageName, " 创建失败: 0x", std::hex, hr, " (", path, ")");
-            Logger::err("War3Material: " + message);
-            // 失败时尝试用 DXSO 编译路径诊断更具体的错误原因
-            const std::string diag = DiagnoseDxsoFailure(device, shaderData, shaderSize, path, isVS);
-            if (!diag.empty()) {
-                Logger::err("War3Material: DXSO 诊断失败: " + diag);
-                setError(message + " | DXSO 诊断失败: " + diag);
-            } else {
-                setError(message);
-            }
+        if (!created) {
+            setError(createError);
             return false;
         }
 

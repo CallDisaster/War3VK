@@ -39,9 +39,26 @@ def source_paths():
                  ('src/d3d9/d3d9_options.cpp', 'src/d3d9/d3d9_shader_helpers.cpp',
                   'src/d3d9/d3d9_fixed_function.cpp', 'src/d3d9/d3d9_adapter.cpp',
                   'src/d3d9/d3d9_format.cpp', 'src/d3d9/d3d9_monitor.cpp',
-                  'src/d3d9/d3d9_names.cpp', 'src/dxso/meson.build'))
+                  'src/d3d9/d3d9_names.cpp', 'src/dxso/meson.build',
+                  'src/d3d9/war3/render/war3_tracked_vk_pipeline.cpp', 'subprojects/war3fx/meson.build'))
+    paths.update(ROOT / relative for relative in SHADOW_PASS_SOURCES + VOLUMETRIC_PASS_SOURCES + WATER_PASS_SOURCES)
+    paths.update((ROOT/'src/d3d9/war3/effects').glob('*.cpp'))
+    paths.update((ROOT/'subprojects/war3fx/shaders').rglob('*.*'))
     paths.update((ROOT/'src/d3d9/shaders').rglob('*.*'))
     return sorted(paths)
+
+
+SHADOW_PASS_SOURCES = (
+    'src/d3d9/d3d9_war3_shadow.cpp', 'src/d3d9/d3d9_war3_shadow_resources.cpp',
+    'src/d3d9/d3d9_war3_shadow_outline.cpp', 'src/d3d9/d3d9_war3_csm.cpp',
+    'src/d3d9/war3/render/war3_gpu_workload_governor.cpp', 'src/d3d9/war3/render/war3_hybrid_ray_tracing.cpp',
+    'src/d3d9/war3/render/war3_point_shadow_cpu_plan.cpp', 'src/d3d9/war3/render/war3_shadow_replay_validation.cpp',
+    'src/d3d9/war3/state/war3_fog_volume.cpp')
+# Phase 4d: the volumetric light pass, built into the host beside the shadow pass.
+VOLUMETRIC_PASS_SOURCES = (
+    'src/d3d9/d3d9_war3_volumetric_light.cpp', 'src/d3d9/war3/render/war3_volumetric_shader_work_admission.cpp')
+# 11-19: the water surface pass, after the shadow pass; it reads the shadow pass's water images.
+WATER_PASS_SOURCES = ('src/d3d9/d3d9_war3_water.cpp', 'tools/render_host/dxvk_core/water_in_place.cpp')
 
 
 def check_host_compile_boundary(build):
@@ -51,7 +68,16 @@ def check_host_compile_boundary(build):
     allowed = {ROOT/'src/d3d9/d3d9_options.cpp', ROOT/'src/d3d9/d3d9_shader_helpers.cpp',
                ROOT/'src/d3d9/d3d9_fixed_function.cpp', ROOT/'src/d3d9/d3d9_adapter.cpp',
                ROOT/'src/d3d9/d3d9_format.cpp', ROOT/'src/d3d9/d3d9_monitor.cpp',
-               ROOT/'src/d3d9/d3d9_names.cpp'}
+               ROOT/'src/d3d9/d3d9_names.cpp',
+               # Phase 4: effect executors shared with the in-process passes,
+               # and the one helper they own pipelines with. Still no device,
+               # pipeline, hook or game source.
+               ROOT/'src/d3d9/war3/render/war3_tracked_vk_pipeline.cpp'}
+    allowed.update((ROOT/'src/d3d9/war3/effects').glob('*.cpp'))
+    # Phase 4c: the shadow pass and its CPU helpers, the sources the x86 device
+    # builds. They reach neither the device nor the game: the data-layer entry
+    # points they call are defined by the host (shadow_host_services.cpp).
+    allowed.update(ROOT / relative for relative in SHADOW_PASS_SOURCES + VOLUMETRIC_PASS_SOURCES + WATER_PASS_SOURCES)
     observed = set()
     for entry in strict_json((build/'compile_commands.json').read_text('utf-8')):
         source = (Path(entry['directory']) / entry['file']).resolve()

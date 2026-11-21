@@ -4,6 +4,8 @@
 #define NOMINMAX
 #endif
 #include <d3d9.h>
+#include "../../../src/d3d9/war3/effects/war3_shadow_scene.h"
+#include "shadow_outcome.h"
 #include <array>
 #include <cstdint>
 #include <exception>
@@ -17,6 +19,7 @@
 #include "../d3d9_sampler_wire.h"
 #include "../d3d9_effects_wire.h"
 #include "../d3d9_texture_stages_wire.h"
+#include "../d3d9_resource_registry.h"
 #include "host_surface_target_policy.h"
 
 namespace warvk::host::dxvkcore {
@@ -40,7 +43,11 @@ public:
 
   static constexpr uint32_t MaxDimension = 256;
   static constexpr uint32_t MaxBufferBytes = d9::MaxBuffer;
-  static constexpr uint32_t BufferSlots = 8, TextureSlots = 16, ShaderSlots = 4, DeclarationSlots = 4;
+  // Texture slots are game-sized (phase 5.1); the other typed tables keep the
+  // laboratory bounds, which already cover the game (two vertex buffers, one
+  // index buffer, no shaders). 64 resource ids always remain for them.
+  static constexpr uint32_t BufferSlots = d9::BufferSlots, TextureSlots = d9::TextureSlots,
+    ShaderSlots = d9::ShaderSlots, DeclarationSlots = d9::DeclarationSlots;
   static constexpr uint32_t FloatRegisters = 32, MaxDeclarationElements = 16;
   static constexpr uint32_t MaxDrawBatch = 32;
   // Bounded by one wire packet of complete fixed-function draws (3,180 B each).
@@ -87,6 +94,100 @@ public:
     uint64_t query = 0, draws = 0;
     ReuseWaitCounters cumulative;
   };
+  // P0 measurement only (warvk-d3d9-host-profile/v1): owner-thread CPU wall
+  // time spent blocked, by the call site that asked for it (WaitSite) and the
+  // primitive that blocked (WaitKind), and submissions by call site.
+  // QueryPerformanceCounter ticks in fixed tables; nothing here changes when
+  // or whether anything waits or is submitted.
+  enum class WaitSite : uint8_t {
+    Other, Initialize, Reset, BufferDynamic, BufferStaticBefore, BufferStaticAfter, CreateTexture,
+    TextureUploadBefore, TextureUploadAfter, TextureLod, ClearFullBefore, ClearFullAfter, ClearRectsBefore,
+    ClearRectsAfter, DrawFixed, DrawBatch, DrawStream, DrawFlight, FlushDraws, Effects, Readback, IssueEvent,
+    WaitEvent, PresentBefore, Present, PresentAfter, Destroy, Finish, ShadowCaster, TextureUploadSlice, Count };
+  // SettleIdle/SettleGpu: settle() with nothing / something submitted and not
+  // yet complete (its submission check and timeline wait); Retire: DXVK
+  // resource retirement after a settle; SubmitCpu: the submission thread's
+  // result for one command list; the rest are the named waits. DiscardCarry,
+  // UploadCopy and CasterCopy are not waits but owner-thread CPU copies
+  // (Discard rename plus carried prefix, the upload memcpy into host-visible
+  // memory, one shadow caster's geometry), kept in the same table.
+  enum class WaitKind : uint8_t {
+    SettleIdle, SettleGpu, Retire, SubmitCpu, PresentRetire, Acquire, PresentQueue, StreamLatency, FlightReuse,
+    Event, DiscardCarry, UploadCopy, CasterCopy, Count };
+  static const char* WaitSiteName(size_t site) noexcept {
+    static constexpr const char* names[size_t(WaitSite::Count)] = { "Other", "Initialize", "Reset", "BufferDynamic",
+      "BufferStaticBefore", "BufferStaticAfter", "CreateTexture", "TextureUploadBefore", "TextureUploadAfter",
+      "TextureLod", "ClearFullBefore", "ClearFullAfter", "ClearRectsBefore", "ClearRectsAfter", "DrawFixed",
+      "DrawBatch", "DrawStream", "DrawFlight", "FlushDraws", "Effects", "Readback", "IssueEvent", "WaitEvent",
+      "PresentBefore", "Present", "PresentAfter", "Destroy", "Finish", "ShadowCaster", "TextureUploadSlice" };
+    return site < size_t(WaitSite::Count) ? names[site] : "unknown";
+  }
+  static const char* WaitKindName(size_t kind) noexcept {
+    static constexpr const char* names[size_t(WaitKind::Count)] = { "SettleIdle", "SettleGpu", "Retire",
+      "SubmitCpu", "PresentRetire", "Acquire", "PresentQueue", "StreamLatency", "FlightReuse", "Event",
+      "DiscardCarry", "UploadCopy", "CasterCopy" };
+    return kind < size_t(WaitKind::Count) ? names[kind] : "unknown";
+  }
+  // polls: Sleep(1) calls inside the wait (PresentRetire, PresentQueue).
+  // slow: waits of at least 1 ms, 5 ms and 20 ms.
+  struct WaitCell { uint64_t count = 0, ticks = 0, maxTicks = 0, polls = 0; std::array<uint64_t, 3> slow{}; };
+  struct WaitProfile {
+    WaitSite site = WaitSite::Other;
+    std::array<std::array<WaitCell, size_t(WaitKind::Count)>, size_t(WaitSite::Count)> waits{};
+    std::array<uint64_t, size_t(WaitSite::Count)> submits{}, gpuSubmits{};
+  };
+  // E0 (WARVK_D3D9_PRESENT_WAIT; block by default since the 2026-11-18
+  // review): how Present's two waits (queue result, frame retirement) sleep.
+  // block: sleep on the completion's own notification in bounded slices, with
+  // a 1 ms timer-resolution request. poll: Sleep(1), the earlier wait.
+  // alternate:N: poll and block in turns of N presents in one run (same-run
+  // A/B). Same deadlines, checks and errors in every mode.
+  struct PresentWaitProfile {
+    uint32_t setting = 0, every = 0;
+    // Per mode (0 poll, 1 block): presents, queueTicks, queueSleeps,
+    // retireTicks, retireSleeps, intervalTicks, intervals (host Present to Present).
+    std::array<std::array<uint64_t, 7>, 2> modes{};
+    // Per mode: Present-to-Present intervals in 1 ms buckets; the last is >= 100 ms.
+    std::array<std::array<uint32_t, 101>, 2> intervalMs{};
+  };
+  // Dynamic buffers' host-visible storage and the two owner-thread paths that
+  // READ it on the CPU: the DISCARD carry and shadow-caster geometry. A
+  // dynamic VB keeps a cached CPU copy updated with every upload (IBs already
+  // have indexBytes), and those reads take it instead of the mapping, which
+  // is uncached write-combined memory on some adapters. Same bytes, same
+  // moments. WARVK_D3D9_DYNAMIC_CPU_COPY: on by default since the 2026-11-18
+  // review; "0" reads the mapping, "alternate:N" in turns of N presents.
+  struct DynamicReadProfile {
+    uint32_t setting = 0, every = 0, flagsSeen = 0;
+    uint64_t created = 0, createdDeviceLocal = 0, createdCached = 0;
+    uint64_t liveBytes = 0, peakBytes = 0, copyBytes = 0, peakCopyBytes = 0;
+    // Per source (0 mapping, 1 CPU copy): carries, carryBytes, carryTicks,
+    // casters, casterTicks, castersFromDynamicVertex.
+    std::array<std::array<uint64_t, 6>, 2> modes{};
+  };
+  // P1 batch 1 (WARVK_D3D9_UPLOAD_SLICES; on by default since the 2026-11-18
+  // review, stream profile only): each texture upload goes into a DXVK
+  // staging slice and its copy is recorded in the open stream list, in order
+  // with the draws around it; the list owns the slice's buffer until GPU
+  // retirement. In-flight staging is bounded in bytes and slices, recycled by
+  // the completion timeline. "0": settle + copy + submit(true) per upload, the
+  // earlier path (and the only one without a stream list); "alternate:N" in
+  // turns of N presents (same-run A/B). Begin/Chunk/Commit and the managed
+  // CPU copy are the same; only the host's GPU upload lifetime differs.
+  struct UploadSliceProfile {
+    uint32_t setting = 0, every = 0;
+    uint64_t recorded = 0, recordedBytes = 0, listFlushes = 0, creditWaits = 0, creditWaitTicks = 0;
+    uint64_t peakInFlightBytes = 0, peakInFlightSlices = 0;
+    // Per mode (0 settle/submit, 1 slices): uploads, ticks inside uploadTextureRegion.
+    std::array<std::array<uint64_t, 2>, 2> modes{};
+  };
+  enum class WaterFallback { None, Msaa, Format, Snapshot, DrawState, Projection, Resources, Pipeline, Count };
+  struct WaterStats {
+    uint64_t draws = 0, snapshots = 0, skippedOldPasses = 0;
+    std::array<uint64_t, size_t(WaterFallback::Count)> fallbacks{};
+    uint64_t gpuSamples = 0;
+    double gpuTotalUs = 0, gpuMaxUs = 0;
+  };
   struct Stats {
     // Development-only, opt-in CPU wall time. Samples delimit EVENT Issue
     // intervals, not presents. Nested stage times are contained in totalNs;
@@ -112,6 +213,10 @@ public:
     // command list; latency waits are the only CPU waits stream draws add.
     bool streamMode = false;
     uint64_t streamSubmissions = 0, streamCapSubmissions = 0, streamDraws = 0, streamFixedDraws = 0;
+    // WARVK_D3D9_STREAM_FLUSH_DRAWS (0: off): the open stream list is submitted
+    // once it holds this many draws; how often that happened.
+    uint32_t streamFlushDraws = 0;
+    uint64_t streamCadenceSubmissions = 0;
     uint64_t streamConstantRenames = 0, streamLatencyWaits = 0;
     uint32_t largestStreamList = 0;
     // Opt-in admission profile, CPU wall time inside drawBatch/drawFixedBatch
@@ -124,10 +229,21 @@ public:
     uint64_t admissionPrepareNs = 0, admissionRecordNs = 0, admissionConstantNs = 0;
     uint64_t admissionBindNs = 0, admissionSamplerNs = 0, admissionDrawNs = 0;
     uint64_t liveLogicalBytes = 0, peakLogicalBytes = 0;
+    // BeforeUi effect executors (before_ui_effects.h): runs, CPU wall time
+    // inside runBeforeUi, and the bytes of the images the executors own.
+    uint64_t beforeUiRuns = 0, beforeUiNs = 0, effectResourceBytes = 0;
+    // Shadow pass (shadow_before_ui.h): runs, and caster draws handed to it.
+    uint64_t shadowRuns = 0, shadowCasterDraws = 0;
+    WaterStats water;
     // Separate milestones: a CPU Present request/queue result is not GPU
     // completion, DXVK resource retirement, or proof of displayed pixels.
     uint64_t presentAttempts = 0, acquiredImages = 0, presentQueued = 0;
     uint64_t presentApiSucceeded = 0, presentGpuCompleted = 0, presentRetired = 0;
+    // WARVK_D3D9_PRESENT_PIPELINE (on unless "0"; stream mode only): Presents
+    // that returned without waiting for their own frame on the GPU, and the
+    // times a window fault made the next Present take that wait after all.
+    uint64_t presentsPipelined = 0, presentPipelineDrains = 0, clearsPipelined = 0;
+    uint32_t presentPipelineSetting = 0;
     // Diagnostic reads of the last successful actual swapchain-image copy,
     // not source-target reads or proof of HWND pixels/scanout.
     uint64_t presentedReadbacks = 0, presentedFrame = 0;
@@ -155,6 +271,16 @@ public:
     bool opaqueTarget = false;
     uint32_t syncInterval = 0;
     std::string adapter;
+    // P0 measurement only (host-profile/v1), see WaitSite.
+    WaitProfile waitProfile;
+    PresentWaitProfile presentWait;
+    DynamicReadProfile dynamicRead;
+    UploadSliceProfile uploadSlices;
+    // Present-to-Present intervals by the phase of whichever alternate:N
+    // switch is set (E0, item 4 or P1), 1 ms buckets, the last >= 100 ms.
+    uint32_t abPhaseSwitch = 0;
+    std::array<std::array<uint32_t, 101>, 2> abIntervalMs{};
+    std::array<uint64_t, 2> abFrames{}, abIntervalTicks{};
   };
   struct ShaderCacheStats {
     uint64_t requests = 0, hits = 0, compileAttempts = 0, compilesSucceeded = 0;
@@ -207,17 +333,44 @@ public:
   void createDeclaration(uint32_t id, const D3DVERTEXELEMENT9* elements, uint32_t count);
   void clear(uint32_t color, float depth, uint32_t flags = D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER);
   void clearRegions(const d9::ClearRegions& regions);
-  void draw(const DrawState& state);
-  void drawFixed(const DrawState& state,const d9::FixedFunctionState& fixed);
+  using CasterIndexSpan = dxvk::war3::effects::scene::CasterIndexSpan;
+  void draw(const DrawState& state, CasterIndexSpan* span = nullptr);
+  void drawFixed(const DrawState& state,const d9::FixedFunctionState& fixed, CasterIndexSpan* span = nullptr);
   // Same all-or-nothing validation as drawBatch, one fixed state per draw. The
   // stream profile records the whole batch into its open list; other profiles
   // keep the original per-draw settle/submit because their FF UBO is single.
-  void drawFixedBatch(const DrawState* states,const d9::FixedFunctionState* fixed,uint32_t count);
+  void drawFixedBatch(const DrawState* states,const d9::FixedFunctionState* fixed,uint32_t count,
+                      CasterIndexSpan* spans = nullptr, uint32_t waterMask = 0);
   // Validate the entire bounded batch before touching GPU state. Each draw's
   // constants occupy a distinct aligned slice until the original DXVK GPU and
   // resource-use retirement completes. One batch produces one submission.
-  void drawBatch(const DrawState* states, uint32_t count);
+  void drawBatch(const DrawState* states, uint32_t count, CasterIndexSpan* spans = nullptr, uint32_t waterMask = 0);
+  void beginWaterScene();
+  bool waterSceneEnabled() const;
   void flushDraws();
+  // Marks a draw already recorded this frame as a shadow caster: the pass
+  // replays its vertex and index buffer at BeforeUi. A draw it cannot use is
+  // counted in the frame's outcome, never an error of the draw itself.
+  void addShadowCaster(const DrawState& state, const dxvk::war3::effects::scene::ShadowCaster& record,
+      const dxvk::war3::effects::scene::ShadowCasterAlpha* alpha,
+                       uint64_t frameSerial, uint64_t mapEpoch, const CasterIndexSpan& span);
+  // The frame ended without BeforeUi: its casters go with it.
+  void endShadowFrame();
+  // Runs the shadow pass and then the BeforeUi effect executors over the
+  // current targets, after every draw recorded so far. Stage values are
+  // fx::SsaoStage / fx::SnowStage.
+  struct BeforeUiOutcome {
+    uint32_t ssaoStage = 0, snowStage = 0, aaStage = 0, bloomStage = 0;
+    bool ssaoRecorded = false, snowRecorded = false, aaRecorded = false, bloomRecorded = false;
+    ShadowOutcome shadow;
+    // What the device's allocator has handed out once this frame's shadows
+    // and effects are recorded, over every heap: the live allocations, and
+    // the chunks they sit in. All of the host's rendering, not the pass alone.
+    uint64_t deviceUsedBytes = 0, deviceAllocatedBytes = 0;
+  };
+  BeforeUiOutcome runBeforeUi(const dxvk::war3::effects::scene::FramePacket& packet,
+                              const dxvk::war3::effects::scene::ShadowPacket& shadow,
+                              uint64_t frameSerial, uint64_t mapEpoch);
   bool hasPendingDraws() const;
   // Tightly packed actual GPU BGRA8 rows [first, first+rows) of the target,
   // size exactly width*rows*4. Callers bound a band to one reply.
@@ -256,9 +409,10 @@ public:
 private:
   struct Owner;
   struct PreparedDraw;
-  PreparedDraw prepareDraw(const DrawState& state,const d9::FixedFunctionState* fixed=nullptr);
+  PreparedDraw prepareDraw(const DrawState& state,const d9::FixedFunctionState* fixed, CasterIndexSpan* outputSpan);
   void recordDraw(const DrawState& state, const PreparedDraw& prepared,
-    uint32_t constantSlot, bool batched, const DrawState* previous,const d9::FixedFunctionState* fixed=nullptr);
+    uint32_t constantSlot, bool batched, const DrawState* previous,const d9::FixedFunctionState* fixed=nullptr,
+    bool waterDraw = false);
   enum class Admission { Work, WindowFaultCleanup };
   Owner& active(Admission admission = Admission::Work);
   void quarantine() noexcept;

@@ -6,7 +6,9 @@ a finished x86 build (llvm-nm only; no compile, game, desktop or deployment) and
 reports two surfaces:
 
 * forward: symbols the data layer still takes from the in-process D3D9 device,
-  DXVK, effects or ImGui. Zero means the data layer links without them.
+  DXVK or effects. Zero means the data layer links without them. ImGui stays
+  in the game process (its overlay is drawn through IDirect3DDevice9) and the
+  stb_image decoder is portable CPU code: neither is the execution end.
 * reverse: symbols device/effects code takes from the data layer at runtime.
   These become the annotations and payloads sent to the host.
 
@@ -44,9 +46,9 @@ LIBRARIES = {
 DATA_DIRS = {'bridge', 'core', 'debug', 'diagnostics', 'game', 'handle', 'hooks', 'japi',
              'math', 'memory', 'model', 'native', 'platform', 'reimpl', 'semantic', 'state'}
 MIXED_DIRS = {'render', 'gpu_skin', 'shadow', 'shader'}
-CORE = frozenset({'device', 'effects', 'dxvk', 'imgui'})
-PORTABLE = frozenset({'util', 'minhook'})
-GROWABLE = frozenset({'mixed', 'tools', 'runtime', 'ui'})
+CORE = frozenset({'device', 'effects', 'dxvk'})
+PORTABLE = frozenset({'util', 'minhook', 'stb'})
+GROWABLE = frozenset({'mixed', 'tools', 'runtime', 'ui', 'imgui'})
 BELOW_NORMAL = 0x00004000
 
 
@@ -56,7 +58,10 @@ def classify(library, name):
         return library
     if name == 'version':  # the version resource, version.o
         return None
-    if name == 'meson-generated_.._war3_imgui_dx9_backend.cpp':
+    # Both generated DX9 backends (prepare_warvk_imgui_dx9.py): the in-process
+    # device's and proxy mode's overlay.
+    if name in ('meson-generated_.._war3_imgui_dx9_backend.cpp',
+                'meson-generated_.._war3_imgui_dx9_proxy_backend.cpp'):
         return 'imgui'
     if name == 'd3d9_war3_hook.cpp':
         return 'data'
@@ -66,6 +71,8 @@ def classify(library, name):
         return 'device'
     if name.startswith('jass_'):
         return 'data'
+    if name == 'war3_shaderpack_image.cpp':  # the stb_image implementation only
+        return 'stb'
     if name.startswith('war3_shaderpack'):
         return 'effects'
     if name == 'war3_shader_api.cpp':
@@ -80,6 +87,8 @@ def classify(library, name):
             return 'data'
         if sub in MIXED_DIRS or name.startswith('war3_gpu_skin_'):
             return 'mixed'
+        if sub == 'effects':  # shared effect executors: execution end, also built into the x64 host
+            return 'effects'
         if sub == 'tools':
             return 'tools'
         if sub == 'ui':

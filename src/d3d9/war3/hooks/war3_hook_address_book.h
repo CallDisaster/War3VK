@@ -142,6 +142,8 @@ struct War3HookAddressBook {
   uintptr_t terrainShadowLayer = 0;
   uintptr_t terrainShadowListA = 0;
   uintptr_t terrainShadowListB = 0;
+  static constexpr uintptr_t terrainShadowUpload = 0x727210;
+  static constexpr uintptr_t terrainShadowGxCallback = 0x743E80;
   uintptr_t shadowUpdateWriteEntry = 0;
   uintptr_t shadowProjectorAddSimple = 0;
   uintptr_t shadowProjectorAddFromObject = 0;
@@ -170,10 +172,8 @@ struct War3HookAddressBook {
   // 抓取 widget 身份链（rawcode + jHandle），喂给 RenderObjectRegistry 兜底。
   uintptr_t widgetRegisterFootprintAndShadowMask = 0;  // 0x65A140
 
-  // 2026-05-30：CDoodads 贴花阴影治理（魔兽自带可见静态阴影 + path blocker）。
-  // 这两个 Toggle 函数是树木/装饰物/可破坏物/path blocker 的"地面贴花阴影"
-  // 唯一对象级注册入口，分别写 RegisterImage(type=0) 与 RegisterImage(type=4)。
-  // hook 入口在 mode>=1 时跳过 enable!=0 写入即可干净屏蔽，不影响 fog/LOS/path。
+  // Optional CDoodads image registrations. The named stencil path and
+  // the packed terrain shadow grid have separate producers.
   uintptr_t terrainShadowToggleStaticStampFromObject = 0;  // 0x74DB30
   uintptr_t terrainShadowToggleEmitterStamp = 0;           // 0x74DE40
 
@@ -227,6 +227,10 @@ struct War3HookAddressBook {
   uintptr_t rqTransparentDispatchType2 = 0;
   uintptr_t rqTransparentDispatchType3 = 0;
   uintptr_t rqTransparentDispatchType4 = 0;
+  // CTerrain::SubmitWaterDraw (__thiscall, ret 8): sole water surface D3D9 draw
+  // submission entry, called by both deferred WaterRenderQueue_DrawThunk
+  // (0x743B20) and direct water loop (0x737900). Never called by particles.
+  uintptr_t waterSubmitDraw = 0;
 };
 
 /**

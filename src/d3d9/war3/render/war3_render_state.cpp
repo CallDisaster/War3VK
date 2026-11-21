@@ -59,6 +59,7 @@ thread_local War3BatchTag g_tlsBatchTag = War3BatchTag::Unknown;
 thread_local int g_tlsDispatcherStage = -1;
 thread_local uint32_t g_tlsBatchHandle = 0;
 thread_local uint32_t g_tlsDispatchHandle = 0;
+thread_local int g_tlsWaterDepth = 0;
 std::atomic<int> g_terrainDepth{0};
 std::atomic<uint32_t> g_lastRenderHandle{0};
 
@@ -291,6 +292,19 @@ bool War3RenderState::IsTerrainRendering() {
   return g_terrainDepth.load(std::memory_order_relaxed) > 0;
 }
 
+void War3RenderState::OnWaterEnter() {
+  ++g_tlsWaterDepth;
+}
+
+void War3RenderState::OnWaterExit() {
+  if (g_tlsWaterDepth > 0)
+    --g_tlsWaterDepth;
+}
+
+bool War3RenderState::IsWaterRendering() {
+  return g_tlsWaterDepth > 0;
+}
+
 void War3RenderState::SetBatchTag(War3BatchTag tag) {
   g_tlsBatchTag = tag;
   g_stateBatchTag.store(tag, std::memory_order_relaxed);
@@ -390,6 +404,21 @@ bool War3RenderState::IsOutlineHandle(uint32_t handle) {
 
 uint32_t War3RenderState::GetOutlineHandleCount() {
   return g_outlineHandleCount.load(std::memory_order_relaxed);
+}
+
+uint32_t War3RenderState::CopyOutlineHandles(uint32_t* out, uint32_t capacity) {
+  if (out == nullptr || capacity == 0u ||
+      g_outlineHandleCount.load(std::memory_order_relaxed) == 0u)
+    return 0u;
+  std::shared_lock<std::shared_mutex> lock(g_outlineHandleMutex);
+  uint32_t count = 0u;
+  for (const uint32_t handle : g_outlineHandles) {
+    if (count >= capacity)
+      break;
+    out[count++] = handle;
+  }
+  std::sort(out, out + count);
+  return count;
 }
 
 void War3RenderState::AddBloomHandle(uint32_t handle, float boost) {
@@ -983,6 +1012,7 @@ void War3RenderState::ResetRuntimeState() {
   g_tlsBatchHandle = 0;
   g_tlsDispatcherStage = -1;
   g_tlsShadowSemanticState = {};
+  g_tlsWaterDepth = 0;
   g_lastRenderHandle.store(0, std::memory_order_relaxed);
   g_terrainDepth.store(0, std::memory_order_relaxed);
   g_debugMode.store(DebugRenderMode::Normal, std::memory_order_relaxed);

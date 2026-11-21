@@ -11,7 +11,10 @@ namespace reimpl {
 thread_local War3InstanceBuffer *War3InstanceBuffer::s_activeBuffer = nullptr;
 
 War3InstanceBuffer *War3InstanceBuffer::Get(D3D9DeviceEx *device) {
-  return device ? device->GetWar3InstanceBuffer() : nullptr;
+  if (!device)
+    return nullptr;
+  IDeviceServices &services = *device;
+  return services.GetWar3InstanceBuffer();
 }
 
 void War3InstanceBuffer::SetActive(War3InstanceBuffer *buffer) {
@@ -21,7 +24,8 @@ void War3InstanceBuffer::SetActive(War3InstanceBuffer *buffer) {
 War3InstanceBuffer *War3InstanceBuffer::GetActive() { return s_activeBuffer; }
 
 War3InstanceBuffer *War3InstanceBuffer::GetActive(D3D9DeviceEx *device) {
-  return s_activeBuffer && s_activeBuffer->m_device == device ? s_activeBuffer : nullptr;
+  const IDirect3DDevice9Ex *api = device;
+  return s_activeBuffer && s_activeBuffer->m_device == api ? s_activeBuffer : nullptr;
 }
 
 void War3InstanceBuffer::Bind(uint32_t streamIdx, uint32_t baseInstanceOffset) {
@@ -97,7 +101,7 @@ void War3InstanceBuffer::OnLostDevice() {
   if (s_activeBuffer == this)
     s_activeBuffer = nullptr;
   if (m_buffer != nullptr && m_lockedPtr)
-    m_buffer->Unlock();
+    GetBuffer()->Unlock();
   m_lockedPtr = nullptr;
   m_buffer = nullptr;
   m_currentOffset = m_activeAllocationStart = m_drawnCountThisAlloc = 0;
@@ -177,7 +181,7 @@ InstanceData *War3InstanceBuffer::Alloc(uint32_t count,
   uint32_t sizeToLock = count * sizeof(InstanceData);
   uint32_t offsetInBytes = m_currentOffset * sizeof(InstanceData);
 
-  if (FAILED(m_buffer->Lock(offsetInBytes, sizeToLock, &ptr, flags))) {
+  if (FAILED(GetBuffer()->Lock(offsetInBytes, sizeToLock, &ptr, flags))) {
     return nullptr;
   }
 
@@ -198,7 +202,7 @@ InstanceData *War3InstanceBuffer::Alloc(uint32_t count,
 
 void War3InstanceBuffer::Unlock() {
   if (m_buffer != nullptr && m_lockedPtr) {
-    m_buffer->Unlock();
+    GetBuffer()->Unlock();
     m_lockedPtr =
         nullptr; // Clear it so we don't accidentally write to it
   }

@@ -5,6 +5,7 @@
 #include "d3d9_shader_validator.h"
 #include "war3/hooks/war3_hook_jass.h"
 #include "war3/platform/war3_native_device_resolver.h"
+#include "war3/platform/war3_proxy_mode.h"
 #include "war3/platform/war3_startup_error.h"
 
 #include "d3d9_annotation.h"
@@ -213,6 +214,19 @@ DLLEXPORT IDirect3D9 *__stdcall Direct3DCreate9(UINT nSDKVersion) {
   const uint32_t ordinal =
       g_d3d9CreateTraceOrdinal.fetch_add(1u, std::memory_order_relaxed) + 1u;
   TraceD3D9Create("entry", ordinal);
+  if (dxvk::war3::proxy::Requested()) {
+    // Proxy mode (war3_proxy_mode.h): the front end's factory, no in-process
+    // device. A front end that cannot be loaded fails the call; an explicit
+    // request never falls back to the in-process renderer. A proxy found beside
+    // this DLL that cannot start stops being requested, and the game continues
+    // in process below (war3_proxy_auto.h).
+    IDirect3D9 *factory = dxvk::war3::proxy::CreateFactory(nSDKVersion);
+    if (factory != nullptr || dxvk::war3::proxy::Requested()) {
+      TraceD3D9Create("return-proxy", ordinal, factory,
+                      factory ? S_OK : D3DERR_NOTAVAILABLE);
+      return factory;
+    }
+  }
   IDirect3D9Ex *pDirect3D = nullptr;
   const HRESULT hr = dxvk::CreateD3D9(false, &pDirect3D, nullptr, 0);
   TraceD3D9Create("return", ordinal, pDirect3D, hr);
@@ -222,6 +236,12 @@ DLLEXPORT IDirect3D9 *__stdcall Direct3DCreate9(UINT nSDKVersion) {
 
 DLLEXPORT HRESULT __stdcall Direct3DCreate9Ex(UINT nSDKVersion,
                                               IDirect3D9Ex **ppDirect3D9Ex) {
+  if (dxvk::war3::proxy::Requested()) {
+    // The front end has no Ex interface; the game does not ask for one.
+    if (ppDirect3D9Ex)
+      *ppDirect3D9Ex = nullptr;
+    return D3DERR_NOTAVAILABLE;
+  }
   return dxvk::CreateD3D9(true, ppDirect3D9Ex, nullptr, 0);
 }
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.wintypes as wintypes
+import contextlib
 import copy
 import functools
 import hashlib
@@ -1644,25 +1645,34 @@ def _launch_process_on_desktop(
     env_block = _build_environment_block(env)
     cmdline = ctypes.create_unicode_buffer(subprocess.list2cmdline([str(x) for x in args]))
     app_name = str(args[0]) if args else ""
-    ok = bool(
-        kernel32.CreateProcessW(
-            app_name,
-            cmdline,
-            None,
-            None,
-            False,
-            CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_CONSOLE,
-            ctypes.cast(env_block, wintypes.LPVOID),
-            str(cwd),
-            ctypes.byref(startup),
-            ctypes.byref(proc_info),
+    capture_dir = _GAME_STDIO_CAPTURE.get("directory")
+    if capture_dir is None:
+        ok = bool(
+            kernel32.CreateProcessW(
+                app_name,
+                cmdline,
+                None,
+                None,
+                False,
+                CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_CONSOLE,
+                ctypes.cast(env_block, wintypes.LPVOID),
+                str(cwd),
+                ctypes.byref(startup),
+                ctypes.byref(proc_info),
+            )
         )
-    )
+        stdio_capture = None
+    else:
+        ok, stdio_capture = _create_process_with_stdio_capture(
+            kernel32, app_name, cmdline, env_block, cwd, startup, proc_info,
+            Path(capture_dir),
+        )
     if not ok:
         return {
             "ok": False,
             "error": f"CreateProcessW 失败: {int(kernel32.GetLastError())}",
             "desktop": desktop_name,
+            **({"stdioCapture": stdio_capture} if stdio_capture is not None else {}),
         }
 
     pid = int(proc_info.dwProcessId)
@@ -1713,10 +1723,238 @@ def _launch_process_on_desktop(
         "nonInteractiveOnly": True,
         "nativeProcessWitness": witness.snapshot(),
         "nativeProcessWitnessAcquisition": witness_acquisition,
+        **({"stdioCapture": stdio_capture} if stdio_capture is not None else {}),
         # Internal-only ownership transfer to launch_war3_test. This object is
         # removed before any MCP/JSON result is returned.
         "_nativeProcessWitness": witness,
     }
+
+
+# Optional capture of the game's stdout/stderr into new files (x64 proxy-mode
+# gates: the D3D9 front end prints its session account there). Set only inside
+# game_stdio_capture(); None keeps every launch exactly as before.
+_GAME_STDIO_CAPTURE: Dict[str, Any] = {"directory": None}
+EXTENDED_STARTUPINFO_PRESENT = 0x00080000
+STARTF_USESTDHANDLES = 0x00000100
+PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x00020002
+
+
+class _StartupInfoExW(ctypes.Structure):
+    _fields_ = [("StartupInfo", _StartupInfoW), ("lpAttributeList", wintypes.LPVOID)]
+
+
+class _InheritableSecurityAttributes(ctypes.Structure):
+    _fields_ = [("nLength", wintypes.DWORD), ("lpSecurityDescriptor", wintypes.LPVOID),
+                ("bInheritHandle", wintypes.BOOL)]
+
+
+@contextlib.contextmanager
+def game_stdio_capture(directory: Path):
+    """Within this scope an isolated-desktop launch writes the child's stdout
+    and stderr to <directory>/game.stdout and game.stderr (new files only).
+
+    Only the two files and NUL are inherited (PROC_THREAD_ATTRIBUTE_HANDLE_LIST),
+    as isolated_render_desktop.py does for the probes.
+    """
+    previous = _GAME_STDIO_CAPTURE["directory"]
+    _GAME_STDIO_CAPTURE["directory"] = Path(directory)
+    try:
+        yield Path(directory)
+    finally:
+        _GAME_STDIO_CAPTURE["directory"] = previous
+
+
+def _create_process_with_stdio_capture(kernel32, app_name, cmdline, env_block, cwd,
+                                       startup, proc_info, directory: Path):
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    k.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                              wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    k.CreateFileW.restype = wintypes.HANDLE
+    k.InitializeProcThreadAttributeList.argtypes = [wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD,
+                                                    ctypes.POINTER(ctypes.c_size_t)]
+    k.InitializeProcThreadAttributeList.restype = wintypes.BOOL
+    k.UpdateProcThreadAttribute.argtypes = [wintypes.LPVOID, wintypes.DWORD, ctypes.c_size_t, wintypes.LPVOID,
+                                            ctypes.c_size_t, wintypes.LPVOID, wintypes.LPVOID]
+    k.UpdateProcThreadAttribute.restype = wintypes.BOOL
+    k.DeleteProcThreadAttributeList.argtypes = [wintypes.LPVOID]
+    k.DeleteProcThreadAttributeList.restype = None
+    k.CloseHandle.argtypes = [wintypes.HANDLE]
+    k.CloseHandle.restype = wintypes.BOOL
+    k.CreateProcessW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.LPVOID, wintypes.LPVOID,
+                                 wintypes.BOOL, wintypes.DWORD, wintypes.LPVOID, wintypes.LPCWSTR,
+                                 ctypes.POINTER(_StartupInfoExW), ctypes.POINTER(_ProcessInformation)]
+    k.CreateProcessW.restype = wintypes.BOOL
+    stdout_path, stderr_path = directory / "game.stdout", directory / "game.stderr"
+    receipt: Dict[str, Any] = {"stdout": str(stdout_path), "stderr": str(stderr_path),
+                               "handleListApplied": False}
+    if not directory.is_dir() or stdout_path.exists() or stderr_path.exists():
+        receipt["error"] = "capture directory missing or capture files already exist"
+        return False, receipt
+    security = _InheritableSecurityAttributes(ctypes.sizeof(_InheritableSecurityAttributes), None, True)
+    handles: List[int] = []
+    storage = None
+    attribute_list = None
+    initialized = False
+    try:
+        for path, access, disposition in ((str(stdout_path), GENERIC_WRITE, 1),
+                                           (str(stderr_path), GENERIC_WRITE, 1),
+                                           ("NUL", GENERIC_READ, OPEN_EXISTING)):
+            handle = k.CreateFileW(path, access, 1, ctypes.byref(security), disposition, 0x80, None)
+            if handle in (None, 0, INVALID_HANDLE_VALUE):
+                receipt["error"] = f"CreateFileW {path}: {ctypes.get_last_error()}"
+                return False, receipt
+            handles.append(int(handle))
+        size = ctypes.c_size_t()
+        k.InitializeProcThreadAttributeList(None, 1, 0, ctypes.byref(size))
+        storage = ctypes.create_string_buffer(max(1, size.value))
+        attribute_list = ctypes.cast(storage, wintypes.LPVOID)
+        if not k.InitializeProcThreadAttributeList(attribute_list, 1, 0, ctypes.byref(size)):
+            receipt["error"] = f"InitializeProcThreadAttributeList: {ctypes.get_last_error()}"
+            return False, receipt
+        initialized = True
+        inherited = (wintypes.HANDLE * 3)(*handles)
+        if not k.UpdateProcThreadAttribute(attribute_list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited,
+                                           ctypes.sizeof(inherited), None, None):
+            receipt["error"] = f"UpdateProcThreadAttribute: {ctypes.get_last_error()}"
+            return False, receipt
+        extended = _StartupInfoExW()
+        extended.StartupInfo = startup
+        extended.StartupInfo.cb = ctypes.sizeof(_StartupInfoExW)
+        extended.StartupInfo.dwFlags |= STARTF_USESTDHANDLES
+        extended.StartupInfo.hStdOutput, extended.StartupInfo.hStdError = handles[0], handles[1]
+        extended.StartupInfo.hStdInput = handles[2]
+        extended.lpAttributeList = attribute_list
+        ok = bool(k.CreateProcessW(
+            app_name, cmdline, None, None, True,
+            CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_CONSOLE | EXTENDED_STARTUPINFO_PRESENT,
+            ctypes.cast(env_block, wintypes.LPVOID), str(cwd), ctypes.byref(extended), ctypes.byref(proc_info)))
+        if not ok:
+            error = ctypes.get_last_error()
+            receipt["error"] = f"CreateProcessW: {error}"
+            kernel32.SetLastError(error)
+        receipt["handleListApplied"] = ok
+        return ok, receipt
+    finally:
+        if initialized:
+            k.DeleteProcThreadAttributeList(attribute_list)
+        for handle in handles:
+            k.CloseHandle(handle)
+
+
+def _post_close_on_desktop(pid: int, desktop_name: str) -> Dict[str, Any]:
+    """WM_CLOSE to the owned game's top-level window from a short-lived worker
+    bound to the game's own Desktop (never the input Desktop)."""
+    result: Dict[str, Any] = {"posted": False, "desktop": desktop_name}
+    if not desktop_name or desktop_name.casefold() == str(_query_input_desktop_name() or "").casefold():
+        result["error"] = "refusing: not an isolated Desktop"
+        return result
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    user32.OpenDesktopW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    user32.OpenDesktopW.restype = wintypes.HANDLE
+    user32.GetThreadDesktop.argtypes = [wintypes.DWORD]
+    user32.GetThreadDesktop.restype = wintypes.HANDLE
+    user32.SetThreadDesktop.argtypes = [wintypes.HANDLE]
+    user32.SetThreadDesktop.restype = wintypes.BOOL
+    user32.CloseDesktop.argtypes = [wintypes.HANDLE]
+    user32.CloseDesktop.restype = wintypes.BOOL
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.EnumDesktopWindows.argtypes = [wintypes.HANDLE, callback_type, wintypes.LPARAM]
+    user32.EnumDesktopWindows.restype = wintypes.BOOL
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetWindowTextW.restype = ctypes.c_int
+    user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    user32.PostMessageW.restype = wintypes.BOOL
+
+    def work() -> None:
+        handle, previous, bound = None, None, False
+        try:
+            handle = user32.OpenDesktopW(desktop_name, 0, False,
+                                         DESKTOP_READOBJECTS | DESKTOP_ENUMERATE | DESKTOP_WRITEOBJECTS)
+            if not handle:
+                result["error"] = f"OpenDesktopW: {ctypes.get_last_error()}"
+                return
+            previous = user32.GetThreadDesktop(kernel32.GetCurrentThreadId())
+            if not user32.SetThreadDesktop(handle):
+                result["error"] = f"SetThreadDesktop: {ctypes.get_last_error()}"
+                return
+            bound = True
+            windows: List[Tuple[int, str]] = []
+
+            def visit(hwnd, _unused):
+                owner = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+                if int(owner.value) == int(pid):
+                    text = ctypes.create_unicode_buffer(256)
+                    user32.GetWindowTextW(hwnd, text, 255)
+                    windows.append((int(hwnd), text.value))
+                return True
+
+            user32.EnumDesktopWindows(handle, callback_type(visit), 0)
+            result["ownedWindowTitles"] = [title for _, title in windows]
+            games = [hwnd for hwnd, title in windows if title == "Warcraft III"]
+            if len(games) != 1:
+                result["error"] = f"expected one owned 'Warcraft III' window, found {len(games)}"
+                return
+            if not user32.PostMessageW(games[0], 0x0010, 0, 0):
+                result["error"] = f"PostMessageW: {ctypes.get_last_error()}"
+                return
+            result["posted"] = True
+        except Exception as exc:  # never raised to the gate
+            result["error"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            if bound and previous:
+                user32.SetThreadDesktop(previous)
+            if handle:
+                user32.CloseDesktop(handle)
+
+    worker = threading.Thread(target=work, name="WarVK-Owned-Close", daemon=True)
+    worker.start()
+    worker.join(5.0)
+    result["workerPending"] = worker.is_alive()
+    return result
+
+
+def natural_exit_owned_game(pid: int, war3_dir: Path, desktop_name: str,
+                            wait_sec: float = 25.0) -> Dict[str, Any]:
+    """End an owned game the way a player does, so that it exits by itself.
+
+    For the x64 proxy-mode gates: the D3D9 front end and the render host write
+    their session accounts only when the game releases its device and exits.
+    The stock EndGame (test command game.end_for_exit_test, which needs
+    DXVK_WAR3_INTERNAL_EXIT_TEST=1), then WM_CLOSE on the game's own Desktop.
+    Never forces anything; the caller's stop_war3 stays the fallback.
+    """
+    started = time.monotonic()
+    result: Dict[str, Any] = {"exited": False}
+    if not _pid_alive(pid):
+        result.update(exited=True, alreadyExited=True)
+        return result
+    end = _invoke_internal_test_request(pid, Path(war3_dir), "game.end_for_exit_test", {}, timeout_sec=6)
+    result["endGame"] = {"ok": end.get("ok"), "error": end.get("error")}
+    deadline = time.monotonic() + 10.0
+    teardown = 0
+    while time.monotonic() < deadline and _pid_alive(pid):
+        reply = _control_plane_request(pid=pid, command="get_runtime_status", payload={}, timeout_sec=2.0)
+        status = dict(reply.get("result") or {})
+        render = dict(status.get("render") or {})
+        runtime = dict(status.get("runtime") or {})
+        teardown = teardown + 1 if reply.get("ok") and not render.get("isInGame") and not runtime.get("gameStarted") else 0
+        if teardown >= 2:
+            break
+        time.sleep(0.5)
+    result["mapTeardownObserved"] = teardown >= 2
+    time.sleep(1.0)
+    if _pid_alive(pid):
+        result["close"] = _post_close_on_desktop(pid, desktop_name)
+    deadline = time.monotonic() + max(1.0, float(wait_sec))
+    while time.monotonic() < deadline and _pid_alive(pid):
+        time.sleep(0.25)
+    result["exited"] = not _pid_alive(pid)
+    result["seconds"] = round(time.monotonic() - started, 2)
+    return result
 
 
 def _normalize_launcher_mode(value: str) -> str:
@@ -10187,6 +10425,12 @@ def _compact_life_and_death_status(status: Dict[str, Any]) -> Dict[str, Any]:
             if isinstance(value, (str, int, float, bool)) or value is None:
                 selected[str(key)] = value
         compact[section_name] = selected
+    # Proxy mode only (absent in process): the data layer's frame account and
+    # terminal state, the evidence the proxy arm judges gameplay from.
+    proxy = status.get("proxyMode")
+    if isinstance(proxy, dict):
+        compact["proxyMode"] = {key: proxy.get(key) for key in (
+            "mode", "deviceConnected", "deviceLost", "terminalKind", "presents", "frame")}
     return compact
 
 
@@ -10210,8 +10454,14 @@ def run_life_and_death_tdr_scenario(
     birth_hold_sec: int = 120,
     strict_external_graphics_hooks: bool = True,
     acknowledge_difficulty_dialog: bool = True,
+    natural_exit_before_stop: bool = False,
 ) -> Dict[str, Any]:
-    """冷启动或连接“生与死”，以低视角巡航并在首次 GPU 故障时止损。"""
+    """冷启动或连接“生与死”，以低视角巡航并在首次 GPU 故障时止损。
+
+    natural_exit_before_stop (x64 proxy-mode gates only, default off): end the
+    owned game with the stock EndGame and its own window close before the
+    usual stop, so the D3D9 front end and the render host write their accounts.
+    """
     w3 = Path(war3_dir)
     source_map = Path(map_path)
     if not source_map.is_file():
@@ -10398,6 +10648,7 @@ def run_life_and_death_tdr_scenario(
     screenshot_rows: List[Dict[str, Any]] = []
     failure_reason = ""
     stop_result: Dict[str, Any] = {}
+    natural_exit: Dict[str, Any] = {}
     started_at = time.monotonic()
     if bool(strict_external_graphics_hooks):
         if not loaded_modules:
@@ -10719,6 +10970,11 @@ def run_life_and_death_tdr_scenario(
                 camera_restore = _invoke_internal_test_request(
                     pid, w3, "camera.apply", restore_payload, timeout_sec=4.0
                 )
+        if owned_process and bool(natural_exit_before_stop) and _pid_alive(pid):
+            natural_exit = natural_exit_owned_game(
+                pid, w3,
+                str(dict(launch.get("desktop", {}) or {}).get("name", "") or desktop_name),
+            )
         if owned_process:
             stop_result = stop_war3(
                 pid=pid,
@@ -10797,6 +11053,7 @@ def run_life_and_death_tdr_scenario(
         "newGpuIncidents": new_incidents,
         "logSummary": log_summary,
         "stop": stop_result,
+        **({"naturalExit": natural_exit} if natural_exit_before_stop else {}),
         "artifactDir": str(artifact_dir),
     }
     result_path = artifact_dir / "life_and_death_tdr_result.json"

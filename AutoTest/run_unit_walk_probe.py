@@ -1,7 +1,14 @@
 """Isolated, single-process WarVK Walk JAPI/hook probe for the copied test map.
 
-The player map and DLL are read-only inputs. AutoTest owns a content-addressed
-instance, isolated desktop, game process and its teardown. No global input.
+The player map is a read-only input; the player's d3d9.dll is absent and must
+stay absent (checked before and after, never created). AutoTest owns a
+content-addressed instance, isolated desktop, game process and its teardown.
+No global input.
+
+Proxy mode (PROXY_ARM set by run_v12202_final_gate.py --mode proxy): the same
+product DLL with its device in the x64 render host. The Walk counters are the
+data layer's CPU hooks in both modes; proxy mode adds the transport account
+(x64_proxy_gate_mode.proxy_acceptance) and world-frame evidence of gameplay.
 """
 
 from __future__ import annotations
@@ -12,7 +19,10 @@ import os
 from pathlib import Path
 import time
 
+import contextlib
+
 import war3_autotest_mcp as war3
+import x64_proxy_gate_mode as x64mode
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,9 +37,10 @@ PINNED = {
     MAP: "AB4402A0EB07176B9858707A1BE3929586281781EE95626792F459642C56C3D4",
     PROBE_MAP: "DA8C842BB5FE22D0F3AEAAAFDCA7DA8C3FA7604A9F10FA800A1E2BEA900EC0BC",
     DLL: "1FFE0BD14C51C8E1D2A9EB94425A06260CD4B480A7CA735E13E946EA93EE35CF",
-    PLAYER / "d3d9.dll": "FF3B7BD521F95935DB204EF2FEBAB828BDE85BA743E509292B9FA9F91B05F003",
     PLAYER / "Game.dll": "E04D1716603C075EB0C8E1E21CF1093A664ADC5249EFAB396BFA08D7B09D0C3A",
 }
+# None: the in-process arm. A x64_proxy_gate_mode.ProxyArm: the proxy arm.
+PROXY_ARM = None
 
 
 def sha256(path: Path) -> str:
@@ -51,6 +62,7 @@ def check_inputs() -> None:
 
 
 def main() -> int:
+    player_dll_before = x64mode.require_player_dll_absent("before")
     check_inputs()
     for key in tuple(os.environ):
         if key.startswith("DXVK_WAR3_") or key.startswith("DXVK_RUNTIME_"):
@@ -68,22 +80,31 @@ def main() -> int:
     receipt: dict = {"inputIdentity": {str(p): h for p, h in PINNED.items()},
                      "globalInputUsed": False, "snapshots": [],
                      "captures": [],
-                     "runtimeAcceptance": False}
+                     "runtimeAcceptance": False,
+                     "mode": "inprocess" if PROXY_ARM is None else "proxy",
+                     "playerDllBefore": player_dll_before}
+    overrides = {
+        "DXVK_WAR3_INTERNAL_TEST_API": "1",
+        "DXVK_WAR3_AUTOTEST_DISABLE_BACKGROUND_THROTTLE": "1",
+        "DXVK_WAR3_AUTOTEST_DISABLE_GAME_PAUSE": "1",
+        "DXVK_WAR3_PERF_RECORD_ON_START": "0",
+        "DISABLE_VULKAN_OBS_CAPTURE": "1",
+    }
+    if PROXY_ARM is not None:
+        overrides.update(PROXY_ARM.env())
+        receipt["proxyArm"] = PROXY_ARM.receipt()
+        receipt["proxySamples"] = []
     try:
-        launch = war3.launch_war3_instance(
-            sandbox_root=str(PLAYER), map_path=str(PROBE_MAP), run_id=RUN_ID,
-            session_id=SESSION_ID, artifact_root=str(ARTIFACTS),
-            windowed=True, use_isolated_desktop=True,
-            deploy_d3d9_before_launch=True, build_d3d9_path=str(DLL),
-            profile="full_default",
-            env_overrides_json=json.dumps({
-                "DXVK_WAR3_INTERNAL_TEST_API": "1",
-                "DXVK_WAR3_AUTOTEST_DISABLE_BACKGROUND_THROTTLE": "1",
-                "DXVK_WAR3_AUTOTEST_DISABLE_GAME_PAUSE": "1",
-                "DXVK_WAR3_PERF_RECORD_ON_START": "0",
-                "DISABLE_VULKAN_OBS_CAPTURE": "1",
-            }),
-        )
+        with (war3.game_stdio_capture(PROXY_ARM.staging) if PROXY_ARM is not None
+              else contextlib.nullcontext()):
+            launch = war3.launch_war3_instance(
+                sandbox_root=str(PLAYER), map_path=str(PROBE_MAP), run_id=RUN_ID,
+                session_id=SESSION_ID, artifact_root=str(ARTIFACTS),
+                windowed=True, use_isolated_desktop=True,
+                deploy_d3d9_before_launch=True, build_d3d9_path=str(DLL),
+                profile="full_default",
+                env_overrides_json=json.dumps(overrides),
+            )
         receipt["launch"] = {k: launch.get(k) for k in (
             "ok", "pid", "sessionId", "instanceRoot", "artifactDir",
             "mapSha256", "dllSha256", "desktop", "envOverrides", "error")}
@@ -114,6 +135,11 @@ def main() -> int:
                 raise RuntimeError(f"walk snapshot failed: {row.get('error')}")
             receipt["snapshots"].append({"elapsedSec": round(time.monotonic() - began, 3),
                                           **row.get("result", {})})
+            if PROXY_ARM is not None:
+                status = war3._control_plane_request(
+                    pid=pid, command="get_runtime_status", payload={}, timeout_sec=2.0)
+                receipt["proxySamples"].append(
+                    x64mode.proxy_status(dict(status.get("result") or {})))
             elapsed = time.monotonic() - began
             label = None
             if 31.0 <= elapsed < 33.5 and not captured_manual:
@@ -144,7 +170,20 @@ def main() -> int:
             "pixelOrAnimationVisualProof": False,
         }
         print(json.dumps(receipt["classification"], ensure_ascii=False), flush=True)
-        return 0
+        if PROXY_ARM is None:
+            return 0
+        # Proxy mode: the game ends by itself, so the front end and the hosts
+        # write their accounts; then the transport-level acceptance.
+        receipt["naturalExit"] = war3.natural_exit_owned_game(
+            pid, instance, str(launch.get("desktop", {}).get("name", "")))
+        receipt["proxyEvidence"] = x64mode.collect_evidence(
+            PROXY_ARM.staging, [Path(launch["artifactDir"])], instance)
+        receipt["proxyWorld"] = x64mode.world_progress(receipt["proxySamples"])
+        receipt["proxyAcceptance"] = x64mode.proxy_acceptance(
+            receipt["proxyEvidence"], receipt["naturalExit"], receipt["proxyWorld"])
+        print(json.dumps({"proxyAcceptance": receipt["proxyAcceptance"]["checks"]},
+                         ensure_ascii=False), flush=True)
+        return 0 if receipt["proxyAcceptance"]["ok"] else 2
     finally:
         if launch and launch.get("ok"):
             receipt["stop"] = war3.stop_war3(
@@ -153,6 +192,8 @@ def main() -> int:
         receipt["sourceIdentityAfter"] = {str(p): sha256(p) for p in PINNED}
         receipt["sourceUnchanged"] = all(
             receipt["sourceIdentityAfter"][str(p)] == h for p, h in PINNED.items())
+        receipt["playerDllAfter"] = x64mode.player_dll_state()
+        receipt["playerDllStayedAbsent"] = receipt["playerDllAfter"]["exists"] is False
         target.mkdir(parents=True, exist_ok=True)
         with (target / "walk-probe.json").open("x", encoding="utf-8") as stream:
             json.dump(receipt, stream, ensure_ascii=False, indent=2, allow_nan=False)

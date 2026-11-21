@@ -25,7 +25,9 @@ COMPILERS = Path('E:/Dev/Toolchains/warvk-rh0-llvm-mingw-20260616/portable/llvm-
 WORKERS = {'readback-backpressure', 'clear-failure-waiting-barrier', 'draw-own-reply',
     'slot-release-before-ack', 'empty-close', 'empty-fault', 'stale-hint-then-fault',
     'settled-reply-before-fault', 'bounded-draw-batch','gpu-group-end-scene','bounded-fixed-batch',
-    'annotated-draw-batch'}
+    'annotated-draw-batch','session-reset','content-payload','ring-healthy','ring-host-exit-barrier','ring-host-exit-idle',
+    'ring-async-refused','ring-device-lost','ring-head-invalid','ring-applied-invalid','ring-reply-invalid',
+    'ring-record-damaged','ring-host-hung'}
 
 
 def read_result(text, launch, desktop, input_desktop, bits):
@@ -62,7 +64,9 @@ def read_result(text, launch, desktop, input_desktop, bits):
 
 def source_set():
     paths = {p for p in (ROOT/'tools/render_host').rglob('*.h')}
-    paths.add(ROOT/'tools/render_host/protocol.cpp')
+    # The Connection header now carries the command ring's named regions and
+    # events, so the CPU fixture links the transport and security helpers too.
+    paths.update(ROOT/'tools/render_host'/name for name in ('protocol.cpp','win32_transport.cpp','win32_security.cpp'))
     paths.update(ROOT/'AutoTest'/name for name in ('test_d3d9_connection_async_cpu.cpp','test_render_host_d3d9_wire.cpp',
         'run_d3d9_connection_async_cpu.py', 'test_d3d9_connection_async_cpu_reader.py'))
     paths.update(Path(m.__file__).resolve() for m in list(sys.modules.values()) if getattr(m, '__file__', None)
@@ -73,6 +77,7 @@ def source_set():
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--output', type=Path, required=True)
+    ap.add_argument('--async-resources', action='store_true', help='also exercise x86 COM resource lifetimes against a CPU ring peer')
     args = ap.parse_args(); out = args.output.resolve()
     require(out.parent == ROOT/'AutoTest/artifacts' and not out.exists(), 'fresh artifact directory')
     out.mkdir()
@@ -81,7 +86,11 @@ def main():
     frozen = []
     env = {k:v for k,v in os.environ.items() if k.upper() in ENV_ALLOW}
     try:
-        frozen = [identity(p) for p in source_set()]
+        inputs = source_set()
+        if args.async_resources:
+            inputs += [ROOT/'AutoTest/test_d3d9_async_resource_com_cpu.cpp',
+                *(ROOT/'tools/render_host'/n for n in ('d3d9_proxy.cpp','owned_child.cpp','process_memory_probe.cpp'))]
+        frozen = [identity(p) for p in inputs]
         receipt['sources'] = list(frozen)
         for bits, arch in ((32, 'i686'), (64, 'x86_64')):
             compiler = COMPILERS/(arch+'-w64-mingw32-clang++.exe')
@@ -89,8 +98,9 @@ def main():
             exe = out/f'x1a-cpu-{bits}.exe'; stem = f'build-{bits}'
             argv = [compiler, '-std=c++17', '-O2', '-Wall', '-Wextra', '-Werror', '-static', '-pthread', '-municode',
                     '-I'+str(ROOT/'tools/render_host'), ROOT/'AutoTest/test_d3d9_connection_async_cpu.cpp',
-                    ROOT/'tools/render_host/protocol.cpp',
-                    '-o', exe, '-luser32']
+                    ROOT/'tools/render_host/protocol.cpp', ROOT/'tools/render_host/win32_transport.cpp',
+                    ROOT/'tools/render_host/win32_security.cpp',
+                    '-o', exe, '-luser32', '-lbcrypt', '-ladvapi32']
             try:
                 receipt['steps'].append(execute(argv, ROOT, out/stem, 120, env))
             finally:
@@ -104,6 +114,17 @@ def main():
             finally:receipt['stepRawArtifacts'].append(capture_raw_artifacts(out,[stem+'.stdout',stem+'.stderr']))
             require(pe_identity(wire)==((0x14c,0x10b) if bits==32 else (0x8664,0x20b)),'wire architecture')
             frozen.append(identity(wire))
+        if args.async_resources:
+            resource_exe=out/'async-resource-com-32.exe';stem='build-async-resource-com'
+            argv=[COMPILERS/'i686-w64-mingw32-clang++.exe','-std=c++17','-O2','-Wall','-Wextra','-Werror',
+                '-Wno-unused-parameter','-Wno-microsoft-exception-spec','-DNOMINMAX','-D_WIN32_WINNT=0x0a00',
+                '-static','-pthread','-municode',ROOT/'AutoTest/test_d3d9_async_resource_com_cpu.cpp',
+                *(ROOT/'tools/render_host'/n for n in ('protocol.cpp','win32_transport.cpp','win32_security.cpp',
+                    'owned_child.cpp','process_memory_probe.cpp')),'-luser32','-lbcrypt','-ladvapi32','-luuid','-lpsapi','-o',resource_exe]
+            try:receipt['steps'].append(execute(argv,ROOT,out/stem,120,env))
+            finally:receipt['stepRawArtifacts'].append(capture_raw_artifacts(out,[stem+'.stdout',stem+'.stderr']))
+            require(pe_identity(resource_exe)==(0x14c,0x10b),'resource COM fixture architecture')
+            frozen.append(identity(resource_exe))
         with IsolatedRenderDesktop(restricted_medium=True) as desktop:
             receipt['desktopSafety'] = desktop.receipt
             for bits in (32, 64):
@@ -130,6 +151,30 @@ def main():
                                    (wire_dir/'case.stdout').read_text('utf-8'))
                 require(match is not None and int(match[1])>=1300,'complete D3D9 wire CPU tests')
                 wire.update(ok=True,checks=int(match[1]))
+            if args.async_resources:
+                case_dir=out/'async-resource-com';case_dir.mkdir()
+                case=receipt['asyncResourceCom']=dict(ok=False)
+                try:
+                    case['process']=desktop.run([resource_exe],cwd=case_dir,stdout_path=case_dir/'case.stdout',
+                        stderr_path=case_dir/'case.stderr',timeout_s=60,env=env)
+                finally:case['initialRawArtifacts']=capture_raw_artifacts(case_dir,['case.stdout','case.stderr'])
+                check_launch(case['process'],desktop.desktop_name,desktop.input_before)
+                require((case_dir/'case.stdout').read_text('utf-8').splitlines()[-1].endswith('terminal cases passed'),
+                    'completed COM resource assertions')
+                prefix='D3D9 async-resource-proxy: '
+                sessions=(case_dir/'case.stderr').read_text('utf-8').split('D3D9 async-clear: ')[1:]
+                require(len(sessions)>=4 and prefix not in sessions[0],'default-off connection is quiet')
+                rows=[]
+                for session in sessions[1:]:
+                    lines=[line[len(prefix):] for line in session.splitlines() if line.startswith(prefix)]
+                    require(len(lines)==1,'one resource account per enabled connection')
+                    row=strict_json(lines[0]);rows.append(row)
+                    require(row['schema']=='warvk-d3d9-async-resource-proxy/v1' and
+                        row['syncTextureCreates']==row['firstFormat']+row['unprovenFormat']+row['switchOff'],
+                        'sync resource account')
+                require({(r['asyncDestroy'],r['asyncCreateTexture']) for r in rows}=={(True,False),(False,True),(True,True)},
+                    'both independent switches')
+                case.update(ok=True,accounts=rows)
         require(receipt['desktopSafety']['ok'] is True, 'isolated CPU cleanup')
         receipt['ok'] = len(receipt['cases']) == 2 and all(r['ok'] for r in receipt['cases'])
     except Exception as error:

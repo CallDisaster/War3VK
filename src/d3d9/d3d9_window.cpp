@@ -183,11 +183,17 @@ namespace dxvk
               if (SUCCEEDED(hr)) {
                 windowData.swapchain->SetWindowedLogicalSourceExtent(
                   VkExtent2D{clientWidth, clientHeight}, false);
-                dxvk::war3::hooks::TryOverrideWindowedClientSize(
+                const bool fields = dxvk::war3::hooks::TryOverrideWindowedClientSize(
                   previousWidth, previousHeight,
                   clientWidth, clientHeight);
-                dxvk::war3::hooks::TryNotifyWindowedUiSizeChanged(
-                  window, clientWidth, clientHeight);
+                const char* uiFailure = "";
+                const bool ui = dxvk::war3::hooks::TryNotifyWindowedUiSizeChanged(
+                  window, clientWidth, clientHeight, &uiFailure);
+                Logger::info(str::format(
+                  "D3D9WindowProc: window resized ", previousWidth, "x", previousHeight,
+                  " -> ", clientWidth, "x", clientHeight,
+                  " gameFields=", fields ? 1 : 0, " gameUi=", ui ? 1 : 0,
+                  ui ? "" : " (", uiFailure, ui ? "" : ")"));
               } else {
                 Logger::warn(str::format(
                   "D3D9WindowProc: windowed WM_SIZE reset failed hr=0x",

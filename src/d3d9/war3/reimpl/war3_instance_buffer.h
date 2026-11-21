@@ -104,7 +104,9 @@ private:
   uint32_t GetStride() const { return sizeof(InstanceData); }
 
 private:
-  D3D9DeviceEx *m_device = nullptr;
+  // D3D9 calls go through the COM interfaces: D3D9DeviceEx is final, so a
+  // call through it would link this data-layer file to d3d9_device.cpp.
+  IDirect3DDevice9Ex *m_device = nullptr;
   Com<D3D9VertexBuffer, false> m_buffer;
 
   uint32_t m_maxInstances = 0;

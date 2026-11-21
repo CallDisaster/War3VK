@@ -32,7 +32,8 @@ std::wstring QuoteAbsoluteFile(const std::wstring& path) {
   return L"\""+path+L"\"";
 }
 OwnedChild::OwnedChild(const std::wstring& executable,const std::wstring& arguments,
-                       const std::wstring& log,const std::wstring& desktop) {
+                       const std::wstring& log,const std::wstring& desktop,HANDLE inherit,
+                       bool parentPriority) {
   auto command=QuoteAbsoluteFile(executable)+L" "+arguments;
   QuoteAbsoluteFile(log);
   if(arguments.find_first_of(L"\r\n")!=std::wstring::npos)
@@ -46,12 +47,12 @@ OwnedChild::OwnedChild(const std::wstring& executable,const std::wstring& argume
     FILE_ATTRIBUTE_NORMAL,nullptr));
   if(!output)Fail();
   Attributes attributes;
-  HANDLE jobs[]={m_job.get()},inherited[]={output.get()};
+  HANDLE jobs[]={m_job.get()},inherited[]={output.get(),inherit};
   // No CreateProcess-then-AssignProcessToJobObject race or uncontained fallback.
   if(!UpdateProcThreadAttribute(attributes.list,0,PROC_THREAD_ATTRIBUTE_JOB_LIST,
       jobs,sizeof(jobs),nullptr,nullptr)||
      !UpdateProcThreadAttribute(attributes.list,0,PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-      inherited,sizeof(inherited),nullptr,nullptr))Fail();
+      inherited,inherit?sizeof(inherited):sizeof(inherited[0]),nullptr,nullptr))Fail();
   STARTUPINFOEXW startup{};startup.StartupInfo.cb=sizeof(startup);
   // Explicit only when requested by an isolation-aware owner; other lab
   // protocols retain their previous inherited-desktop behavior.
@@ -62,7 +63,9 @@ OwnedChild::OwnedChild(const std::wstring& executable,const std::wstring& argume
   startup.StartupInfo.hStdInput=nullptr;
   PROCESS_INFORMATION info{};
   if(!CreateProcessW(executable.c_str(),command.data(),nullptr,nullptr,TRUE,
-      CREATE_NO_WINDOW|BELOW_NORMAL_PRIORITY_CLASS|EXTENDED_STARTUPINFO_PRESENT,
+      // parentPriority: no class of its own, so a Normal parent gets a Normal
+      // child and a BelowNormal or Idle parent a child of its own class.
+      CREATE_NO_WINDOW|(parentPriority?0:BELOW_NORMAL_PRIORITY_CLASS)|EXTENDED_STARTUPINFO_PRESENT,
       nullptr,nullptr,&startup.StartupInfo,&info))Fail();
   Handle thread(info.hThread);m_process.reset(info.hProcess);m_pid=info.dwProcessId;
   try {
@@ -84,10 +87,11 @@ OwnedChild::~OwnedChild() {
   DrainChild(m_process.get());
 }
 DWORD OwnedChild::wait(DWORD milliseconds) {
+  // Labelled exit-wait: this waits for the child to end, it is not setup.
   const DWORD result=WaitForSingleObject(m_process.get(),milliseconds);
-  if(result==WAIT_TIMEOUT)throw Failure(Fault::Timeout,Stage::Setup,WAIT_TIMEOUT);
-  if(result!=WAIT_OBJECT_0)Fail();
-  DWORD code=STILL_ACTIVE;if(!GetExitCodeProcess(m_process.get(),&code))Fail();
+  if(result==WAIT_TIMEOUT)throw Failure(Fault::Timeout,Stage::ExitWait,WAIT_TIMEOUT);
+  if(result!=WAIT_OBJECT_0)throw Failure(Fault::System,Stage::ExitWait,GetLastError());
+  DWORD code=STILL_ACTIVE;if(!GetExitCodeProcess(m_process.get(),&code))throw Failure(Fault::System,Stage::ExitWait,GetLastError());
   return code;
 }
 void OwnedChild::terminateAndWait() {m_job.reset();wait(5000);}

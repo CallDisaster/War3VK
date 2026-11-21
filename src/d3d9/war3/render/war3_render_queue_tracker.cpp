@@ -6,6 +6,9 @@
 #include "war3_shadow_runtime_bridge.h"
 #include "war3_render_state.h"
 #include "../../../util/util_time.h"
+#include "../../../util/log/log.h"
+#include "../../../util/util_string.h"
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <mutex>
@@ -55,11 +58,20 @@ ResolveInfoByElement(void *element, void *sceneNodeHint) {
 }
 } // namespace
 
+// The table holds the render queue elements of one frame (older epochs are
+// reclaimable). Measured peak: 397 entries per frame, no probe failures
+// (生与死, proxy mode, 7584 frames; docs/research/2026-11-17-x64-x86-memory-relief.md).
+// 2^16 entries (6 MB) leave more than 100x headroom; the configured 2^18
+// (24 MB of the low 2 GiB) is kept only as the upper bound. Reset() logs
+// the peak and any probe failures, so an overflow would show in the log.
+constexpr uint32_t kRenderQueueTrackerCapacity = 1u << 16;
+
 RenderQueueTracker::RenderQueueTracker() {
-  uint32_t capacity =
-      dxvk::war3::internal::kNativeRenderQueueFastTrackerCapacity;
+  uint32_t capacity = std::min(
+      dxvk::war3::internal::kNativeRenderQueueFastTrackerCapacity,
+      kRenderQueueTrackerCapacity);
   if (capacity == 0 || (capacity & (capacity - 1u)) != 0u) {
-    capacity = 1u << 18; // 默认 26 万条目
+    capacity = kRenderQueueTrackerCapacity;
   }
   m_entries.resize(capacity);
   m_mask = capacity - 1u;
@@ -118,6 +130,26 @@ void RenderQueueTracker::Reset() {
   if (nextEpoch == 0)
     nextEpoch = 1;
   m_epoch.store(nextEpoch, std::memory_order_relaxed);
+
+  // Occupancy of the epoch that just ended. Logged (product log) only when a
+  // peak grows by a quarter or new probe failures appear: a few lines a game.
+  const uint32_t stamped = m_epochStamped.exchange(0u, std::memory_order_relaxed);
+  const uint32_t probeFailures =
+      m_epochProbeFailures.exchange(0u, std::memory_order_relaxed);
+  m_totalProbeFailures += probeFailures;
+  ++m_occupancyEpochs;
+  m_peakStamped = std::max(m_peakStamped, stamped);
+  m_peakProbeFailures = std::max(m_peakProbeFailures, probeFailures);
+  if (m_peakStamped > m_loggedPeakStamped + m_loggedPeakStamped / 4u ||
+      m_peakProbeFailures > m_loggedPeakProbeFailures) {
+    m_loggedPeakStamped = m_peakStamped;
+    m_loggedPeakProbeFailures = m_peakProbeFailures;
+    Logger::info(str::format("WarVK RenderQueueTracker: capacity=", m_mask + 1u,
+        " peakEntriesPerFrame=", m_peakStamped,
+        " peakProbeFailuresPerFrame=", m_peakProbeFailures,
+        " totalProbeFailures=", m_totalProbeFailures,
+        " frames=", m_occupancyEpochs, " maxProbes=", kMaxProbes));
+  }
 
   if (dxvk::war3::internal::kNativeRenderQueueTrackerStatsEnabled) {
     m_statFrame++;
@@ -192,6 +224,8 @@ void RenderQueueTracker::MarkTagStage(void *batchArray, uint32_t before,
       m_semanticLayerConflicts.fetch_add(1, std::memory_order_relaxed);
   };
 
+  uint32_t stamped = 0u;
+  uint32_t probeFailures = 0u;
   for (uint32_t i = before; i < after; ++i) {
     auto *record = base + i * kElementStride;
     void *element = *reinterpret_cast<void **>(record);
@@ -201,7 +235,8 @@ void RenderQueueTracker::MarkTagStage(void *batchArray, uint32_t before,
         record + kElementLayerIndexOffset);
 
     size_t h = HashElementKey(element) & m_mask;
-    for (size_t p = 0; p < kMaxProbes; ++p) {
+    size_t p = 0;
+    for (; p < kMaxProbes; ++p) {
       auto &entry = m_entries[(h + p) & m_mask];
       void *currentKey = entry.key.load(std::memory_order_relaxed);
 
@@ -221,6 +256,7 @@ void RenderQueueTracker::MarkTagStage(void *batchArray, uint32_t before,
               std::memory_order_relaxed);
           entry.state.store(PackState(tag, stage, currentEpoch),
                             std::memory_order_release);
+          ++stamped;
           break;
         }
 
@@ -277,11 +313,18 @@ void RenderQueueTracker::MarkTagStage(void *batchArray, uint32_t before,
               std::memory_order_relaxed);
           entry.state.store(PackState(tag, stage, currentEpoch),
                             std::memory_order_release);
+          ++stamped;
           break;
         }
       }
     }
+    if (p == kMaxProbes)
+      ++probeFailures;
   }
+  if (stamped != 0u)
+    m_epochStamped.fetch_add(stamped, std::memory_order_relaxed);
+  if (probeFailures != 0u)
+    m_epochProbeFailures.fetch_add(probeFailures, std::memory_order_relaxed);
 }
 
 void RenderQueueTracker::MarkTags(void *batchArray, uint32_t before,

@@ -4,10 +4,10 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-MANAGER_H = (ROOT / "src/d3d9/d3d9_war3_fog_volume.h").read_text(
+MANAGER_H = (ROOT / "src/d3d9/war3/state/war3_fog_volume.h").read_text(
     encoding="utf-8"
 )
-MANAGER_CPP = (ROOT / "src/d3d9/d3d9_war3_fog_volume.cpp").read_text(
+MANAGER_CPP = (ROOT / "src/d3d9/war3/state/war3_fog_volume.cpp").read_text(
     encoding="utf-8"
 )
 PASS_H = (ROOT / "src/d3d9/d3d9_war3_volumetric_light.h").read_text(

@@ -4,6 +4,7 @@
 #include "../tools/war3_perf_monitor.h"
 
 #include "../../d3d9_war3_hook.h"
+#include "../core/war3_execution_services.h"
 #include "../model/war3_model_hook.h"
 #include "../model/war3_model_resource_cache.h"
 #include "../model/war3_model_registry.h"
@@ -53,16 +54,9 @@
 #undef max
 #endif
 
-// Phase 7.108b：shadow append survey 在 d3d9_device.cpp 实现。
-namespace dxvk::war3_diag {
-  uint64_t QueryShadowAppendTotal();
-  uint64_t QueryShadowAppendUnique();
-  uint32_t QueryShadowAppendRawcodeAt(uint32_t idx);
-  // 2026-09-16 P0 Gap A：device 侧 palette 记忆槽位复核计数
-  //（d3d9_device.cpp 实现）。
-  uint64_t QueryDevicePaletteSlotCacheServedAfterConfirmCount();
-  uint64_t QueryDevicePaletteSlotCacheRejectedStaleCount();
-}
+// Phase 7.108b 的 shadow append survey 与 2026-09-16 P0 Gap A 的 device 侧
+// palette 记忆槽位复核计数都在 d3d9_device.cpp 实现，这里经
+// war3::ProcessServices() 读取，不直接链接设备。
 
 namespace dxvk::war3::render {
 
@@ -6777,10 +6771,11 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
     // 2026-09-16 P0 palette 缝隙修复度量：device(Gap A)/shadow-core(Gap B)
     // 记忆槽位复核计数，直接拉 atomic getter（进程累计值）。
     summary.semanticSceneSkinnedPaletteSlotCacheDeviceServedAfterConfirmCount =
-        ::dxvk::war3_diag::
-            QueryDevicePaletteSlotCacheServedAfterConfirmCount();
+        ::dxvk::war3::ProcessServices()
+            .QueryDevicePaletteSlotCacheServedAfterConfirmCount();
     summary.semanticSceneSkinnedPaletteSlotCacheDeviceRejectedStaleCount =
-        ::dxvk::war3_diag::QueryDevicePaletteSlotCacheRejectedStaleCount();
+        ::dxvk::war3::ProcessServices()
+            .QueryDevicePaletteSlotCacheRejectedStaleCount();
     // 2026-09-17 上级裁定（线程修复方案 B 第一部分）：构建推进边界线程见证
     // （进程累计值，直接拉 atomic getter；与 A5 拒绝计数不同分母）。
     summary.semanticBuildOffThreadRefusedCount =
@@ -7866,13 +7861,13 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
           ::dxvk::war3::hooks::QueryShadowProjectorBlockedFourCCSampleAt(i);
     }
     // Phase 7.108b：shadowCasters append survey。
-    summary.shadowAppendTotalCount =
-        ::dxvk::war3_diag::QueryShadowAppendTotal();
+    auto& deviceCounters = ::dxvk::war3::ProcessServices();
+    summary.shadowAppendTotalCount = deviceCounters.QueryShadowAppendTotal();
     summary.shadowAppendRawcodeUniqueCount =
-        ::dxvk::war3_diag::QueryShadowAppendUnique();
+        deviceCounters.QueryShadowAppendUnique();
     for (uint32_t i = 0u; i < 16u; ++i) {
       summary.shadowAppendRawcodeSamples[i] =
-          ::dxvk::war3_diag::QueryShadowAppendRawcodeAt(i);
+          deviceCounters.QueryShadowAppendRawcodeAt(i);
     }
   }
   // Phase 7.97 诊断：直接拉 atomic getter，反映最近一次 ManifestCopy 真实

@@ -3,17 +3,24 @@
 #include "host_surface_target.h"
 #include "../d3d9_draw_wire.h"
 #include "../d3d9_annotation_wire.h"
+#include "../d3d9_content_wire.h"
 #include "../d3d9_declaration_wire.h"
-#include "../d3d9_ff_wire.h"
+#include "../d3d9_ff_delta_wire.h"
+#include "../d3d9_ff_fast_decode.h"
 #include "../d3d9_shader_tokens.h"
 #include "../d3d9_window_identity.h"
 #include "../win32_transport.h"
+#include "../d3d9_ring_channel.h"
+#include "../d3d9_sync_profile.h"
 #include "../../../src/util/log/log.h"
 #include <chrono>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <cwchar>
 #include <limits>
+#include <string>
 
 namespace dxvk { Logger Logger::s_instance("warvk-d3d9-host.log"); }
 using namespace warvk::host;
@@ -32,10 +39,127 @@ void ExitMilestone(const char* phase,ULONGLONG processStart) noexcept {
     DWORD written=0;WriteFile(GetStdHandle(STD_ERROR_HANDLE),line,DWORD(count),&written,nullptr);
   }
 }
+// Exit-delay measurement (docs/research/2026-11-17-x64-host-exit-delay.md):
+// the boundaries after wmain returns. Kernel32 calls and a stack buffer only,
+// no CRT, heap or lock, so it is usable from a static destructor and from the
+// loader's process-detach callback. Each line is one WriteFile to the
+// inherited log handle; a later line proves the earlier write returned.
+void RawExitMilestone(const char* phase) noexcept {
+  char line[192];size_t n=0;
+  const auto text=[&](const char* s){while(*s&&n+1<sizeof(line))line[n++]=*s++;};
+  const auto number=[&](unsigned long long v){
+    char digits[24];size_t d=0;do{digits[d++]=char('0'+v%10);v/=10;}while(v&&d<sizeof(digits));
+    while(d&&n+1<sizeof(line))line[n++]=digits[--d];
+  };
+  LARGE_INTEGER qpc{};QueryPerformanceCounter(&qpc);
+  text("D3D9 host exit-milestone pid=");number(GetCurrentProcessId());
+  text(" tid=");number(GetCurrentThreadId());text(" phase=");text(phase);
+  text(" tickMs=");number(GetTickCount64());text(" qpc=");number(static_cast<unsigned long long>(qpc.QuadPart));text("\n");
+  DWORD written=0;WriteFile(GetStdHandle(STD_ERROR_HANDLE),line,DWORD(n),&written,nullptr);
+}
 struct MainExitWitness {
   ULONGLONG start;
-  ~MainExitWitness(){ExitMilestone("wmain-locals-complete",start);}
+  ~MainExitWitness(){ExitMilestone("wmain-locals-complete",start);RawExitMilestone("wmain-locals-write-returned");}
 };
+// Constructed first and destroyed last of the C++ static objects.
+struct StaticExitWitness { ~StaticExitWitness(){RawExitMilestone("static-destructors-last");} };
+__attribute__((init_priority(101))) StaticExitWitness staticExitWitness;
+// The executable's own TLS callback: DLL_PROCESS_DETACH runs inside the
+// loader's process shutdown (after the CRT's exit, with the loader lock held).
+void NTAPI ExitTlsCallback(PVOID,DWORD reason,PVOID) {
+  if(reason==DLL_PROCESS_DETACH)RawExitMilestone("loader-process-detach");
+}
+__attribute__((section(".CRT$XLY"),used)) const PIMAGE_TLS_CALLBACK warvkExitTlsCallback=ExitTlsCallback;
+// Exit-delay switches (docs/research/2026-11-17-x64-host-exit-delay.md), on by
+// default since the 2026-11-18 review; `off` names the value that keeps the
+// earlier behaviour, for a control arm. Each is read once, at its use.
+bool ExitSwitch(const wchar_t* name,const wchar_t* off) noexcept {
+  wchar_t v[16]{};const DWORD n=GetEnvironmentVariableW(name,v,16);
+  return !(n&&n<16&&!std::wcscmp(v,off));
+}
+// WARVK_D3D9_HOST_EXIT_BUFFERED (off: "0"): the exit accounts are formatted in memory
+// and written a few whole lines at a time, instead of one stderr write per
+// fprintf (about 800 for the shadow-host line alone). Same bytes, same order;
+// if memory cannot be had the rest goes straight to stderr. What is held is
+// written once it passes HoldBytes at the end of a line, so a fault during the
+// accounts loses at most the lines since then, and when it goes out of scope.
+// `complete` turns false when stderr did not take every byte.
+struct ExitText {
+  static constexpr size_t HoldBytes=32768;
+  bool buffered=false,complete=true;std::string text;
+  ExitText()=default;
+  ExitText(const ExitText&)=delete;ExitText& operator=(const ExitText&)=delete;
+  ~ExitText(){flush();}
+#if defined(__GNUC__)||defined(__clang__)
+  __attribute__((format(printf,2,3)))
+#endif
+  void add(const char* format,...) noexcept {
+    va_list args;va_start(args,format);
+    if(buffered) {
+      va_list size;va_copy(size,args);
+      const int n=std::vsnprintf(nullptr,0,format,size);va_end(size);
+      const size_t at=text.size();
+      bool room=n>=0;
+      if(room)try{text.resize(at+size_t(n)+1);}catch(...){room=false;}
+      if(room) {
+        std::vsnprintf(&text[at],size_t(n)+1,format,args);text.resize(at+size_t(n));va_end(args);
+        if(text.size()>=HoldBytes&&text.back()=='\n')flush();
+        return;
+      }
+      flush();buffered=false;
+    }
+    if(std::vfprintf(stderr,format,args)<0)complete=false;
+    va_end(args);
+  }
+  void flush() noexcept {
+    if(text.empty())return;
+    size_t done=0;
+    while(done<text.size()) {
+      const size_t n=std::fwrite(text.data()+done,1,text.size()-done,stderr);
+      if(!n)break;
+      done+=n;
+    }
+    if(done!=text.size()||std::fflush(stderr)!=0)complete=false;
+    text.clear();
+  }
+};
+// WARVK_D3D9_HOST_EXIT_GL_WATCHER (off: "keep"): after the normal teardown and the
+// final accounts, while every thread of this process still runs, ask
+// opengl32's "Palette Watcher" thread to end the way opengl32 itself does
+// (WM_CLOSE to its window; bounded wait). opengl32 starts that thread when a
+// pixel format is set on a window of another process (here the game's
+// window); left running into ExitProcess it is killed before the loader's
+// detach, whose poll for it can then sleep 100 x 50 ms. Nothing is skipped:
+// if the window is absent or the thread does not end, exit is as before.
+void ClosePaletteWatcher(ULONGLONG processStart) noexcept {
+  struct Found { DWORD pid=0;HWND window=nullptr;DWORD thread=0;unsigned windows=0; } found;
+  found.pid=GetCurrentProcessId();
+  const auto begin=GetTickCount64();
+  EnumWindows([](HWND window,LPARAM context)->BOOL {
+    auto& f=*reinterpret_cast<Found*>(context);
+    DWORD pid=0;const DWORD thread=GetWindowThreadProcessId(window,&pid);
+    wchar_t name[32]{};
+    if(pid==f.pid&&GetClassNameW(window,name,32)>0&&!std::wcscmp(name,L"Palette Watcher")) {
+      ++f.windows;if(!f.window){f.window=window;f.thread=thread;}
+    }
+    return TRUE;
+  },reinterpret_cast<LPARAM>(&found));
+  BOOL posted=FALSE;DWORD waited=WAIT_FAILED;
+  // Exactly one such window, its thread held open, and the window looked at
+  // again right before the message: anything else leaves the exit as it was.
+  if(found.windows==1) {
+    if(const HANDLE thread=OpenThread(SYNCHRONIZE,FALSE,found.thread)) {
+      DWORD pid=0;wchar_t name[32]{};
+      const bool same=GetWindowThreadProcessId(found.window,&pid)==found.thread&&pid==found.pid
+        &&GetClassNameW(found.window,name,32)>0&&!std::wcscmp(name,L"Palette Watcher");
+      if(same)posted=PostMessageW(found.window,WM_CLOSE,0,0);
+      if(posted)waited=WaitForSingleObject(thread,500);
+      CloseHandle(thread);
+    }
+  }
+  std::fprintf(stderr,"D3D9 host exit gl-watcher windows=%u thread=%lu posted=%d waited=%lu elapsedMs=%llu processElapsedMs=%llu\n",
+    found.windows,found.thread,int(posted),waited,GetTickCount64()-begin,GetTickCount64()-processStart);
+}
 void LogExitIntent(const char* strategy,DWORD code,ULONGLONG processStart) noexcept {
   std::fprintf(stderr,"D3D9 host exit-intent pid=%lu strategy=%s code=%lu processElapsedMs=%llu\n",
     GetCurrentProcessId(),strategy,code,GetTickCount64()-processStart);
@@ -97,6 +221,134 @@ struct AdmissionSample {
   uint64_t query=0;
   AdmissionCounters cumulative;
 };
+// P0 measurement only (warvk-d3d9-host-profile/v1): per wire op the count and
+// CPU wall time of its apply; the time spent waiting for the next record; the
+// backend's waits and submissions by call site (GPU::WaitProfile). Cumulative,
+// QueryPerformanceCounter ticks, fixed tables. One line on stderr (host.log)
+// every WARVK_D3D9_SYNC_PROFILE_EVERY Present messages and one at a normal
+// exit. The snapshot is written after the Present reply is published.
+struct HostProfile {
+  int64_t frequency=d9::profile::Frequency(),start=d9::profile::Clock();
+  uint64_t every=d9::profile::Every(),presents=0;
+  std::array<uint64_t,d9::profile::Ops> count{},ticks{},maxTicks{};
+  std::array<std::array<uint64_t,3>,d9::profile::Ops> slow{}; // applies of at least 1 ms, 5 ms, 20 ms
+  const uint64_t slowTicks[3]={uint64_t(frequency)/1000u,uint64_t(frequency)/200u,uint64_t(frequency)/50u};
+  uint64_t idleTicks=0,applyTicks=0,writeTicks=0;
+  // Lost-wakeup measurement: how each park ended, and the last synchronous
+  // reply (when, which op, whether it signalled `progress`).
+  d9::profile::WakeLog wake;
+  int64_t lastReply=0;uint64_t lastReplySequence=0;uint32_t lastReplyOp=0,lastReplySignaled=0;
+  uint32_t loopSleeps=0,loopTimeouts=0,loopStatus=0;
+  std::array<char,40960> text{};
+  void applied(d9::Op op,int64_t begin,int64_t end) noexcept {
+    const auto index=d9::profile::OpIndex(op);const auto t=uint64_t(end-begin);
+    ++count[index];ticks[index]+=t;maxTicks[index]=std::max(maxTicks[index],t);applyTicks+=t;
+    for(size_t i=0;i<3;++i)slow[index][i]+=t>=slowTicks[i];
+    if(op==d9::Op::Present)++presents;
+  }
+  // frameScenes/worldSceneEnters: the annotation channel's frame scenes and
+  // world-scene entries (in-game frames), as annotation-host/v1 prints them.
+  void snapshot(const char* reason,const GPU::Stats& s,uint64_t records,uint64_t syncRecords,uint64_t parks,
+      uint64_t wakes,uint64_t frameScenes,uint64_t worldSceneEnters) noexcept {
+    using namespace d9::profile;
+    const auto now=d9::profile::Clock();
+    const auto us=[this](uint64_t t){return static_cast<unsigned long long>(Micros(t,frequency));};
+    Line line(text.data(),text.size());
+    line.add("D3D9 host-profile: {\"schema\":\"warvk-d3d9-host-profile/v1\",\"reason\":\"%s\",\"pid\":%lu,"
+      "\"every\":%llu,\"timing\":%s,\"presents\":%llu,\"seconds\":%.6f,\"qpc\":%lld,\"qpcFrequency\":%lld,\"unixMs\":%llu,"
+      "\"idleUs\":%llu,\"applyUs\":%llu,\"profileWriteUs\":%llu,\"ringRecords\":%llu,\"ringSyncRecords\":%llu,"
+      "\"ringParks\":%llu,\"ringWakes\":%llu,\"submitted\":%llu,\"gpuCompleted\":%llu,\"draws\":%llu,"
+      "\"presentApiSucceeded\":%llu,\"syncInterval\":%u,\"streamMode\":%s,\"frameScenes\":%llu,"
+      "\"worldSceneEnters\":%llu,\"ops\":[",
+      reason,GetCurrentProcessId(),static_cast<unsigned long long>(every),TimingEnabled()?"true":"false",
+      static_cast<unsigned long long>(presents),double(now-start)/double(frequency),static_cast<long long>(now),static_cast<long long>(frequency),
+      static_cast<unsigned long long>(UnixMs()),us(idleTicks),us(applyTicks),us(writeTicks),
+      static_cast<unsigned long long>(records),static_cast<unsigned long long>(syncRecords),
+      static_cast<unsigned long long>(parks),static_cast<unsigned long long>(wakes),
+      static_cast<unsigned long long>(s.submitted),static_cast<unsigned long long>(s.gpuCompleted),
+      static_cast<unsigned long long>(s.draws),static_cast<unsigned long long>(s.presentApiSucceeded),
+      s.syncInterval,s.streamMode?"true":"false",static_cast<unsigned long long>(frameScenes),
+      static_cast<unsigned long long>(worldSceneEnters));
+    bool first=true;
+    for(size_t i=1;i<Ops;++i) {
+      if(!count[i])continue;
+      line.add("%s{\"op\":%u,\"name\":\"%s\",\"count\":%llu,\"us\":%llu,\"maxUs\":%llu,\"slow\":[%llu,%llu,%llu]}",
+        first?"":",",unsigned(i),OpName(i),static_cast<unsigned long long>(count[i]),us(ticks[i]),us(maxTicks[i]),
+        static_cast<unsigned long long>(slow[i][0]),static_cast<unsigned long long>(slow[i][1]),
+        static_cast<unsigned long long>(slow[i][2]));
+      first=false;
+    }
+    line.close("],\"waits\":[");first=true;
+    const auto& w=s.waitProfile;
+    for(size_t site=0;site<w.waits.size();++site)for(size_t kind=0;kind<w.waits[site].size();++kind) {
+      const auto& c=w.waits[site][kind];
+      if(!c.count)continue;
+      line.add("%s{\"site\":\"%s\",\"kind\":\"%s\",\"count\":%llu,\"us\":%llu,\"maxUs\":%llu,\"polls\":%llu,"
+        "\"slow\":[%llu,%llu,%llu]}",
+        first?"":",",GPU::WaitSiteName(site),GPU::WaitKindName(kind),static_cast<unsigned long long>(c.count),
+        us(c.ticks),us(c.maxTicks),static_cast<unsigned long long>(c.polls),
+        static_cast<unsigned long long>(c.slow[0]),static_cast<unsigned long long>(c.slow[1]),
+        static_cast<unsigned long long>(c.slow[2]));
+      first=false;
+    }
+    line.close("],\"submits\":[");first=true;
+    for(size_t site=0;site<w.submits.size();++site) {
+      if(!w.submits[site])continue;
+      line.add("%s{\"site\":\"%s\",\"submits\":%llu,\"waitForGpu\":%llu}",first?"":",",GPU::WaitSiteName(site),
+        static_cast<unsigned long long>(w.submits[site]),static_cast<unsigned long long>(w.gpuSubmits[site]));
+      first=false;
+    }
+    line.close("]");
+    {
+      // E0: per present-wait mode (0 poll, 1 block); us for the tick fields.
+      const auto& p=s.presentWait;
+      line.add(",\"presentPipeline\":{\"setting\":%u,\"presents\":%llu,\"clears\":%llu,\"drains\":%llu}",s.presentPipelineSetting,
+        static_cast<unsigned long long>(s.presentsPipelined),static_cast<unsigned long long>(s.clearsPipelined),
+        static_cast<unsigned long long>(s.presentPipelineDrains));
+      line.add(",\"presentWait\":{\"setting\":%u,\"every\":%u,\"modes\":[",p.setting,p.every);
+      for(size_t m=0;m<2;++m) {
+        const auto& c=p.modes[m];
+        line.add("%s{\"presents\":%llu,\"queueUs\":%llu,\"queueSleeps\":%llu,\"retireUs\":%llu,\"retireSleeps\":%llu,"
+          "\"intervalUs\":%llu,\"intervals\":%llu,\"intervalMs\":[",m?",":"",static_cast<unsigned long long>(c[0]),us(c[1]),
+          static_cast<unsigned long long>(c[2]),us(c[3]),static_cast<unsigned long long>(c[4]),us(c[5]),
+          static_cast<unsigned long long>(c[6]));
+        for(size_t b=0;b<p.intervalMs[m].size();++b)line.add("%s%u",b?",":"",p.intervalMs[m][b]);
+        line.close("]}");
+      }
+      line.close("]}");
+    }
+    {
+      // Item 4: dynamic storage and its CPU reads by source (0 mapping, 1 CPU copy).
+      const auto& d=s.dynamicRead;const auto n=[](uint64_t v){return static_cast<unsigned long long>(v);};
+      line.add(",\"dynamicRead\":{\"setting\":%u,\"every\":%u,\"flagsSeen\":%u,\"created\":%llu,\"createdDeviceLocal\":%llu,"
+        "\"createdCached\":%llu,\"liveBytes\":%llu,\"peakBytes\":%llu,\"copyBytes\":%llu,\"peakCopyBytes\":%llu,\"modes\":["
+        "[%llu,%llu,%llu,%llu,%llu,%llu],[%llu,%llu,%llu,%llu,%llu,%llu]]}",d.setting,d.every,d.flagsSeen,n(d.created),
+        n(d.createdDeviceLocal),n(d.createdCached),n(d.liveBytes),n(d.peakBytes),n(d.copyBytes),n(d.peakCopyBytes),
+        n(d.modes[0][0]),n(d.modes[0][1]),us(d.modes[0][2]),n(d.modes[0][3]),us(d.modes[0][4]),n(d.modes[0][5]),
+        n(d.modes[1][0]),n(d.modes[1][1]),us(d.modes[1][2]),n(d.modes[1][3]),us(d.modes[1][4]),n(d.modes[1][5]));
+      // P1 batch 1: staging slices (mode 0 settle/submit, 1 slices).
+      const auto& u=s.uploadSlices;
+      line.add(",\"uploadSlices\":{\"setting\":%u,\"every\":%u,\"recorded\":%llu,\"recordedBytes\":%llu,\"listFlushes\":%llu,"
+        "\"creditWaits\":%llu,\"creditWaitUs\":%llu,\"peakInFlightBytes\":%llu,\"peakInFlightSlices\":%llu,"
+        "\"modes\":[[%llu,%llu],[%llu,%llu]]}",u.setting,u.every,n(u.recorded),n(u.recordedBytes),n(u.listFlushes),
+        n(u.creditWaits),us(u.creditWaitTicks),n(u.peakInFlightBytes),n(u.peakInFlightSlices),
+        n(u.modes[0][0]),us(u.modes[0][1]),n(u.modes[1][0]),us(u.modes[1][1]));
+      // Present-to-Present intervals by A/B phase (1 E0, 2 item 4, 3 P1; 0 none).
+      line.add(",\"ab\":{\"switch\":%u,\"frames\":[%llu,%llu],\"intervalUs\":[%llu,%llu],\"intervalMs\":[",
+        s.abPhaseSwitch,n(s.abFrames[0]),n(s.abFrames[1]),us(s.abIntervalTicks[0]),us(s.abIntervalTicks[1]));
+      for(size_t m=0;m<2;++m) {
+        line.add("%s[",m?",":"");
+        for(size_t b=0;b<s.abIntervalMs[m].size();++b)line.add("%s%u",b?",":"",s.abIntervalMs[m][b]);
+        line.close("]");
+      }
+      line.close("]}");
+    }
+    wake.print(line,frequency);
+    line.close(",\"truncated\":%s}\n",line.truncated()?"true":"false");
+    line.write(stderr);
+    if(TimingEnabled())writeTicks+=uint64_t(d9::profile::Clock()-now);
+  }
+};
 struct Session {
   explicit Session(DWORD peer,ipc::Nonce nonce,HANDLE process=nullptr,surface::Mode mode=surface::Mode::Peer)
     :peerPid(peer),peerProcess(process),surfaceMode(mode),marker(d9::WindowMarker(nonce)){}
@@ -110,16 +362,62 @@ struct Session {
   GPU::Stats uninitializedStats{};
   const GPU::Stats& stats() const { return gpu?gpu->stats():uninitializedStats; }
   std::array<Entry,d9::MaxResources+1> entries{};
+  // One past the highest id an entry was ever written for: what the scans
+  // below cover, instead of the whole bound.
+  uint32_t entryLimit=1;
+  std::vector<uint8_t> slotScratch; // slot(): which typed slots are taken
   d9::ResourceRegistry registry;
   d9::TextureUpload textureUpload;
   d9::TextureStages textureStages;
   HandleStats handles;
   uint64_t accepted=0,rejected=0,backendCalls=0;
-  // Accepted DrawFixedBatch messages only; one-draw DrawFixed is not counted.
+  // An asynchronous scene record (FrameScene / StageMarker) was refused: x86
+  // is told through the ring block and sends none once it has read that; the
+  // ones already on their way are ignored, as if they had not been sent.
+  bool sceneStopped=false;uint64_t sceneRefusals=0,sceneRecordsIgnored=0;
+  // Both fixed batch encodings share the existing accepted-batch account.
   uint64_t fixedBatches=0,fixedBatchDraws=0;uint32_t largestFixedBatch=0;
+  uint32_t asyncResources=0,textureSlots=GPU::TextureSlots;
+  uint64_t asyncDestroys=0,asyncTextureCreates=0,unnegotiatedResources=0;
+  bool admitAsyncResource(d9::Op op,uint32_t feature) {
+    if(op==d9::Op::Destroy)++asyncDestroys;else ++asyncTextureCreates;
+    if(asyncResources&feature)return true;
+    ++unnegotiatedResources;return false;
+  }
+  void reportAsyncResources(ExitText& out) const {
+    if(asyncResources)
+      out.add("D3D9 async-resource-host: {\"schema\":\"warvk-d3d9-async-resource-host/v1\","
+        "\"asyncDestroy\":%s,\"asyncCreateTexture\":%s,\"destroyReceived\":%llu,\"createTextureReceived\":%llu,"
+        "\"unnegotiatedRejected\":%llu,\"logicalCreated\":%llu,\"logicalDestroyed\":%llu,\"texturesCreated\":%llu,"
+        "\"liveResources\":%u}\n",asyncResources&d9::InitializeAsyncDestroy?"true":"false",
+        asyncResources&d9::InitializeAsyncCreateTexture?"true":"false",asyncDestroys,asyncTextureCreates,unnegotiatedResources,
+        handles.logicalHandlesCreated,handles.logicalHandlesDestroyed,stats().texturesCreated,stats().liveResources);
+  }
+  void reportWater(ExitText& out) const {
+    const auto& w = stats().water;
+    using R = GPU::WaterFallback;
+    const auto n = [&](R reason) { return w.fallbacks[size_t(reason)]; };
+    out.add("D3D9 in-place water: draws=%llu snapshots=%llu skippedOldPasses=%llu "
+      "fallbacks={msaa:%llu,format:%llu,snapshot:%llu,drawState:%llu,projection:%llu,resources:%llu,pipeline:%llu} "
+      "gpu=%s gpuSamples=%llu gpuMeanUs=%.2f gpuMaxUs=%.2f\n",
+      w.draws, w.snapshots, w.skippedOldPasses, n(R::Msaa), n(R::Format), n(R::Snapshot), n(R::DrawState),
+      n(R::Projection), n(R::Resources), n(R::Pipeline), w.gpuSamples ? "sampled" : "unavailable",
+      w.gpuSamples, w.gpuSamples ? w.gpuTotalUs / double(w.gpuSamples) : 0.0, w.gpuMaxUs);
+  }
+  bool fixedDelta=false;
+  uint64_t deltaMessages=0,deltaRecords=0,deltaRejected=0,deltaVerified=0;
+  void reportFixedDelta(ExitText& out) const {
+    if(fixedDelta||deltaMessages)
+      out.add("D3D9 fixed-delta-host: {\"schema\":\"warvk-d3d9-fixed-delta-host/v1\","
+        "\"messages\":%llu,\"records\":%llu,\"restoredBytes\":%llu,\"rejected\":%llu,\"verified\":%llu}\n",
+        deltaMessages,deltaRecords,deltaRecords*d9::FixedDrawBytes,deltaRejected,deltaVerified);
+  }
   // Session-owned decode targets (about 60 KiB), never per-message stack copies.
   std::array<GPU::DrawState,d9::MaxFixedDrawBatch> fixedBatchStates{};
   std::array<d9::FixedFunctionState,d9::MaxFixedDrawBatch> fixedBatchFixed{};
+  // WARVK_D3D9_FAST_DECODE (off: "0").
+  d9::FixedDrawDecoder fixedDecoder;
+  const bool fastDecode=ExitSwitch(L"WARVK_D3D9_FAST_DECODE",L"0");
   bool initialized=false,finished=false;
   bool presentedReadback=false;
   // A captured diagnostic frame at the current extent; Reset drops it.
@@ -144,14 +442,98 @@ struct Session {
   bool annotations=false,annotationsPending=false;
   d9::DrawAnnotations pendingAnnotations;
   d9::AnnotationRecorder annotationRecorder;
+  d9::SceneTracker sceneTracker;
+  // The frame's scene packet and what the BeforeUi executors did with it.
+  d9::scene::FramePacket scenePacket;
+  uint64_t effectRecords=0,effectFrames=0,ssaoRecorded=0,snowRecorded=0,aaRecorded=0,bloomRecorded=0,effectInsertionsRefused=0;
+  uint32_t lastSsaoStage=0,lastSnowStage=0,lastAaStage=0,lastBloomStage=0;
+  uint64_t effectNs=0,effectResourceBytes=0; // copied from the backend after each run
+  // The frame's shadow records, and what the shadow pass did with them and
+  // with the caster draws (shadow_before_ui.h).
+  d9::scene::ShadowPacket shadowPacket;
+  uint64_t shadowRecords=0,shadowCasterRecords=0,shadowRuns=0,shadowMapRenders=0,shadowReceiverDraws=0;
+  uint64_t shadowCastersUsed=0,shadowCastersRefused=0,shadowCastersDrawn=0,shadowReplayRejected=0;
+  std::array<uint64_t,4> shadowRefusals{};
+  // Casters the pass took from dynamic buffers, and the bytes it copied;
+  // ShadowCasterAlpha records that reached a caster.
+  uint64_t shadowCastersCopied=0,shadowCopiedBytes=0,shadowAlphaRecords=0;
+  dxvkcore::ShadowOutcome lastShadow;
+  // Every run of the pass in order, for a gate that compares two executors
+  // frame by frame; a session of more runs than this keeps the first ones.
+  static constexpr size_t ShadowRunLogLimit=256;
+  std::vector<dxvkcore::ShadowOutcome> shadowRunLog;
+  uint64_t shadowPeakResourceBytes=0;
+  // The device's allocator after each of those runs, {used, allocated} bytes:
+  // what the pass owns is part of it, and so is whatever a map or a device
+  // that ended left behind.
+  std::vector<std::array<uint64_t,2>> shadowDeviceLog;
+  // Content payloads, negotiated with annotations: the only copy of each blob.
+  struct ContentStore {
+    d9::ContentIndex index;
+    std::unordered_map<uint64_t,std::vector<uint8_t>> blobs;
+    std::vector<uint8_t> incoming;
+    uint64_t chunks=0,uploadedBytes=0,reads=0,readBytes=0,boundRefs=0,refusedRefs=0;
+    void drop() {index.abort();std::vector<uint8_t>().swap(incoming);}
+  } content;
+  // Keep the checked identity at its wire index for both executors. A batch
+  // is preflighted as a whole even when its recording switches pipelines.
+  std::array<d9::scene::ShadowCaster, GPU::MaxDrawBatch> annotatedCasters{};
+  uint32_t casterMask = 0;
+  bool inspectAnnotations(uint32_t& waterMask) {
+    static_assert(GPU::MaxDrawBatch <= 32 && GPU::MaxFixedDrawBatch <= GPU::MaxDrawBatch);
+    casterMask = 0;
+    bool bound=true;
+    const bool inspectWater = sceneTracker.active && gpu->waterSceneEnabled();
+    pendingAnnotations.forEach([&](uint16_t index,uint16_t schema,const uint8_t* data,uint16_t bytes) {
+      if(const auto kind=d9::ContentKindOf(schema))bound=bound&&content.index.bound(d9::DecodeContentRef(data),kind);
+      if (inspectWater && schema == uint32_t(d9::AnnotationSchema::ShadowCaster) &&
+          d9::scene::DecodeShadowCaster(data, bytes, annotatedCasters[index])) {
+        casterMask |= 1u << index;
+        if (d9::scene::IsWaterSurfaceRecord(annotatedCasters[index]))
+          waterMask |= 1u << index;
+      }
+    });
+    return bound;
+  }
+  // The draws were recorded; a ShadowCaster record hands its draw to the
+  // shadow pass, for the frame the next BeforeUi belongs to.
+  // prepareDraw writes the checked index span at the same batch index as the
+  // annotation. Only a successfully recorded draw can deliver it.
+  std::array<GPU::CasterIndexSpan,GPU::MaxDrawBatch> casterSpans;
   void deliverAnnotations(const GPU::DrawState* states) {
     uint32_t last=UINT32_MAX;
+    d9::scene::ShadowCaster caster;d9::scene::ShadowCasterAlpha alpha;
+    bool hasCaster=false,hasAlpha=false;uint16_t casterIndex=0;
+    const auto handCaster=[&] {
+      if(!hasCaster)return;
+      hasCaster=false;++backendCalls;++shadowCasterRecords;if(hasAlpha)++shadowAlphaRecords;
+      // The draw itself was accepted; a caster the pass cannot take is
+      // counted by the pass, so nothing is left to refuse here.
+      try {gpu->addShadowCaster(states[casterIndex],caster,hasAlpha?&alpha:nullptr,effectFrames+1,
+          sceneTracker.generation+1,casterSpans[casterIndex]);}
+      catch(const GPU::ProfileRejected&) {}
+    };
     pendingAnnotations.forEach([&](uint16_t index,uint16_t schema,const uint8_t* data,uint16_t bytes) {
       const auto& s=states[index];
       if(index!=last){++annotationRecorder.annotatedDraws;last=index;}
+      if(d9::ContentKindOf(schema))++content.boundRefs;
       annotationRecorder.draw(schema,data,bytes,uint32_t(s.primitiveType),s.primitiveCount,s.numVertices,s.startIndex);
+      // A caster goes to the pass with its draw's companion record, which
+      // follows it (records ascend by draw and schema).
+      if(hasCaster&&casterIndex!=index)handCaster();
+      if(schema==uint32_t(d9::AnnotationSchema::ShadowCaster)) {
+        if (casterMask & (1u << index)) {
+          caster=annotatedCasters[index];hasCaster=true;
+        } else hasCaster=d9::scene::DecodeShadowCaster(data,bytes,caster);
+        casterIndex=index;hasAlpha=false;
+      } else if(schema==uint32_t(d9::AnnotationSchema::ShadowCasterAlpha)&&hasCaster&&casterIndex==index) {
+        hasAlpha=d9::scene::DecodeShadowCasterAlpha(data,bytes,alpha);
+      }
     });
+    handCaster();
   }
+  // The scene packet ends with its frame, and at a session change.
+  void clearScene() {scenePacket.clear();shadowPacket.clear();gpu->endShadowFrame();}
   bool admissionProfile=false;
   AdmissionCounters admission;
   std::array<AdmissionSample,128> admissionSamples{};
@@ -172,8 +554,8 @@ struct Session {
     auto result=handles;
     result.liveLogicalHandles=registry.liveCount();
     result.liveQueries=0;
-    for(const auto& entry:entries)
-      if(registry.matches(entry.ref,d9::Type::EventQuery))++result.liveQueries;
+    for(uint32_t id=1;id<entryLimit;++id)
+      if(registry.matches(entries[id].ref,d9::Type::EventQuery))++result.liveQueries;
     return result;
   }
   static bool buffer(d9::Type t){return t==d9::Type::VertexBuffer||t==d9::Type::IndexBuffer;}
@@ -199,9 +581,16 @@ struct Session {
   }
   uint32_t slot(d9::Type type){
     if(!d9::ValidType(type)||type==d9::Type::EventQuery)return 0;
-    const uint32_t max=buffer(type)?GPU::BufferSlots:type==d9::Type::Texture?GPU::TextureSlots:type==d9::Type::Declaration?GPU::DeclarationSlots:GPU::ShaderSlots;
-    for(uint32_t n=1;n<=max;++n){bool used=false;for(const auto& e:entries)if(registry.matches(e.ref,e.type)&&e.slot==n&&(e.type==type||(buffer(type)&&buffer(e.type))))used=true;
-      if(!used)return n;}return 0;
+    const uint32_t max=buffer(type)?GPU::BufferSlots:type==d9::Type::Texture?textureSlots:type==d9::Type::Declaration?GPU::DeclarationSlots:GPU::ShaderSlots;
+    // One pass over the live entries, then the lowest free slot (the tables are
+    // game-sized: a scan per candidate slot would be quadratic).
+    slotScratch.assign(size_t(max)+1,0);
+    for(uint32_t id=1;id<entryLimit;++id) {
+      const auto& e=entries[id];
+      if(e.slot&&e.slot<=max&&registry.matches(e.ref,e.type)&&(e.type==type||(buffer(type)&&buffer(e.type))))slotScratch[e.slot]=1;
+    }
+    for(uint32_t n=1;n<=max;++n)if(!slotScratch[n])return n;
+    return 0;
   }
   HRESULT apply(const d9::Header& h,const uint8_t* payload,d9::Packet& result,uint32_t& resultBytes){
     resultBytes=0;
@@ -209,6 +598,13 @@ struct Session {
     // message they declared. Anything else is refused and drops them.
     const bool annotated=annotationsPending;annotationsPending=false;
     if(annotated&&!pendingAnnotations.binds(h))return D3DERR_INVALIDCALL;
+    // An open content upload admits only its own next chunk; anything else is
+    // refused and drops the blob.
+    if(content.index.active()&&h.op!=d9::Op::ContentUpload){content.drop();return D3DERR_INVALIDCALL;}
+    // A draw is refused whole when one of its records names content that is
+    // not there: the executor never sees a dangling reference.
+    uint32_t waterMask = 0;
+    if(annotated&&!inspectAnnotations(waterMask)){++content.refusedRefs;return D3DERR_INVALIDCALL;}
     // Keep the actual dispatcher safe for direct CPU tests as well as decoded
     // wire packets. No malformed identity or payload reaches a backend call.
     if(!d9::ValidOp(uint32_t(h.op))||h.payloadBytes>d9::MaxPayload
@@ -234,7 +630,7 @@ struct Session {
       // never a recoverable rejection that would let the proxy reuse this ID.
       Require(registry.commitCreate(ref,type),"D3D9 resource create commit invariant");
       Entry entry{};entry.ref=ref;entry.type=type;entry.slot=index;entry.size=size;
-      entry.width=w;entry.height=height;entries[ref.id]=entry;
+      entry.width=w;entry.height=height;entries[ref.id]=entry;entryLimit=std::max(entryLimit,ref.id+1);
       ++handles.logicalHandlesCreated;
       if(ref.generation>1)++handles.logicalHandlesReused;
       if(type==d9::Type::EventQuery) {
@@ -286,7 +682,8 @@ struct Session {
           gpu->initialize(init.width,init.height,nullptr,0,0,nullptr,false,nullptr,surface::Mode::Peer,factory.get(),init.opaque,0);
         }
         targetWidth=init.width;targetHeight=init.height;
-        retainContent=init.retainContent;annotations=init.annotations;initialized=true;break;
+        retainContent=init.retainContent;annotations=init.annotations;fixedDelta=init.fixedDelta;
+        asyncResources=init.asyncResources;initialized=true;break;
       }
       case d9::Op::CreateBuffer:{
         if(h.payloadBytes||!unused(3)||!h.args[0]||h.args[0]>d9::MaxBuffer||h.args[1]>1||h.args[2]>1
@@ -415,7 +812,10 @@ struct Session {
         d9::DrawCommand command;if(h.id||!unused(0)||!d9::DecodeDraw(payload,h.payloadBytes,command))return D3DERR_INVALIDCALL;
         GPU::DrawState s;if(!resolveDraw(command,s))return D3DERR_INVALIDCALL;
         ++backendCalls;
-        try { gpu->draw(s); }
+        try {
+          if (waterMask) gpu->drawBatch(&s,1,casterSpans.data(),waterMask);
+          else gpu->draw(s,annotated?casterSpans.data():nullptr);
+        }
         catch (const GPU::ProfileRejected&) { return D3DERR_INVALIDCALL; }
         if(annotated)deliverAnnotations(&s);
         break;
@@ -425,7 +825,10 @@ struct Session {
         if(h.id||!unused(0)||!d9::DecodeFixedDraw(payload,h.payloadBytes,command,fixed)
           ||!resolveDraw(command,state,true))return D3DERR_INVALIDCALL;
         ++backendCalls;
-        try {gpu->drawFixed(state,fixed);}
+        try {
+          if (waterMask) gpu->drawFixedBatch(&state,&fixed,1,casterSpans.data(),waterMask);
+          else gpu->drawFixed(state,fixed,annotated?casterSpans.data():nullptr);
+        }
         catch(const GPU::ProfileRejected&) {return D3DERR_INVALIDCALL;}
         if(annotated)deliverAnnotations(&state);
         break;
@@ -461,25 +864,43 @@ struct Session {
         }
         if(admissionProfile)admission.batchDecodeNs+=ElapsedNs(decodeBegin);
         ++backendCalls;
-        try { gpu->drawBatch(states.data(),count); }
+        try {
+          if (waterMask) gpu->drawBatch(states.data(),count,casterSpans.data(),waterMask);
+          else gpu->drawBatch(states.data(),count,annotated?casterSpans.data():nullptr);
+        }
         catch(const GPU::ProfileRejected&) { return D3DERR_INVALIDCALL; }
         admission.batchDraws+=count;
         if(annotated)deliverAnnotations(states.data());
         break;
       }
-      case d9::Op::DrawFixedBatch:{
-        const auto count=h.args[0];
-        if(h.id||!unused(1)||!count||count>d9::MaxFixedDrawBatch||h.payloadBytes!=count*d9::FixedDrawBytes)
+      case d9::Op::DrawFixedBatch:case d9::Op::DrawFixedDeltaBatch:{
+        const auto count=h.args[0];const bool delta=h.op==d9::Op::DrawFixedDeltaBatch;
+        if(delta) {
+          if(!fixedDelta)return D3DERR_INVALIDCALL;
+        } else if(h.id||!unused(1)||!count||count>d9::MaxFixedDrawBatch||h.payloadBytes!=count*d9::FixedDrawBytes)
           return D3DERR_INVALIDCALL;
         const auto decodeBegin=admissionProfile?Clock::now():Clock::time_point{};
-        for(uint32_t i=0;i<count;++i) {
+        const auto stage=[&](uint32_t i,const uint8_t* bytes) {
           d9::DrawCommand command;
-          if(!d9::DecodeFixedDraw(payload+i*d9::FixedDrawBytes,d9::FixedDrawBytes,command,fixedBatchFixed[i])
-            ||!resolveDraw(command,fixedBatchStates[i],true))return D3DERR_INVALIDCALL;
-        }
+          // Same result and outputs either way; the decoder keeps what did not change since the
+          // previous record (d3d9_ff_fast_decode.h).
+          return (fastDecode?fixedDecoder.decode(bytes,command,fixedBatchFixed[i])
+              :d9::DecodeFixedDraw(bytes,d9::FixedDrawBytes,command,fixedBatchFixed[i]))
+            &&resolveDraw(command,fixedBatchStates[i],true);
+        };
+        if(delta) {
+          const auto status=d9::StageFixedDeltaBatch(h,payload,stage);
+          if(status==d9::FixedDeltaResult::HashMismatch)
+            std::fprintf(stderr,"D3D9 fixed delta-mismatch sequence=%llu count=%u\n",h.sequence,count);
+          if(status!=d9::FixedDeltaResult::Valid)return D3DERR_INVALIDCALL;
+        } else for(uint32_t i=0;i<count;++i)
+          if(!stage(i,payload+i*d9::FixedDrawBytes))return D3DERR_INVALIDCALL;
         if(admissionProfile)admission.batchDecodeNs+=ElapsedNs(decodeBegin);
         ++backendCalls;
-        try { gpu->drawFixedBatch(fixedBatchStates.data(),fixedBatchFixed.data(),count); }
+        try {
+          if (waterMask) gpu->drawFixedBatch(fixedBatchStates.data(),fixedBatchFixed.data(),count,casterSpans.data(),waterMask);
+          else gpu->drawFixedBatch(fixedBatchStates.data(),fixedBatchFixed.data(),count,annotated?casterSpans.data():nullptr);
+        }
         catch(const GPU::ProfileRejected&) { return D3DERR_INVALIDCALL; }
         admission.batchDraws+=count;
         ++fixedBatches;fixedBatchDraws+=count;largestFixedBatch=std::max(largestFixedBatch,count);
@@ -491,10 +912,88 @@ struct Session {
         annotationsPending=true;break;
       case d9::Op::FrameScene:
         if(!annotations||h.id||!unused(1)||!d9::ValidFrameScene(h.args[0],payload,h.payloadBytes))return D3DERR_INVALIDCALL;
+        if(sceneStopped){++sceneRecordsIgnored;break;}
+        // An unusable camera is not a protocol error: effects report it.
+        if(shadowPacket.accept(h.args[0],payload,h.payloadBytes))++shadowRecords;
+        else {
+          scenePacket.accept(h.args[0],payload,h.payloadBytes);
+          if(h.args[0]!=uint32_t(d9::AnnotationSchema::FrameCamera))++effectRecords;
+        }
         annotationRecorder.scene(h.args[0],payload,h.payloadBytes);break;
-      case d9::Op::StageMarker:
+      case d9::Op::StageMarker:{
         if(!annotations||h.id||h.payloadBytes||!unused(1)||!d9::ValidStage(h.args[0]))return D3DERR_INVALIDCALL;
+        if(sceneStopped){++sceneRecordsIgnored;break;}
+        // Effects go between the completed world scene and whatever follows
+        // it, once. Anywhere else the marker is refused and nothing runs.
+        const bool insert=h.args[0]==uint32_t(d9::Stage::BeforeUi)&&(scenePacket.effects()||shadowPacket.work());
+        if(insert&&!sceneTracker.canInsertBeforeUi()){++effectInsertionsRefused;return D3DERR_INVALIDCALL;}
+        if(!sceneTracker.mark(h.args[0],gpu->stats().draws))return D3DERR_INVALIDCALL;
+        if (h.args[0] == uint32_t(d9::Stage::WorldSceneEnter)) gpu->beginWaterScene();
+        if(insert) {
+          ++backendCalls;
+          GPU::BeforeUiOutcome outcome;
+          try { outcome=gpu->runBeforeUi(scenePacket,shadowPacket,effectFrames+1,sceneTracker.generation+1); }
+          catch(const GPU::ProfileRejected&) { return D3DERR_INVALIDCALL; }
+          ++effectFrames;sceneTracker.insertedBeforeUi();
+          effectNs=gpu->stats().beforeUiNs;effectResourceBytes=gpu->stats().effectResourceBytes;
+          lastSsaoStage=outcome.ssaoStage;lastSnowStage=outcome.snowStage;
+          lastAaStage=outcome.aaStage;lastBloomStage=outcome.bloomStage;
+          ssaoRecorded+=outcome.ssaoRecorded;snowRecorded+=outcome.snowRecorded;
+          aaRecorded+=outcome.aaRecorded;bloomRecorded+=outcome.bloomRecorded;
+          const auto& shadow=outcome.shadow;
+          shadowCastersRefused+=shadow.refused;shadowCastersUsed+=shadow.received-shadow.refused;
+          for(size_t i=0;i<shadowRefusals.size();++i)shadowRefusals[i]+=shadow.refusals[i];
+          shadowCastersCopied+=shadow.copied;shadowCopiedBytes+=shadow.copiedBytes;
+          if(shadow.ran) {
+            ++shadowRuns;shadowMapRenders+=shadow.mapExecuted;shadowReceiverDraws+=shadow.receiverExecuted;
+            shadowCastersDrawn+=shadow.drawnCasters;shadowReplayRejected+=shadow.replayRejected;lastShadow=shadow;
+            shadowPeakResourceBytes=std::max(shadowPeakResourceBytes,shadow.resourceBytes);
+            if(shadowRunLog.size()<ShadowRunLogLimit) {
+              shadowRunLog.push_back(shadow);
+              shadowDeviceLog.push_back({outcome.deviceUsedBytes,outcome.deviceAllocatedBytes});
+            }
+          }
+        }
+        if(h.args[0]==uint32_t(d9::Stage::FrameEnd))clearScene();
         annotationRecorder.stage(h.args[0]);break;
+      }
+      case d9::Op::SessionReset:{
+        // Registered and folded only: no host executor owns per-map state yet.
+        if(!annotations||!d9::ValidSessionReset(h))return D3DERR_INVALIDCALL;
+        const auto generation=uint64_t(h.args[1])|(uint64_t(h.args[2])<<32);
+        if(!sceneTracker.reset(generation))return D3DERR_INVALIDCALL;
+        annotationRecorder.reset(h.args[0],generation);clearScene();
+        // Content identities belong to the map that ended.
+        content.index.clear();content.blobs.clear();break;
+      }
+      case d9::Op::ContentUpload:{
+        d9::ContentChunk chunk;
+        if(!annotations||!d9::DecodeContentUpload(h,payload,chunk)){content.drop();return D3DERR_INVALIDCALL;}
+        const auto admitted=content.index.admit(chunk);
+        if(admitted==d9::ContentIndex::Admit::Refused){content.drop();return D3DERR_INVALIDCALL;}
+        if(!chunk.offset){content.incoming.clear();content.incoming.reserve(chunk.total);}
+        content.incoming.insert(content.incoming.end(),payload,payload+chunk.count);
+        ++content.chunks;content.uploadedBytes+=chunk.count;
+        if(admitted==d9::ContentIndex::Admit::Complete) {
+          annotationRecorder.content(chunk.kind,chunk.key,chunk.revision,content.incoming.data(),chunk.total);
+          content.blobs[chunk.key]=std::move(content.incoming);content.incoming=std::vector<uint8_t>();
+        }
+        break;
+      }
+      case d9::Op::ContentRelease:{
+        d9::ContentRef released;
+        if(!annotations||!d9::DecodeContentRelease(h,released)||!content.index.release(released))return D3DERR_INVALIDCALL;
+        content.blobs.erase(released.key);annotationRecorder.release(released.key,released.revision);break;
+      }
+      case d9::Op::ContentRead:{
+        // The stored bytes only: no GPU work, settle, or ordering change.
+        d9::ContentRef wanted;uint32_t offset=0,count=0;
+        if(!annotations||!d9::DecodeContentRead(h,wanted,offset,count))return D3DERR_INVALIDCALL;
+        const auto* meta=content.index.find(wanted);
+        if(!meta||offset>meta->bytes||count>meta->bytes-offset)return D3DERR_INVALIDCALL;
+        std::memcpy(result.data()+d9::ReplyBytes,content.blobs.find(wanted.key)->second.data()+offset,count);
+        resultBytes=count;++content.reads;content.readBytes+=count;break;
+      }
       case d9::Op::ClearRegions:{
         d9::ClearRegions regions;
         if(!d9::DecodeClearRegions(h,payload,regions,targetWidth,targetHeight))return D3DERR_INVALIDCALL;
@@ -574,7 +1073,7 @@ struct Session {
         if(h.id||h.payloadBytes||!unused(0))return D3DERR_INVALIDCALL;
         // Offscreen remains unsupported and retains its old command counts.
         if(!gpu->stats().presenterImplemented)return E_NOTIMPL;
-        ++backendCalls;const auto hr=gpu->present();
+        ++backendCalls;const auto hr=gpu->present();sceneTracker.frameEnd();clearScene();
         if(hr==D3D_OK&&presentedReadback) {
           presentedCurrent=true;
           // The frame number, plus the whole frozen image when it fits; larger
@@ -596,7 +1095,8 @@ struct Session {
         // are the only ones in this profile. The window's own resize keeps
         // them. Nothing half-created or uploading either way.
         if(!resize.keepResources)
-          for(const auto& entry:entries)if(buffer(entry.type)&&registry.matches(entry.ref,entry.type))return D3DERR_INVALIDCALL;
+          for(uint32_t id=1;id<entryLimit;++id)
+            if(buffer(entries[id].type)&&registry.matches(entries[id].ref,entries[id].type))return D3DERR_INVALIDCALL;
         if(registry.reservedCount()||textureUpload.active())return D3DERR_INVALIDCALL;
         if(presenter) {
           // The client must already have the new extent; host-owned surfaces stay 64x64.
@@ -609,6 +1109,8 @@ struct Session {
         ++backendCalls;gpu->reset(resize.width,resize.height,resize.interval,resize.opaque,resize.keepResources);
         targetWidth=resize.width;targetHeight=resize.height;presentedCurrent=false;break;
       }
+      // Attaching is the transport's business (wmain); it is never a session command.
+      case d9::Op::AttachRing:return D3DERR_INVALIDCALL;
       case d9::Op::Finish:
         if(h.id||h.payloadBytes||!unused(0))return D3DERR_INVALIDCALL;
         if(registry.liveCount()!=0||registry.reservedCount()!=0)return D3DERR_INVALIDCALL;
@@ -665,38 +1167,163 @@ struct Session {
   }
 };
 }
+// The window a WSI session presents into belongs to the peer. Both processes
+// compare its client extent with the back buffer, and those are the same
+// numbers only when both see the window with the same DPI awareness - as the
+// in-process device does by living in the game. So this process takes the
+// peer's awareness, before it touches a window or the GPU. An unaware peer
+// leaves it as it started.
+static void AdoptPeerDpiAwareness(HANDLE peer){
+  using Get=HRESULT(WINAPI*)(HANDLE,int*);using Set=HRESULT(WINAPI*)(int);
+  const HMODULE shcore=LoadLibraryExW(L"shcore.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
+  const auto get=shcore?reinterpret_cast<Get>(reinterpret_cast<void*>(GetProcAddress(shcore,"GetProcessDpiAwareness"))):nullptr;
+  const auto set=shcore?reinterpret_cast<Set>(reinterpret_cast<void*>(GetProcAddress(shcore,"SetProcessDpiAwareness"))):nullptr;
+  // PROCESS_DPI_AWARENESS: 0 unaware, 1 system, 2 per monitor.
+  int theirs=0,own=0;HRESULT queried=E_NOTIMPL,applied=S_FALSE;
+  if(get&&set) {
+    queried=get(peer,&theirs);
+    if(SUCCEEDED(queried)&&theirs!=0)applied=set(theirs);
+    get(nullptr,&own);
+  }
+  std::fprintf(stderr,"D3D9 host dpi-awareness peer=%d queried=0x%08lx applied=0x%08lx own=%d\n",
+    theirs,static_cast<unsigned long>(queried),static_cast<unsigned long>(applied),own);
+  std::fflush(stderr);
+}
 int wmain(int argc,wchar_t**argv){
   const auto processStart=GetTickCount64();
+  // Exit-delay measurement: registered after every static constructor, so
+  // the CRT's exit runs it first; keep the TLS callback referenced.
+  std::atexit([]{RawExitMilestone("crt-exit-begin");});
+  (void)*static_cast<const volatile PIMAGE_TLS_CALLBACK*>(&warvkExitTlsCallback);
   MainExitWitness finalLocals{processStart};
   std::unique_ptr<Session> session;
+  const auto reportFailedAccounts=[&]{if(session){ExitText out;session->reportFixedDelta(out);session->reportAsyncResources(out);session->reportWater(out);}};
   try{
-    Require(argc==4,"nonce parent-pid parent-creation");const auto nonce=lab::ParseNonce(argv[1]);const auto pid=std::stoull(argv[2]);
-    Require(pid>0&&pid<=UINT32_MAX,"parent PID range");auto parent=lab::OpenPeer(DWORD(pid),std::stoull(argv[3]));
+    Require(argc>=4&&argc<=6,"nonce parent-pid parent-creation [inherited-parent-handle [resource-fixture]]");
+    enum class Fixture {None,OneSlot,Allocation,AfterApply,DeviceLost,Delayed};
+    Fixture fixture=Fixture::None;
+    if(argc==6) {
+      // Only the isolated raw fixture supplies this argument. Neither the
+      // product proxy nor any wire message can request a synthetic outcome.
+      Require(d9::ReadGameProfile()==d9::GameProfile::None,"resource fixture excludes game profiles");
+      d9::RequireIsolatedDesktop();
+      const std::wstring arg=argv[5];
+      if(arg==L"--test-resource-one-slot")fixture=Fixture::OneSlot;
+      else if(arg==L"--test-resource-allocation")fixture=Fixture::Allocation;
+      else if(arg==L"--test-resource-after-apply")fixture=Fixture::AfterApply;
+      else if(arg==L"--test-resource-device-lost")fixture=Fixture::DeviceLost;
+      else if(arg==L"--test-resource-delay")fixture=Fixture::Delayed;
+      else Require(false,"unknown resource fixture");
+    }
+    const auto nonce=lab::ParseNonce(argv[1]);const auto pid=std::stoull(argv[2]);
+    Require(pid>0&&pid<=UINT32_MAX,"parent PID range");
+    // A parent that shares itself is adopted; otherwise it is opened by PID.
+    auto parent=argc>=5?lab::AdoptPeer(std::stoull(argv[4]),DWORD(pid),std::stoull(argv[3]))
+      :lab::OpenPeer(DWORD(pid),std::stoull(argv[3]));
+    AdoptPeerDpiAwareness(parent.get());
     const auto surfaceMode=surface::ReadStartupMode();
     std::fprintf(stderr,"D3D9 host dev surface-owner mode=%s productIntegrated=false\n",surface::ModeName(surfaceMode));
     std::fflush(stderr);
     auto pipe=lab::CreateServer(nonce,lab::Channel::D3D9Dev5);lab::IoStats io;lab::Accept(pipe.get(),parent.get(),io);lab::VerifyPeer(pipe.get(),true,DWORD(pid));
     Require(!GetModuleHandleW(L"Game.dll"),"game forbidden");
     session=std::make_unique<Session>(DWORD(pid),nonce,parent.get(),surfaceMode);
+    if(fixture==Fixture::OneSlot)session->textureSlots=1;
+    // The table never grows after this: a create is committed after its GPU
+    // object exists, where running out of memory could no longer be refused.
+    Require(session->registry.reserveAll(),"D3D9 resource table memory");
     wchar_t admissionMode[8]{};
     const DWORD admissionLength=GetEnvironmentVariableW(L"WARVK_D3D9_ADMISSION_PROFILE",admissionMode,8);
     Require(!admissionLength||(admissionLength==1&&admissionMode[0]==L'1'),"unknown admission diagnostic mode");
     session->admissionProfile=admissionLength!=0;
     const bool profile=session->admissionProfile;auto& admission=session->admission;
     d9::Packet request{},response{};uint64_t sequence=1;bool initializationLogged=false;
+    // Command ring (d3d9_command_ring.h): attached by the one message after a
+    // successful Initialize; from its reply on, every message arrives here.
+    std::unique_ptr<d9::ring::PeerChannel> ringChannel;std::unique_ptr<d9::ring::Consumer> ring;
+    bool attachAllowed=false;uint64_t ringRecords=0,ringSyncRecords=0,ringParks=0,ringWakes=0;
+    HostProfile hostProfile; // P0 measurement only
     while(!session->finished){
-      // Only D3D9dev opts in: a live idle producer is not a truncated frame.
-      // The first received byte starts the unchanged shared 5 s header/body
-      // window, so sending one byte cannot hold an incomplete frame forever.
+      const auto profileIdle=d9::profile::Ticks();
       const auto idleBegin=profile?Clock::now():Clock::time_point{};
-      lab::ReadFirstByteAfterIdle(pipe.get(),parent.get(),request.data(),io);
-      const auto readBegin=profile?Clock::now():Clock::time_point{};
-      const lab::ReadWindow deadline;lab::ReadExact(pipe.get(),parent.get(),request.data()+1,d9::HeaderBytes-1,deadline,lab::Stage::Header,io);
-      d9::Header h;Require(d9::DecodeHeader(request.data(),h),"D3D9 header invalid");
-      Require(h.nonce==nonce&&h.sequence==sequence&&sequence!=UINT64_MAX,"D3D9 scope/sequence");
-      lab::ReadExact(pipe.get(),parent.get(),request.data()+d9::HeaderBytes,h.payloadBytes,deadline,lab::Stage::Body,io);
+      auto readBegin=idleBegin;d9::Header h;
+      const bool fromRing=ring!=nullptr;bool ringSync=false;
+      if(!fromRing) {
+        // Only D3D9dev opts in: a live idle producer is not a truncated frame.
+        // The first received byte starts the unchanged shared 5 s header/body
+        // window, so sending one byte cannot hold an incomplete frame forever.
+        lab::ReadFirstByteAfterIdle(pipe.get(),parent.get(),request.data(),io);
+        if(profile)readBegin=Clock::now();
+        const lab::ReadWindow deadline;lab::ReadExact(pipe.get(),parent.get(),request.data()+1,d9::HeaderBytes-1,deadline,lab::Stage::Header,io);
+        Require(d9::DecodeHeader(request.data(),h),"D3D9 header invalid");
+        Require(h.nonce==nonce&&h.sequence==sequence&&sequence!=UINT64_MAX,"D3D9 scope/sequence");
+        lab::ReadExact(pipe.get(),parent.get(),request.data()+d9::HeaderBytes,h.payloadBytes,deadline,lab::Stage::Body,io);
+      } else {
+        // Poll briefly, then say so and sleep. The producer signals `work`
+        // only when it sees `parked`; the timeout is a recheck, not a failure.
+        for(uint32_t polls=0;;) {
+          const auto status=ring->tryRead(request,h,ringSync);
+          if(status==d9::ring::Consumer::Read::Item)break;
+          if(status==d9::ring::Consumer::Read::Closed)throw lab::Failure(lab::Fault::EndOfStream,lab::Stage::Header);
+          if(status==d9::ring::Consumer::Read::Faulted) {
+            // Nothing after a refused record is executed. Tell x86 why, then stop.
+            const auto fault=ring->fault();
+            ring->publishFault(fault,0,ring->expected());SetEvent(ringChannel->progress());
+            std::printf("{\"schema\":\"warvk-d3d9-command-ring-fault/v1\",\"fault\":\"%s\",\"expectedSequence\":%llu,"
+              "\"records\":%llu}\n",d9::ring::FaultName(fault),ring->expected(),ringRecords);std::fflush(stdout);
+            Require(false,"D3D9 command ring refused");
+          }
+          if(polls<d9::ring::SpinPolls){++polls;YieldProcessor();continue;}
+          ring->setParked(true);
+          const auto again=ring->tryRead(request,h,ringSync);
+          if(again!=d9::ring::Consumer::Read::Empty) {
+            // Item is taken below; Closed and Faulted are met again by the next poll.
+            ring->setParked(false);if(again==d9::ring::Consumer::Read::Item)break;
+            continue;
+          }
+          ++ringParks;HANDLE waits[2]={ringChannel->work(),parent.get()};
+          const auto sleepBegin=d9::profile::Clock();
+          const auto waited=WaitForMultipleObjects(2,waits,FALSE,d9::ring::RecheckMs);
+          ring->setParked(false);
+          {
+            // Lost-wakeup measurement: unvalidated peek; tryRead stays the reader.
+            const auto tail=ring->peekTail();const bool progress=tail!=ring->consumed();
+            d9::profile::WakeEvent e;e.begin=sleepBegin;e.end=d9::profile::Clock();e.status=waited;
+            e.op=hostProfile.lastReplyOp;e.sequence=ring->expected();e.before=ring->consumed();e.after=tail;
+            e.peerFlag=ring->producerWaiting()?1u:0u;e.signaled=hostProfile.lastReplySignaled;
+            hostProfile.wake.ended(e,waited==WAIT_OBJECT_0,waited==WAIT_OBJECT_0+1,progress,false);
+            ++hostProfile.loopSleeps;hostProfile.loopTimeouts+=waited==WAIT_TIMEOUT;hostProfile.loopStatus=waited;
+          }
+          if(waited==WAIT_OBJECT_0+1)throw lab::Failure(lab::Fault::PeerExited,lab::Stage::Header);
+          if(waited!=WAIT_OBJECT_0&&waited!=WAIT_TIMEOUT)throw lab::Failure(lab::Fault::System,lab::Stage::Header,GetLastError());
+          polls=0;
+        }
+        Require(h.sequence==sequence,"D3D9 ring sequence");
+        // The read above returned this record's ring space. A producer asleep
+        // for space is told now rather than after the record is applied (which
+        // may take long); the notification after the apply stays as it is.
+        if(ring->producerWaitingSpace())SetEvent(ringChannel->progress());
+        ++ringRecords;if(ringSync)++ringSyncRecords;
+        if(hostProfile.lastReply) {
+          // >= 500 ms from a synchronous reply to the next record: which side waited.
+          const auto now=d9::profile::Ticks();
+          if(now-hostProfile.lastReply>=hostProfile.frequency/2) {
+            ++hostProfile.wake.slowTurnarounds;
+            d9::profile::WakeEvent e;e.kind=uint32_t(d9::profile::WakeKind::SlowTurnaround);e.begin=hostProfile.lastReply;e.end=now;
+            e.status=hostProfile.loopStatus;e.op=hostProfile.lastReplyOp;e.sequence=hostProfile.lastReplySequence;
+            e.before=hostProfile.loopSleeps;e.after=hostProfile.loopTimeouts;
+            e.peerFlag=ring->producerWaiting()?1u:0u;e.signaled=hostProfile.lastReplySignaled;
+            hostProfile.wake.record(e);
+          }
+          hostProfile.lastReply=0;
+        }
+        hostProfile.loopSleeps=hostProfile.loopTimeouts=hostProfile.loopStatus=0;
+        if(profile)readBegin=Clock::now();
+      }
+      const auto profileApply=d9::profile::Ticks();hostProfile.idleTicks+=uint64_t(profileApply-profileIdle);
       const auto applyBegin=profile?Clock::now():Clock::time_point{};
-      const bool batchOp=h.op==d9::Op::DrawBatch||h.op==d9::Op::DrawFixedBatch;
+      const bool batchOp=h.op==d9::Op::DrawBatch||d9::IsFixedBatch(h.op);
+      const bool deltaOp=h.op==d9::Op::DrawFixedDeltaBatch;
+      if(deltaOp)++session->deltaMessages;
       if(profile) {
         const auto read=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(applyBegin-readBegin).count());
         admission.idleNs+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(readBegin-idleBegin).count());
@@ -715,7 +1342,41 @@ int wmain(int argc,wchar_t**argv){
         }
         std::fprintf(stderr,"D3D9 host init-apply complete result=%lu elapsedMs=%llu\n",DWORD(hr),GetTickCount64()-initStart);
         std::fflush(stderr);
-      } else hr=session->apply(h,request.data()+d9::HeaderBytes,response,bytes);
+      } else if(h.op==d9::Op::AttachRing) {
+        // The session's regions are named by its nonce; a refused attach leaves
+        // the pipe in use. A region that cannot be opened or is not fresh throws.
+        bool exact=attachAllowed&&!fromRing&&!h.id&&!h.payloadBytes&&d9::ring::ValidCapacity(h.args[0])
+          &&h.args[1]==d9::ring::ReplyCapacity&&h.args[2]==d9::ring::Version;
+        for(size_t i=3;i<h.args.size();++i)exact=exact&&!h.args[i];
+        hr=D3DERR_INVALIDCALL;
+        if(exact) {
+          ringChannel=std::make_unique<d9::ring::PeerChannel>(nonce,h.args[0]);
+          ring=std::make_unique<d9::ring::Consumer>(ringChannel->producerBlock(),ringChannel->data(),
+            ringChannel->consumerBlock(),ringChannel->reply(),ringChannel->capacity(),nonce,h.sequence);
+          hr=D3D_OK;
+          std::fprintf(stderr,"D3D9 host command-ring attached capacity=%u sequence=%llu\n",ringChannel->capacity(),h.sequence);
+          std::fflush(stderr);
+        }
+      } else {
+        // apply can mutate upload/annotation state even before opcode dispatch.
+        const auto feature=d9::AsyncResourceFeature(h.op);
+        if(fromRing&&!ringSync&&feature) {
+          if(!session->admitAsyncResource(h.op,feature))hr=D3DERR_INVALIDCALL;
+          else if(fixture==Fixture::DeviceLost)hr=D3DERR_DEVICELOST;
+          else {
+            if(fixture==Fixture::Allocation)throw std::bad_alloc();
+            if(fixture==Fixture::Delayed)Sleep(2500);
+            hr=session->apply(h,request.data()+d9::HeaderBytes,response,bytes);
+            if(fixture==Fixture::AfterApply&&hr==D3D_OK)throw std::runtime_error("fixture stopped after resource apply");
+          }
+        } else hr=session->apply(h,request.data()+d9::HeaderBytes,response,bytes);
+      }
+      hostProfile.applied(h.op,profileApply,d9::profile::Ticks());
+      if(deltaOp) {
+        if(hr!=D3D_OK)++session->deltaRejected;
+        else {session->deltaRecords+=h.args[0];if(h.args[1])session->deltaVerified+=h.args[0];}
+      }
+      attachAllowed=h.op==d9::Op::Initialize&&hr==D3D_OK;
       const auto replyBegin=profile?Clock::now():Clock::time_point{};
       if(profile) {
         const auto applied=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(replyBegin-applyBegin).count());
@@ -727,7 +1388,57 @@ int wmain(int argc,wchar_t**argv){
       }
       if(SUCCEEDED(hr))++session->accepted;else ++session->rejected;
       const auto&s=session->stats();d9::Reply r{uint32_t(hr),s.submitted,s.gpuCompleted,s.retired,s.draws,bytes};
-      d9::EncodeReply(h,r,response);lab::WriteBytes(pipe.get(),parent.get(),response.data(),d9::ReplyBytes+bytes,io);++sequence;
+      if(!fromRing) {
+        d9::EncodeReply(h,r,response);lab::WriteBytes(pipe.get(),parent.get(),response.data(),d9::ReplyBytes+bytes,io);
+      } else {
+        // A synchronous record gets its reply; an asynchronous one may only
+        // succeed. Either way x86 learns of a lost device before it is told the
+        // record was executed, and a refused asynchronous record never is.
+        // Two asynchronous outcomes are not refusals. A Present of a window
+        // resized ahead of its Reset drops the frame; x86 reports success for
+        // that either way. A refused scene record stops the scene records,
+        // not the session: the game's own picture does not depend on them.
+        const bool skippedPresent=!ringSync&&h.op==d9::Op::Present&&hr==HRESULT(d9::PresentSkipped);
+        const bool sceneRefusal=!ringSync&&hr!=D3D_OK&&hr!=D3DERR_DEVICELOST
+          &&(h.op==d9::Op::FrameScene||h.op==d9::Op::StageMarker);
+        if(sceneRefusal) {
+          ring->publishSceneRefused();session->sceneStopped=true;
+          if(!session->sceneRefusals++) {
+            // A queued WorldSceneExit will be ignored. Abandon the partial
+            // frame now so it cannot hold the next map generation open.
+            session->clearScene();session->sceneTracker.active=false;session->sceneTracker.frameEnd();
+            std::fprintf(stderr,"D3D9 host scene record refused op=%u sequence=%llu result=0x%08lx; later scene records are ignored\n",
+              uint32_t(h.op),h.sequence,static_cast<unsigned long>(hr));std::fflush(stderr);
+          }
+        }
+        const bool refused=!ringSync&&hr!=D3D_OK&&!skippedPresent&&!sceneRefusal;
+        if(hr==D3DERR_DEVICELOST)ring->publishFault(d9::ring::Fault::DeviceLost,uint32_t(hr),h.sequence);
+        else if(refused)ring->publishFault(d9::ring::Fault::AsyncRefused,uint32_t(hr),h.sequence);
+        if(ringSync)ring->writeReply(h,r,response.data()+d9::ReplyBytes);
+        if(!refused) {
+          ring->publishApplied(h.sequence,s.submitted,s.gpuCompleted,s.retired,s.draws);
+          if(h.op==d9::Op::Finish&&SUCCEEDED(hr))ring->publishFinished();
+        }
+        const bool producerWaiting=ring->producerWaiting();
+        ++hostProfile.wake.notifyChecks;hostProfile.wake.notified+=producerWaiting;
+        if(refused||hr==D3DERR_DEVICELOST||producerWaiting){++ringWakes;SetEvent(ringChannel->progress());}
+        if(ringSync) {
+          hostProfile.lastReply=d9::profile::Ticks();hostProfile.lastReplySequence=h.sequence;
+          hostProfile.lastReplyOp=uint32_t(h.op);hostProfile.lastReplySignaled=producerWaiting?1u:0u;
+        }
+        if(refused&&hr!=D3DERR_DEVICELOST) {
+          std::printf("{\"schema\":\"warvk-d3d9-command-ring-fault/v1\",\"fault\":\"async-refused\",\"expectedSequence\":%llu,"
+            "\"records\":%llu}\n",h.sequence,ringRecords);std::fflush(stdout);
+          // Which record and why: the row above is pinned by the gates.
+          std::fprintf(stderr,"D3D9 host asynchronous record refused op=%u sequence=%llu result=0x%08lx\n",
+            uint32_t(h.op),h.sequence,static_cast<unsigned long>(hr));std::fflush(stderr);
+          Require(false,"D3D9 asynchronous ring record refused");
+        }
+      }
+      ++sequence;
+      if(h.op==d9::Op::Present&&hostProfile.every&&hostProfile.presents%hostProfile.every==0)
+        hostProfile.snapshot("periodic",session->stats(),ringRecords,ringSyncRecords,ringParks,ringWakes,
+          session->annotationRecorder.frameScenes,session->sceneTracker.enters);
       if(profile) {
         const auto replied=ElapsedNs(replyBegin);
         admission.replyNs+=replied;
@@ -757,6 +1468,7 @@ int wmain(int argc,wchar_t**argv){
         session->handleStats().print();
         std::printf("\"productIntegrated\":false,\"gameTouched\":false,\"memorySavingsProven\":false}\n");
         std::fflush(stdout);std::fflush(stderr);
+        reportFailedAccounts();
         if(s.faultCleanupCompleted) {
           session.reset();LogExitIntent("owner-cleanup-return",2,processStart);return 2;
         }
@@ -766,7 +1478,12 @@ int wmain(int argc,wchar_t**argv){
     const auto s=session->stats();const auto accepted=session->accepted,rejected=session->rejected,calls=session->backendCalls;
     const auto handles=session->handleStats();
     Require(s.normalTeardown,"normal DXVK teardown");
-    std::fprintf(stderr,"D3D9 draw-batch-host: {\"schema\":\"warvk-d3d9-draw-batch-host/v1\","
+    RawExitMilestone("exit-accounts-begin");
+    hostProfile.snapshot("exit",s,ringRecords,ringSyncRecords,ringParks,ringWakes,
+      session->annotationRecorder.frameScenes,session->sceneTracker.enters);
+    RawExitMilestone("exit-profile-written");
+    ExitText exitOut;exitOut.buffered=ExitSwitch(L"WARVK_D3D9_HOST_EXIT_BUFFERED",L"0");
+    exitOut.add("D3D9 draw-batch-host: {\"schema\":\"warvk-d3d9-draw-batch-host/v1\","
       "\"batches\":%llu,\"batchedDraws\":%llu,\"largestBatch\":%u,\"constantCapacityBytes\":%llu,"
       "\"draws\":%llu,\"submitted\":%llu,\"gpuCompleted\":%llu,\"retired\":%llu,"
       "\"flightCapacity\":%u,\"flightSubmissions\":%llu,\"flightReuses\":%llu,"
@@ -777,7 +1494,7 @@ int wmain(int argc,wchar_t**argv){
       s.submissionGroupCapacity,s.groupedSubmissions,s.nonIndexedDraws,s.batchStateReuse,s.redundantStateBindingsSkipped);
     // Separate versioned line: the frozen v1 batch schema above is unchanged.
     if (s.streamMode)
-      std::fprintf(stderr,"D3D9 stream-host: {\"schema\":\"warvk-d3d9-stream-host/v1\","
+      exitOut.add("D3D9 stream-host: {\"schema\":\"warvk-d3d9-stream-host/v1\","
         "\"streamDraws\":%llu,\"streamFixedDraws\":%llu,\"streamSubmissions\":%llu,\"streamCapSubmissions\":%llu,"
         "\"largestStreamList\":%u,\"maxStreamDraws\":%u,\"maxStreamLatency\":%u,\"constantRenames\":%llu,"
         "\"latencyWaits\":%llu,\"ringBytes\":%llu,\"submitted\":%llu,\"gpuCompleted\":%llu,\"retired\":%llu}\n",
@@ -785,36 +1502,110 @@ int wmain(int argc,wchar_t**argv){
         GPU::MaxStreamDraws,GPU::MaxStreamLatency,s.streamConstantRenames,s.streamLatencyWaits,s.batchConstantBytes,
         s.submitted,s.gpuCompleted,s.retired);
     // Printed for every profile: zero when no dynamic buffer was written.
-    std::fprintf(stderr,"D3D9 dynamic-buffer-host: {\"schema\":\"warvk-d3d9-dynamic-buffer-host/v1\","
+    exitOut.add("D3D9 dynamic-buffer-host: {\"schema\":\"warvk-d3d9-dynamic-buffer-host/v1\","
       "\"dynamicBuffers\":%llu,\"orderedUploads\":%llu,\"noOverwriteUploads\":%llu,\"discardUploads\":%llu,"
       "\"discardRenames\":%llu,\"discardCarriedBytes\":%llu,\"uploadSettles\":%llu}\n",
       s.dynamicBuffers,s.orderedDynamicUploads,s.noOverwriteUploads,s.discardUploads,
       s.discardRenames,s.discardCarriedBytes,s.uploadSettles);
     // Printed for every profile: zero resets and skips when unused. Window
     // resets are the resets of the window's own resize, which kept every resource.
-    std::fprintf(stderr,"D3D9 reset-host: {\"schema\":\"warvk-d3d9-reset-host/v1\",\"resets\":%llu,"
+    exitOut.add("D3D9 reset-host: {\"schema\":\"warvk-d3d9-reset-host/v1\",\"resets\":%llu,"
       "\"windowResets\":%llu,\"presentsSkipped\":%llu,\"width\":%u,\"height\":%u,\"opaqueTarget\":%s,\"syncInterval\":%u}\n",
       s.resets,s.windowResets,s.presentsSkipped,s.width,s.height,s.opaqueTarget?"true":"false",s.syncInterval);
-    // Accepted DrawFixedBatch messages; printed for every profile, zero if unused.
-    std::fprintf(stderr,"D3D9 fixed-batch-host: {\"schema\":\"warvk-d3d9-fixed-batch-host/v1\","
+    // Accepted fixed batches; printed for every profile, zero if unused.
+    exitOut.add("D3D9 fixed-batch-host: {\"schema\":\"warvk-d3d9-fixed-batch-host/v1\","
       "\"batches\":%llu,\"draws\":%llu,\"largestBatch\":%u,\"capacity\":%u}\n",
       session->fixedBatches,session->fixedBatchDraws,session->largestFixedBatch,d9::MaxFixedDrawBatch);
-    std::fprintf(stderr,"D3D9 backing-host: {\"schema\":\"warvk-d3d9-backing-host/v1\",\"retainContent\":%s,"
+    session->reportFixedDelta(exitOut);session->reportAsyncResources(exitOut);
+    session->reportWater(exitOut);
+    exitOut.add("D3D9 backing-host: {\"schema\":\"warvk-d3d9-backing-host/v1\",\"retainContent\":%s,"
       "\"retainedBytes\":%llu,\"peakRetainedBytes\":%llu,\"contentReads\":%llu,\"contentReadBytes\":%llu}\n",
       session->retainContent?"true":"false",session->retainedBytes,session->peakRetainedBytes,
       session->contentReads,session->contentReadBytes);
+    if(ring)
+      exitOut.add("D3D9 command-ring-host: {\"schema\":\"warvk-d3d9-command-ring-host/v1\",\"capacity\":%u,"
+        "\"records\":%llu,\"syncRecords\":%llu,\"parks\":%llu,\"wakes\":%llu}\n",
+        ringChannel->capacity(),ringRecords,ringSyncRecords,ringParks,ringWakes);
     // Only a negotiated session prints its annotation account.
     if(session->annotations) {
       const auto& a=session->annotationRecorder;
-      std::fprintf(stderr,"D3D9 annotation-host: {\"schema\":\"warvk-d3d9-annotation-host/v1\",\"annotatedDraws\":%llu,"
-        "\"drawRecords\":%llu,\"frameScenes\":%llu,\"stageMarkers\":%llu,\"digest\":\"%016llx\"}\n",
-        a.annotatedDraws,a.drawRecords,a.frameScenes,a.stageMarkers,a.digest);
+      const auto& t=session->sceneTracker;
+      exitOut.add("D3D9 annotation-host: {\"schema\":\"warvk-d3d9-annotation-host/v1\",\"annotatedDraws\":%llu,"
+        "\"drawRecords\":%llu,\"frameScenes\":%llu,\"stageMarkers\":%llu,\"worldSceneEnters\":%llu,"
+        "\"worldSceneExits\":%llu,\"worldSceneActive\":%s,\"sessionResets\":%llu,\"sessionGeneration\":%llu,"
+        "\"digest\":\"%016llx\"}\n",
+        a.annotatedDraws,a.drawRecords,a.frameScenes,a.stageMarkers,t.enters,t.exits,t.active?"true":"false",
+        a.sessionResets,t.generation,a.digest);
+      // Only a session that received effect records prints their account.
+      if(session->effectRecords)
+        exitOut.add("D3D9 scene-effects-host: {\"schema\":\"warvk-d3d9-scene-effects-host/v1\",\"effectRecords\":%llu,"
+          "\"beforeUiRuns\":%llu,\"ssaoRecorded\":%llu,\"snowRecorded\":%llu,\"aaRecorded\":%llu,"
+          "\"bloomRecorded\":%llu,\"insertionsRefused\":%llu,"
+          "\"lastSsaoStage\":%u,\"lastSnowStage\":%u,\"lastAaStage\":%u,\"lastBloomStage\":%u,"
+          "\"beforeUiNs\":%llu,\"resourceBytes\":%llu}\n",
+          session->effectRecords,session->effectFrames,session->ssaoRecorded,session->snowRecorded,
+          session->aaRecorded,session->bloomRecorded,
+          session->effectInsertionsRefused,session->lastSsaoStage,session->lastSnowStage,
+          session->lastAaStage,session->lastBloomStage,
+          session->effectNs,session->effectResourceBytes);
+      // Only a session that received shadow records or casters prints theirs.
+      if(session->shadowRecords||session->shadowCasterRecords) {
+        // One run, as the in-process fixture prints its own (test_render_host_d3d9_shadow.cpp).
+        const auto printRun=[&exitOut](const dxvkcore::ShadowOutcome& s) {
+          uint32_t time=0;std::memcpy(&time,&s.gameTime,4);
+          exitOut.add("{\"casters\":%u,\"replayDraws\":%u,\"drawnCasters\":%u,\"cascades\":%u,"
+            "\"cascadeDrawn\":[%u,%u,%u,%u],\"mapExecuted\":%u,\"receiverExecuted\":%u,"
+            "\"earlyReturn\":%u,\"inputReject\":%u,\"replayRejected\":%u,\"completeMap\":%u,"
+            "\"alphaPrepared\":%u,"
+            "\"taaModule\":%u,\"taaMode\":%u,\"taaHistory\":%u,\"taaInvalidation\":%u,\"pointShadow\":%u,\"outline\":%u,"
+            "\"volumetric\":%u,\"volumetricBackend\":%d,\"volumetricComposite\":%u,\"volumetricBytes\":%llu,"
+            "\"volumetricFogVolumes\":%u,\"volumetricWeather\":%u,"
+            "\"gameTimeBits\":\"%08x\",\"tombstoneSerial\":%llu,"
+            "\"stagePolicyRevision\":%llu,\"resourceBytes\":%llu}",
+            s.casters,s.replayDraws,s.drawnCasters,s.cascades,s.cascadeDrawn[0],s.cascadeDrawn[1],
+            s.cascadeDrawn[2],s.cascadeDrawn[3],s.mapExecuted,s.receiverExecuted,s.earlyReturn,s.inputReject,
+            s.replayRejected,s.completeMap,s.alphaPrepared,s.taaModule,s.taaMode,s.taaHistory,s.taaInvalidation,
+            s.pointShadow,s.outline,s.volumetric,s.volumetricBackend,s.volumetricComposite,
+            static_cast<unsigned long long>(s.volumetricBytes),s.volumetricFogVolumes,s.volumetricWeather,time,
+            static_cast<unsigned long long>(s.tombstoneSerial),static_cast<unsigned long long>(s.stagePolicyRevision),
+            static_cast<unsigned long long>(s.resourceBytes));
+        };
+        exitOut.add("D3D9 shadow-host: {\"schema\":\"warvk-d3d9-shadow-host/v2\",\"shadowRecords\":%llu,"
+          "\"casterRecords\":%llu,\"alphaRecords\":%llu,\"runs\":%llu,\"mapRenders\":%llu,\"receiverDraws\":%llu,"
+          "\"castersUsed\":%llu,\"castersRefused\":%llu,\"refusedDynamic\":%llu,\"refusedLayout\":%llu,"
+          "\"refusedRange\":%llu,\"castersCopied\":%llu,\"copiedBytes\":%llu,"
+          "\"castersDrawn\":%llu,\"replayRejected\":%llu,"
+          "\"peakResourceBytes\":%llu,\"last\":",
+          session->shadowRecords,session->shadowCasterRecords,session->shadowAlphaRecords,session->shadowRuns,
+          session->shadowMapRenders,
+          session->shadowReceiverDraws,session->shadowCastersUsed,session->shadowCastersRefused,
+          session->shadowRefusals[1],session->shadowRefusals[2],session->shadowRefusals[3],
+          session->shadowCastersCopied,session->shadowCopiedBytes,
+          session->shadowCastersDrawn,session->shadowReplayRejected,
+          static_cast<unsigned long long>(session->shadowPeakResourceBytes));
+        printRun(session->lastShadow);
+        exitOut.add(",\"runLog\":[");
+        for(size_t i=0;i<session->shadowRunLog.size();++i){if(i)exitOut.add(",");printRun(session->shadowRunLog[i]);}
+        exitOut.add("],\"deviceMemoryLog\":[");
+        for(size_t i=0;i<session->shadowDeviceLog.size();++i)
+          exitOut.add("%s[%llu,%llu]",i?",":"",static_cast<unsigned long long>(session->shadowDeviceLog[i][0]),
+            static_cast<unsigned long long>(session->shadowDeviceLog[i][1]));
+        exitOut.add("]}\n");
+      }
+      const auto& store=session->content;const auto& index=store.index;
+      exitOut.add("D3D9 content-host: {\"schema\":\"warvk-d3d9-content-host/v1\",\"blobs\":%llu,\"bytes\":%llu,"
+        "\"peakBlobs\":%llu,\"peakBytes\":%llu,\"uploads\":%llu,\"replaced\":%llu,\"released\":%llu,\"aborted\":%llu,"
+        "\"cleared\":%llu,\"chunks\":%llu,\"uploadedBytes\":%llu,\"reads\":%llu,\"readBytes\":%llu,\"boundRefs\":%llu,"
+        "\"refusedRefs\":%llu,\"lastRevision\":%llu}\n",
+        static_cast<unsigned long long>(index.count()),index.bytes(),index.peakBlobs,index.peakBytes,index.committedBlobs,
+        index.replacedBlobs,index.releasedBlobs,index.abortedBlobs,index.clearedBlobs,store.chunks,store.uploadedBytes,
+        store.reads,store.readBytes,store.boundRefs,store.refusedRefs,index.lastRevision());
     }
     if (s.reuseWaitProfile) {
       for (uint32_t i = 0; i < s.reuseWaitSampleCount; ++i) {
         const auto& sample = s.reuseWaitSamples[i];
         const auto& wait = sample.cumulative;
-        std::fprintf(stderr, "D3D9 reuse-wait: {\"schema\":\"warvk-d3d9-reuse-wait/v1\","
+        exitOut.add("D3D9 reuse-wait: {\"schema\":\"warvk-d3d9-reuse-wait/v1\","
           "\"query\":%llu,\"draws\":%llu,\"episodes\":%llu,\"gpuCalls\":%llu,"
           "\"totalNs\":%llu,\"cpuSubmissionNs\":%llu,\"gpuWaitNs\":%llu,\"retirementNs\":%llu,"
           "\"dropped\":%u}\n", sample.query, sample.draws, wait.episodes, wait.gpuCalls,
@@ -823,7 +1614,7 @@ int wmain(int argc,wchar_t**argv){
     }
     for(uint32_t i=0;i<session->admissionSampleCount;++i) {
       const auto& sample=session->admissionSamples[i];const auto& a=sample.cumulative;
-      std::fprintf(stderr,"D3D9 admission-host: {\"schema\":\"warvk-d3d9-admission-host/v1\",\"query\":%llu,"
+      exitOut.add("D3D9 admission-host: {\"schema\":\"warvk-d3d9-admission-host/v1\",\"query\":%llu,"
         "\"messages\":%llu,\"idleNs\":%llu,\"readNs\":%llu,\"replyNs\":%llu,\"batchMessages\":%llu,\"batchDraws\":%llu,"
         "\"batchReadNs\":%llu,\"batchDecodeNs\":%llu,\"batchApplyNs\":%llu,\"batchReplyNs\":%llu,"
         "\"prepareNs\":%llu,\"recordNs\":%llu,\"constantNs\":%llu,\"bindNs\":%llu,\"samplerNs\":%llu,\"drawNs\":%llu,"
@@ -832,6 +1623,14 @@ int wmain(int argc,wchar_t**argv){
         a.batchApplyNs,a.batchReplyNs,a.prepareNs,a.recordNs,a.constantNs,a.bindNs,a.samplerNs,a.drawNs,a.flushApplyNs,a.waitEventApplyNs,a.otherApplyNs,
         session->admissionSamplesDropped);
     }
+    if(s.streamFlushDraws)
+      exitOut.add("D3D9 host stream-cadence: flushDraws=%u submissions=%llu\n",s.streamFlushDraws,s.streamCadenceSubmissions);
+    if(session->sceneRefusals)
+      exitOut.add("D3D9 host scene-refusals: refused=%llu ignored=%llu\n",session->sceneRefusals,session->sceneRecordsIgnored);
+    exitOut.flush();
+    // The teardown was normal either way; whether its accounts all reached
+    // stderr is a separate fact and is said separately.
+    if(!exitOut.complete)RawExitMilestone("exit-accounts-incomplete");
     ExitMilestone("before-session-reset",processStart);session.reset();
     ExitMilestone("after-session-reset",processStart);
     std::printf("{\"schema\":\"warvk-d3d9-host/v1\",\"ok\":true,\"bits\":64,\"actualDxvkCore\":true,\"actualDxso\":true,"
@@ -851,7 +1650,14 @@ int wmain(int argc,wchar_t**argv){
       s.initialized?"true":"false",s.shutdownQueueDrained?"true":"false",s.presentedReadbacks,s.presentedFrame);
     handles.print();
     std::printf("\"productIntegrated\":false,\"gameTouched\":false,\"memorySavingsProven\":false}\n");
+    if(ExitSwitch(L"WARVK_D3D9_HOST_EXIT_GL_WATCHER",L"keep"))ClosePaletteWatcher(processStart);
     LogExitIntent("normal-return",0,processStart);return 0;
-  }catch(const std::exception&e){(void)session.release();std::fprintf(stderr,"D3D9 host failure: %s\n",e.what());SelfFailStop(processStart);}
-  catch(...){(void)session.release();std::fprintf(stderr,"D3D9 host failure: unknown exception\n");SelfFailStop(processStart);}
+  }catch(const lab::Failure&e){
+    reportFailedAccounts();
+    // The transport failure's own coordinates, ahead of the generic line.
+    (void)session.release();
+    std::fprintf(stderr,"D3D9 host transport: fault=%s stage=%s win32=%lu\n",lab::FaultName(e.fault),lab::StageName(e.stage),e.win32);
+    std::fprintf(stderr,"D3D9 host failure: %s\n",e.what());SelfFailStop(processStart);}
+  catch(const std::exception&e){reportFailedAccounts();(void)session.release();std::fprintf(stderr,"D3D9 host failure: %s\n",e.what());SelfFailStop(processStart);}
+  catch(...){reportFailedAccounts();(void)session.release();std::fprintf(stderr,"D3D9 host failure: unknown exception\n");SelfFailStop(processStart);}
 }

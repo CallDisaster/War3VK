@@ -115,10 +115,16 @@ War3VolumetricExecutionDiagnostics g_weatherVolumeDiagnostics;
 
 class VolumetricExecutionWitness {
 public:
-  explicit VolumetricExecutionWitness(bool weatherOnly = false)
-      : m_weatherOnly(weatherOnly) { }
+  explicit VolumetricExecutionWitness(bool weatherOnly = false,
+      War3VolumetricExecutionDiagnostics* last = nullptr)
+      : m_weatherOnly(weatherOnly), m_last(last) { }
   War3VolumetricExecutionDiagnostics value;
   ~VolumetricExecutionWitness() {
+    if (m_last != nullptr) {
+      const uint64_t observed = m_last->observedFrames + 1u;
+      *m_last = value;
+      m_last->observedFrames = observed;
+    }
     static const bool enabled =
         env::getEnvVar("DXVK_WAR3_VISUAL_API_DIAGNOSTICS") == "1";
     if (!enabled && !m_weatherOnly)
@@ -131,6 +137,7 @@ public:
   }
 private:
   bool m_weatherOnly;
+  War3VolumetricExecutionDiagnostics* m_last;
 };
 War3VolumetricShaderWorkRuntimeDiagnostics
     g_volumetricShaderWorkRuntimeDiagnostics = {};
@@ -597,8 +604,14 @@ QueryWar3VolumetricShaderWorkRuntimeDiagnostics() noexcept {
 
 War3VolumetricLightPass::War3VolumetricLightPass(D3D9DeviceEx* device,
                                                bool weatherOnly)
-    : m_parent(device), m_device(device->GetDXVKDevice()),
-      m_weatherOnly(weatherOnly) {
+    : War3VolumetricLightPass(device->GetDXVKDevice(), nullptr, weatherOnly) {
+  m_parent = device;
+}
+
+War3VolumetricLightPass::War3VolumetricLightPass(const Rc<DxvkDevice>& device,
+                                               War3ShadowReceiverPass* shadow,
+                                               bool weatherOnly)
+    : m_device(device), m_weatherOnly(weatherOnly), m_shadowSource(shadow) {
   try {
   DxvkSamplerKey linearKey = {};
   linearKey.setFilter(VK_FILTER_LINEAR, VK_FILTER_LINEAR,
@@ -1617,8 +1630,7 @@ bool War3VolumetricLightPass::drawVolumetricLight(
   const bool wantsSunVolume = requestedSunRadiancePeak > 1e-6f;
   const bool hasPointVolumeCandidate = selectedPointCount > 0u;
 
-  auto* shadowPass =
-      !m_weatherOnly && m_parent ? m_parent->GetWar3ShadowReceiverPass() : nullptr;
+  auto* shadowPass = !m_weatherOnly ? shadowSource() : nullptr;
 
   Rc<DxvkImageView> shadowMapView = nullptr;
   War3CsmData csmData = {};
@@ -2703,7 +2715,14 @@ bool War3VolumetricLightPass::compositeVolumetricLight(
   VkRenderingAttachmentInfo attachment = {
       VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
   attachment.imageView = input.colorView->handle();
-  attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  // The layout the frame's colour target is in: the attachment layout in the
+  // x86 device, GENERAL where the target is kept in GENERAL (the x64 render
+  // host). Rendering names it, it does not assume it.
+  attachment.imageLayout =
+      colorImage->queryLayout(input.colorView->imageSubresources()) ==
+              VK_IMAGE_LAYOUT_GENERAL
+          ? VK_IMAGE_LAYOUT_GENERAL
+          : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
   attachment.loadOp = IsFullRect(compositeScissor, extent)
       ? VK_ATTACHMENT_LOAD_OP_DONT_CARE
       : VK_ATTACHMENT_LOAD_OP_LOAD;
@@ -2830,7 +2849,9 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
       return;
     }
     try {
-      m_weatherOwner = std::make_unique<War3VolumetricLightPass>(m_parent, true);
+      m_weatherOwner = m_parent
+          ? std::make_unique<War3VolumetricLightPass>(m_parent, true)
+          : std::make_unique<War3VolumetricLightPass>(m_device, m_shadowSource, true);
       m_weatherResourceRetry.clear();
     } catch (const DxvkError&) {
       if (m_device->getDeviceStatus() == VK_ERROR_DEVICE_LOST)
@@ -2871,6 +2892,11 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
   m_weatherOwner->RunMedium(ctx, input, weatherSettings);
 }
 
+// The device's shadow pass in process; the one the owner named in the host.
+War3ShadowReceiverPass* War3VolumetricLightPass::shadowSource() const {
+  return m_parent ? m_parent->GetWar3ShadowReceiverPass() : m_shadowSource;
+}
+
 uint64_t War3VolumetricLightPass::resourceBytes() const {
   uint64_t bytes = 0u;
   const auto addImage = [&](const Rc<DxvkImage>& image) {
@@ -2899,7 +2925,7 @@ uint64_t War3VolumetricLightPass::resourceBytes() const {
 
 void War3VolumetricLightPass::RunMedium(const Rc<DxvkCommandList>& ctx,
     const War3PipelineInput& input, const War3VolumetricLightSettings& settings) {
-  VolumetricExecutionWitness witness(m_weatherOnly);
+  VolumetricExecutionWitness witness(m_weatherOnly, &m_lastRun);
   auto& execution = witness.value;
   execution.frameSerial = input.frameSerial;
   execution.mapEpoch = input.mapEpoch;
@@ -3078,8 +3104,7 @@ void War3VolumetricLightPass::RunMedium(const Rc<DxvkCommandList>& ctx,
   // CSM 只约束太阳散射；缺失时 sun fail-soft，而独立点光体积仍可继续。
   execution.stage = "waiting-for-csm";
   if (settings.requireCsmSnapshot && hasSunVolume) {
-    auto* shadowPass =
-        m_parent ? m_parent->GetWar3ShadowReceiverPass() : nullptr;
+    auto* shadowPass = shadowSource();
     if (!shadowPass && !hasPointVolume) {
       static bool s_loggedMissingShadowPass = false;
       if (!s_loggedMissingShadowPass) {

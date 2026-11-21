@@ -208,6 +208,9 @@ JassPauseGameTestResult SetJassGamePausedForTest(bool paused);
 
 /** Internal owner-thread test only: leave the map through stock EndGame(false). */
 bool EndJassGameForExitTest(std::string& error);
+// The stock RestartGame(false): the map is unloaded and loaded again in the
+// same process. For the map-transition tests; same switch as the exit test.
+bool RestartJassGameForMapTest(std::string& error);
 
 /**
  * Resolve ConvertCameraField/SetCameraField and force only the local camera's

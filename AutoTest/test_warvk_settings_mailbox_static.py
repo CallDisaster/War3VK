@@ -51,10 +51,30 @@ class WarVkSettingsMailboxStaticTests(unittest.TestCase):
             self.pipeline_cpp.index("void War3RenderPipeline::OnFrameStart()") :
             self.pipeline_cpp.index("bool War3RenderPipeline::NotifyDraw")
         ]
-        self.assertIn("mailbox->mutex", frame_start)
-        self.assertIn("mailbox->pendingRevision", frame_start)
-        self.assertIn("m_settings = mailbox->pending", frame_start)
-        self.assertIn("mailbox->pending = m_settings", frame_start)
+        # Phase 5.1-c: the mailbox half of the frame start is one
+        # implementation shared with proxy mode; the pipeline calls it first
+        # and last.
+        self.assertIn(
+            "m_settingsResolver.BeginFrame(*m_settingsMailbox, m_settings);",
+            frame_start,
+        )
+        self.assertIn(
+            "m_settingsResolver.FinishFrame(*m_settingsMailbox, m_settings);",
+            frame_start,
+        )
+        resolver = (
+            ROOT / "src/d3d9/war3/render/war3_settings_resolver.cpp"
+        ).read_text(encoding="utf-8")
+        begin = resolver.split("void War3SettingsFrameResolver::BeginFrame(", 1)[1].split(
+            "void War3SettingsFrameResolver::FinishFrame(", 1)[0]
+        finish = resolver.split("void War3SettingsFrameResolver::FinishFrame(", 1)[1]
+        self.assertIn("mailboxPtr->mutex", begin)
+        self.assertIn("mailboxPtr->pendingRevision", begin)
+        self.assertIn("settings = mailboxPtr->pending", begin)
+        self.assertIn("mailboxPtr->mutex", finish)
+        self.assertIn("mailboxPtr->pending = settings", finish)
+        # Nothing else takes the pending settings into a pipeline frame.
+        self.assertNotIn("m_settings = mailbox->pending", self.pipeline_cpp)
 
     def test_cs_derived_lighting_does_not_mutate_the_authored_snapshot(self):
         shadow = (ROOT / "src/d3d9/d3d9_war3_shadow.cpp").read_text(

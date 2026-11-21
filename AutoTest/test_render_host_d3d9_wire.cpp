@@ -7,14 +7,226 @@
 #include "test_render_host_effects.h"
 #include "test_render_host_texture_stages.h"
 #include "test_render_host_annotation.h"
-#include "../tools/render_host/d3d9_ff_wire.h"
+#include "test_render_host_content.h"
+#include "test_render_host_upload_window.h"
+#include "../tools/render_host/d3d9_ff_delta_wire.h"
+#include <random>
 #include "../tools/render_host/dxvk_core/d3d9_batch_state.h"
 #include <cstdio>
 #include <cstring>
 using namespace warvk::host;
+template<class Check> static void TestFixedDelta(Check check) {
+  using Result=d9::FixedDeltaResult;
+  std::mt19937 rng(0x50440001u);
+  const auto scalar=[&]{return float(int(rng()%65536)-32768)/128.0f;};
+  d9::DrawCommand draw;draw.resources[0]={1,1};draw.resources[5]={2,1};
+  d9::FixedFunctionState state;
+  const auto first=d9::EncodeFixedDraw(draw,state);
+  d9::FixedDrawPacket previous{};
+  std::array<uint8_t,d9::MaxPayload> payload{};
+  std::array<d9::FixedDrawPacket,d9::MaxFixedDrawBatch> expected;
+  d9::Header h;h.op=d9::Op::DrawFixedDeltaBatch;
+  for(bool verify:{false,true})for(uint32_t count=1;count<=d9::MaxFixedDrawBatch;++count) {
+    h.args[0]=count;h.args[1]=verify;h.payloadBytes=0;previous.fill(0);
+    for(uint32_t i=0;i<count;++i) {
+      switch(i%7) {
+        case 0: // A reset/resize changes the next complete input, even mid-sequence.
+          state={};draw.state.viewport.Width=1+rng()%4096;break;
+        case 1: // UP stream offset and resource generation.
+          draw.state.streamOffset=rng();++draw.resources[0].generation;break;
+        case 2: // Restored state block and post-world-lighting values.
+          for(auto& m:state.transforms)for(auto& row:m.m)for(float& v:row)v=scalar();
+          state.render[0]=rng()%2;state.render[9]=rng();state.material.Diffuse.r=scalar();break;
+        case 3:
+          for(auto& f:draw.state.vertexFloatConstants)f=scalar();
+          for(auto& f:draw.state.pixelFloatConstants)f=scalar();
+          state.lightCount=8;
+          for(auto& l:state.lights){l.Type=D3DLIGHT_DIRECTIONAL;l.Diffuse.r=scalar();l.Direction.z=1;}
+          break;
+        case 4:state.lights[7].Phi+=1;break; // Just word 794.
+        case 5:state.lightCount=rng()%8;break; // Removed slots must become zero.
+        case 6:break; // An identical input still describes a draw.
+      }
+      expected[i]=d9::EncodeFixedDraw(draw,state);
+      const auto at=h.payloadBytes;
+      const auto size=d9::EncodeFixedDeltaRecord(expected[i],previous,payload.data()+at,uint32_t(payload.size())-at,verify);
+      check(size&&expected[i]==previous);h.payloadBytes+=size;
+      if(i%7==4)check(size==12u+verify*8&&d9::U32(payload.data()+at)==(1u<<24)&&d9::U32(payload.data()+at+4)==(1u<<26));
+      if(i%7==6)check(size==4u+verify*8&&d9::U32(payload.data()+at)==0);
+      if(verify)check(d9::U64(payload.data()+at+size-8)==d9::FoldFnv1a64(expected[i].data(),d9::FixedDrawBytes));
+    }
+    uint32_t seen=0;
+    const auto status=d9::StageFixedDeltaBatch(h,payload.data(),[&](uint32_t i,const uint8_t* bytes) {
+      ++seen;check(!std::memcmp(bytes,expected[i].data(),d9::FixedDrawBytes));
+      d9::DrawCommand out;d9::FixedFunctionState ff;
+      return d9::DecodeFixedDraw(bytes,d9::FixedDrawBytes,out,ff)&&d9::EncodeFixedDraw(out,ff)==expected[i];
+    });
+    check(status==Result::Valid&&seen==count);
+  }
+  for(bool verify:{false,true}) {
+    previous.fill(0);h.args[0]=d9::MaxFixedDrawBatch;h.args[1]=verify;h.payloadBytes=0;
+    for(uint32_t i=0;i<h.args[0];++i) {
+      const auto at=h.payloadBytes;
+      const auto bytes=d9::EncodeFixedDeltaRecord(first,previous,payload.data()+at,uint32_t(payload.size())-at,verify);
+      check(i?bytes==4u+8u*verify:bytes>4u);h.payloadBytes+=bytes;
+    }
+    check(d9::StageFixedDeltaBatch(h,payload.data(),[&](uint32_t,const uint8_t* bytes) {
+      return !std::memcmp(bytes,first.data(),first.size());
+    })==Result::Valid);
+  }
+  // A literal vector pins little-endian values and ascending block/word order
+  // independently of the decoder (including a changed word becoming zero).
+  {
+    previous.fill(0);previous[31*4]=0xff;d9::FixedDrawPacket full{};
+    d9::P32(full.data()+2*4,0x12345678);d9::P32(full.data()+32*4,0xabcdef89);
+    d9::P32(full.data()+794*4,0x01020304);
+    const uint32_t wire[]={0x1000003,0x80000004,0x12345678,0,1,0xabcdef89,0x4000000,0x01020304};
+    check(d9::EncodeFixedDeltaRecord(full,previous,payload.data(),uint32_t(payload.size()),false)==sizeof(wire));
+    for(unsigned i=0;i<sizeof(wire)/4;++i)check(d9::U32(payload.data()+4*i)==wire[i]);
+  }
+  // Literal all-word changes exercise bit 31 in every full block. Such
+  // arbitrary packets are a codec test; valid fixed states have constant words.
+  for(bool verify:{false,true}) {
+    previous.fill(0);uint32_t used=0,records=0,batches=0,total=0;
+    const auto flush=[&] {
+      h.args[0]=records;h.args[1]=verify;h.payloadBytes=used;
+      uint32_t staged=0;
+      check(d9::StageFixedDeltaBatch(h,payload.data(),[&](uint32_t i,const uint8_t* p) {
+        const uint8_t value=(total+i)%2?0x11:0xee;++staged;
+        return std::all_of(p,p+d9::FixedDrawBytes,[&](uint8_t b){return b==value;});
+      })==Result::Valid&&staged==records);
+      total+=records;++batches;records=used=0;previous.fill(0);
+    };
+    for(unsigned i=0;i<20;++i) {
+      if(!d9::FixedDeltaHasRoom(used,verify))flush();
+      d9::FixedDrawPacket full;full.fill(i%2?0x11:0xee);
+      const auto size=d9::EncodeFixedDeltaRecord(full,previous,payload.data()+used,uint32_t(payload.size())-used,verify);
+      check(size==d9::FixedDeltaRecordBound(verify)&&d9::U32(payload.data()+used)==0x1ffffffu);
+      used+=size;++records;
+    }
+    flush();check(batches==2&&total==20);
+  }
+  // The encoder finds dirty words four at a time with a scalar tail. Pin its
+  // bytes against the plain word-by-word form: every word position set and
+  // cleared on its own, then sparse and dense random changes, at each output
+  // alignment.
+  {
+    const auto reference=[](const d9::FixedDrawPacket& full,d9::FixedDrawPacket& base,uint8_t* out) {
+      uint32_t blocks=0,at=4;
+      for(uint32_t b=0;b<d9::FixedDeltaBlocks;++b) {
+        uint32_t mask=0;const auto maskAt=at;
+        for(uint32_t w=b*32;w<std::min(b*32+32,d9::FixedDrawWords);++w) {
+          const auto value=d9::U32(full.data()+w*4);
+          if(value==d9::U32(base.data()+w*4))continue;
+          if(!mask)at+=4;
+          mask|=1u<<(w%32);d9::P32(out+at,value);at+=4;d9::P32(base.data()+w*4,value);
+        }
+        if(mask){blocks|=1u<<b;d9::P32(out+maskAt,mask);}
+      }
+      d9::P32(out,blocks);return at;
+    };
+    d9::FixedDrawPacket full{},mine{},theirs{};
+    std::array<uint8_t,d9::FixedDrawBytes+4*(1+d9::FixedDeltaBlocks)+8> a{},b{};
+    const auto same=[&](uint32_t shift) {
+      const auto x=d9::EncodeFixedDeltaRecord(full,mine,a.data()+shift,uint32_t(a.size())-shift,false);
+      const auto y=reference(full,theirs,b.data()+shift);
+      check(x==y&&!std::memcmp(a.data()+shift,b.data()+shift,x)&&mine==theirs&&mine==full);
+    };
+    for(uint32_t w=0;w<d9::FixedDrawWords;++w){d9::P32(full.data()+w*4,0x80000001u+w);same(w%4);}
+    for(uint32_t w=0;w<d9::FixedDrawWords;++w){d9::P32(full.data()+w*4,0);same((w+1)%4);}
+    for(uint32_t round=0;round<4000;++round) {
+      const uint32_t changes=round%5?rng()%24:rng()%d9::FixedDrawWords;
+      for(uint32_t i=0;i<changes;++i)
+        d9::P32(full.data()+(rng()%d9::FixedDrawWords)*4,round%3?uint32_t(rng()):uint32_t(rng()%2));
+      same(round%4);
+    }
+  }
+  // A complete valid prefix, then damage the last record. The observable
+  // output changes only when the entire staged batch was accepted.
+  h.args[0]=2;h.args[1]=1;previous.fill(0);
+  const auto second=d9::EncodeFixedDeltaRecord(first,previous,payload.data(),uint32_t(payload.size()),true);
+  h.payloadBytes=second+d9::EncodeFixedDeltaRecord(first,previous,payload.data()+second,uint32_t(payload.size())-second,true);
+  const auto good=h;const auto goodPayload=payload;
+  std::array<d9::FixedDrawPacket,2> output{};
+  const auto receive=[&](const d9::Header& msg,const uint8_t* p) {
+    decltype(output) scratch;
+    const auto status=d9::StageFixedDeltaBatch(msg,p,[&](uint32_t i,const uint8_t* full) {
+      d9::DrawCommand out;d9::FixedFunctionState ff;
+      if(i>=scratch.size()||!d9::DecodeFixedDraw(full,d9::FixedDrawBytes,out,ff))return false;
+      scratch[i]=d9::EncodeFixedDraw(out,ff);return true;
+    });
+    if(status==Result::Valid)output=scratch;
+    return status;
+  };
+  const auto reject=[&](const d9::Header& bad,Result reason=Result::Invalid) {
+    output[0].fill(0xad);output[1].fill(0xde);const auto before=output;
+    check(receive(bad,payload.data())==reason&&output==before);
+    check(receive(good,goodPayload.data())==Result::Valid&&output[0]==first&&output[1]==first);
+    payload=goodPayload;
+  };
+  for(unsigned bit=25;bit<32;++bit){d9::P32(payload.data()+second,1u<<bit);reject(good);}
+  d9::P32(payload.data()+second,1);d9::P32(payload.data()+second+4,0);reject(good);
+  for(unsigned bit=27;bit<32;++bit){d9::P32(payload.data()+second,1u<<24);d9::P32(payload.data()+second+4,1u<<bit);reject(good);}
+  for(unsigned count:{0u,21u}){auto bad=good;bad.args[0]=count;reject(bad);}
+  {auto bad=good;bad.args[1]=2;reject(bad);}
+  for(size_t i=2;i<good.args.size();++i){auto bad=good;bad.args[i]=1;reject(bad);}
+  {auto bad=good;bad.payloadBytes+=4;reject(bad);}
+  for(unsigned bytes=0;bytes<good.payloadBytes;++bytes){auto bad=good;bad.payloadBytes=bytes;reject(bad);}
+  payload[good.payloadBytes-1]^=1;reject(good,Result::HashMismatch);
+  // Supply the correct hash for each invalid complete state, to reach the
+  // existing fixed draw validator after a valid first record.
+  for(unsigned invalid=0;invalid<3;++invalid) {
+    auto badFull=first;
+    if(invalid==0)d9::P32(badFull.data()+d9::DrawBytes,0x7fc00000);
+    if(invalid==1)d9::P32(badFull.data()+d9::FixedDrawBytes-8*26*4-4,9);
+    if(invalid==2)badFull.back()=1;
+    previous=first;auto bad=good;bad.payloadBytes=second+d9::EncodeFixedDeltaRecord(badFull,previous,
+      payload.data()+second,uint32_t(payload.size())-second,true);reject(bad);
+  }
+  // Independent FNV-1a vector and an annotation on the last legal draw.
+  check(d9::FoldFnv1a64(reinterpret_cast<const uint8_t*>("hello"),5)==0xa430d84680aabd0bull);
+  d9::Header a;a.op=d9::Op::AnnotateDraws;a.args[0]=1;a.args[1]=20;a.args[2]=uint32_t(h.op);
+  auto tag=d9::EncodeDrawTag({1,2,3});a.payloadBytes=d9::AppendDrawRecord(payload.data(),uint32_t(payload.size()),19,
+    uint16_t(d9::AnnotationSchema::DrawTag),tag.data(),uint16_t(tag.size()));
+  d9::DrawAnnotations annotations;h.args[0]=20;
+  check(d9::DecodeDrawAnnotations(a,payload.data(),annotations)&&annotations.binds(h));
+  h.args[0]=19;check(!annotations.binds(h));h.op=d9::Op::DrawFixedBatch;h.args[0]=20;check(!annotations.binds(h));
+}
+
 int main(){
   unsigned checks=0,failures=0;
   auto check=[&](bool value){++checks;if(!value)++failures;};
+  // Preserve the legacy receipt's check count; new contracts fail this run directly.
+  auto require=[](bool ok){if(!ok){std::fputs("async-resource wire contract failed\n",stderr);std::abort();}};
+  for(uint32_t flags=0;flags<32;++flags) {
+    d9::Header h;h.args[0]=h.args[1]=64;h.args[6]=flags;h.sequence=1;h.nonce={1,2};
+    d9::Packet packet{};d9::Header decoded;d9::Initialization init;
+    require(d9::EncodeHeader(h,packet.data())&&d9::DecodeHeader(packet.data(),decoded)&&d9::DecodeInitialization(decoded,init));
+    require(init.asyncResources==(flags&24)&&init.fixedDelta==bool(flags&4)&&init.annotations==bool(flags&2)
+      &&init.retainContent==bool(flags&1));
+    d9::Reply reply;d9::EncodeReply(h,{},packet);require(d9::DecodeReply(h,packet.data(),reply)&&!reply.result&&!reply.payloadBytes);
+    for(bool ring:{false,true})for(bool batches:{false,true})
+      require(d9::ValidResourceTransport(flags,ring,batches)==(!(flags&24)||(ring&&batches)));
+  }
+  uint32_t bits=0;
+  for(const auto format:{D3DFMT_A8R8G8B8,D3DFMT_X8R8G8B8,D3DFMT_A8B8G8R8,D3DFMT_X8B8G8R8,D3DFMT_R5G6B5,
+      D3DFMT_A1R5G5B5,D3DFMT_X1R5G5B5,D3DFMT_A4R4G4B4,D3DFMT_A8L8,D3DFMT_A8,D3DFMT_L8,
+      D3DFMT_DXT1,D3DFMT_DXT2,D3DFMT_DXT3,D3DFMT_DXT4,D3DFMT_DXT5}) {
+    const auto bit=d9::TextureFormatBit(format);require(bit&&!(bit&(bit-1))&&!(bits&bit));bits|=bit;
+    d9::TextureLayout layout;require(d9::MakeTextureLayout(13,7,0,layout,format)&&layout.levels==4);
+    const bool bc=format>=D3DFMT_DXT1&&format<=D3DFMT_DXT5;
+    const uint32_t unit=bc?(format==D3DFMT_DXT1?8:16):(format==D3DFMT_A8||format==D3DFMT_L8)?1:
+      (format==D3DFMT_A8R8G8B8||format==D3DFMT_X8R8G8B8||format==D3DFMT_A8B8G8R8||format==D3DFMT_X8B8G8R8)?4:2;
+    uint32_t offset=0;
+    for(unsigned i=0;i<4;++i) {
+      const auto w=13u>>i,h=std::max(1u,7u>>i),pitch=(bc?(w+3)/4:w)*unit,bytes=pitch*(bc?(h+3)/4:h);
+      const auto& l=layout.level[i];require(l.width==w&&l.height==h&&l.pitch==pitch&&l.offset==offset&&l.bytes==bytes);
+      offset+=bytes;
+    }
+    require(layout.bytes==offset);
+  }
+  require(bits==0xffff&&!d9::TextureFormatBit(D3DFMT_UNKNOWN));
+  TestFixedDelta(check);
   warvk_fvf_test::Run(check);
   warvk_texture_test::Run(check);
   warvk_residency_test::Run(check);
@@ -22,6 +234,8 @@ int main(){
   warvk_effects_test::Run(check);
   warvk_texture_stages_test::Run(check);
   warvk_annotation_test::Run(check);
+  warvk_content_test::Run(check);
+  warvk_upload_window_test::Run(check);
   {
     d9::FixedFunctionState state,decoded;d9::DrawCommand draw,copy;
     draw.resources[0]={1,2};draw.resources[5]={6,2};
@@ -171,10 +385,24 @@ int main(){
     check(d9::DecodeHeader(p.data(),back)&&back.op==d9::Op::DrawFixedBatch);
     wait.op=d9::Op::ReadContent;check(d9::Encode(wait,data,p));
     check(d9::DecodeHeader(p.data(),back)&&back.op==d9::Op::ReadContent);
-    for(const auto op:{d9::Op::AnnotateDraws,d9::Op::FrameScene,d9::Op::StageMarker,d9::Op::Reset}) {
+    for(const auto op:{d9::Op::AnnotateDraws,d9::Op::FrameScene,d9::Op::StageMarker,d9::Op::Reset,d9::Op::AttachRing,
+        d9::Op::SessionReset,d9::Op::ContentUpload,d9::Op::ContentRelease,d9::Op::ContentRead,d9::Op::DrawFixedDeltaBatch}) {
       wait.op=op;check(d9::Encode(wait,data,p));check(d9::DecodeHeader(p.data(),back)&&back.op==op);
     }
-    ipc::WriteLe(p.data()+6,uint16_t(d9::Op::Reset)+1,2);check(!d9::DecodeHeader(p.data(),back));
+    ipc::WriteLe(p.data()+6,uint16_t(d9::Op::DrawFixedDeltaBatch)+1,2);check(!d9::DecodeHeader(p.data(),back));
+    // EncodeHeader writes exactly the bytes Encode puts ahead of a payload.
+    {std::array<uint8_t,d9::HeaderBytes> only{};wait.op=d9::Op::Present;wait.payloadBytes=0;
+      check(d9::EncodeHeader(wait,only.data())&&d9::Encode(wait,nullptr,p)&&std::equal(only.begin(),only.end(),p.begin()));}
+    // SessionReset: a reason, a nonzero generation, nothing else.
+    {d9::Header reset;reset.op=d9::Op::SessionReset;reset.args[0]=uint32_t(d9::SessionResetReason::MapTransition);reset.args[1]=1;
+      check(d9::ValidSessionReset(reset));
+      auto c=reset;c.args[0]=uint32_t(d9::SessionResetReason::GameExit);c.args[1]=0;c.args[2]=1;check(d9::ValidSessionReset(c));
+      c=reset;c.args[0]=0;check(!d9::ValidSessionReset(c));c.args[0]=3;check(!d9::ValidSessionReset(c));
+      c=reset;c.args[1]=0;check(!d9::ValidSessionReset(c));
+      c=reset;c.id=1;check(!d9::ValidSessionReset(c));c=reset;c.generation=1;check(!d9::ValidSessionReset(c));
+      c=reset;c.payloadBytes=4;check(!d9::ValidSessionReset(c));
+      for(size_t i=3;i<reset.args.size();++i){c=reset;c.args[i]=1;check(!d9::ValidSessionReset(c));}
+      c=reset;c.op=d9::Op::StageMarker;check(!d9::ValidSessionReset(c));}
     check(d9::Encode(h,data,p));}
   for(size_t i=112;i<128;++i){auto broken=p;broken[i]=1;check(!d9::DecodeHeader(broken.data(),back));}
   for(const uint32_t value:{0u,65536u,UINT32_MAX}){auto broken=p;d9::P32(broken.data()+8,value);check(d9::DecodeHeader(broken.data(),back)==(value<=d9::MaxPayload));}
@@ -182,7 +410,7 @@ int main(){
   {auto reused=p;d9::P32(reused.data()+44,2);check(d9::DecodeHeader(reused.data(),back)&&back.generation==2);}
   {auto broken=p;d9::P32(broken.data()+44,0);check(!d9::DecodeHeader(broken.data(),back));}
   {auto old=p;old[3]='1';ipc::WriteLe(old.data()+4,1,2);check(!d9::DecodeHeader(old.data(),back));}
-  {auto broken=p;d9::P32(broken.data()+40,65);check(!d9::DecodeHeader(broken.data(),back));}
+  {auto broken=p;d9::P32(broken.data()+40,d9::MaxResources+1);check(!d9::DecodeHeader(broken.data(),back));}
   {auto broken=p;d9::P32(broken.data()+12,1);check(!d9::DecodeHeader(broken.data(),back));}
   d9::Reply r{0,3,2,1,1,4},decoded;d9::Packet rp{};d9::EncodeReply(h,r,rp);
   check(d9::DecodeReply(h,rp.data(),decoded));check(decoded.submitted==3&&decoded.completed==2&&decoded.retired==1);
@@ -195,11 +423,11 @@ int main(){
   d9::Header init;init.args[0]=64;init.args[1]=64;d9::Initialization mode;
   check(d9::DecodeInitialization(init,mode));check(mode.profile==d9::PresentationProfile::Offscreen&&!mode.retainContent&&!mode.annotations);
   for(size_t i=2;i<16;++i){if(i==6)continue;auto invalid=init;invalid.args[i]=1;check(!d9::DecodeInitialization(invalid,mode));}
-  // Feature word: only the content-authority and annotation bits are defined.
-  {auto retain=init;retain.args[6]=d9::InitializeRetainContent;check(d9::DecodeInitialization(retain,mode)&&mode.retainContent&&!mode.annotations);}
-  {auto annotate=init;annotate.args[6]=d9::InitializeAnnotations;check(d9::DecodeInitialization(annotate,mode)&&!mode.retainContent&&mode.annotations);}
-  {auto both=init;both.args[6]=3;check(d9::DecodeInitialization(both,mode)&&mode.retainContent&&mode.annotations);}
-  for(const uint32_t value:{4u,5u,0x80000000u,UINT32_MAX}){auto invalid=init;invalid.args[6]=value;check(!d9::DecodeInitialization(invalid,mode));}
+  for(uint32_t features=0;features<8;++features) {
+    auto h=init;h.args[6]=features;check(d9::DecodeInitialization(h,mode)&&mode.retainContent==bool(features&1)
+      &&mode.annotations==bool(features&2)&&mode.fixedDelta==bool(features&4));
+  }
+  for(const uint32_t value:{32u,33u,0x80000000u,UINT32_MAX}){auto invalid=init;invalid.args[6]=value;check(!d9::DecodeInitialization(invalid,mode));}
   init.args[2]=1;init.args[3]=0x80401234;init.args[4]=17;init.args[5]=1;
   check(d9::DecodeInitialization(init,mode));check(mode.window==0x80401234&&mode.thread==17&&mode.interval==1);
   {auto diagnostic=init;diagnostic.args[2]=2;check(d9::DecodeInitialization(diagnostic,mode));
@@ -212,7 +440,7 @@ int main(){
   for(size_t i=7;i<16;++i){auto invalid=init;invalid.args[i]=1;check(!d9::DecodeInitialization(invalid,mode));}
   {auto retain=init;retain.args[6]=1;check(d9::DecodeInitialization(retain,mode)&&mode.retainContent&&mode.window==0x80401234);}
   {auto annotate=init;annotate.args[6]=2;check(d9::DecodeInitialization(annotate,mode)&&mode.annotations&&mode.window==0x80401234);}
-  {auto invalid=init;invalid.args[6]=4;check(!d9::DecodeInitialization(invalid,mode));}
+  {auto delta=init;delta.args[6]=4;check(d9::DecodeInitialization(delta,mode)&&mode.fixedDelta&&mode.window==0x80401234);}
   {auto invalid=init;invalid.id=1;check(!d9::DecodeInitialization(invalid,mode));}
   {auto invalid=init;invalid.payloadBytes=1;check(!d9::DecodeInitialization(invalid,mode));}
   // Back buffer format: 0 keeps A8R8G8B8, D3DFMT_X8R8G8B8 is the opaque target.
@@ -276,7 +504,7 @@ int main(){
     auto broken=draw;d9::P32(broken.data()+8*i+4,0);
     const auto saved=d9::EncodeDraw(copy);check(!d9::DecodeDraw(broken.data(),broken.size(),copy));
     check(d9::EncodeDraw(copy)==saved);
-    broken=draw;d9::P32(broken.data()+8*i,65);check(!d9::DecodeDraw(broken.data(),broken.size(),copy));
+    broken=draw;d9::P32(broken.data()+8*i,d9::MaxResources+1);check(!d9::DecodeDraw(broken.data(),broken.size(),copy));
   }
   for(uint32_t i=0;i<d9::DrawBytes;++i)check(!d9::DecodeDraw(draw.data(),i,copy));
   check(d9::U32(draw.data()+48)==65560&&d9::U32(draw.data()+52)==40);

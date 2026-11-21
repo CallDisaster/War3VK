@@ -3123,25 +3123,31 @@ bool TryOverrideWindowedClientSize(UINT previousWidth, UINT previousHeight,
   return wroteAny;
 }
 
-bool TryNotifyWindowedUiSizeChanged(HWND window, UINT width, UINT height) {
-  if (window == nullptr || width == 0u || height == 0u ||
-      g_windowMessageTargetLookup == nullptr) {
+bool TryNotifyWindowedUiSizeChanged(HWND window, UINT width, UINT height,
+                                    const char** failure) {
+  const auto failed = [failure](const char* step) {
+    if (failure != nullptr)
+      *failure = step;
     return false;
-  }
+  };
+  if (window == nullptr || width == 0u || height == 0u)
+    return failed("arguments");
+  if (g_windowMessageTargetLookup == nullptr)
+    return failed("lifecycle hooks not installed");
 
   const uintptr_t lParamStateAddr =
       g_windowSizeLParamStateAddr.load(std::memory_order_acquire);
   if (lParamStateAddr == 0u ||
       !IsReadableRange(reinterpret_cast<const void *>(lParamStateAddr),
                        sizeof(LPARAM))) {
-    return false;
+    return failed("size state address");
   }
 
   DWORD oldProtect = 0u;
   const LPARAM sizeLParam = MAKELPARAM(width, height);
   if (!VirtualProtect(reinterpret_cast<void *>(lParamStateAddr), sizeof(LPARAM),
                       PAGE_EXECUTE_READWRITE, &oldProtect)) {
-    return false;
+    return failed("size state protection");
   }
 
   *reinterpret_cast<LPARAM *>(lParamStateAddr) = sizeLParam;
@@ -3151,19 +3157,19 @@ bool TryNotifyWindowedUiSizeChanged(HWND window, UINT width, UINT height) {
 
   void *target = g_windowMessageTargetLookup(reinterpret_cast<void *>(window));
   if (target == nullptr || !IsReadableRange(target, sizeof(uintptr_t)))
-    return false;
+    return failed("no message target for the window");
 
   const uintptr_t vtbl = *reinterpret_cast<const uintptr_t *>(target);
   if (vtbl == 0u ||
       !IsReadableRange(reinterpret_cast<const void *>(vtbl + sizeof(uintptr_t)),
                        sizeof(uintptr_t))) {
-    return false;
+    return failed("message target vtable");
   }
 
   auto onSize =
       *reinterpret_cast<WindowMessageOnSizeFn const *>(vtbl + sizeof(uintptr_t));
   if (onSize == nullptr)
-    return false;
+    return failed("message target has no size handler");
 
   onSize(target);
   war3dbg::Print(

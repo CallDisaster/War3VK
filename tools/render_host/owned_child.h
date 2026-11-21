@@ -8,8 +8,10 @@ namespace warvk::host::lab {
 // Lab-only: an external process watchdog is mandatory for kernel stalls.
 class OwnedChild {
 public:
+  // `inherit`: one more handle the child inherits (ShareSelf), or null.
   OwnedChild(const std::wstring& executable,const std::wstring& arguments,
-             const std::wstring& createNewLog,const std::wstring& desktop=L"");
+             const std::wstring& createNewLog,const std::wstring& desktop=L"",HANDLE inherit=nullptr,
+             bool parentPriority=false);
   ~OwnedChild();
   OwnedChild(const OwnedChild&)=delete;
   OwnedChild& operator=(const OwnedChild&)=delete;

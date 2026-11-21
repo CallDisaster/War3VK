@@ -138,6 +138,20 @@ struct FrameHistory::Impl : history::CaptureLifecycle {
   }
 };
 
+// Sandbox only (WARVK_D3D9_EVIDENCE_TEST=1): the isolated desktop has no keyboard,
+// so an empty WarVK\\Temp\\evidence_request.txt stands for Ctrl+Shift+C.
+static void PollEvidenceTestRequest() noexcept {
+  static const std::wstring path=[]()->std::wstring{
+    wchar_t value[4]={},module[MAX_PATH+1]={};
+    if(GetEnvironmentVariableW(L"WARVK_D3D9_EVIDENCE_TEST",value,4)!=1||value[0]!=L'1')return {};
+    const DWORD size=GetModuleFileNameW(nullptr,module,MAX_PATH);
+    if(!size||size>=MAX_PATH)return {};
+    std::wstring text(module,size);const auto slash=text.find_last_of(L"\\/");
+    return slash==std::wstring::npos?std::wstring():text.substr(0,slash)+L"\\WarVK\\Temp\\evidence_request.txt";
+  }();
+  if(!path.empty()&&DeleteFileW(path.c_str()))TriggerFrameHistoryFromGame();
+}
+
 FrameHistory::FrameHistory(const Rc<DxvkDevice>& d):m(new Impl(d)){}
 FrameHistory::~FrameHistory(){stopRecorder();}
 std::shared_ptr<FrameHistory> FrameHistory::Create(const Rc<DxvkDevice>& d){
@@ -252,6 +266,7 @@ void FrameHistory::runRecorder() noexcept {
           throw std::runtime_error("raw-export-failed");
         hud().packageReady=true;session.finished(true);
       }
+      PollEvidenceTestRequest();
       std::unique_lock<std::mutex> sleepLock(m->wakeMutex);
       m->wake.wait_for(sleepLock,std::chrono::milliseconds(100),[&]{return m->stopping.load();});
     }

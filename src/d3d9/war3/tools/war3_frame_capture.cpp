@@ -377,6 +377,58 @@ bool CaptureSurfaceToBmp(IDirect3DDevice9* device, D3D9Surface* sourceSurface,
   return true;
 }
 
+// A foreign device's back buffer: read it back in its own format and extent.
+bool CaptureBackBufferToBmp(IDirect3DDevice9* device, IDirect3DSurface9* backBuffer,
+                            const std::filesystem::path& outputPath,
+                            uint32_t* outWidth, uint32_t* outHeight,
+                            std::string* outError) {
+  D3DSURFACE_DESC desc = {};
+  if (!device || !backBuffer || FAILED(backBuffer->GetDesc(&desc)) ||
+      desc.Width == 0u || desc.Height == 0u ||
+      (desc.Format != D3DFMT_A8R8G8B8 && desc.Format != D3DFMT_X8R8G8B8)) {
+    if (outError)
+      *outError = "back buffer unavailable or not 32-bit BGRA";
+    return false;
+  }
+
+  Com<IDirect3DSurface9> sysmemSurface;
+  HRESULT hr = device->CreateOffscreenPlainSurface(desc.Width, desc.Height, desc.Format,
+                                                   D3DPOOL_SYSTEMMEM, &sysmemSurface, nullptr);
+  if (FAILED(hr)) {
+    if (outError)
+      *outError = "CreateOffscreenPlainSurface failed: " + FormatHresult(hr);
+    return false;
+  }
+
+  hr = device->GetRenderTargetData(backBuffer, sysmemSurface.ptr());
+  if (FAILED(hr)) {
+    if (outError)
+      *outError = "GetRenderTargetData failed: " + FormatHresult(hr);
+    return false;
+  }
+
+  D3DLOCKED_RECT lockedRect = {};
+  hr = sysmemSurface->LockRect(&lockedRect, nullptr, D3DLOCK_READONLY);
+  if (FAILED(hr)) {
+    if (outError)
+      *outError = "LockRect(readback) failed: " + FormatHresult(hr);
+    return false;
+  }
+
+  const bool writeOk =
+      WriteBmp24(outputPath, reinterpret_cast<const uint8_t*>(lockedRect.pBits),
+                 desc.Width, desc.Height, static_cast<uint32_t>(lockedRect.Pitch), outError);
+  sysmemSurface->UnlockRect();
+  if (!writeOk)
+    return false;
+
+  if (outWidth)
+    *outWidth = desc.Width;
+  if (outHeight)
+    *outHeight = desc.Height;
+  return true;
+}
+
 War3FrameCaptureResult LoadCaptureRequest(const std::string& requestPath,
                                           bool* outParseOk) {
   War3FrameCaptureResult result = {};
@@ -479,8 +531,40 @@ bool HasPendingFrameCaptureRequest() {
   return GetFileAttributesA(requestPath.c_str()) != INVALID_FILE_ATTRIBUTES;
 }
 
+namespace {
+
+using CaptureToBmp = std::function<bool(const std::filesystem::path&, uint32_t*,
+                                        uint32_t*, std::string*)>;
+
+bool ProcessPendingFrameCaptureWith(const CaptureToBmp& captureToBmp,
+                                    War3FrameCaptureResult* outResult);
+
+} // namespace
+
 bool ProcessPendingFrameCapture(IDirect3DDevice9* device, D3D9Surface* sourceSurface,
                                 War3FrameCaptureResult* outResult) {
+  return ProcessPendingFrameCaptureWith(
+      [device, sourceSurface](const std::filesystem::path& path, uint32_t* width,
+                              uint32_t* height, std::string* error) {
+        return CaptureSurfaceToBmp(device, sourceSurface, path, width, height, error);
+      },
+      outResult);
+}
+
+bool ProcessPendingFrameCapture(IDirect3DDevice9* device, IDirect3DSurface9* backBuffer,
+                                War3FrameCaptureResult* outResult) {
+  return ProcessPendingFrameCaptureWith(
+      [device, backBuffer](const std::filesystem::path& path, uint32_t* width,
+                           uint32_t* height, std::string* error) {
+        return CaptureBackBufferToBmp(device, backBuffer, path, width, height, error);
+      },
+      outResult);
+}
+
+namespace {
+
+bool ProcessPendingFrameCaptureWith(const CaptureToBmp& captureToBmp,
+                                    War3FrameCaptureResult* outResult) {
   timeline::Scope capturePollTimeline("FrameCapture/Poll");
   War3FrameCaptureResult result = {};
   auto memoryRequest = PopPendingMemoryRequest();
@@ -682,8 +766,7 @@ bool ProcessPendingFrameCapture(IDirect3DDevice9* device, D3D9Surface* sourceSur
     result.stage13ReplayDrawCount = cadence.stage13ReplayDrawCount;
     result.shadowMapRenderSerial = cadence.shadowMapRenderSerial;
   }
-  result.ok = CaptureSurfaceToBmp(device, sourceSurface, outputPath,
-                                  &result.width, &result.height, &result.error);
+  result.ok = captureToBmp(outputPath, &result.width, &result.height, &result.error);
   WriteCaptureResultJson(result);
   if (memoryRequest != nullptr)
     CompletePendingMemoryRequest(memoryRequest, result);
@@ -702,5 +785,7 @@ bool ProcessPendingFrameCapture(IDirect3DDevice9* device, D3D9Surface* sourceSur
     *outResult = result;
   return true;
 }
+
+} // namespace
 
 } // namespace dxvk::war3::tools

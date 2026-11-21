@@ -1,6 +1,7 @@
 #include "d3d9_war3_shadow.h"
 #include "d3d9_war3_debug.h"
 
+#include "war3/render/war3_hybrid_ray_tracing.h"
 #include "war3/render/war3_render_objects.h"
 
 #include "../util/util_bit.h"
@@ -57,6 +58,65 @@ uint64_t War3ComputeShadowMatrixUploadKey(
   return hash;
 }
 
+}
+
+uint64_t War3ShadowReceiverPass::ResourceBytes() const {
+  // Every Rc<DxvkImage> and Rc<DxvkBuffer> member of the pass. The two point
+  // ray views belong to the hybrid ray tracer's images; an image is counted
+  // once however many members reach it.
+  std::vector<const DxvkPagedResource*> seen;
+  uint64_t bytes = 0u;
+  const auto add = [&](const DxvkPagedResource* resource, const Rc<DxvkResourceAllocation>& storage) {
+    if (resource == nullptr || storage == nullptr ||
+        std::find(seen.begin(), seen.end(), resource) != seen.end())
+      return;
+    seen.push_back(resource);
+    bytes += storage->getMemoryInfo().size;
+  };
+  const auto image = [&](const Rc<DxvkImage>& i) {
+    if (i != nullptr)
+      add(i.ptr(), i->storage());
+  };
+  const auto view = [&](const Rc<DxvkImageView>& v) {
+    if (v != nullptr && v->image() != nullptr)
+      add(v->image(), v->image()->storage());
+  };
+  const auto buffer = [&](const Rc<DxvkBuffer>& b) {
+    if (b != nullptr)
+      add(b.ptr(), b->storage());
+  };
+  image(m_outlineMaskVisible);
+  image(m_outlineMaskAll);
+  image(m_colorCopy);
+  image(m_depthCopy);
+  image(m_motionVectorImage);
+  image(m_shadowCurrent);
+  for (const auto& history : m_shadowHistory)
+    image(history);
+  image(m_shadowMap);
+  image(m_shadowCasterMask);
+  image(m_volumeSunShadowMap);
+  image(m_pointShadowCube);
+  image(m_pointShadowNeutralCube);
+  image(m_waterDepth);
+  image(m_waterInfo);
+  view(m_pointRayHiZVisibilityView);
+  view(m_pointRayHiZView);
+  // The two views are this frame's only; the hybrid ray tracer keeps its depth
+  // pyramid, visibility and uniforms from one frame to the next (x64 4d-3).
+  if (m_hybridRayTracing) {
+    image(m_hybridRayTracing->HizImage());
+    image(m_hybridRayTracing->VisibilityImage());
+    buffer(m_hybridRayTracing->UniformBuffer());
+  }
+  buffer(m_shadowUniformBuffer);
+  buffer(m_lightBuffer);
+  for (const auto& slot : m_shadowMatrixUploadSlots)
+    buffer(slot.buffer);
+  buffer(m_vertexBlendPaletteBuffer);
+  buffer(m_dummyPaletteBuffer);
+  buffer(m_pointShadowUniformBuffer);
+  return bytes;
 }
 
 bool War3ShadowReceiverPass::GetVolumetricShadowSnapshot(
@@ -1231,11 +1291,14 @@ void War3ShadowReceiverPass::copyColor(const Rc<DxvkCommandList> &ctx,
 
   ctx->cmdCopyImage(DxvkCmdBuffer::ExecBuffer, &copyInfo);
 
-  // Transition back: src to COLOR_ATTACHMENT_OPTIMAL, copy to SHADER_READ_ONLY
+  // Transition back: src to its original layout, copy to SHADER_READ_ONLY.
+  // The receiver that follows loads the target before it blends into it, so
+  // the barrier opens it for attachment reads as well as writes.
   barriers[0].srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
   barriers[0].srcAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
   barriers[0].dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-  barriers[0].dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+  barriers[0].dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
+                              VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
   barriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
   barriers[0].newLayout = srcLayout;
 
@@ -1318,7 +1381,10 @@ void War3ShadowReceiverPass::copyDepth(const Rc<DxvkCommandList> &ctx,
   barriers[0].srcAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
   barriers[0].dstStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
                              VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
-  barriers[0].dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+  // The depth is next loaded as an attachment (the unit outline) as well as
+  // written: the transition is made visible to both.
+  barriers[0].dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                              VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
   barriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
   barriers[0].newLayout = srcLayout;
 

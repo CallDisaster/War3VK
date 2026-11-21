@@ -42,9 +42,11 @@ bool TryOverrideWindowedClientSize(UINT previousWidth, UINT previousHeight,
  * @param window 当前游戏窗口句柄。
  * @param width  当前 client width。
  * @param height 当前 client height。
+ * @param failure 非空时，失败返回前写入没有通过的那一步的名字（静态字符串）。
  * @return 成功命中并调用原生 resize 回调时返回 true。
  */
-bool TryNotifyWindowedUiSizeChanged(HWND window, UINT width, UINT height);
+bool TryNotifyWindowedUiSizeChanged(HWND window, UINT width, UINT height,
+                                    const char** failure = nullptr);
 
 /**
  * @brief 获取已识别的主循环线程 ID。

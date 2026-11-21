@@ -47,8 +47,15 @@ struct FixedKeyView {
 inline dxvk::Vector4 FixedColor(DWORD c) {
   return dxvk::Vector4(float((c>>16)&255)/255,float((c>>8)&255)/255,float(c&255)/255,float(c>>24)/255);
 }
+// The two matrix inverses of the vertex block depend only on the world and view matrices, which the game
+// changes far less often than it draws. A bitwise-equal input gives the same output, so a block filled
+// from this cache is byte-identical to one filled by FillFixedFunctionTransforms.
+struct FixedTransformCache {
+  dxvk::Matrix4 world,view,worldView,normal,inverseView;
+  bool viewValid=false,worldValid=false;
+};
 inline void FillFixedVertex(void* mapped,const d9::FixedFunctionState& state,
-    const dxvk::D3D9FFShaderKeyVS& key,const D3DVIEWPORT9& vp,bool zTest) {
+    const dxvk::D3D9FFShaderKeyVS& key,const D3DVIEWPORT9& vp,bool zTest,FixedTransformCache* cache=nullptr) {
   using namespace dxvk;
   // Same mapped uniform layout and transform convention as UpdateFixedFunctionVS.
   std::memset(mapped,0,sizeof(D3D9FixedFunctionVS));
@@ -59,7 +66,18 @@ inline void FillFixedVertex(void* mapped,const d9::FixedFunctionState& state,
   D3D9ViewportInfo viewport;
   viewport.inverseExtent=Vector4(2.0f/float(vp.Width),-2.0f/float(vp.Height),zTest?1.0f:0.0f,1.0f);
   viewport.inverseOffset=Vector4(-float(vp.X),-float(vp.Y),0,0)*viewport.inverseExtent+Vector4(-1,1,0,0);
-  FillFixedFunctionTransforms(data,world,view,projection,textures.data(),viewport);
+  if(cache) {
+    if(!cache->viewValid||std::memcmp(&cache->view,&view,sizeof(Matrix4))) {
+      cache->view=view;cache->inverseView=transpose(inverse(view));cache->viewValid=true;cache->worldValid=false;
+    }
+    if(!cache->worldValid||std::memcmp(&cache->world,&world,sizeof(Matrix4))) {
+      cache->world=world;cache->worldView=view*world;cache->normal=inverse(cache->worldView);cache->worldValid=true;
+    }
+    data->WorldView=cache->worldView;data->NormalMatrix=cache->normal;data->InverseView=cache->inverseView;
+    data->Projection=projection;
+    for(uint32_t i=0;i<data->TexcoordMatrices.size();++i)data->TexcoordMatrices[i]=textures[i];
+    data->ViewportInfo=viewport;
+  } else FillFixedFunctionTransforms(data,world,view,projection,textures.data(),viewport);
   data->GlobalAmbient=FixedColor(state.render[d9::FFIndex(d9::FFRenderStates,D3DRS_AMBIENT)]);
   for(uint32_t i=0;i<state.lightCount;++i)data->Lights[i]=D3D9Light(state.lights[i],view);
   data->Material=state.material;data->TweenFactor=0;data->Key=key.Data;

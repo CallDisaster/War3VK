@@ -13,6 +13,13 @@ from run_render_host_protocol_gate import ROOT, identity, pe_identity
 from run_render_host_core_gate import execute
 
 
+def guarded_identity(path):
+    """Protected files are compared, never created: an absent player DLL must stay absent."""
+    if not path.exists():
+        return {'path': str(path), 'exists': False}
+    return identity(path)
+
+
 def inputs():
     suffixes = {'.cpp', '.c', '.h', '.hpp', '.in', '.inc', '.def', '.vert',
                 '.frag', '.comp', '.glsl', '.rc', '.txt'}
@@ -54,7 +61,7 @@ def main():
     output.mkdir(exist_ok=False)
     preserved = [ROOT / 'build32_weather_20261010/src/d3d9/d3d9.dll',
                  Path('E:/Work/Warcraft III/d3d9.dll')]
-    before = [identity(p) for p in preserved]
+    before = [guarded_identity(p) for p in preserved]
     source = [identity(p) for p in inputs()]
     receipt = dict(schema='warvk-device-owned-build/v1', ok=False,
                    gameLaunched=False, deployed=False, releaseReady=False,
@@ -112,7 +119,7 @@ def main():
     except Exception as exc:
         receipt['error'] = str(exc)
     finally:
-        receipt['preservedAfter'] = [identity(p) for p in preserved]
+        receipt['preservedAfter'] = [guarded_identity(p) for p in preserved]
         receipt['preservedUnchanged'] = before == receipt['preservedAfter']
         if not receipt['preservedUnchanged']:
             receipt['ok'] = False

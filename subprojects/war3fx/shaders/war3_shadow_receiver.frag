@@ -22,6 +22,12 @@ layout(set = 1, binding = 13) uniform texture2D s_pointContactHiz;
 layout(set = 1, binding = 14) uniform texture2D s_nativeLightBaseline;
 layout(set = 1, binding = 15) uniform texture2D s_nativeLightWithoutB;
 layout(set = 1, binding = 16) uniform texture2D s_nativeLightWithoutBoth;
+// The water (x64 render host, u_water.w = 1): the depth of the water's surface
+// (the game draws its water without writing depth, so s_depth under the water
+// is the ground's), and what this pass finds on the surface for the water pass:
+// x = the sun's visibility on the surface, y = the water's depth under it.
+layout(set = 1, binding = 17) uniform texture2D s_waterDepth;
+layout(set = 1, binding = 18, rg16f) uniform image2D s_waterInfoWrite;
 
 layout(set = 1, binding = 3, scalar, row_major)
 uniform ShadowData {
@@ -48,6 +54,12 @@ uniform ShadowData {
   vec4 u_pointRayParams2; // x=steps y=startOffset z=maxLights w=A1 layerCount
   // x=projection-derived far clear raw, y=known, z=raw depth quantum
   vec4 u_depthContract;
+  // x = shadow fade start, y = fade end (world units of water above the
+  // ground), z = the surface's own shadow 0..1, w = 1 when the water is bound
+  vec4 u_water;
+  // rgb = each channel's share of the sun shadow's strength (1 1 1: a grey
+  // shadow). The shadow takes the beam and leaves the sky's light.
+  vec4 u_shadowTint;
 } ubo;
 
 struct PointLight {
@@ -434,6 +446,11 @@ float sampleShadowPcf(uint cascadeIndex, vec2 uv, float refDepth,
   float kernel = ubo.u_params6.x;
   if (!validFloat(kernel) || kernel < 0.0 || kernel > 3.0)
     return 1.0;
+  float uniformVisibility = 1.0;
+  if (shadowKernelIsUniform(cascadeIndex, uv, refDepth, radiusTexel, kernel,
+                            receiverPlaneGradient, receiverPlaneValid,
+                            uniformVisibility))
+    return uniformVisibility;
   if (kernel >= 0.5 && kernel < 1.5)
     return sampleShadowGrid(cascadeIndex, uv, refDepth, radiusTexel, 2,
                             receiverPlaneGradient, receiverPlaneValid);
@@ -477,6 +494,10 @@ float computeWallFilterWeight(float wallFactor, float wallStabilityFactor,
   return clamp(receiverWeight * grazingWeight, 0.0, 1.0);
 }
 
+#ifdef WARVK_HOST_LAYER_RECEIVER
+#include "war3_shadow_available.glsl"
+#endif
+
 float computeShadowVisibility(vec3 worldPos, vec3 worldDx, vec3 worldDy,
                               float viewDepth, float biasExtra, vec2 rot,
                               float wallFilterWeight) {
@@ -501,6 +522,11 @@ float computeShadowVisibility(vec3 worldPos, vec3 worldDx, vec3 worldDy,
       return 1.0;
   }
 
+#ifdef WARVK_HOST_LAYER_RECEIVER
+  if (ubo.u_sunDir.w <= -16.0 && ubo.u_sunDir.w >= -31.0)
+    return availableShadowVisibility(int(-ubo.u_sunDir.w) - 16, cascadeCount, worldPos,
+        worldDx, worldDy, viewDepth, biasExtra, rot, wallFilterWeight);
+#endif
   int c0 = cascadeCount - 1;
   for (int i = 0; i < cascadeCount; i++) {
     if (viewDepth <= splits[i]) {
@@ -559,6 +585,9 @@ float computeShadowVisibility(vec3 worldPos, vec3 worldDx, vec3 worldDy,
     float far0 = splits[c0];
     float t = clamp((viewDepth - (far0 - blendRange)) / blendRange, 0.0, 1.0);
     float w = t * t * (3.0 - 2.0 * t);
+    // Outside the blend band the next cascade has no weight.
+    if (w <= 0.0)
+      return vis0;
 
     int c1 = c0 + 1;
     vec4 l1 = p * ubo.u_lightViewProj[c1];
@@ -1192,6 +1221,24 @@ void main() {
   float linearDepthDx = dFdx(linearDepthCandidate);
   float linearDepthDy = dFdy(linearDepthCandidate);
 
+  // The water's surface at this pixel, built before any per-pixel return as
+  // the candidates above (u_water.w is uniform for the draw).
+  bool waterBound = ubo.u_water.w > 0.5;
+  float waterRaw = 1.0;
+  if (waterBound) {
+    waterRaw = texelFetch(
+      sampler2D(s_waterDepth, s_samplers[nonuniformEXT(p_colorSampler)]),
+      pix, 0).r;
+  }
+  bool waterRawValid = waterBound && validFloat(waterRaw);
+  float waterNCandidate = clamp(normalizedDepth
+      ? ((waterRawValid ? waterRaw : 1.0) - safeMinZ) / safeDepthSpan
+      : (waterRawValid ? waterRaw : 1.0), 0.0, 1.0);
+  vec4 surfaceH = vec4(clipCandidate.xy, waterNCandidate, 1.0) * ubo.u_invViewProj;
+  bool surfaceHValid = validVec4(surfaceH) && abs(surfaceH.w) >= 1e-6;
+  vec3 surfacePos = surfaceHValid ? surfaceH.xyz / surfaceH.w : vec3(0.0);
+  bool surfacePosValid = surfaceHValid && validVec3(surfacePos);
+
   if (!validFloat(depth)) {
     o_color = col;
     return;
@@ -1350,6 +1397,25 @@ void main() {
   if (!worldPosCandidateValid) {
     o_color = col;
     return;
+  }
+
+  // Water above the ground here: its surface is nearer than the ground and is
+  // not the far clear. Its depth over the ground (world Z is up) goes to the
+  // water pass at once, before any return below; the sun's visibility on the
+  // surface follows when the shadow is computed.
+  bool waterPixel = waterRawValid && surfacePosValid &&
+      waterRaw < depth - max(2.0 * ubo.u_depthContract.z, 1.0e-6) &&
+      abs(waterRaw - clearRaw) > clearEpsilon;
+  float waterColumn = waterPixel ? max(surfacePos.z - worldPos.z, 0.0) : 0.0;
+  if (waterPixel)
+    imageStore(s_waterInfoWrite, pix, vec4(1.0, waterColumn, 0.0, 0.0));
+  // How much of the bed's shadow the water above it leaves: all of it where
+  // the water is shallow, none where it is deep.
+  float waterKeep = 1.0;
+  if (waterPixel) {
+    float fadeStart = max(ubo.u_water.x, 0.0);
+    float fadeEnd = max(ubo.u_water.y, fadeStart + 1.0);
+    waterKeep = 1.0 - smoothstep(fadeStart, fadeEnd, waterColumn);
   }
 
   if (debugMode == 6) {
@@ -1539,9 +1605,30 @@ void main() {
         pix,
         0).r;
     } else {
+      // One evaluation for the ground and for the water over it (a second
+      // call doubled the shader and its compile ran past the host's reply
+      // deadline). Under water the point rises from the bed to the surface
+      // as the bed's shadow fades, and the surface is flat: its share has no
+      // receiver slope, extra bias or wall filtering.
+      vec3 shadowPos = worldPos;
+      vec3 shadowDx = worldDx;
+      vec3 shadowDy = worldDy;
+      float shadowViewDepth = viewDepth;
+      float shadowBias = biasExtra;
+      float shadowWall = wallFilterWeight;
+      if (waterPixel && waterKeep < 1.0) {
+        shadowPos = mix(worldPos, surfacePos, 1.0 - waterKeep);
+        vec4 liftedViewH = vec4(shadowPos, 1.0) * ubo.u_view;
+        if (validVec4(liftedViewH))
+          shadowViewDepth = abs(liftedViewH.z);
+        shadowDx *= waterKeep;
+        shadowDy *= waterKeep;
+        shadowBias *= waterKeep;
+        shadowWall *= waterKeep;
+      }
       currVis = computeShadowVisibility(
-          worldPos, worldDx, worldDy, viewDepth, biasExtra, pcfRot,
-          wallFilterWeight);
+          shadowPos, shadowDx, shadowDy, shadowViewDepth, shadowBias, pcfRot,
+          shadowWall);
     }
 
     vis = validFloat(currVis) ? clamp(currVis, 0.0, 1.0) : 1.0;
@@ -1697,7 +1784,23 @@ void main() {
   }
 
   vis = validFloat(vis) ? clamp(vis, 0.0, 1.0) : 1.0;
-  float mul = 1.0 - strength + strength * vis;
+
+  // The water: the ground under it keeps its shadow where the water is
+  // shallow (the bed seen through it); as the water deepens the shadow was
+  // taken nearer the surface (above) and weakens to the surface's own, lighter
+  // one. The ground's shadow is not the water's: deep water showed the bed's
+  // shadows displaced, cliffs' shadows ran down it.
+  if (waterPixel) {
+    float surfaceShadow = clamp(ubo.u_water.z, 0.0, 1.0);
+    // The prepass evaluates at the bed only, so with it deep water keeps no
+    // shadow rather than the bed's.
+    float deepShadow = prepassEnabled ? 0.0 : surfaceShadow;
+    float sunOnSurface = prepassEnabled ? mix(1.0, vis, waterKeep) : vis;
+    imageStore(s_waterInfoWrite, pix, vec4(sunOnSurface, waterColumn, 0.0, 0.0));
+    vis = mix(1.0, vis, mix(deepShadow, 1.0, waterKeep));
+  }
+  vec3 strengthRgb = clamp(strength * ubo.u_shadowTint.rgb, 0.0, 1.0);
+  vec3 mul = vec3(1.0) - strengthRgb + strengthRgb * vis;
   vec3 baseColor = col.rgb * mul;
   vec3 rimAdd = vec3(0.0);
   if (rimIntensity > 1e-4 && needNormal) {

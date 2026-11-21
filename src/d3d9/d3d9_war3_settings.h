@@ -79,7 +79,12 @@ struct War3ShadowSettings {
   // Release hardening：0.70 让 Poisson16 的采样落在更小的 texel 半径内；
   // 配合固定 4096 CSM 保持清晰边缘，不用扩大滤波掩盖几何撕裂。
   float pcfRadius = 0.70f;
-  float receiverBias = 0.004f;
+  // Normalized light depth for a 4096 map; the pass scales it to the actual
+  // resolution. A cascade's depth range is about its width, so one shadow
+  // texel is about 1/4096 of it at every cascade and this is about 1.6 texels
+  // everywhere. The old 0.004 was 16 to 33 texels, 7 to 94 world units along
+  // the light: feet and low walls fell inside it and cast no shadow.
+  float receiverBias = 0.0004f;
   float cascadeBlendRange = 120.0f;
   War3ShadowPcfKernel pcfKernel = War3ShadowPcfKernel::Poisson16;
   // DirectInline has no temporal integration. Rotating a PCF kernel with a
@@ -87,12 +92,15 @@ struct War3ShadowSettings {
   // visible stripe field, so the release baseline is deterministic.
   bool pcfRotate = false;
   War3ShadowPcfRotateMode pcfRotateMode = War3ShadowPcfRotateMode::Off;
-  float cascadeBiasScale = 0.5f;
+  // receiverBias already follows the cascade's texel size.
+  float cascadeBiasScale = 0.0f;
   float pcfCascadeRadiusScale = 0.5f;
 
   float casterDepthBias = 1.0f;
   float casterSlopeBias = 1.5f;
-  float casterBiasClamp = 0.0f;
+  // About four texels. Triangles nearly parallel to the light would otherwise
+  // be pushed far behind themselves and lose their contact with the ground.
+  float casterBiasClamp = 0.001f;
 
   bool pcssEnabled = false;
   float pcssSearchRadius = 6.0f;
@@ -185,7 +193,8 @@ struct War3ShadowSettings {
   uint32_t pointShadowMaxFacesPerFrame = 6;
 
   War3ShadowReceiverMode receiverMode = War3ShadowReceiverMode::NormalBias;
-  float normalBiasScale = 0.005f;
+  // Extra bias at full grazing light, about two texels.
+  float normalBiasScale = 0.0005f;
   float rimIntensity = 0.0f;
   float rimPower = 2.0f;
   War3ShadowAltitudeMode altitudeMode = War3ShadowAltitudeMode::SineAltitude;
@@ -432,6 +441,86 @@ struct War3OccludedOutlineSettings {
   float colorA = 0.8f;
 };
 
+struct War3CasterClassSettings {
+  bool castShadow = true;
+  float maxShadowLength = 0.0f;
+};
+using War3CasterClasses = std::array<War3CasterClassSettings, 5>;
+
+// The light's colour at one time of day, and how bright it is.
+struct War3SunTintKey {
+  float r = 1.0f, g = 1.0f, b = 1.0f;
+  float intensity = 1.0f;
+};
+
+// The player's sun (Ctrl+F1, the sun dial). Not part of the Lighting record:
+// the proxy carries it in the diagnostics block (war3_proxy_diag_block.h).
+struct War3SunStyleSettings {
+  // The shadow as long as the sun's altitude makes it, instead of the 35..55
+  // degree band the shadow altitude is otherwise kept in. Only the shadow's
+  // length: the light's colour, its brightness and the shading follow the
+  // sun's altitude either way (War3SunCycle, the look of the hour).
+  bool realShadowLength = false;
+  // The sun's altitude at noon and the moon's at midnight, in degrees, while
+  // no path is set.
+  float noonAltitudeDeg = 60.0f;
+  // The light's colour over the day from the curve below, in place of the
+  // sun's and the moon's own colours.
+  bool customTint = false;
+  // The path of the sun (and of the moon by night) seen from above, as the
+  // dial draws it: from the east rim at sunrise through (0, pathNorth) at
+  // noon to the west rim, in radii of the dial, north positive. Unset, the
+  // default path runs (through the south, light from the bottom of the
+  // screen).
+  bool pathSet = false;
+  float pathNorth = -0.5f;
+  // The keys' hours: the moon at 00:00, sunrise at 06:00, 09:00, noon at
+  // 12:00, 15:00 and sunset at 18:00 (War3SunCycle::TintAt blends them). The
+  // sunrise and sunset keys are the light at the horizon: its colour (the
+  // golden hour fades from it to the day's) and its brightness, which is low
+  // because sun and moon change places there. The defaults follow the sun's
+  // own colours on the default path.
+  static constexpr size_t KeyCount = 6;
+  static constexpr float KeyHours[KeyCount] = { 0.0f, 6.0f, 9.0f, 12.0f, 15.0f, 18.0f };
+  std::array<War3SunTintKey, KeyCount> tint = {{
+      { 0.60f, 0.74f, 1.00f, 0.46f },
+      { 1.00f, 0.54f, 0.18f, 0.14f },
+      { 1.00f, 0.96f, 0.89f, 1.00f },
+      { 1.00f, 0.98f, 0.93f, 1.00f },
+      { 1.00f, 0.95f, 0.86f, 1.00f },
+      { 1.00f, 0.50f, 0.16f, 0.14f },
+  }};
+};
+
+// The player's water (Ctrl+F1). Not part of the Lighting record: the proxy
+// carries it in the diagnostics block (war3_proxy_diag_block.h), like the sun's
+// style. Only the x64 render host has the water's surface (the water draws'
+// replay), so in process none of this changes the picture.
+struct War3WaterSettings {
+  // The sun's shadow on the ground under the water fades with the depth of
+  // the water above that ground: whole up to shadowFadeStart world units,
+  // gone from shadowFadeEnd on (a cliff level is 128 units).
+  float shadowFadeStart = 24.0f;
+  float shadowFadeEnd = 72.0f;
+  // The sun's shadow on the water's surface itself, 0..1 of the shadow's
+  // strength on the ground.
+  float surfaceShadow = 0.3f;
+  // The water's surface: reflection, the sun's glint, the colour of depth.
+  bool surfaceEnabled = true;
+  float reflection = 0.6f;  // 0..1
+  float specular = 1.0f;    // 0..2, the sun's glint
+  float waveScale = 1.0f;   // 0..2, how much the ripples bend the surface
+  float waveSpeed = 1.0f;   // 0..3
+  float clarity = 0.5f;     // 0..1, how far into the water one sees
+  // At the game's water draw in the render host. Auto uses the Vulkan adapter.
+  int inPlace = 2;          // 0 off, 1 on, 2 discrete GPUs only
+  float style = 1.0f;       // 0..1, from the original fixed-function result
+  float depthColor = 1.0f;  // 0..2
+  float foam = 1.0f;       // 0..2
+  float refraction = 1.0f; // 0..2
+  float caustics = 1.0f;   // 0..2, light concentrated on the shallow bottom
+};
+
 struct War3RenderSettings {
   War3DirectionalLightSettings sun = {};
   War3ShadowSettings shadows = {};
@@ -444,6 +533,10 @@ struct War3RenderSettings {
     bool autoOverride = false;
     Vector4 color = Vector4(0.0f, 0.0f, 0.0f, 0.0f);
   } ambient;
+
+  War3CasterClasses casterClasses{};
+  War3SunStyleSettings sunStyle{};
+  War3WaterSettings water{};
 };
 
 } // namespace dxvk

@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <vector>
@@ -44,7 +45,6 @@ struct Frame { Slice slice; uint64_t serial; int32_t result; uint64_t cpu100ns; 
 struct Store {
   std::atomic<DWORD> tid{0};
   std::atomic<uint64_t> otherPresents{0};
-  std::atomic<bool> nativeSyncInstalled{false}, nativeSyncCandidate{false};
   std::mutex mutex;
   std::array<Frame,Capacity> frames{};
   size_t count = 0, next = 0;
@@ -52,7 +52,13 @@ struct Store {
   std::array<LockSite,32> lockSites{};
   uint64_t censusOverflow = 0;
 };
-Store& store() { static Store s; return s; }
+// The store is 5.2 MB; only DXVK_WAR3_FRAME_TIMELINE=1 uses it. Every caller
+// checks Enabled() first, so it is built on the heap at the first use there
+// and never exists otherwise; it is destroyed when the former function-local
+// static was (the DLL can be loaded and freed more than once in a process).
+// The native frame-sync flags are recorded either way.
+Store& store() { static const std::unique_ptr<Store> s(new Store()); return *s; }
+std::atomic<bool> nativeSyncInstalled{false}, nativeSyncCandidate{false};
 struct Local {
   Ledger ledger;
   const void* swapchain = nullptr;
@@ -106,8 +112,8 @@ void Present(const void* swapchain, bool recording) noexcept {
   local.nativeSync={};
 }
 void NativeFrameSyncInstalled(bool installed, bool candidate) noexcept {
-  store().nativeSyncCandidate.store(candidate);
-  store().nativeSyncInstalled.store(installed);
+  nativeSyncCandidate.store(candidate);
+  nativeSyncInstalled.store(installed);
 }
 bool NativeFrameSyncRecordingOwner() noexcept {
   return owner() && local.previousRecording;
@@ -191,8 +197,8 @@ std::string CaptureJson() {
     out<<"{\"caller\":"<<c.caller<<",\"flags\":"<<c.flags<<",\"result\":"<<c.result
        <<",\"calls\":"<<c.calls<<'}';
   }
-  out<<"]},\"nativeFrameSync\":{\"installed\":"<<(s.nativeSyncInstalled.load()?"true":"false")
-     <<",\"candidate\":"<<(s.nativeSyncCandidate.load()?"true":"false")
+  out<<"]},\"nativeFrameSync\":{\"installed\":"<<(nativeSyncInstalled.load()?"true":"false")
+     <<",\"candidate\":"<<(nativeSyncCandidate.load()?"true":"false")
      <<",\"policy\":\"request-one-only; no-pixel-consumer; recording-owner; native-screenshot-retained\"},\"frames\":[";
   for(size_t i=0;i<frames.size();++i) {
     const auto& r=frames[i]; const auto& a=r.slice; if(i)out<<',';
