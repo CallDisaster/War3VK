@@ -109,3 +109,7 @@ Agents/
 # 一次性压缩包/临时分析文件
 /src/src.rar
 /tiara.ai
+
+# Logs the build tools write beside their build trees
+/build*.configure.log
+/build*.ninja.log

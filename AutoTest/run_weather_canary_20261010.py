@@ -812,7 +812,7 @@ def run(args: argparse.Namespace, suite=None) -> int:
     import war3_autotest_mcp as war3
     import winreg
     out = artifact_dir(args.name)
-    player_dll_before = x64mode.require_player_dll_absent("before")
+    player_dll_before = x64mode.player_dll_guard("before")
     arm = None
     if args.mode == "proxy":
         if suite:
@@ -1033,11 +1033,11 @@ def run(args: argparse.Namespace, suite=None) -> int:
             except Exception as cleanup_error:
                 receipt["stop"] = {"ok": False, "error": str(cleanup_error)}
         receipt["playerDllAfter"] = x64mode.player_dll_state()
-        if receipt["playerDllAfter"]["exists"]:
+        if not x64mode.player_dll_unchanged(player_dll_before, receipt["playerDllAfter"]):
             receipt["runtimeAcceptance"] = False
         save_final_run_receipt(out, receipt, protected, dimensions, winreg, war3.WAR3_VIDEO_REG_KEY)
-        if receipt["playerDllAfter"]["exists"]:
-            raise RuntimeError("player d3d9.dll appeared during the run")
+        if not x64mode.player_dll_unchanged(player_dll_before, receipt["playerDllAfter"]):
+            raise RuntimeError("player d3d9.dll changed during the run")
 
 
 def run_proxy_verdict(war3, receipt: dict, arm, launch: dict, instance: Path, pid: int,

@@ -223,7 +223,7 @@ def phase_from_markers(temp: Path) -> str:
 
 
 def main() -> int:
-    player_dll_before = x64mode.require_player_dll_absent("before")
+    player_dll_before = x64mode.player_dll_guard("before")
     for path, expected in EXPECTED.items():
         if not path.is_file() or sha256(path) != expected:
             raise RuntimeError(f"input identity mismatch: {path}")
@@ -606,7 +606,7 @@ def main() -> int:
             receipt["sourceIdentityAfter"][str(path)] == value
             for path, value in EXPECTED.items())
         receipt["playerDllAfter"] = x64mode.player_dll_state()
-        receipt["playerDllStayedAbsent"] = receipt["playerDllAfter"]["exists"] is False
+        receipt["playerDllUnchanged"] = x64mode.player_dll_unchanged(player_dll_before, receipt["playerDllAfter"])
         write_json_new(layout.artifact_dir / "cross-map-result.json", receipt)
 
 

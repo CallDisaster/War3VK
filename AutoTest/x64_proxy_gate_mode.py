@@ -6,8 +6,9 @@ run_weather_canary_20261010.py and run_startup_diag_gate.py.
 
 The in-process arm of a gate keeps its own environment, assertions and outputs.
 What both arms share from here is the player-directory guard: the player's
-E:/Work/Warcraft III/d3d9.dll is absent and must stay absent - it is never
-created, copied or restored - and each arm pins the sandbox DLL it actually
+E:/Work/Warcraft III/d3d9.dll is only looked at and must be the same after the
+gate as before it (absent stays absent, a player's own file keeps its bytes) - it
+is never created, copied or restored - and each arm pins the sandbox DLL it actually
 loads to the hash of the DLL under test.
 
 The proxy arm adds:
@@ -76,17 +77,24 @@ def identity(path: Path) -> Dict[str, Any]:
 
 
 def player_dll_state() -> Dict[str, Any]:
-    """The player's DLL is only looked at: absent is the expected state."""
+    """The player's DLL is only looked at, never written."""
     if PLAYER_DLL.exists():
         return {"path": str(PLAYER_DLL), "exists": True, **identity(PLAYER_DLL)}
     return {"path": str(PLAYER_DLL), "exists": False}
 
 
-def require_player_dll_absent(stage: str) -> Dict[str, Any]:
+def player_dll_guard(stage: str) -> Dict[str, Any]:
+    """The player's DLL before a gate. Gates run in the sandbox only, so a file the
+    player put there (the author's own trial of a build) may stay; what a gate
+    must never do is change it (player_dll_unchanged after the run)."""
     state = player_dll_state()
-    if state["exists"]:
-        raise RuntimeError(f"player d3d9.dll must stay absent ({stage}): {PLAYER_DLL}")
+    state["stage"] = stage
     return state
+
+
+def player_dll_unchanged(before: Dict[str, Any], after: Dict[str, Any]) -> bool:
+    keys = ("path", "exists", "size", "sha256")
+    return {k: before.get(k) for k in keys} == {k: after.get(k) for k in keys}
 
 
 def pe_bits(path: Path) -> int:

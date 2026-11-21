@@ -5,13 +5,14 @@ from pathlib import Path
 import tempfile
 import unittest
 import zipfile
-from package_v122_release import (make_archive, verify_archive, verify_win32, members, PLAYER, AUTHOR,
-                                  PLAYER_SOURCES, PLAYER_RUNNING_PREDECESSOR_SHA, VERSION)
+from package_v122_release import (make_archive, verify_archive, verify_win32, verify_win64, members, PLAYER,
+                                  AUTHOR, PLAYER_SOURCES, PLAYER_RUNNING_PREDECESSOR_SHA, VERSION, FRONT_SHA256,
+                                  foreign_imports)
 
 
 class ReleaseArchiveTests(unittest.TestCase):
     def test_patch_version_and_player_identity(self):
-        self.assertEqual(VERSION, '1.22.03')
+        self.assertEqual(VERSION, '1.30.00')
         self.assertEqual(PLAYER_RUNNING_PREDECESSOR_SHA,
             '1FFE0BD14C51C8E1D2A9EB94425A06260CD4B480A7CA735E13E946EA93EE35CF')
         with tempfile.TemporaryDirectory() as tmp:
@@ -19,7 +20,7 @@ class ReleaseArchiveTests(unittest.TestCase):
             (package / 'README.md').write_text('payload', encoding='utf-8')
             make_archive(package, root / 'p.zip', ('README.md',), {})
             manifest = json.loads((package / 'manifest.json').read_text())
-            self.assertEqual(manifest['version'], '1.22.03')
+            self.assertEqual(manifest['version'], '1.30.00')
 
     def test_actual_pe_reader_contract(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -37,9 +38,31 @@ class ReleaseArchiveTests(unittest.TestCase):
             path.write_bytes(data)
             with self.assertRaises(ValueError):
                 verify_win32(path)
+            self.assertEqual(verify_win64(path)['machine'], 0x8664)
+            struct.pack_into('<H', data, 0x84, 0x14c)
+            struct.pack_into('<H', data, 0x98, 0x10b)
+            path.write_bytes(data)
+            with self.assertRaises(ValueError):
+                verify_win64(path)
+
+    def test_x64_renderer_members(self):
+        # 1.30: the 64-bit renderer ships in WarVK/x64 beside d3d9.dll; the product
+        # starts it when all three files are there (war3_proxy_auto.cpp).
+        for member in ('WarVK/x64/warvk-d3d9-front.dll', 'WarVK/x64/warvk-d3d9-host.exe', 'WarVK/x64/dxvk.conf',
+                       'WarVK_EvidenceStart.cmd'):
+            self.assertIn(member, PLAYER)
+        repo = Path(__file__).resolve().parents[1]
+        auto = (repo / 'src/d3d9/war3/platform/war3_proxy_auto.cpp').read_text(encoding='utf-8')
+        for name in ('warvk-d3d9-front.dll', 'warvk-d3d9-host.exe', 'dxvk.conf'):
+            self.assertIn(name, auto)
+        self.assertEqual(FRONT_SHA256, '14E995B67B7435ABB5535F0019E855077D5F50EEBD602885CA0D0C0600609AB4')
+        self.assertEqual(foreign_imports(['KERNEL32.dll', 'api-ms-win-crt-runtime-l1-1-0.dll', 'USER32.dll']), [])
+        self.assertEqual(foreign_imports(['KERNEL32.dll', 'libc++.dll', 'libwinpthread-1.dll']),
+                         ['libc++.dll', 'libwinpthread-1.dll'])
 
     def test_whitelists(self):
-        self.assertEqual([x for x in PLAYER if x.endswith('.dll')], ['d3d9.dll'])
+        self.assertEqual([x for x in PLAYER if x.endswith('.dll')], ['d3d9.dll', 'WarVK/x64/warvk-d3d9-front.dll'])
+        self.assertEqual([x for x in PLAYER if x.endswith('.exe')], ['WarVK/x64/warvk-d3d9-host.exe'])
         self.assertFalse(any(x.endswith(('.dll', '.exe', '.lua', '.ai')) for x in AUTHOR))
         self.assertIn('README_CN.md', PLAYER)
         self.assertIn('WarVK/icons/atom.blp', AUTHOR)

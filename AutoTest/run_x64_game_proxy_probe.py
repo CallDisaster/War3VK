@@ -33,7 +33,7 @@ ping, runtime status, wait_until, one capture_final_frame.
 --vanilla runs the game as it ships: no d3d9.dll in the instance, no host, no
 WarVK environment, so the game uses Windows' own Direct3D 9. It is the
 reference arm of the comparison with the original game
-(run_v123_vanilla_compare.py), which counts frames from outside with Direct3D
+(run_v130_vanilla_compare.py), which counts frames from outside with Direct3D
 9's own Present events. The probe records the wall-clock start of its run
 (observer.beganUnixSeconds) so those events can be cut to the same window.
 """

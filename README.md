@@ -1,17 +1,27 @@
-# WarVK 1.22.03
+# WarVK 1.30.00
 
 [简体中文](README_CN.md) · [Changelog](CHANGELOG.md) · [Map-author API](WarVK/README.md) · [Downloads](https://github.com/CallDisaster/War3VK/releases/latest)
 
-WarVK enhances **Warcraft III 1.27a (32-bit)** using a DXVK-derived D3D9-to-Vulkan backend. It adds directional/point shadows, volumetric lighting, local fog, post-processing, diagnostics and a bounded JASS API, without changing map gameplay.
+WarVK enhances **Warcraft III 1.27a (32-bit)** using a DXVK-derived D3D9-to-Vulkan backend. It adds directional/point shadows, volumetric lighting, local fog, post-processing, diagnostics and a bounded JASS API, without changing map gameplay. Since 1.30 the Vulkan renderer runs in a separate 64-bit process by default, which gives the game's own 32-bit address space about 500 MiB back.
 
-## Changes in 1.22.03
+## Changes in 1.30.00
+
+- **64-bit rendering (on by default).** DXVK, the GPU driver, shadows and post-processing moved to a separate 64-bit process, `WarVK\x64\warvk-d3d9-host.exe`; the game process keeps only the game and a thin forwarding layer. Usable space in the game's low 2 GiB after loading, same machine and map: Lost Temple 1030 → 1551 MiB, the large custom map 生与死 476 → 1042 MiB — about 240 MiB more than the game's own OpenGL mode. It turns on by itself when the player package's `WarVK\x64` folder is present; delete or rename that folder to get the single-process mode of 1.22.03 back. If the 64-bit process cannot start, WarVK falls back by itself.
+- **Shadows per category.** Units, buildings, doodads, destructables and others can each have casting turned off or their shadow length capped; parts that touch the ground (infantry feet, low fences) no longer cast; shadows no longer vanish wholesale with a low camera and many units; the shadows Warcraft bakes into the ground are removed.
+- **Sun disc and the colour of the day.** Drag the sun or lock the time of day in the console. Light colours were retuned: warm light with cool shadows, twilight around sunrise and sunset, bluish moonlight; "real shadow length" now changes only the length.
+- **New water (64-bit rendering, on by default on discrete GPUs).** WarVK takes over at the moment the game draws its water: depth tint, shallow-water refraction and caustics, reflections and sky, long waves travelling with the wind with glints on their crests, shore foam; no more large shadows cast from the shore onto deep water. Water style 0 is the game's own water.
+- **Fixes.** The Infernal's green light is no longer lit pale yellow (with 64-bit rendering; the single-process mode still tints it). Found and fixed while 64-bit rendering was in testing, never present in 1.22.03's single-process mode: trees, buildings and water glowing under the fog of war and the black mask; smoke and water mist turning into solid blue or black silhouettes; campaign cutscenes and the first frame of a map turning grey-white or blue-white; a black screen without UI after the intro movie.
+- **Console.** Render Stats shows a Warcraft address-space bar and the 64-bit process's memory and VRAM; performance logs can be recorded. Frame evidence for catching rare picture faults is off by default; start with `WarVK_EvidenceStart.cmd` from the player package when you need it.
+- Shader API 1.2.0 and JASS wire `warvk:v1` are unchanged. See the [changelog](CHANGELOG.md) and [1.30.00 notes](docs/RELEASE_1.30.00.md).
+
+### Earlier in 1.22.03
 
 - **Panel settings are saved.** Anything changed under "built-in render settings" in the Ctrl+F1 panel is written to `WarVK\settings.ini` and restored on the next start. Only touched values are stored; the panel has a "restore defaults" button.
 - **Unit portraits are no longer tinted by WarVK lighting.** The sun/ambient rewrite now applies to the world scene only; the portrait model keeps the game's own light instead of getting darker or brighter with the time of day.
 - **Shadows and volumetric light no longer draw over the UI while the game is paused or the menu is open.** Paused frames dispatch the world stages through a different path, so the old boundary was never found and the passes ran at frame end. The boundary is now the end of the world scene.
 - **Melee games with computer players no longer drop a shadow frame about once a second.** 1.27a re-enters the script runner whenever a JASS thread resumes (melee AI does so several times per second); it was mistaken for a map change and reset the whole shadow session. It now counts as a map change only when the world is not being rendered.
 - **Sharper, more visible volumetric light.** Dedicated shadow map 1536→2048 with a tighter near layer (5.5→2.9 world units per texel); the shaft edge guide no longer falls straight to 1/8 at 1440p/4K (now 1/3 and 1/4). Default intensity 1.2→1.5, contrast 2.1→2.5, occluded-shaft darkening cap 24%→36%. Still off by default; about 14 MiB more VRAM when enabled.
-- Shader API 1.2.0 and JASS wire `warvk:v1` are unchanged. See the [changelog](CHANGELOG.md) and [1.22.03 notes](docs/RELEASE_1.22.03.md).
+- See the [1.22.03 notes](docs/RELEASE_1.22.03.md).
 
 ### Earlier in 1.22.02
 
@@ -50,13 +60,13 @@ A historical same-DLL, matched isolated 2560×1440 A-B-B-A experiment measured m
 
 ## Requirements / installation
 
-- Windows 10/11; Warcraft III **1.27a / 32-bit**.
+- **64-bit** Windows 10/11; Warcraft III **1.27a / 32-bit**.
 - A GPU and official driver supporting **Vulkan 1.3** plus the extensions this fork uses: NVIDIA 551.61+, AMD Adrenalin 24.2.1+, Intel 32.0.101.6557+ (see `WarVK_GPU_REQUIREMENTS.md`). If start-up fails, WarVK tells you why and which driver to install.
 - Only verified executable/Game.dll signatures are supported; unknown layouts are not guessed.
 
 1. Fully exit Warcraft III and the editor; back up any existing `d3d9.dll` separately.
-2. Extract **WarVK-1.22.03-win32.zip** and put its DLL beside `war3.exe`.
-3. Start normally; `d3d9.log` should report `DXVK: 1.22.03`.
+2. Extract all of **WarVK-1.30.00-win32.zip** into the folder of `war3.exe`: `d3d9.dll` and the `WarVK` folder (with `x64` inside) should sit right beside `war3.exe`.
+3. Start normally. `warvk-d3d9-host.exe` under Task Manager's Details means 64-bit rendering is on; each start's logs are in `WarVK\logs`.
 4. Press **Ctrl+F1** for settings and Render Stats. Normal optimizations do not require recording.
 
 Do not use old experimental launch scripts for normal play. Environment variables are an internal diagnostic surface and can override defaults; supported player/author entry points are the panel and documented JAPI. Heavy frame evidence is **off by default**. Do not install conflicting D3D9 proxy DLLs.
@@ -79,18 +89,21 @@ The separate **author-kit** ZIP contains JASS/YDWE integration, not a runtime DL
 - Launching with `-opengl` (some map tools/launchers force it) means Warcraft III never loads `d3d9.dll`, so WarVK is inactive.
 - Worst-case 1440p/4K Froxel requests may safely fall back to Legacy. Fine foliage and point-shadow surfaces can still need map-specific assessment.
 - Not every JASS wrapper is implemented or exhaustively runtime-tested. Check capability/error results and [author notes](WarVK/README.md).
-- **Excluded:** unfinished Water-branch changes, automatic native-model point-light takeover, the 64-bit renderer and unapproved culling/Consume experiments. Existing explicit author-created point lights remain supported.
+- **64-bit rendering limits.** Keep anti-aliasing (MSAA) off. If the 64-bit process fails while playing, the game exits; it cannot switch back to the single-process mode mid-game. Alt-Tab, resizing by dragging, restoring from minimized and changing display scaling while running have no automated tests. Full screen supports only the primary display's current resolution; windowed mode is the safer start. The picture is slightly brighter than in the single-process mode and shadows tear now and then; neither cause is found yet. Water reflects only what is on screen.
+- The first map after installing may stall for a few seconds while the driver compiles the shadow shaders for the first time; later starts do not. When a map fades through white or another colour, shadows float above that colour.
+- Isolated automated tests ran on a single NVIDIA RTX 4060 Ti; this formal build has no player acceptance yet.
+- **Excluded:** automatic native-model point-light takeover and unapproved culling/Consume experiments. Existing explicit author-created point lights remain supported.
 
 ## Reports and rollback
 
 If the game does not start, attach `WarVK\Log\startup-error.txt`. Otherwise include map name, fresh-process/map-change sequence, settings, screenshots and performance HTML when available. Logs, runtime status and GPU/crash reports help; remove private data before publishing. Heavy evidence is not required for normal play.
 
-Fully exit before restoring the backed-up DLL. To uninstall, remove WarVK's DLL; logs can be managed separately.
+Fully exit before restoring the backed-up DLL. To stop using 64-bit rendering for now, delete or rename `WarVK\x64`. To uninstall, delete `d3d9.dll` and the `x64`, `logs`, `cache` and `Evidence` folders inside `WarVK` (`Evidence` may hold evidence packages or performance logs you have not sent yet).
 
 ## Development / licensing
 
-Product/JAPI display: **1.22.03**; subsequent fixes retain the 1.22 numbering series. External Shader API remains **1.2.0**, JASS wire remains **warvk:v1**; existing scripts do not need an ABI migration.
+Product/JAPI display: **1.30.00**; subsequent fixes retain the 1.30 numbering series. External Shader API remains **1.2.0**, JASS wire remains **warvk:v1**; existing scripts do not need an ABI migration.
 
-Runtime code: `src/d3d9/`; Warcraft integration: `src/d3d9/war3/`; shaders: `subprojects/war3fx/`; author integration: `WarVK/`; tests: `AutoTest/`. Use pinned dependencies and explicit release options, not an old diagnostic build directory. See [release scope](docs/RELEASE_1.22.02.md).
+Runtime code: `src/d3d9/`; Warcraft integration: `src/d3d9/war3/`; shaders: `subprojects/war3fx/`; author integration: `WarVK/`; tests: `AutoTest/`. Use pinned dependencies and explicit release options, not an old diagnostic build directory. See [release scope](docs/RELEASE_1.30.00.md).
 
 WarVK is GPLv3 at project level: [LICENSE](LICENSE), [COPYING](COPYING), [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Dependencies retain their original notices. This is an unofficial project built on DXVK, Dear ImGui, MinHook, Vulkan and Warcraft community research.

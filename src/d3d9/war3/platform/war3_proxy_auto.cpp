@@ -42,6 +42,10 @@ const wchar_t* const kSettings[][2] = {
   {L"WARVK_D3D9_ASYNC_SCENE", L"1"},
   {L"WARVK_D3D9_PRESENT_AHEAD", L"1"},
   {L"WARVK_D3D9_FIXED_DELTA", L"1"},
+  // Frame evidence (the host's frame ring and per-frame tear audit, about 0.4 ms
+  // a frame and up to 1 GiB of video memory) is off for players; the player
+  // package's WarVK_EvidenceStart.cmd sets it to 1 before starting the game.
+  {L"WARVK_D3D9_EVIDENCE", L"0"},
 };
 
 std::atomic<bool> g_fellBack{false};

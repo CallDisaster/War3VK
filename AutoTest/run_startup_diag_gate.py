@@ -293,7 +293,7 @@ def main() -> int:
     args.dll = args.dll.resolve()
     args.sha = args.sha.upper()
     only = set(filter(None, args.only.split(",")))
-    player_before = x64mode.require_player_dll_absent("before")
+    player_before = x64mode.player_dll_guard("before")
     for p, want in PINNED.items():
         if sha256(p) != want:
             raise RuntimeError(f"identity mismatch: {p}")
@@ -331,13 +331,13 @@ def main() -> int:
         receipt["verdicts"] = verdicts
         measured = [v for v in verdicts.values() if "ok" in v]
         receipt["ok"] = (bool(measured) and all(v["ok"] for v in measured) and receipt["sourceUnchanged"]
-                         and not receipt["playerDllAfter"]["exists"])
+                         and x64mode.player_dll_unchanged(player_before, receipt["playerDllAfter"]))
         out.mkdir(parents=True, exist_ok=True)
         with (out / "startup-diag.json").open("x", encoding="utf-8") as s:
             json.dump(receipt, s, ensure_ascii=False, indent=2, default=str)
         print("verdicts", json.dumps(verdicts, ensure_ascii=False), flush=True)
-        print("sourceUnchanged", receipt["sourceUnchanged"], "playerDllAbsent",
-              not receipt["playerDllAfter"]["exists"], flush=True)
+        print("sourceUnchanged", receipt["sourceUnchanged"], "playerDllUnchanged",
+              x64mode.player_dll_unchanged(player_before, receipt["playerDllAfter"]), flush=True)
     if arm is not None:
         return 0  # nothing measurable yet; see the verdicts
     return 0 if receipt["ok"] else 2

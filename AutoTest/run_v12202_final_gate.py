@@ -187,8 +187,8 @@ def main() -> int:
     dll, sha = args.dll.resolve(), args.sha.upper()
     if not dll.is_file() or sha256(dll) != sha:
         raise RuntimeError(f"candidate identity mismatch: {dll}")
-    # The player's DLL is absent and stays absent; it is never created here.
-    x64mode.require_player_dll_absent("before the gate")
+    # The player's DLL is only looked at; it must be the same after the gate.
+    player_before = x64mode.player_dll_guard("before the gate")
     run_id = args.run_id or f"v12202-{args.tag}-{args.gate}"
     arm = None
     if args.mode == "proxy":
@@ -225,8 +225,9 @@ def main() -> int:
     else:
         result = pressure(dll, sha, run_id if args.run_id else f"v12202-{args.tag}-pressure", arm)
 
-    x64mode.require_player_dll_absent("after the gate")
-    print(f"player_dll_absent=True gate={args.gate} mode={args.mode} exit={result}", flush=True)
+    if not x64mode.player_dll_unchanged(player_before, x64mode.player_dll_state()):
+        raise RuntimeError("player d3d9.dll changed during the gate")
+    print(f"player_dll_unchanged=True gate={args.gate} mode={args.mode} exit={result}", flush=True)
     return result
 
 

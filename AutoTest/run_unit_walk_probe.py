@@ -62,7 +62,7 @@ def check_inputs() -> None:
 
 
 def main() -> int:
-    player_dll_before = x64mode.require_player_dll_absent("before")
+    player_dll_before = x64mode.player_dll_guard("before")
     check_inputs()
     for key in tuple(os.environ):
         if key.startswith("DXVK_WAR3_") or key.startswith("DXVK_RUNTIME_"):
@@ -193,7 +193,7 @@ def main() -> int:
         receipt["sourceUnchanged"] = all(
             receipt["sourceIdentityAfter"][str(p)] == h for p, h in PINNED.items())
         receipt["playerDllAfter"] = x64mode.player_dll_state()
-        receipt["playerDllStayedAbsent"] = receipt["playerDllAfter"]["exists"] is False
+        receipt["playerDllUnchanged"] = x64mode.player_dll_unchanged(player_dll_before, receipt["playerDllAfter"])
         target.mkdir(parents=True, exist_ok=True)
         with (target / "walk-probe.json").open("x", encoding="utf-8") as stream:
             json.dump(receipt, stream, ensure_ascii=False, indent=2, allow_nan=False)
